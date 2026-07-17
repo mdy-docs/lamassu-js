@@ -87,6 +87,10 @@ typedef struct JsCompiler {
     const char *err_msg;
     uint32_t err_pos;
     int func_depth;
+    /* module compilation (NULL if compiling a plain script) */
+    JsModule *module;
+    JsModBinding *mbind; /* top-level module bindings (exports/imports) */
+    uint32_t mbind_count;
 } JsCompiler;
 
 #define FN (cx->cur->fn)
@@ -94,6 +98,8 @@ typedef struct JsCompiler {
 static bool compile_stmt(JsCompiler *cx, const JsAstNode *n);
 static bool compile_expr(JsCompiler *cx, const JsAstNode *n);
 static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat, bool declaring);
+static bool compile_function(JsCompiler *cx, const JsAstNode *fnode);
+static int emit_module_load(JsCompiler *cx, const JsAstNode *n);
 static bool compile_function(JsCompiler *cx, const JsAstNode *fnode);
 
 static bool cerr(JsCompiler *cx, uint32_t pos, const char *msg) {
@@ -401,10 +407,20 @@ static int resolve_upvalue(JsCompiler *cx, JsFuncState *fs, const uint16_t *name
 
 /* ---- declaration pre-scan ---- */
 
+static JsModBinding *resolve_module_binding(JsCompiler *cx, const uint16_t *name,
+                                            uint32_t len);
+
 static bool pattern_declare(JsCompiler *cx, const JsAstNode *pat, bool is_const,
                             uint32_t scope_floor, bool tdz) {
     switch ((JsAstKind)pat->kind) {
     case JS_AST_IDENT: {
+        /* module-top-level exported names live in the exports object, not a
+         * local slot — skip declaring them here (SET_EXPORT initializes). */
+        if (cx->module && cx->cur->is_module) {
+            JsModBinding *b = resolve_module_binding(cx, pat->units, pat->len);
+            if (b && b->kind == JS_MB_EXPORT)
+                return true;
+        }
         uint16_t slot;
         if (!declare_local(cx, pat->units, pat->len, is_const, pat->pos,
                            scope_floor, &slot))
@@ -449,6 +465,9 @@ static bool prescan_declarations(JsCompiler *cx, JsAstNode *const *stmts,
                                  uint32_t count, uint32_t scope_floor) {
     for (uint32_t i = 0; i < count; i++) {
         const JsAstNode *s = stmts[i];
+        /* unwrap `export <decl>` */
+        if (s->kind == JS_AST_EXPORT_NAMED && s->a)
+            s = s->a;
         if (s->kind == JS_AST_LET_DECL) {
             for (uint32_t d = 0; d < s->count; d++) {
                 if (!pattern_declare(cx, s->items[d]->a, (s->flags & JS_F_CONST) != 0,
@@ -456,6 +475,12 @@ static bool prescan_declarations(JsCompiler *cx, JsAstNode *const *stmts,
                     return false;
             }
         } else if (s->kind == JS_AST_FUNC_DECL) {
+            /* exported functions become export bindings, not locals */
+            if (cx->module && cx->cur->is_module) {
+                JsModBinding *b = resolve_module_binding(cx, s->units, s->len);
+                if (b && b->kind == JS_MB_EXPORT)
+                    continue;
+            }
             uint16_t slot;
             if (!declare_local(cx, s->units, s->len, false, s->pos, scope_floor, &slot))
                 return false;
@@ -553,6 +578,46 @@ static bool emit_finally_gosubs(JsCompiler *cx, int floor) {
 
 /* ---- identifiers ---- */
 
+/* Finds a module-level binding (export/import) by local name, or NULL. */
+static JsModBinding *resolve_module_binding(JsCompiler *cx, const uint16_t *name,
+                                            uint32_t len) {
+    for (uint32_t i = 0; i < cx->mbind_count; i++) {
+        if (units_equal(cx->mbind[i].name, cx->mbind[i].len, name, len))
+            return &cx->mbind[i];
+    }
+    return NULL;
+}
+
+/* Emits access to a module binding; returns 0 not-a-binding, 1 emitted, -1 error. */
+static int emit_module_load(JsCompiler *cx, const JsAstNode *n) {
+    JsModBinding *b = resolve_module_binding(cx, n->units, n->len);
+    if (!b)
+        return 0;
+    if (b->kind == JS_MB_EXPORT) {
+        uint16_t c;
+        if (!atom_const(cx, b->export_name, b->export_len, n->pos, &c))
+            return -1;
+        return emit_op_u16(cx, JS_OP_GET_EXPORT, c, +1) ? 1 : -1;
+    }
+    if (b->kind == JS_MB_IMPORT_NS)
+        return emit_op_u16(cx, JS_OP_IMPORT_NS, b->import_index, +1) ? 1 : -1;
+    return emit_op_u16(cx, JS_OP_GET_IMPORT, b->import_index, +1) ? 1 : -1;
+}
+
+static int emit_module_store(JsCompiler *cx, const JsAstNode *target) {
+    JsModBinding *b = resolve_module_binding(cx, target->units, target->len);
+    if (!b)
+        return 0;
+    if (b->kind != JS_MB_EXPORT)
+        return cerr(cx, target->pos, "cannot assign to an imported binding") ? -1 : -1;
+    if (b->is_const)
+        return cerr(cx, target->pos, "assignment to constant variable") ? -1 : -1;
+    uint16_t c;
+    if (!atom_const(cx, b->export_name, b->export_len, target->pos, &c))
+        return -1;
+    return emit_op_u16(cx, JS_OP_SET_EXPORT, c, 0) ? 1 : -1;
+}
+
 static bool compile_ident_load(JsCompiler *cx, const JsAstNode *n) {
     note_pos(cx, n->pos);
     int idx = resolve_local_in(cx->cur, n->units, n->len);
@@ -564,6 +629,11 @@ static bool compile_ident_load(JsCompiler *cx, const JsAstNode *n) {
         return false;
     if (up >= 0)
         return emit_op_u16(cx, JS_OP_GET_UPVAL, (uint16_t)up, +1);
+    if (cx->module) {
+        int m = emit_module_load(cx, n);
+        if (m != 0)
+            return m > 0;
+    }
     uint16_t c;
     if (!atom_const(cx, n->units, n->len, n->pos, &c))
         return false;
@@ -586,6 +656,11 @@ static bool compile_ident_store(JsCompiler *cx, const JsAstNode *target) {
         if (is_const)
             return cerr(cx, target->pos, "assignment to constant variable");
         return emit_op_u16(cx, JS_OP_SET_UPVAL, (uint16_t)up, 0);
+    }
+    if (cx->module) {
+        int m = emit_module_store(cx, target);
+        if (m != 0)
+            return m > 0;
     }
     uint16_t c;
     if (!atom_const(cx, target->units, target->len, target->pos, &c))
@@ -653,11 +728,31 @@ static bool compile_pattern_default(JsCompiler *cx, const JsAstNode *def,
     return compile_pattern_store(cx, def->a, declaring);
 }
 
+/* Emits the initializing write of an exported binding (bypasses const). */
+static int emit_module_init(JsCompiler *cx, const JsAstNode *tgt) {
+    JsModBinding *b = resolve_module_binding(cx, tgt->units, tgt->len);
+    if (!b || b->kind != JS_MB_EXPORT)
+        return 0;
+    uint16_t c;
+    if (!atom_const(cx, b->export_name, b->export_len, tgt->pos, &c))
+        return -1;
+    return emit_op_u16(cx, JS_OP_SET_EXPORT, c, 0) ? 1 : -1;
+}
+
 static bool store_target(JsCompiler *cx, const JsAstNode *tgt, bool declaring) {
     if (declaring) {
         int idx = resolve_local_in(cx->cur, tgt->units, tgt->len);
-        if (idx < 0)
+        if (idx < 0) {
+            /* an exported top-level binding: initialize the export */
+            if (cx->module && cx->cur->is_module) {
+                int m = emit_module_init(cx, tgt);
+                if (m > 0)
+                    return emit_op(cx, JS_OP_POP, -1);
+                if (m < 0)
+                    return false;
+            }
             return cerr(cx, tgt->pos, "internal: undeclared binding");
+        }
         return emit_op_u16(cx, JS_OP_SET_LOCAL, cx->cur->locals[idx].slot, 0) &&
                emit_op(cx, JS_OP_POP, -1);
     }
@@ -1236,6 +1331,10 @@ static bool compile_expr(JsCompiler *cx, const JsAstNode *n) {
                 if (up >= 0)
                     return emit_op_u16(cx, JS_OP_GET_UPVAL, (uint16_t)up, +1) &&
                            emit_op(cx, JS_OP_TYPEOF, 0);
+                if (cx->module && resolve_module_binding(cx, n->a->units, n->a->len)) {
+                    int m = emit_module_load(cx, n->a);
+                    return m > 0 && emit_op(cx, JS_OP_TYPEOF, 0);
+                }
                 uint16_t c;
                 if (!atom_const(cx, n->a->units, n->a->len, n->a->pos, &c))
                     return false;
@@ -1269,7 +1368,9 @@ static bool compile_expr(JsCompiler *cx, const JsAstNode *n) {
     case JS_AST_ASSIGN:
         return compile_assign(cx, n);
     case JS_AST_AWAIT:
-        return cerr(cx, n->pos, "async/await arrives in phase 6");
+        note_pos(cx, n->pos);
+        /* operand in, result out: net stack effect 0 */
+        return compile_expr(cx, n->a) && emit_op(cx, JS_OP_AWAIT, 0);
     case JS_AST_REGEX:
         return cerr(cx, n->pos, "regex arrives with the engine integration (phase 10)");
     case JS_AST_SPREAD:
@@ -1377,6 +1478,7 @@ static bool compile_function(JsCompiler *cx, const JsAstNode *fnode) {
         return cerr(cx, fnode->pos, "out of memory");
     JsFunctionCell *fn = (JsFunctionCell *)cell;
     memset((char *)fn + sizeof(JsGcCell), 0, sizeof *fn - sizeof(JsGcCell));
+    fn->module = cx->module; /* nested fns share the module (exports/imports) */
 
     JsFuncState fs;
     memset(&fs, 0, sizeof fs);
@@ -1385,13 +1487,14 @@ static bool compile_function(JsCompiler *cx, const JsAstNode *fnode) {
     fs.fn_value = js_value_from_cell(cell);
     fs.scratch_slot = -1;
     fs.is_arrow = (fnode->flags & JS_F_ARROW) != 0;
+    if (!js_gc_protect(cx->vm, &fs.fn_value))
+        return cerr(cx, fnode->pos, "out of memory");
+    /* Intern the name only after fn is rooted (interning may collect). */
     if (fnode->len && !fs.is_arrow) {
         JsValue nm = js_atom(cx->vm, fnode->units, fnode->len);
         if (js_is_string(nm))
-            fn->name = js_value_string(nm);
+            ((JsFunctionCell *)js_value_cell(fs.fn_value))->name = js_value_string(nm);
     }
-    if (!js_gc_protect(cx->vm, &fs.fn_value))
-        return cerr(cx, fnode->pos, "out of memory");
     cx->cur = &fs;
 
     bool ok = true;
@@ -1410,7 +1513,8 @@ static bool compile_function(JsCompiler *cx, const JsAstNode *fnode) {
 
     fn->n_params = n_params;
     fn->fn_flags = (uint8_t)((fs.is_arrow ? JS_FN_ARROW : 0) |
-                             (has_rest ? JS_FN_HAS_REST : 0));
+                             (has_rest ? JS_FN_HAS_REST : 0) |
+                             ((fnode->flags & JS_F_ASYNC) ? JS_FN_ASYNC : 0));
     fn->n_locals = fs.slot_max;
     fn->max_stack = (uint32_t)(fs.max_depth < 0 ? 0 : fs.max_depth) + 8;
 
@@ -1453,13 +1557,33 @@ static bool compile_let_decl(JsCompiler *cx, const JsAstNode *n) {
 static bool hoist_functions(JsCompiler *cx, JsAstNode *const *stmts, uint32_t count) {
     for (uint32_t i = 0; i < count; i++) {
         const JsAstNode *s = stmts[i];
+        /* `export function f(){}` wraps the FUNC_DECL; unwrap it */
+        bool exported = false;
+        if (s->kind == JS_AST_EXPORT_NAMED && s->a && s->a->kind == JS_AST_FUNC_DECL) {
+            s = s->a;
+            exported = true;
+        }
         if (s->kind != JS_AST_FUNC_DECL)
             continue;
+        if (!compile_function(cx, s))
+            return false;
+        if (exported ||
+            (cx->module && cx->cur->is_module && resolve_module_binding(cx, s->units, s->len) &&
+             resolve_module_binding(cx, s->units, s->len)->kind == JS_MB_EXPORT)) {
+            /* exported function: initialize the export binding */
+            uint16_t c;
+            JsModBinding *b = resolve_module_binding(cx, s->units, s->len);
+            const uint16_t *ename = b ? b->export_name : s->units;
+            uint32_t elen = b ? b->export_len : s->len;
+            if (!atom_const(cx, ename, elen, s->pos, &c) ||
+                !emit_op_u16(cx, JS_OP_SET_EXPORT, c, 0) || !emit_op(cx, JS_OP_POP, -1))
+                return false;
+            continue;
+        }
         int idx = resolve_local_in(cx->cur, s->units, s->len);
         if (idx < 0)
             return cerr(cx, s->pos, "internal: function not pre-declared");
-        if (!compile_function(cx, s) ||
-            !emit_op_u16(cx, JS_OP_SET_LOCAL, cx->cur->locals[idx].slot, 0) ||
+        if (!emit_op_u16(cx, JS_OP_SET_LOCAL, cx->cur->locals[idx].slot, 0) ||
             !emit_op(cx, JS_OP_POP, -1))
             return false;
     }
@@ -1874,10 +1998,34 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
     case JS_AST_LABELED:
         return compile_stmt_labeled(cx, n);
     case JS_AST_IMPORT:
-    case JS_AST_EXPORT_NAMED:
-    case JS_AST_EXPORT_DEFAULT:
     case JS_AST_EXPORT_ALL:
-        return cerr(cx, n->pos, "modules arrive in phase 7");
+        if (!cx->module)
+            return cerr(cx, n->pos, "import/export requires the module loader (js_eval_module)");
+        /* bindings/deps handled at analyze/link/eval time; no runtime code */
+        return true;
+    case JS_AST_EXPORT_NAMED:
+        if (!cx->module)
+            return cerr(cx, n->pos, "import/export requires the module loader (js_eval_module)");
+        if (n->a) /* export <declaration> */
+            return compile_stmt(cx, n->a);
+        return true; /* export { ... }: bindings resolved by name */
+    case JS_AST_EXPORT_DEFAULT: {
+        if (!cx->module)
+            return cerr(cx, n->pos, "import/export requires the module loader (js_eval_module)");
+        /* exports.default = value */
+        note_pos(cx, n->pos);
+        if (n->a->kind == JS_AST_FUNC_EXPR || n->a->kind == JS_AST_FUNC_DECL) {
+            if (!compile_function(cx, n->a))
+                return false;
+        } else if (!compile_expr(cx, n->a)) {
+            return false;
+        }
+        uint16_t c;
+        static const uint16_t def_name[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
+        if (!atom_const(cx, def_name, 7, n->pos, &c))
+            return false;
+        return emit_op_u16(cx, JS_OP_SET_EXPORT, c, 0) && emit_op(cx, JS_OP_POP, -1);
+    }
     default:
         return cerr(cx, n->pos, "unsupported statement");
     }
@@ -1926,6 +2074,278 @@ JsFunctionCell *js_compile_ast(JsContext *ctx, const JsAstNode *module,
     fn->n_locals = fs.slot_max;
     fn->max_stack = (uint32_t)(fs.max_depth < 0 ? 0 : fs.max_depth) + 8;
     fn->n_params = 0;
+    /* top-level await makes the module body a suspendable (async) fiber */
+    if (module->flags & JS_F_HAS_TLA)
+        fn->fn_flags |= JS_FN_ASYNC;
+
+    js_gc_unprotect(vm, &fs.fn_value);
+    js_arena_free(&cx.arena);
+    if (!ok) {
+        err->msg = cx.err_msg ? cx.err_msg : "compile error";
+        err->pos = cx.err_pos;
+        return NULL;
+    }
+    return fn;
+}
+
+/* ---- module analysis + module-body compilation ---- */
+
+static JsString *intern_atom(JsCompiler *cx, const uint16_t *u, uint32_t len) {
+    JsValue a = js_atom(cx->vm, u, len);
+    return js_is_string(a) ? js_value_string(a) : NULL;
+}
+
+/* Records a dependency specifier (deduplicated). Returns false on OOM. */
+static bool mod_add_dep(JsCompiler *cx, JsModule *m, JsString *spec) {
+    for (uint32_t i = 0; i < m->dep_spec_count; i++)
+        if (m->dep_specs[i] == spec)
+            return true;
+    JsString **na = js_realloc_raw(cx->vm, m->dep_specs,
+                                   (size_t)m->dep_spec_count * sizeof(JsString *),
+                                   (size_t)(m->dep_spec_count + 1) * sizeof(JsString *));
+    if (!na)
+        return false;
+    m->dep_specs = na;
+    m->dep_specs[m->dep_spec_count++] = spec;
+    return true;
+}
+
+static JsModuleImport *mod_add_import(JsCompiler *cx, JsModule *m, JsString *spec,
+                                      JsString *imported, uint8_t kind) {
+    JsModuleImport *na = js_realloc_raw(cx->vm, m->imports,
+                                        (size_t)m->import_count * sizeof(JsModuleImport),
+                                        (size_t)(m->import_count + 1) * sizeof(JsModuleImport));
+    if (!na)
+        return NULL;
+    m->imports = na;
+    JsModuleImport *imp = &m->imports[m->import_count];
+    imp->specifier = spec;
+    imp->imported_name = imported;
+    imp->kind = kind;
+    imp->source = NULL;
+    m->import_count++;
+    return imp;
+}
+
+static bool mod_add_star(JsCompiler *cx, JsModule *m, JsString *spec, uint8_t kind,
+                         JsString *imported, JsString *exported) {
+    JsStarExport *na = js_realloc_raw(cx->vm, m->stars,
+                                      (size_t)m->star_count * sizeof(JsStarExport),
+                                      (size_t)(m->star_count + 1) * sizeof(JsStarExport));
+    if (!na)
+        return false;
+    m->stars = na;
+    JsStarExport *s = &m->stars[m->star_count];
+    s->specifier = spec;
+    s->source = NULL;
+    s->kind = kind;
+    s->imported = imported;
+    s->exported = exported;
+    m->star_count++;
+    return true;
+}
+
+static bool mbind_add(JsCompiler *cx, uint32_t *cap, JsModBinding b) {
+    if (cx->mbind_count == *cap) {
+        uint32_t ncap = *cap ? *cap * 2 : 8;
+        JsModBinding *na = js_arena_alloc(&cx->arena, (size_t)ncap * sizeof(JsModBinding));
+        if (!na)
+            return false;
+        if (cx->mbind_count)
+            memcpy(na, cx->mbind, cx->mbind_count * sizeof(JsModBinding));
+        cx->mbind = na;
+        *cap = ncap;
+    }
+    cx->mbind[cx->mbind_count++] = b;
+    return true;
+}
+
+/* Adds exported names from a declaration (let/const/function) to mbind. */
+static bool mbind_add_export(JsCompiler *cx, uint32_t *cap, const uint16_t *local,
+                             uint32_t local_len, const uint16_t *exp, uint32_t exp_len,
+                             bool is_const) {
+    JsModBinding b;
+    b.name = local;
+    b.len = local_len;
+    b.kind = JS_MB_EXPORT;
+    b.is_const = is_const;
+    b.import_index = 0;
+    b.export_name = exp ? exp : local;
+    b.export_len = exp ? exp_len : local_len;
+    return mbind_add(cx, cap, b);
+}
+
+/* Collects binding names of a declaration pattern into the export list. */
+static bool export_pattern_names(JsCompiler *cx, uint32_t *cap, const JsAstNode *pat,
+                                 bool is_const) {
+    switch ((JsAstKind)pat->kind) {
+    case JS_AST_IDENT:
+        return mbind_add_export(cx, cap, pat->units, pat->len, NULL, 0, is_const);
+    case JS_AST_DEFAULT:
+        return export_pattern_names(cx, cap, pat->a, is_const);
+    case JS_AST_ARRAY_PATTERN:
+        for (uint32_t i = 0; i < pat->count; i++) {
+            const JsAstNode *el = pat->items[i];
+            if (el->kind == JS_AST_HOLE)
+                continue;
+            if (!export_pattern_names(cx, cap, el->kind == JS_AST_REST ? el->a : el, is_const))
+                return false;
+        }
+        return true;
+    case JS_AST_OBJECT_PATTERN:
+        for (uint32_t i = 0; i < pat->count; i++) {
+            const JsAstNode *prop = pat->items[i];
+            if (!export_pattern_names(cx, cap, prop->kind == JS_AST_REST ? prop->a : prop->b,
+                                      is_const))
+                return false;
+        }
+        return true;
+    default:
+        return true;
+    }
+}
+
+static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mod) {
+    uint32_t cap = 0;
+    for (uint32_t i = 0; i < module->count; i++) {
+        const JsAstNode *n = module->items[i];
+        switch ((JsAstKind)n->kind) {
+        case JS_AST_IMPORT: {
+            JsString *spec = intern_atom(cx, n->units, n->len);
+            if (!spec || !mod_add_dep(cx, mod, spec))
+                return cerr(cx, n->pos, "out of memory");
+            for (uint32_t s = 0; s < n->count; s++) {
+                const JsAstNode *sp = n->items[s];
+                JsModBinding b;
+                memset(&b, 0, sizeof b);
+                b.name = sp->units2;
+                b.len = sp->len2;
+                if (sp->flags & JS_F_SPEC_NS) {
+                    b.kind = JS_MB_IMPORT_NS;
+                    if (!mod_add_import(cx, mod, spec, NULL, JS_IMPORT_NS))
+                        return cerr(cx, n->pos, "out of memory");
+                } else {
+                    b.kind = JS_MB_IMPORT;
+                    JsString *imported;
+                    if (sp->flags & JS_F_SPEC_DEFAULT) {
+                        static const uint16_t d[] = {'d','e','f','a','u','l','t'};
+                        imported = intern_atom(cx, d, 7);
+                    } else {
+                        imported = intern_atom(cx, sp->units, sp->len);
+                    }
+                    if (!imported ||
+                        !mod_add_import(cx, mod, spec, imported,
+                                        (sp->flags & JS_F_SPEC_DEFAULT) ? JS_IMPORT_DEFAULT
+                                                                        : JS_IMPORT_NAMED))
+                        return cerr(cx, n->pos, "out of memory");
+                }
+                b.import_index = (uint16_t)(mod->import_count - 1);
+                if (!mbind_add(cx, &cap, b))
+                    return cerr(cx, n->pos, "out of memory");
+            }
+            break;
+        }
+        case JS_AST_EXPORT_ALL: {
+            JsString *spec = intern_atom(cx, n->units, n->len);
+            if (!spec || !mod_add_dep(cx, mod, spec))
+                return cerr(cx, n->pos, "out of memory");
+            if (n->len2) { /* export * as ns from 'm' */
+                JsString *ns = intern_atom(cx, n->units2, n->len2);
+                if (!ns || !mod_add_star(cx, mod, spec, JS_REEXP_NS, NULL, ns))
+                    return cerr(cx, n->pos, "out of memory");
+            } else { /* export * from 'm' */
+                if (!mod_add_star(cx, mod, spec, JS_REEXP_ALL, NULL, NULL))
+                    return cerr(cx, n->pos, "out of memory");
+            }
+            break;
+        }
+        case JS_AST_EXPORT_NAMED:
+            if (n->a) {
+                const JsAstNode *d = n->a;
+                if (d->kind == JS_AST_LET_DECL) {
+                    bool is_const = (d->flags & JS_F_CONST) != 0;
+                    for (uint32_t k = 0; k < d->count; k++)
+                        if (!export_pattern_names(cx, &cap, d->items[k]->a, is_const))
+                            return false;
+                } else if (d->kind == JS_AST_FUNC_DECL) {
+                    if (!mbind_add_export(cx, &cap, d->units, d->len, NULL, 0, false))
+                        return false;
+                }
+            } else if (n->len) { /* export { x as y } from 'm' (re-export) */
+                JsString *spec = intern_atom(cx, n->units, n->len);
+                if (!spec || !mod_add_dep(cx, mod, spec))
+                    return cerr(cx, n->pos, "out of memory");
+                for (uint32_t s = 0; s < n->count; s++) {
+                    const JsAstNode *sp = n->items[s];
+                    JsString *imp = intern_atom(cx, sp->units, sp->len);
+                    JsString *exp = intern_atom(cx, sp->units2, sp->len2);
+                    if (!imp || !exp ||
+                        !mod_add_star(cx, mod, spec, JS_REEXP_NAMED, imp, exp))
+                        return cerr(cx, n->pos, "out of memory");
+                }
+            } else { /* export { a, b as c } (local) */
+                for (uint32_t s = 0; s < n->count; s++) {
+                    const JsAstNode *sp = n->items[s];
+                    if (!mbind_add_export(cx, &cap, sp->units, sp->len, sp->units2, sp->len2,
+                                          false))
+                        return false;
+                }
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    return true;
+}
+
+JsFunctionCell *js_compile_module_body(JsContext *ctx, const JsAstNode *module,
+                                       JsModule *mod, JsCompileError *err) {
+    JsVm *vm = ctx->vm;
+    JsCompiler cx;
+    memset(&cx, 0, sizeof cx);
+    cx.ctx = ctx;
+    cx.vm = vm;
+    cx.module = mod;
+    js_arena_init(&cx.arena, vm);
+
+    JsGcCell *cell = js_gc_new_cell(vm, JS_KIND_FUNCTION, sizeof(JsFunctionCell));
+    if (!cell) {
+        err->msg = "out of memory";
+        err->pos = 0;
+        return NULL;
+    }
+    JsFunctionCell *fn = (JsFunctionCell *)cell;
+    memset((char *)fn + sizeof(JsGcCell), 0, sizeof *fn - sizeof(JsGcCell));
+    fn->module = mod;
+
+    JsFuncState fs;
+    memset(&fs, 0, sizeof fs);
+    fs.fn = fn;
+    fs.fn_value = js_value_from_cell(cell);
+    fs.is_module = true;
+    fs.scratch_slot = -1;
+    fs.slot_count = 1;
+    fs.slot_max = 1;
+    cx.cur = &fs;
+    if (!js_gc_protect(vm, &fs.fn_value)) {
+        err->msg = "out of memory";
+        err->pos = 0;
+        return NULL;
+    }
+
+    bool ok = analyze_module(&cx, module, mod);
+    if (ok)
+        ok = compile_block_stmts(&cx, module->items, module->count);
+    if (ok)
+        ok = emit_op_u16(&cx, JS_OP_GET_LOCAL, JS_COMPLETION_SLOT, +1) &&
+             emit_op(&cx, JS_OP_RETURN, -1);
+
+    fn->n_locals = fs.slot_max;
+    fn->max_stack = (uint32_t)(fs.max_depth < 0 ? 0 : fs.max_depth) + 8;
+    fn->n_params = 0;
+    if (module->flags & JS_F_HAS_TLA)
+        fn->fn_flags |= JS_FN_ASYNC;
 
     js_gc_unprotect(vm, &fs.fn_value);
     js_arena_free(&cx.arena);

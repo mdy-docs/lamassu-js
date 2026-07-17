@@ -70,6 +70,8 @@ JsString *js_to_string_cell(JsContext *ctx, JsValue v, int depth) {
         return js_ascii_cell(vm, "false");
     if (js_is_function(v))
         return js_ascii_cell(vm, "[function]");
+    if (js_is_promise(v))
+        return js_ascii_cell(vm, "[object Promise]");
     if (js_is_object(v)) {
         JsObject *o = js_value_object(v);
         if (o->obj_kind != JS_OBJ_ARRAY)
@@ -173,8 +175,8 @@ static bool loose_eq_values(JsContext *ctx, JsValue a, JsValue b) {
             return js_get_number(a) == js_to_number_value(ctx, b);
         if (as && bn)
             return js_to_number_value(ctx, a) == js_get_number(b);
-        bool acell = js_is_object(a) || js_is_function(a);
-        bool bcell = js_is_object(b) || js_is_function(b);
+        bool acell = js_is_object(a) || js_is_function(a) || js_is_promise(a);
+        bool bcell = js_is_object(b) || js_is_function(b) || js_is_promise(b);
         if (acell && bcell)
             return a.bits == b.bits;
         if (acell && (bn || bs)) {
@@ -383,7 +385,14 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
     }
     if (js_is_number(base))
         return method_lookup(ctx, ctx->number_methods, key, out);
-    /* booleans, functions: no properties */
+    if (js_is_promise(base))
+        return method_lookup(ctx, ctx->promise_methods, key, out);
+    if (js_is_function(base)) {
+        JsGcCell *c = js_value_cell(base);
+        if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->statics)
+            return method_lookup(ctx, ((JsNative *)c)->statics, key, out);
+    }
+    /* booleans: no properties */
     return JS_PROP_OK;
 }
 
@@ -606,19 +615,78 @@ static void upvalues_close_from(JsFiber *fb, uint32_t floor) {
     }
 }
 
+JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *ud) {
+    JsVm *vm = ctx->vm;
+    JsString *nm = name ? js_ascii_cell(vm, name) : NULL;
+    if (name && !nm)
+        return js_undefined();
+    /* nm is unreferenced across the next allocation; re-fetch after. */
+    JsValue nmv = nm ? js_value_from_cell(&nm->gc) : js_undefined();
+    js_gc_protect(vm, &nmv);
+    JsGcCell *c = js_gc_new_cell(vm, JS_KIND_NATIVE, sizeof(JsNative));
+    js_gc_unprotect(vm, &nmv);
+    if (!c)
+        return js_undefined();
+    JsNative *nf = (JsNative *)c;
+    nf->fn = fn;
+    nf->bound_fn = NULL;
+    nf->ud = ud;
+    nf->name = js_is_string(nmv) ? js_value_string(nmv) : NULL;
+    nf->statics = NULL;
+    nf->bound = js_undefined();
+    nf->is_bound = false;
+    return js_value_from_cell(c);
+}
+
+/* Bound native: js_bytecode.h declares this for the promise module. */
+JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound) {
+    JsVm *vm = ctx->vm;
+    js_gc_protect(vm, &bound);
+    JsGcCell *c = js_gc_new_cell(vm, JS_KIND_NATIVE, sizeof(JsNative));
+    js_gc_unprotect(vm, &bound);
+    if (!c)
+        return js_undefined();
+    JsNative *nf = (JsNative *)c;
+    nf->fn = NULL;
+    nf->bound_fn = fn;
+    nf->ud = NULL;
+    nf->name = NULL;
+    nf->statics = NULL;
+    nf->bound = bound;
+    nf->is_bound = true;
+    return js_value_from_cell(c);
+}
+
+bool js_object_set_ascii(JsContext *ctx, JsObject *obj, const char *key, JsValue v) {
+    JsVm *vm = ctx->vm;
+    js_gc_protect(vm, &v);
+    JsString *k = js_ascii_cell(vm, key);
+    JsString *ik = k ? js_intern_cell(vm, k) : NULL;
+    js_gc_unprotect(vm, &v);
+    if (!ik)
+        return false;
+    return js_map_set(vm, &obj->props, ik, v);
+}
+
 bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
                         JsNativeFn fn, void *userdata) {
     JsVm *vm = ctx->vm;
     JsValue key = js_atom(vm, name, name_len);
     if (!js_is_string(key))
         return false;
+    js_gc_protect(vm, &key);
     JsGcCell *c = js_gc_new_cell(vm, JS_KIND_NATIVE, sizeof(JsNative));
+    js_gc_unprotect(vm, &key);
     if (!c)
         return false;
     JsNative *nf = (JsNative *)c;
     nf->fn = fn;
+    nf->bound_fn = NULL;
     nf->ud = userdata;
+    nf->statics = NULL;
     nf->name = js_value_string(key);
+    nf->bound = js_undefined();
+    nf->is_bound = false;
     return js_map_set(vm, &ctx->globals->props, js_value_string(key),
                       js_value_from_cell(c));
 }
@@ -702,7 +770,11 @@ static int frame_setup(JsContext *ctx, JsFiber *fb, JsClosure *cl, uint32_t base
 
 /* ---- the dispatch loop ---- */
 
-static bool run_fiber(JsContext *ctx, JsFiber *fb, JsValue *result) {
+/* async-call helper: runs cl on its own fiber, returns a result promise */
+static bool call_async(JsContext *ctx, JsClosure *cl, JsValue this_val,
+                       const JsValue *args, int argc, JsValue *out);
+
+static JsRunStatus run_fiber(JsContext *ctx, JsFiber *fb, JsValue *result) {
     JsVm *vm = ctx->vm;
 
 #define S (fb->stack)
@@ -720,6 +792,9 @@ run:; /* (re)load the top frame */
         uint32_t base = fr->base;
         uint32_t ip = fr->ip;
         uint32_t op_ip = ip;
+        /* a resume-with-rejection sets failed before re-entering */
+        if (fb->failed)
+            goto on_error;
 
 #define READ_U16() (ip += 2, (uint16_t)(code[ip - 2] | ((uint16_t)code[ip - 1] << 8)))
 #define READ_U32()                                                              \
@@ -795,7 +870,9 @@ run:; /* (re)load the top frame */
                 break;
             case JS_OP_GET_UPVAL: {
                 JsUpvalue *uv = cl->upvals[READ_U16()];
-                JsValue v = uv->open ? fb->stack[uv->slot] : uv->closed;
+                /* an open upvalue aliases the stack of the fiber that owns
+                 * it, which may differ from fb during a nested call */
+                JsValue v = uv->open ? uv->fiber->stack[uv->slot] : uv->closed;
                 if (v.bits == JS_SPECIAL_TDZ)
                     RT_THROW("ReferenceError: cannot access variable before initialization");
                 PUSH(v);
@@ -804,7 +881,7 @@ run:; /* (re)load the top frame */
             case JS_OP_SET_UPVAL: {
                 JsUpvalue *uv = cl->upvals[READ_U16()];
                 if (uv->open)
-                    fb->stack[uv->slot] = PEEK(0);
+                    uv->fiber->stack[uv->slot] = PEEK(0);
                 else
                     uv->closed = PEEK(0);
                 break;
@@ -853,13 +930,13 @@ run:; /* (re)load the top frame */
                     PEEK(0) = js_number(js_get_number(a) + js_get_number(b));
                     break;
                 }
-                if (js_is_object(a) || js_is_function(a)) {
+                if (js_is_object(a) || js_is_function(a) || js_is_promise(a)) {
                     JsString *s = js_to_string_cell(ctx, a, 0);
                     if (!s)
                         RT_THROW("out of memory");
                     PEEK(1) = a = js_value_from_cell(&s->gc);
                 }
-                if (js_is_object(b) || js_is_function(b)) {
+                if (js_is_object(b) || js_is_function(b) || js_is_promise(b)) {
                     JsString *s = js_to_string_cell(ctx, b, 0);
                     if (!s)
                         RT_THROW("out of memory");
@@ -1264,9 +1341,17 @@ run:; /* (re)load the top frame */
                 uint8_t flags = code[ip++];
                 JsFunctionCell *proto = js_value_function(K[cidx]);
                 fr->ip = ip; /* GC-safe point before allocations */
-                JsClosure *ncl = closure_new(vm, proto);
+                JsClosure *ncl = closure_new(vm, proto); /* upvals[] are NULL */
                 if (!ncl)
                     RT_THROW("out of memory");
+                /* Root ncl on the operand stack before capturing upvalues:
+                 * upvalue_capture is a GC safe point, and ncl is otherwise
+                 * unreachable. (Its NULL upvals are skipped by the tracer.) */
+                PUSH(js_value_from_cell(&ncl->gc));
+                if (flags & 1) { /* arrow: capture lexical this */
+                    ncl->has_this = true;
+                    ncl->this_val = cl->has_this ? cl->this_val : S[base - 1];
+                }
                 for (uint16_t i = 0; i < proto->n_upvals; i++) {
                     if (proto->upvals[i].from_local) {
                         JsUpvalue *uv = upvalue_capture(vm, fb, base + proto->upvals[i].idx);
@@ -1277,11 +1362,6 @@ run:; /* (re)load the top frame */
                         ncl->upvals[i] = cl->upvals[proto->upvals[i].idx];
                     }
                 }
-                if (flags & 1) { /* arrow: capture lexical this */
-                    ncl->has_this = true;
-                    ncl->this_val = cl->has_this ? cl->this_val : S[base - 1];
-                }
-                PUSH(js_value_from_cell(&ncl->gc));
                 break;
             }
             case JS_OP_CALL:
@@ -1307,7 +1387,9 @@ run:; /* (re)load the top frame */
                         JsNative *nf = (JsNative *)cc;
                         fr->ip = ip;
                         JsValue res;
-                        bool ok = nf->fn(ctx, S[nb - 1], &S[nb], (int)argc, &res);
+                        bool ok = nf->is_bound
+                            ? nf->bound_fn(ctx, nf->bound, S[nb - 1], &S[nb], (int)argc, &res)
+                            : nf->fn(ctx, S[nb - 1], &S[nb], (int)argc, &res);
                         fb->sp = nb - 2;
                         if (!ok) {
                             fb->error = res;
@@ -1318,8 +1400,20 @@ run:; /* (re)load the top frame */
                         break;
                     }
                     if (cc->kind == JS_KIND_CLOSURE) {
+                        JsClosure *callee_cl = (JsClosure *)cc;
                         fr->ip = ip;
-                        int rc = frame_setup(ctx, fb, (JsClosure *)cc, nb, argc);
+                        if (callee_cl->fn->fn_flags & JS_FN_ASYNC) {
+                            /* async call: run on its own fiber, return a
+                             * promise, keep executing this frame */
+                            JsValue promise;
+                            if (!call_async(ctx, callee_cl, S[nb - 1], &S[nb],
+                                            (int)argc, &promise))
+                                RT_THROW("out of memory");
+                            fb->sp = nb - 2;
+                            PUSH(promise);
+                            break;
+                        }
+                        int rc = frame_setup(ctx, fb, callee_cl, nb, argc);
                         if (rc == -1)
                             RT_THROW("out of memory");
                         if (rc == -2)
@@ -1363,6 +1457,55 @@ run:; /* (re)load the top frame */
                 ip = ret;
                 break;
             }
+            case JS_OP_AWAIT: {
+                /* Leave the awaited value on the stack (keeps it rooted);
+                 * resume replaces it with the settled value or throws. */
+                JsValue awaited = PEEK(0);
+                fr->ip = ip; /* resume just after AWAIT */
+                fb->err_pos = lookup_pos(fn, op_ip);
+                JsPromise *pr;
+                if (js_is_promise(awaited)) {
+                    pr = js_value_promise(awaited);
+                } else {
+                    pr = js_promise_alloc(ctx);
+                    if (!pr)
+                        RT_THROW("out of memory");
+                    js_promise_fulfill(ctx, pr, awaited);
+                }
+                if (!js_promise_await(ctx, pr, fb))
+                    RT_THROW("out of memory");
+                return JS_RUN_SUSPENDED;
+            }
+            case JS_OP_GET_EXPORT: {
+                JsString *name = js_value_string(K[READ_U16()]);
+                bool found;
+                JsValue v = js_map_get(&fn->module->exports->props, name, &found);
+                PUSH(found ? v : js_undefined());
+                break;
+            }
+            case JS_OP_SET_EXPORT: {
+                JsString *name = js_value_string(K[READ_U16()]);
+                if (!js_map_set(vm, &fn->module->exports->props, name, PEEK(0)))
+                    RT_THROW("out of memory");
+                break;
+            }
+            case JS_OP_GET_IMPORT: {
+                JsModuleImport *imp = &fn->module->imports[READ_U16()];
+                if (!imp->source || !imp->source->exports)
+                    RT_THROW("ReferenceError: module binding is not available");
+                bool found;
+                JsValue v = js_map_get(&imp->source->exports->props, imp->imported_name,
+                                       &found);
+                PUSH(found ? v : js_undefined());
+                break;
+            }
+            case JS_OP_IMPORT_NS: {
+                JsModuleImport *imp = &fn->module->imports[READ_U16()];
+                if (!imp->source || !imp->source->exports)
+                    RT_THROW("ReferenceError: module namespace is not available");
+                PUSH(js_value_from_cell(&imp->source->exports->gc));
+                break;
+            }
             case JS_OP_THROW:
                 fb->error = POPV();
                 fb->failed = true;
@@ -1376,7 +1519,7 @@ run:; /* (re)load the top frame */
                 fb->frame_count--;
                 if (fb->frame_count == 0) {
                     *result = ret;
-                    return true;
+                    return JS_RUN_DONE;
                 }
                 S[base - 2] = ret;
                 fb->sp = base - 1;
@@ -1413,7 +1556,7 @@ on_error:
     }
     *result = fb->error;
     ctx->error_pos = fb->err_pos;
-    return false;
+    return JS_RUN_ERROR;
 
 #undef S
 #undef PUSH
@@ -1427,10 +1570,11 @@ on_error:
 
 /* ---- fiber entry ---- */
 
-static bool run_closure(JsContext *ctx, JsClosure *cl, JsValue this_val,
-                        const JsValue *args, int argc, JsValue *result) {
+/* Allocates a fiber and sets up frame 0 for a call; NULL + *err set on OOM. */
+static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
+                            const JsValue *args, int argc, const char **err) {
     JsVm *vm = ctx->vm;
-    *result = js_undefined();
+    *err = NULL;
 
     /* Root cl/this across the fiber allocation (a GC safe point); args are
      * kept alive by the caller's fiber, which is still ctx->fiber here. */
@@ -1440,41 +1584,101 @@ static bool run_closure(JsContext *ctx, JsClosure *cl, JsValue this_val,
     JsGcCell *fc = js_gc_new_cell(vm, JS_KIND_FIBER, sizeof(JsFiber));
     js_gc_unprotect(vm, &this_val);
     js_gc_unprotect(vm, &cl_val);
-    if (!fc)
-        return false;
+    if (!fc) {
+        *err = "out of memory";
+        return NULL;
+    }
     cl = (JsClosure *)js_value_cell(cl_val);
     JsFiber *fb = (JsFiber *)fc;
-    /* preserve the GC header js_gc_new_cell set up (next/kind/mark) */
     memset((char *)fb + sizeof(JsGcCell), 0, sizeof *fb - sizeof(JsGcCell));
     fb->error = js_undefined();
-    fb->caller = ctx->fiber;
     fb->fuel = ctx->fuel ? ctx->fuel : UINT64_MAX;
-    ctx->fiber = fb; /* GC root */
 
-    bool ok;
     if (!stack_ensure(vm, fb, (uint32_t)(2 + argc) + cl->fn->n_locals +
                                   cl->fn->max_stack + 8)) {
-        fiber_throw(ctx, fb, "out of memory");
-        *result = fb->error;
-        ok = false;
-    } else {
-        fb->stack[0] = js_value_from_cell(&cl->gc);
-        fb->stack[1] = this_val;
-        for (int i = 0; i < argc; i++)
-            fb->stack[2 + i] = args[i];
-        fb->sp = (uint32_t)(2 + argc);
-        int rc = frame_setup(ctx, fb, cl, 2, (uint32_t)argc);
-        if (rc != 0) {
-            fiber_throw(ctx, fb, rc == -2 ? "RangeError: maximum call stack size exceeded"
-                                          : "out of memory");
-            *result = fb->error;
-            ok = false;
-        } else {
-            ok = run_fiber(ctx, fb, result);
-        }
+        *err = "out of memory";
+        return NULL;
     }
-    ctx->fiber = fb->caller;
-    return ok;
+    fb->stack[0] = js_value_from_cell(&cl->gc);
+    fb->stack[1] = this_val;
+    for (int i = 0; i < argc; i++)
+        fb->stack[2 + i] = args[i];
+    fb->sp = (uint32_t)(2 + argc);
+    int rc = frame_setup(ctx, fb, cl, 2, (uint32_t)argc);
+    if (rc != 0) {
+        *err = rc == -2 ? "RangeError: maximum call stack size exceeded" : "out of memory";
+        return NULL;
+    }
+    return fb;
+}
+
+/*
+ * Runs (or resumes) a fiber to its next yield point. Manages ctx->fiber and
+ * settles the fiber's result promise when it finishes.
+ */
+static JsRunStatus advance_fiber(JsContext *ctx, JsFiber *fb, JsValue *out) {
+    JsFiber *saved = ctx->fiber;
+    fb->caller = saved;
+    ctx->fiber = fb;
+    JsRunStatus st = run_fiber(ctx, fb, out);
+    ctx->fiber = saved;
+    if (fb->result_promise) {
+        if (st == JS_RUN_DONE)
+            js_promise_resolve_with(ctx, fb->result_promise, *out);
+        else if (st == JS_RUN_ERROR)
+            js_promise_reject(ctx, fb->result_promise, fb->error);
+    }
+    return st;
+}
+
+static bool call_async(JsContext *ctx, JsClosure *cl, JsValue this_val,
+                       const JsValue *args, int argc, JsValue *out) {
+    JsVm *vm = ctx->vm;
+    JsPromise *p = js_promise_alloc(ctx);
+    if (!p)
+        return false;
+    JsValue pv = js_value_from_cell(&p->gc);
+    js_gc_protect(vm, &pv); /* keep the result promise alive across spawn/run */
+    const char *err;
+    JsFiber *fb = spawn_fiber(ctx, cl, this_val, args, argc, &err);
+    if (!fb) {
+        js_gc_unprotect(vm, &pv);
+        return false;
+    }
+    fb->result_promise = js_value_promise(pv);
+    fb->is_async = true;
+    JsValue tmp;
+    advance_fiber(ctx, fb, &tmp); /* settles pv if it completes now; else parks */
+    js_gc_unprotect(vm, &pv);
+    *out = pv;
+    return true;
+}
+
+void js_resume_fiber(JsContext *ctx, JsFiber *fb, JsValue value, bool is_throw) {
+    if (is_throw) {
+        fb->sp--; /* drop the awaited operand left on the stack by AWAIT */
+        fb->error = value;
+        fb->failed = true;
+    } else {
+        fb->stack[fb->sp - 1] = value; /* replace operand with the settled value */
+    }
+    JsValue tmp;
+    advance_fiber(ctx, fb, &tmp);
+}
+
+/* Synchronous call: cl must not be async. Returns false with *result=error. */
+static bool run_closure(JsContext *ctx, JsClosure *cl, JsValue this_val,
+                        const JsValue *args, int argc, JsValue *result) {
+    *result = js_undefined();
+    const char *err;
+    JsFiber *fb = spawn_fiber(ctx, cl, this_val, args, argc, &err);
+    if (!fb) {
+        JsString *s = js_ascii_cell(ctx->vm, err);
+        *result = s ? js_value_from_cell(&s->gc) : js_undefined();
+        return false;
+    }
+    JsRunStatus st = advance_fiber(ctx, fb, result);
+    return st == JS_RUN_DONE;
 }
 
 bool js_interp_run(JsContext *ctx, JsFunctionCell *fn, JsValue *result) {
@@ -1496,16 +1700,23 @@ bool js_call(JsContext *ctx, JsValue fn, JsValue this_val, const JsValue *args,
     JsGcCell *c = js_value_cell(fn);
     if (c->kind == JS_KIND_NATIVE) {
         JsNative *nf = (JsNative *)c;
-        return nf->fn(ctx, this_val, args, argc, result);
+        return nf->is_bound
+            ? nf->bound_fn(ctx, nf->bound, this_val, args, argc, result)
+            : nf->fn(ctx, this_val, args, argc, result);
     }
-    if (c->kind == JS_KIND_CLOSURE)
-        return run_closure(ctx, (JsClosure *)c, this_val, args, argc, result);
-    /* bare function prototype: wrap */
-    JsClosure *cl = closure_new(ctx->vm, (JsFunctionCell *)c);
-    if (!cl) {
-        *result = js_undefined();
-        return false;
+    JsClosure *cl;
+    if (c->kind == JS_KIND_CLOSURE) {
+        cl = (JsClosure *)c;
+    } else {
+        cl = closure_new(ctx->vm, (JsFunctionCell *)c); /* bare prototype: wrap */
+        if (!cl) {
+            *result = js_undefined();
+            return false;
+        }
     }
+    /* Calling an async function yields a promise, not a synchronous result. */
+    if (cl->fn->fn_flags & JS_FN_ASYNC)
+        return call_async(ctx, cl, this_val, args, argc, result);
     return run_closure(ctx, cl, this_val, args, argc, result);
 }
 
@@ -1535,12 +1746,71 @@ JsValue js_compile_module(JsContext *ctx, const uint16_t *src, size_t len,
     return js_value_from_cell(&fn->gc);
 }
 
-bool js_run_module(JsContext *ctx, JsValue fn, JsValue *result) {
-    if (!js_is_function(fn)) {
+bool js_run_module(JsContext *ctx, JsValue fnv, JsValue *result) {
+    JsVm *vm = ctx->vm;
+    if (!js_is_function(fnv)) {
         *result = js_undefined();
         return false;
     }
-    return js_interp_run(ctx, js_value_function(fn), result);
+    JsFunctionCell *fn = js_value_function(fnv);
+    JsClosure *cl = closure_new(vm, fn);
+    if (!cl) {
+        *result = js_undefined();
+        return false;
+    }
+    bool is_async = (fn->fn_flags & JS_FN_ASYNC) != 0; /* top-level await */
+
+    if (!is_async) {
+        /* Sync module: run to completion, then drain microtasks it scheduled
+         * (e.g. Promise.resolve().then(...) at top level). */
+        bool ok = run_closure(ctx, cl, js_undefined(), NULL, 0, result);
+        js_run_jobs(ctx);
+        return ok;
+    }
+
+    /* TLA module: drive as an async fiber, drain jobs until it settles. */
+    JsValue clv = js_value_from_cell(&cl->gc);
+    js_gc_protect(vm, &clv); /* root cl before the promise allocation GCs */
+    JsPromise *p = js_promise_alloc(ctx);
+    if (!p) {
+        js_gc_unprotect(vm, &clv);
+        *result = js_undefined();
+        return false;
+    }
+    JsValue pv = js_value_from_cell(&p->gc);
+    js_gc_protect(vm, &pv);
+    const char *err;
+    JsFiber *fb = spawn_fiber(ctx, (JsClosure *)js_value_cell(clv), js_undefined(),
+                              NULL, 0, &err);
+    if (!fb) {
+        js_gc_unprotect(vm, &clv);
+        js_gc_unprotect(vm, &pv);
+        JsString *s = js_ascii_cell(vm, err);
+        *result = s ? js_value_from_cell(&s->gc) : js_undefined();
+        return false;
+    }
+    fb->result_promise = js_value_promise(pv);
+    fb->is_async = true;
+    JsValue tmp;
+    advance_fiber(ctx, fb, &tmp);
+    js_run_jobs(ctx);
+    js_gc_unprotect(vm, &clv);
+
+    JsPromise *rp = js_value_promise(pv);
+    bool ok;
+    if (rp->state == JS_PROMISE_REJECTED) {
+        *result = rp->value;
+        ok = false;
+    } else if (rp->state == JS_PROMISE_FULFILLED) {
+        *result = rp->value;
+        ok = true;
+    } else {
+        /* still pending: awaited something that never settled */
+        *result = js_undefined();
+        ok = true;
+    }
+    js_gc_unprotect(vm, &pv);
+    return ok;
 }
 
 JsValue js_to_string(JsContext *ctx, JsValue v) {

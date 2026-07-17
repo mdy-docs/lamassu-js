@@ -41,6 +41,7 @@ typedef struct JsValue {
 #define JS_TAG_STRING    UINT64_C(0xFFFA000000000000)
 #define JS_TAG_OBJECT    UINT64_C(0xFFFB000000000000)
 #define JS_TAG_FUNCTION  UINT64_C(0xFFFC000000000000)
+#define JS_TAG_PROMISE   UINT64_C(0xFFFD000000000000)
 #define JS_CANONICAL_NAN UINT64_C(0x7FF8000000000000)
 
 #define JS_SPECIAL_UNDEFINED (JS_TAG_SPECIAL | 0)
@@ -90,6 +91,7 @@ static inline bool js_get_bool(JsValue v) { return v.bits == JS_SPECIAL_TRUE; }
 static inline bool js_is_string(JsValue v) { return (v.bits & JS_TAG_MASK) == JS_TAG_STRING; }
 static inline bool js_is_object(JsValue v) { return (v.bits & JS_TAG_MASK) == JS_TAG_OBJECT; }
 static inline bool js_is_function(JsValue v) { return (v.bits & JS_TAG_MASK) == JS_TAG_FUNCTION; }
+static inline bool js_is_promise(JsValue v) { return (v.bits & JS_TAG_MASK) == JS_TAG_PROMISE; }
 
 /* Identity (same bits), not ===: two equal-content heap strings differ. */
 static inline bool js_same_value(JsValue a, JsValue b) { return a.bits == b.bits; }
@@ -173,6 +175,60 @@ bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
 
 uint32_t js_context_error_pos(const JsContext *ctx);
 void     js_context_set_fuel(JsContext *ctx, uint64_t fuel); /* 0 = unlimited */
+
+/* ---- promises / async (phase 6) ---- */
+
+/*
+ * Host-side promise API. A native that needs time returns a pending promise
+ * (js_promise_new); the host settles it later with js_resolve/js_reject and
+ * then drains the microtask queue with js_run_jobs. The host MUST keep the
+ * returned promise reachable (e.g. js_gc_protect) until it settles it —
+ * otherwise the collector may reclaim an in-flight promise.
+ *
+ * js_resolve adopts a promise/thenable argument (chains), matching JS. To
+ * fulfill with an object value verbatim, that object simply must not be a
+ * promise.
+ */
+JsValue js_promise_new(JsContext *ctx);          /* undefined on OOM */
+bool    js_resolve(JsContext *ctx, JsValue promise, JsValue value);
+bool    js_reject(JsContext *ctx, JsValue promise, JsValue reason);
+
+/* Runs queued microtasks (promise reactions, async resumptions) to quiescence. */
+void js_run_jobs(JsContext *ctx);
+bool js_has_pending_jobs(const JsContext *ctx);
+
+/* ---- ES modules (phase 7) ---- */
+
+/*
+ * Host module resolver. Given an import `specifier` and the `referrer`
+ * (importing module's specifier, empty for the root), return the resolved
+ * module's source. Write a canonical specifier to *out_specifier (used as
+ * the cache/identity key; may equal the input) and the UTF-16 source to
+ * *out_source / *out_len. Return true on success, false if not found.
+ *
+ * The returned buffers must stay valid until the call returns (the engine
+ * copies what it needs). Specifiers are compared by content for caching.
+ */
+typedef bool (*JsModuleResolver)(void *ud, const uint16_t *specifier, size_t spec_len,
+                                 const uint16_t *referrer, size_t ref_len,
+                                 const uint16_t **out_specifier, size_t *out_spec_len,
+                                 const uint16_t **out_source, size_t *out_len);
+
+void js_set_module_resolver(JsContext *ctx, JsModuleResolver fn, void *ud);
+
+/*
+ * Compiles, links, and evaluates a root module (its dependencies are pulled
+ * in through the resolver). Returns the module's namespace (exports) object
+ * on success, or undefined with err_msg/err_pos set on a compile/link
+ * error, or the thrown value with return-false semantics via ok.
+ */
+JsValue js_eval_module(JsContext *ctx, const uint16_t *specifier, size_t spec_len,
+                       const uint16_t *source, size_t source_len, bool *ok,
+                       const char **err_msg, uint32_t *err_pos);
+
+/* Reads a named export from a module namespace object (host convenience). */
+JsValue js_module_get_export(JsContext *ctx, JsValue ns, const uint16_t *name,
+                             size_t name_len);
 
 /* ToString for host display; undefined on OOM. */
 JsValue js_to_string(JsContext *ctx, JsValue v);

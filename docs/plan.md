@@ -18,6 +18,12 @@ language.
 - A native command-line tool (`jsvm`) that compiles and runs a JavaScript
   file — both a developer convenience and the harness the script-level and
   differential test suites drive.
+- A browser playground (`web/`) — the engine built to WebAssembly with
+  Emscripten (`make web` → `web/jsvm.{js,wasm}`), a REPL page with runnable
+  samples, deployed to GitHub Pages by `.github/workflows/pages.yml`. The
+  REPL keeps a persistent VM so state carries across runs; a `print()` native
+  captures output. The `web` build is non-freestanding (Emscripten supplies
+  libc); the freestanding `wasm` target remains the embeddable core.
 
 ## Non-goals
 
@@ -255,14 +261,63 @@ past phase 7.
 | 2 | Lexer + parser → AST, incl. template literals, destructuring patterns, ASI | 3–4 |
 | 3 | Bytecode format, compiler, interpreter core: expressions, control flow, scoping; minimal `jsvm` CLI (compile + run a file, print result/errors) | 2–3 |
 | 4 | Functions, closures/upvalues, heap-frame fibers, try/catch/throw | 2 |
-| 5 | Object/Array/String/Math/JSON builtins, `for-of` | 2 |
-| 6 | Promises, microtask queue, async/await (suspend/resume on fibers) | 1–2 |
-| 7 | ES modules: compile → link → evaluate, host resolver hook, cyclic imports | 1–2 |
+| 5 | ✅ Object/Array/String/Number methods, Math, JSON, statics + global conversions; freestanding math kernel; hidden per-type method tables | 2 |
+| 6 | ✅ Promises, microtask queue, async/await (fiber suspend/resume), Promise.all/race/allSettled, executor, top-level await, host promise API | 1–2 |
+| 7 | ✅ ES modules: compile→instantiate→link→evaluate, host resolver, cyclic/diamond imports, live bindings, star re-export, async modules + TLA | 1–2 |
 | 8 | Bytecode serializer + validating loader; CLI grows `--emit-bytecode`/`--run-bytecode` to round-trip the format | 1 |
 | 9 | WASM export surface + example host glue; fuel/memory/stack limits | 1–2 |
 | 10 | Regex: integrate `third_party/regex-engine` — binding layer (RegExp object, match results, named groups), step-budget patch, pattern-count cap; behind a compile flag | 1–2 |
 | opt | Shapes + inline caches for property access (see "Property storage") — only once benchmarks exist | 2–3 |
 | — | Fuzzing (parser + interpreter under ASan/UBSan), differential testing vs Node | background |
+
+## Known deviations from spec (as of phase 5)
+
+Tracked so differential testing against Node has a baseline; most resolve in
+later phases.
+
+- **Object key order follows hash order, not insertion order.** Affects
+  `Object.keys/values/entries`, `for` over object props, and
+  `JSON.stringify` of objects. Resolved when shapes land (they store
+  properties in insertion order) — see "Property storage".
+- **Case mapping is ASCII only** (`toUpperCase`/`toLowerCase`); full Unicode
+  case folding would need the UCD tables the regex engine ships.
+- **`Array.prototype.sort` is a stable O(n²) binary insertion sort** — fine
+  for templating-sized arrays; revisit if large-array sorting matters.
+- **Transcendental math is ~1e-12 accurate**, not correctly-rounded (custom
+  freestanding kernel, no libm). `sqrt`/`floor`/`ceil`/`trunc`/`round` are
+  exact (native ops).
+- **`toString`/dtoa is exact for safe integers and for magnitudes within
+  ~1e±22**; extreme magnitudes may differ from Node in the last digit
+  (shortest-round-trip via float scaling, not a full big-integer dtoa).
+- **`Object.freeze` returns the object but does not enforce immutability.**
+- **`Array.from` supports strings and arrays**, not arbitrary array-likes or
+  iterators.
+- **`replace`/`split` take string patterns only** (regex arrives in phase 10).
+- **No `new`/constructors, no prototype chain** — builtin methods live on
+  hidden per-context tables, invisible to scripts. `Promise(executor)` is
+  callable without `new` (the subset's deliberate accommodation).
+- **Unhandled promise rejections are silent** — tracked (`handled` flag) but
+  not reported; a host hook can be added later.
+- **A top-level-await module awaiting a host promise** returns from
+  `js_run_module` still pending; the host settles the promise, calls
+  `js_run_jobs`, and reads the completion via the module's result (the
+  microtask queue drives the resumption).
+- **All re-export forms are supported** — `export * from`,
+  `export { a as b } from`, and `export * as ns from`. Named and `export *`
+  re-exports are **snapshots** taken once the source module finishes
+  evaluating (dependency order guarantees it has); a later mutation of a
+  re-exported *mutable* binding is not observed. `export * as ns` is live by
+  reference (it aliases the source namespace object). For a template runtime
+  this is exact, since re-exports are functions/constants; true live indirect
+  re-export of mutable bindings would need accessor-property exports (a
+  candidate for the shapes pass).
+- **Cross-module cycles degrade to `undefined`** for a binding read before
+  the exporting module initialized it (real ESM would throw a TDZ error);
+  hoisted `export function` is available throughout, so mutually-recursive
+  function modules work.
+- **Module evaluation drains the whole microtask queue** after each module
+  body (via `js_run_module`); there is no cross-module async evaluation
+  ordering beyond dependency order.
 
 ## Testing & hardening strategy
 

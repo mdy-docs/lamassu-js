@@ -61,6 +61,7 @@ JsVm *js_vm_new(const JsVmConfig *cfg) {
 void js_vm_free(JsVm *vm) {
     if (!vm)
         return;
+    js_jobs_free_all(vm); /* microtask queue holds raw job nodes */
     while (vm->contexts)
         js_context_free(vm->contexts);
     JsGcCell *c = vm->cells;
@@ -113,6 +114,11 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->string_methods = NULL;
     ctx->array_methods = NULL;
     ctx->number_methods = NULL;
+    ctx->promise_methods = NULL;
+    ctx->modules = NULL;
+    ctx->module_count = ctx->module_cap = 0;
+    ctx->resolver = NULL;
+    ctx->resolver_ud = NULL;
     ctx->fiber = NULL;
     ctx->fuel = 0;
     ctx->error_pos = 0;
@@ -140,10 +146,16 @@ JsContext *js_context_new(JsVm *vm) {
 void js_context_free(JsContext *ctx) {
     if (!ctx)
         return;
+    js_modules_free_registry(ctx); /* module cells are freed via the GC sweep */
     *ctx->prev_link = ctx->next;
     if (ctx->next)
         ctx->next->prev_link = ctx->prev_link;
     js_realloc_raw(ctx->vm, ctx, sizeof *ctx, 0);
+}
+
+void js_set_module_resolver(JsContext *ctx, JsModuleResolver fn, void *ud) {
+    ctx->resolver = fn;
+    ctx->resolver_ud = ud;
 }
 
 JsValue js_context_globals(JsContext *ctx) {

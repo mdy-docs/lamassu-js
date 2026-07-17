@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jsvm playground — a JavaScript engine in C, compiled to WebAssembly</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #161c2b; --panel-2: #1c2436; --edge: #2a3550;
+    --fg: #e6ebf5; --muted: #93a1bd; --accent: #6ea8fe; --accent-2: #7ee0c0;
+    --err: #ff8a8a; --ok: #7ee0c0; --shadow: rgba(0,0,0,.35);
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f6fb; --panel: #ffffff; --panel-2: #eef2fa; --edge: #d7deee;
+      --fg: #1a2233; --muted: #5a6784; --accent: #2f6fed; --accent-2: #159a75;
+      --err: #c0392b; --ok: #159a75; --shadow: rgba(20,30,60,.10);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--fg); font-family: var(--sans);
+    display: flex; flex-direction: column; min-height: 100vh; line-height: 1.5;
+  }
+  header {
+    padding: 20px 24px 12px; border-bottom: 1px solid var(--edge);
+  }
+  h1 { margin: 0; font-size: 20px; letter-spacing: .2px; }
+  h1 .tag {
+    font: 600 11px/1 var(--mono); color: var(--bg); background: var(--accent-2);
+    padding: 4px 7px; border-radius: 6px; vertical-align: 2px; margin-left: 8px;
+  }
+  .sub { color: var(--muted); font-size: 13.5px; margin-top: 4px; }
+  .sub code { font-family: var(--mono); color: var(--fg); }
+  main {
+    flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 1px;
+    background: var(--edge); min-height: 0;
+  }
+  @media (max-width: 820px) { main { grid-template-columns: 1fr; } }
+  .col { background: var(--bg); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .bar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--edge);
+  }
+  .bar .label { font: 600 11px/1 var(--mono); text-transform: uppercase;
+    letter-spacing: .8px; color: var(--muted); margin-right: 2px; }
+  button {
+    font: inherit; font-size: 13px; color: var(--fg); background: var(--panel-2);
+    border: 1px solid var(--edge); border-radius: 8px; padding: 6px 12px;
+    cursor: pointer; transition: background .12s, border-color .12s, transform .05s;
+  }
+  button:hover { border-color: var(--accent); }
+  button:active { transform: translateY(1px); }
+  button.run { background: var(--accent); color: #08101f; border-color: transparent; font-weight: 600; }
+  @media (prefers-color-scheme: light) { button.run { color: #fff; } }
+  button.run:hover { filter: brightness(1.08); }
+  .samples { display: flex; gap: 6px; flex-wrap: wrap; padding: 10px 14px;
+    background: var(--panel); border-bottom: 1px solid var(--edge); }
+  .chip {
+    font-size: 12.5px; padding: 4px 10px; border-radius: 999px;
+    background: transparent; border: 1px solid var(--edge); color: var(--muted);
+    cursor: pointer;
+  }
+  .chip:hover { color: var(--fg); border-color: var(--accent); }
+  .chip.active { color: var(--bg); background: var(--accent); border-color: transparent; font-weight: 600; }
+  textarea {
+    flex: 1; width: 100%; resize: none; border: 0; outline: 0; padding: 16px;
+    background: var(--bg); color: var(--fg); font-family: var(--mono);
+    font-size: 13.5px; line-height: 1.55; tab-size: 2; min-height: 220px;
+  }
+  .out-wrap { flex: 1; overflow: auto; min-height: 0; }
+  pre.out {
+    margin: 0; padding: 16px; font-family: var(--mono); font-size: 13.5px;
+    line-height: 1.55; white-space: pre-wrap; word-break: break-word; color: var(--fg);
+  }
+  pre.out .result { color: var(--ok); }
+  pre.out .error { color: var(--err); }
+  .hint { color: var(--muted); font-size: 12px; }
+  kbd {
+    font: 600 11px/1 var(--mono); background: var(--panel-2); border: 1px solid var(--edge);
+    border-bottom-width: 2px; border-radius: 5px; padding: 3px 5px;
+  }
+  footer {
+    padding: 10px 24px; border-top: 1px solid var(--edge); color: var(--muted);
+    font-size: 12.5px; display: flex; gap: 16px; flex-wrap: wrap; align-items: center;
+  }
+  footer a { color: var(--accent); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .status { color: var(--muted); font-size: 12px; margin-left: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>jsvm playground <span class="tag">C → WASM</span></h1>
+  <div class="sub">
+    A JavaScript engine written from scratch in C — bytecode compiler, mark-sweep GC,
+    closures, <code>async</code>/<code>await</code>, and ES modules — compiled to WebAssembly and
+    running entirely in your browser. Everything below executes in the C&nbsp;VM, not your browser's JS engine.
+  </div>
+</header>
+
+<main>
+  <section class="col">
+    <div class="bar">
+      <span class="label">Source</span>
+      <button class="run" id="run">Run ▶</button>
+      <button id="reset" title="Discard REPL state and start a fresh VM">Reset</button>
+      <span class="hint">or press <kbd id="kbd">⌘↵</kbd></span>
+    </div>
+    <div class="samples" id="samples"></div>
+    <textarea id="code" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+  </section>
+  <section class="col">
+    <div class="bar"><span class="label">Output</span>
+      <span class="hint">print() output, then <span style="color:var(--ok)">⇒ the value of the last expression</span></span>
+    </div>
+    <div class="out-wrap"><pre class="out" id="out"></pre></div>
+  </section>
+</main>
+
+<footer>
+  <span id="engine">Loading WebAssembly…</span>
+  <a href="https://github.com/" id="repo" target="_blank" rel="noopener">source on GitHub</a>
+  <span class="status" id="status"></span>
+</footer>
+
+<script src="jsvm.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  var SAMPLES = [
+    ["Welcome",
+`// Everything here runs in a C-based JS engine compiled to WASM.
+const engine = { name: 'jsvm', lang: 'C', target: 'WebAssembly' };
+print(\`Hello from \${engine.name} — written in \${engine.lang}!\`);
+for (const [k, v] of Object.entries(engine)) print(\`  \${k}: \${v}\`);
+2 ** 10;`],
+
+    ["Closures",
+`// Each counter keeps its own private state (real upvalue capture).
+function makeCounter(start = 0) {
+  let n = start;
+  return { inc: () => ++n, dec: () => --n, value: () => n };
+}
+const c = makeCounter(10);
+c.inc(); c.inc(); c.dec();
+print('counter =', c.value());
+
+// per-iteration loop bindings
+const fns = [];
+for (let i = 0; i < 3; i++) fns.push(() => i);
+fns.map(f => f()).join(',');`],
+
+    ["Arrays",
+`const nums = [5, 2, 8, 1, 9, 3, 7];
+print('sorted   :', [...nums].sort((a, b) => a - b).join(', '));
+print('evens    :', nums.filter(n => n % 2 === 0).join(', '));
+print('squares  :', nums.map(n => n * n).join(', '));
+print('sum      :', nums.reduce((a, b) => a + b, 0));
+print('max      :', Math.max(...nums));
+nums.filter(n => n > 4).map(n => n * 10).join(', ');`],
+
+    ["Destructuring",
+`const user = { name: 'Ada', roles: ['admin', 'dev'], age: 36 };
+const { name, roles: [primary, ...rest], age = 0 } = user;
+print(\`\${name} (\${age}) — \${primary}, also \${rest.join('/')}\`);
+
+const [first, , third, ...tail] = [10, 20, 30, 40, 50];
+[first, third, tail].map(String).join(' | ');`],
+
+    ["async / await",
+`// The suspendable-fiber design makes await nearly free.
+function delay(v) { return Promise.resolve(v); }
+
+async function pipeline() {
+  const a = await delay(2);
+  const b = await delay(3);
+  const all = await Promise.all([delay(10), delay(20), delay(30)]);
+  return a * b + all.reduce((x, y) => x + y, 0);
+}
+
+print('awaiting…');
+await pipeline();`],
+
+    ["Promises",
+`let log = 'start';
+Promise.resolve()
+  .then(() => log += ' → then1')
+  .then(() => log += ' → then2');
+
+Promise.reject('oops').catch(e => print('caught:', e));
+
+const settled = await Promise.allSettled([
+  Promise.resolve('ok'),
+  Promise.reject('bad'),
+]);
+print('statuses:', settled.map(s => s.status).join(', '));
+
+await Promise.resolve();  // let microtasks flush
+log;`],
+
+    ["JSON",
+`const data = {
+  title: 'jsvm',
+  features: ['closures', 'async', 'modules'],
+  meta: { version: 1, wasm: true },
+};
+const text = JSON.stringify(data, null, 2);
+print(text);
+
+const parsed = JSON.parse(text);
+\`round-trip ok: \${parsed.features.length} features, wasm=\${parsed.meta.wasm}\`;`],
+
+    ["Errors",
+`function risky(n) {
+  if (n < 0) throw new_error_like('negative not allowed');
+  return Math.sqrt(n);
+}
+function new_error_like(msg) { return { message: msg }; }
+
+let log = '';
+for (const n of [16, -4, 9]) {
+  try {
+    log += \`√\${n}=\${risky(n)} \`;
+  } catch (e) {
+    log += \`[error: \${e.message}] \`;
+  } finally {
+    log += '· ';
+  }
+}
+log.trim();`],
+
+    ["Recursion",
+`// Deep call stacks live on the fiber's heap, not the C stack.
+function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
+const seq = [];
+for (let i = 0; i < 12; i++) seq.push(fib(i));
+print('fibonacci:', seq.join(', '));
+
+function fact(n) { return n <= 1 ? 1 : n * fact(n - 1); }
+\`10! = \${fact(10)}\`;`],
+
+    ["Text",
+`const s = '  The Quick Brown Fox  ';
+print('trimmed :', JSON.stringify(s.trim()));
+print('upper   :', s.trim().toUpperCase());
+print('words   :', s.trim().split(' ').length);
+print('reversed:', s.trim().split('').reverse().join(''));
+print('slug    :', s.trim().toLowerCase().split(' ').join('-'));
+'padded'.padStart(10, '·').padEnd(14, '·');`],
+
+    ["Math",
+`print('π       =', Math.PI.toFixed(6));
+print('e        =', Math.E.toFixed(6));
+print('√2       =', Math.sqrt(2).toFixed(6));
+print('sin(π/6) =', Math.sin(Math.PI / 6).toFixed(4));
+print('2^0.5    =', Math.pow(2, 0.5).toFixed(6));
+print('(255)₁₆  =', (255).toString(16));
+print('parseInt =', parseInt('0xFF'), parseInt('101', 2));
+Math.hypot(3, 4);`],
+  ];
+
+  var codeEl = document.getElementById('code');
+  var outEl = document.getElementById('out');
+  var runBtn = document.getElementById('run');
+  var resetBtn = document.getElementById('reset');
+  var samplesEl = document.getElementById('samples');
+  var engineEl = document.getElementById('engine');
+  var statusEl = document.getElementById('status');
+  var kbdEl = document.getElementById('kbd');
+
+  var isMac = /Mac|iPhone|iPad/.test(navigator.platform);
+  kbdEl.textContent = isMac ? '⌘↵' : 'Ctrl+↵';
+
+  var evalFn = null, resetFn = null, ready = false, activeChip = null;
+
+  SAMPLES.forEach(function (s, i) {
+    var b = document.createElement('button');
+    b.className = 'chip';
+    b.textContent = s[0];
+    b.onclick = function () { loadSample(i, b); };
+    samplesEl.appendChild(b);
+  });
+
+  function loadSample(i, chip) {
+    codeEl.value = SAMPLES[i][1];
+    if (activeChip) activeChip.classList.remove('active');
+    activeChip = chip; chip.classList.add('active');
+    if (ready) run();
+  }
+
+  function setOut(text) {
+    outEl.textContent = '';
+    // color the last "⇒ …" result line or an error/uncaught line
+    var lines = text.split('\n');
+    lines.forEach(function (line, idx) {
+      var span = document.createElement('span');
+      if (line.indexOf('⇒') === 0) span.className = 'result';
+      else if (/^(Uncaught|SyntaxError|internal:)/.test(line)) span.className = 'error';
+      span.textContent = line + (idx < lines.length - 1 ? '\n' : '');
+      outEl.appendChild(span);
+    });
+  }
+
+  function run() {
+    if (!ready) return;
+    var t0 = performance.now();
+    var out;
+    try {
+      out = evalFn(codeEl.value);
+    } catch (e) {
+      out = 'internal: ' + (e && e.message ? e.message : e);
+    }
+    var ms = (performance.now() - t0);
+    setOut(out || '(no output)');
+    statusEl.textContent = ms < 1 ? '<1 ms' : ms.toFixed(1) + ' ms';
+  }
+
+  runBtn.onclick = run;
+  resetBtn.onclick = function () {
+    if (resetFn) resetFn();
+    outEl.textContent = '';
+    statusEl.textContent = 'VM reset';
+  };
+  codeEl.addEventListener('keydown', function (e) {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); run(); }
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      var s = codeEl.selectionStart, en = codeEl.selectionEnd;
+      codeEl.value = codeEl.value.slice(0, s) + '  ' + codeEl.value.slice(en);
+      codeEl.selectionStart = codeEl.selectionEnd = s + 2;
+    }
+  });
+
+  createJsvm().then(function (M) {
+    evalFn = M.cwrap('jsvm_eval', 'string', ['string']);
+    resetFn = M.cwrap('jsvm_reset', null, []);
+    ready = true;
+    engineEl.textContent = 'jsvm engine ready — ' + (SAMPLES.length) + ' samples';
+    loadSample(0, samplesEl.firstChild);
+  }).catch(function (e) {
+    engineEl.textContent = 'failed to load engine: ' + e;
+  });
+})();
+</script>
+</body>
+</html>

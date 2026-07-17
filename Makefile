@@ -26,7 +26,8 @@ CFLAGS  ?= -O2 -g
 
 SRC := src/js_vm.c src/js_gc.c src/js_string.c src/js_map.c src/js_object.c \
        src/js_arena.c src/js_lexer.c src/js_parser.c src/js_number.c \
-       src/js_compiler.c src/js_interp.c
+       src/js_compiler.c src/js_interp.c src/js_mathkernel.c src/js_builtins.c \
+       src/js_promise.c src/js_module.c
 HDR := include/jsvm.h src/jsvm_internal.h src/js_syntax.h src/js_bytecode.h
 INC := -Iinclude -Isrc
 
@@ -56,6 +57,30 @@ build/test_exec_asan: $(SRC) test/test_exec.c $(HDR)
 	@mkdir -p build
 	$(CC) $(WARNINGS) $(ASAN) $(INC) $(SRC) test/test_exec.c -o $@
 
+build/test_builtins: $(SRC) test/test_builtins.c $(HDR)
+	@mkdir -p build
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(SRC) test/test_builtins.c -o $@
+
+build/test_builtins_asan: $(SRC) test/test_builtins.c $(HDR)
+	@mkdir -p build
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(SRC) test/test_builtins.c -o $@
+
+build/test_async: $(SRC) test/test_async.c $(HDR)
+	@mkdir -p build
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(SRC) test/test_async.c -o $@
+
+build/test_async_asan: $(SRC) test/test_async.c $(HDR)
+	@mkdir -p build
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(SRC) test/test_async.c -o $@
+
+build/test_modules: $(SRC) test/test_modules.c $(HDR)
+	@mkdir -p build
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(SRC) test/test_modules.c -o $@
+
+build/test_modules_asan: $(SRC) test/test_modules.c $(HDR)
+	@mkdir -p build
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(SRC) test/test_modules.c -o $@
+
 # the jsvm CLI: compile + run a .js file
 .PHONY: cli
 cli: build/jsvm
@@ -65,13 +90,20 @@ build/jsvm: $(SRC) tools/jsvm_cli.c $(HDR)
 
 .PHONY: test
 test: build/test_runner build/test_runner_asan build/test_syntax build/test_syntax_asan \
-      build/test_exec build/test_exec_asan
+      build/test_exec build/test_exec_asan build/test_builtins build/test_builtins_asan \
+      build/test_async build/test_async_asan build/test_modules build/test_modules_asan
 	./build/test_runner
 	./build/test_runner_asan
 	./build/test_syntax
 	./build/test_syntax_asan
 	./build/test_exec
 	./build/test_exec_asan
+	./build/test_builtins
+	./build/test_builtins_asan
+	./build/test_async
+	./build/test_async_asan
+	./build/test_modules
+	./build/test_modules_asan
 
 # Freestanding wasm32: no libc, no OS. The core never calls libc; the shim
 # provides the mem* symbols the compiler itself may emit. -fno-builtin keeps
@@ -85,6 +117,24 @@ build/jsvm.wasm: $(SRC) src/js_wasm_shim.c $(HDR)
 	  $(INC) -Wl,--no-entry -Wl,--export-all -Wl,-z,stack-size=1048576 \
 	  $(SRC) src/js_wasm_shim.c -o $@
 
+# Browser demo: emscripten build of the REPL surface -> web/jsvm.{js,wasm}.
+# Needs emcc on PATH (Emscripten SDK). Unlike `wasm`, this is NOT freestanding:
+# emscripten supplies libc (malloc/free), which the core's default allocator
+# uses. Output loads as a MODULARIZE factory `createJsvm`.
+EMCC ?= emcc
+
+.PHONY: web
+web: web/jsvm.js
+web/jsvm.js: $(SRC) src/wasm_api.c $(HDR)
+	@mkdir -p web
+	$(EMCC) -O2 $(INC) $(SRC) src/wasm_api.c \
+	  -sMODULARIZE=1 -sEXPORT_NAME=createJsvm \
+	  -sENVIRONMENT=web,node \
+	  -sEXPORTED_FUNCTIONS=_jsvm_eval,_jsvm_reset,_malloc,_free \
+	  -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,stringToUTF8,lengthBytesUTF8 \
+	  -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=33554432 \
+	  -o web/jsvm.js
+
 .PHONY: clean
 clean:
-	rm -rf build
+	rm -rf build web/jsvm.js web/jsvm.wasm

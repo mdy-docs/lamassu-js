@@ -320,8 +320,8 @@ static void test_errors(void) {
     expect_error("for (const x of 42) {}", RUN_RUNTIME_ERR, "not iterable");
     /* phase gates still ahead */
     expect_error("let r = /a/;", RUN_COMPILE_ERR, "phase 10");
-    expect_error("import 'm';", RUN_COMPILE_ERR, "phase 7");
-    expect_error("let x = await y;", RUN_COMPILE_ERR, "phase 6");
+    expect_error("import 'm';", RUN_COMPILE_ERR, "module loader");
+    expect_error("let x = await y;", RUN_RUNTIME_ERR, "y is not defined");
 }
 
 static void test_functions(void) {

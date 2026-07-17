@@ -125,6 +125,68 @@ static void print_utf16(FILE *f, const uint16_t *units, size_t len) {
     }
 }
 
+/* ---- module resolver (file-based, relative to the root file's dir) ---- */
+
+static char g_root_dir[1024];
+/* keep resolved sources/specifiers alive until program exit (CLI simplicity) */
+#define MAX_RES 64
+static uint16_t *g_res_src[MAX_RES];
+static uint16_t *g_res_spec[MAX_RES];
+static int g_res_count;
+
+static bool file_resolver(void *ud, const uint16_t *spec, size_t spec_len,
+                          const uint16_t *ref, size_t ref_len, const uint16_t **out_spec,
+                          size_t *out_spec_len, const uint16_t **out_source, size_t *out_len) {
+    (void)ud;
+    (void)ref;
+    (void)ref_len;
+    if (g_res_count >= MAX_RES)
+        return false;
+    /* build path = root_dir/spec, appending .js if no extension */
+    char name[512];
+    size_t n = spec_len < 500 ? spec_len : 500;
+    for (size_t i = 0; i < n; i++)
+        name[i] = (char)(spec[i] < 128 ? spec[i] : '_');
+    name[n] = 0;
+    /* strip a leading ./ */
+    char *rel = name;
+    if (rel[0] == '.' && rel[1] == '/')
+        rel += 2;
+    char path[2048];
+    bool has_ext = strstr(rel, ".js") != NULL;
+    snprintf(path, sizeof path, "%s/%s%s", g_root_dir, rel, has_ext ? "" : ".js");
+
+    size_t bl;
+    uint8_t *bytes = read_file(path, &bl);
+    if (!bytes)
+        return false;
+    size_t slen;
+    uint16_t *src = utf8_to_utf16(bytes, bl, &slen);
+    free(bytes);
+    if (!src)
+        return false;
+    uint16_t *sp = malloc((spec_len + 1) * sizeof(uint16_t));
+    for (size_t i = 0; i < spec_len; i++)
+        sp[i] = spec[i];
+    g_res_src[g_res_count] = src;
+    g_res_spec[g_res_count] = sp;
+    g_res_count++;
+    *out_spec = sp;
+    *out_spec_len = spec_len;
+    *out_source = src;
+    *out_len = slen;
+    return true;
+}
+
+static void set_root_dir(const char *file) {
+    snprintf(g_root_dir, sizeof g_root_dir, "%s", file);
+    char *slash = strrchr(g_root_dir, '/');
+    if (slash)
+        *slash = 0;
+    else
+        snprintf(g_root_dir, sizeof g_root_dir, ".");
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: jsvm <file.js>\n");
@@ -153,12 +215,36 @@ int main(int argc, char **argv) {
 
     static const uint16_t print_name[] = {'p', 'r', 'i', 'n', 't'};
     js_register_native(ctx, print_name, 5, native_print, NULL);
+    set_root_dir(argv[1]);
+    js_set_module_resolver(ctx, file_resolver, NULL);
 
     int status = 0;
     const char *err_msg;
     uint32_t err_pos;
     JsValue fn = js_compile_module(ctx, src, len, &err_msg, &err_pos);
-    if (!js_is_function(fn)) {
+    bool is_module = !js_is_function(fn) && err_msg && strstr(err_msg, "module loader");
+
+    if (is_module) {
+        /* the file uses import/export: run it through the module pipeline */
+        static const uint16_t root_spec[] = {'<', 'r', 'o', 'o', 't', '>'};
+        bool ok;
+        JsValue ns = js_eval_module(ctx, root_spec, 6, src, len, &ok, &err_msg, &err_pos);
+        (void)ns;
+        if (!ok && err_msg) {
+            fprintf(stderr, "%s: %s\n", argv[1], err_msg);
+            status = 1;
+        } else if (!ok) {
+            js_gc_protect(vm, &ns);
+            JsValue str = js_to_string(ctx, ns);
+            size_t slen;
+            const uint16_t *su = js_string_units(str, &slen);
+            fprintf(stderr, "%s: uncaught ", argv[1]);
+            if (su)
+                print_utf16(stderr, su, slen);
+            fputc('\n', stderr);
+            status = 1;
+        }
+    } else if (!js_is_function(fn)) {
         uint32_t line, col;
         js_source_line_col(src, len, err_pos, &line, &col);
         fprintf(stderr, "%s:%u:%u: SyntaxError: %s\n", argv[1], line, col, err_msg);

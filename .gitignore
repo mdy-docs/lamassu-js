@@ -1,1 +1,6 @@
 build/
+
+# Emscripten build artifacts for the web playground (rebuilt by CI / `make web`).
+# web/index.html is source and IS committed.
+web/jsvm.js
+web/jsvm.wasm

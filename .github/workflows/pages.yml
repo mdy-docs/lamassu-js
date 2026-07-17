@@ -1,0 +1,58 @@
+name: Deploy playground to GitHub Pages
+
+# Builds the jsvm engine to WebAssembly with Emscripten and publishes the
+# web/ playground to GitHub Pages. Enable Pages in repo Settings → Pages with
+# "Source: GitHub Actions" for this to deploy.
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; let a newer run cancel an in-progress one.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.74
+          actions-cache-folder: emsdk-cache
+
+      - name: Verify toolchain
+        run: emcc --version
+
+      - name: Build WebAssembly playground
+        run: make web
+
+      - name: Sanity-check the artifacts exist
+        run: test -f web/jsvm.js && test -f web/jsvm.wasm && test -f web/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

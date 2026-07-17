@@ -70,6 +70,13 @@ typedef enum JsOp {
     JS_OP_TRY_POP,
     JS_OP_GOSUB,           /* u32; pushes return ip, jumps */
     JS_OP_RET_SUB,         /* pops return ip, jumps */
+    /* phase 6 */
+    JS_OP_AWAIT,           /* peeks operand; suspends fiber until it settles */
+    /* phase 7: module bindings (via the running frame's fn->module) */
+    JS_OP_GET_EXPORT,      /* u16 name-atom const idx -> push module.exports[name] */
+    JS_OP_SET_EXPORT,      /* u16 name; peeks; module.exports[name] = value */
+    JS_OP_GET_IMPORT,      /* u16 import idx -> push source.exports[importedName] */
+    JS_OP_IMPORT_NS,       /* u16 import idx -> push source's namespace object */
 } JsOp;
 
 /* TDZ sentinel: internal special value, never exposed to scripts. */
@@ -99,10 +106,72 @@ bool      js_spread_into_object(JsContext *ctx, JsObject *dst, JsValue src);
 /* js_builtins.c: installs the standard library into a fresh context. */
 bool js_builtins_init(JsContext *ctx);
 
+/* ---- js_promise.c ---- */
+JsPromise *js_promise_alloc(JsContext *ctx);              /* NULL on OOM */
+void js_promise_fulfill(JsContext *ctx, JsPromise *p, JsValue value);
+void js_promise_reject(JsContext *ctx, JsPromise *p, JsValue reason);
+/* resolution procedure: adopts the state of a promise argument, else fulfills */
+void js_promise_resolve_with(JsContext *ctx, JsPromise *p, JsValue value);
+JsPromise *js_promise_then(JsContext *ctx, JsPromise *p, JsValue on_f, JsValue on_r);
+bool js_promise_await(JsContext *ctx, JsPromise *p, JsFiber *fiber);
+void js_gc_mark_jobs(JsVm *vm);   /* mark the microtask queue */
+void js_jobs_free_all(JsVm *vm);  /* free queue + recycled nodes at teardown */
+bool js_promise_builtins_init(JsContext *ctx);
+
+/* Resumes a fiber suspended at await (js_interp.c); settles its result promise. */
+void js_resume_fiber(JsContext *ctx, JsFiber *fiber, JsValue value, bool is_throw);
+
+/* ---- js_module.c ---- */
+
+/*
+ * Compiler-side module analysis result: the classified top-level bindings and
+ * the import/star descriptors. Built during compilation and attached to the
+ * module record.
+ */
+typedef enum JsModBindKind {
+    JS_MB_EXPORT = 0,    /* exported top-level binding (lives in exports) */
+    JS_MB_IMPORT = 1,    /* named/default import (indexed) */
+    JS_MB_IMPORT_NS = 2, /* namespace import (indexed) */
+} JsModBindKind;
+
+typedef struct JsModBinding {
+    const uint16_t *name; /* local name (points into source) */
+    uint32_t len;
+    uint8_t kind;
+    bool is_const;
+    uint16_t import_index; /* JS_MB_IMPORT/NS: index into module->imports */
+    const uint16_t *export_name; /* JS_MB_EXPORT: exported-as name */
+    uint32_t export_len;
+} JsModBinding;
+
+/* Marks a module cell and frees its owned arrays (js_module.c helpers). */
+void js_gc_mark_module(JsVm *vm, JsModule *m);
+void js_module_free_cell(JsVm *vm, JsModule *m);
+void js_modules_free_registry(JsContext *ctx);
+void js_gc_mark_module_registry(JsContext *ctx);
+
+/* Compiles a parsed module AST into a body function bound to `mod`. */
+JsFunctionCell *js_compile_module_body(JsContext *ctx, const JsAstNode *module,
+                                       JsModule *mod, JsCompileError *err);
+
 /* Creates a native function cell (not registered anywhere); undefined on OOM. */
 JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *ud);
+/* Bound native carrying a captured value (js_interp.c). */
+JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound);
 /* Defines an own property by ASCII key; false on OOM. */
 bool js_object_set_ascii(JsContext *ctx, JsObject *obj, const char *key, JsValue v);
+
+/* js_mathkernel.c — freestanding transcendentals (~1e-12 accuracy). */
+double js_k_exp(double x);
+double js_k_log(double x);
+double js_k_pow(double x, double y);
+double js_k_sin(double x);
+double js_k_cos(double x);
+double js_k_tan(double x);
+double js_k_atan(double x);
+double js_k_atan2(double y, double x);
+double js_k_asin(double x);
+double js_k_acos(double x);
 
 /* js_number.c */
 double  js_make_double(uint64_t mant, int exp10);

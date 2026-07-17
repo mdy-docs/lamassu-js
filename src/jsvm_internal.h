@@ -26,6 +26,8 @@ typedef enum JsGcKind {
     JS_KIND_CLOSURE = 5,  /* callable: prototype + captured upvalues */
     JS_KIND_UPVALUE = 6,
     JS_KIND_NATIVE = 7,   /* callable host function */
+    JS_KIND_PROMISE = 8,
+    JS_KIND_MODULE = 9,
 } JsGcKind;
 
 /* Every GC allocation starts with this header; cells live on vm->cells. */
@@ -90,6 +92,9 @@ typedef struct JsUpvalDesc {
 
 #define JS_FN_ARROW 0x01
 #define JS_FN_HAS_REST 0x02
+#define JS_FN_ASYNC 0x04
+
+typedef struct JsModule JsModule;
 
 typedef struct JsFunctionCell {
     JsGcCell gc;
@@ -104,7 +109,8 @@ typedef struct JsFunctionCell {
     uint16_t n_params;
     uint8_t fn_flags;
     uint32_t n_locals, max_stack;
-    JsString *name; /* may be NULL */
+    JsString *name;     /* may be NULL */
+    JsModule *module;   /* module this fn belongs to (exports/imports); may be NULL */
 } JsFunctionCell;
 
 typedef struct JsFiber JsFiber;
@@ -133,12 +139,131 @@ typedef struct JsClosure {
     JsUpvalue *upvals[];
 } JsClosure;
 
+/* Bound native: receives a captured value (used for promise resolve/reject). */
+typedef bool (*JsBoundFn)(JsContext *ctx, JsValue bound, JsValue this_val,
+                          const JsValue *args, int argc, JsValue *result);
+
 typedef struct JsNative {
     JsGcCell gc;
-    JsNativeFn fn;
+    JsNativeFn fn;       /* used when !is_bound */
+    JsBoundFn bound_fn;  /* used when is_bound */
     void *ud;
-    JsString *name; /* may be NULL */
+    JsString *name;      /* may be NULL */
+    JsObject *statics;   /* namespace statics (String.fromCharCode, ...); may be NULL */
+    JsValue bound;       /* captured value for bound natives */
+    bool is_bound;
 } JsNative;
+
+/* ---- promises & microtasks ---- */
+
+typedef enum JsPromiseState {
+    JS_PROMISE_PENDING = 0,
+    JS_PROMISE_FULFILLED = 1,
+    JS_PROMISE_REJECTED = 2,
+} JsPromiseState;
+
+/*
+ * A pending promise's subscribers. `then` reactions call handlers and settle
+ * a derived promise; `await` reactions resume a suspended async fiber.
+ */
+typedef struct JsReaction JsReaction;
+struct JsReaction {
+    JsReaction *next;
+    uint8_t kind; /* 0 = then, 1 = await */
+    JsValue on_fulfilled; /* then: callable or undefined */
+    JsValue on_rejected;  /* then: callable or undefined */
+    struct JsPromise *result; /* then: derived promise (may be NULL) */
+    struct JsFiber *fiber;    /* await: fiber to resume */
+};
+
+typedef struct JsPromise {
+    JsGcCell gc;
+    uint8_t state;
+    bool handled;      /* a reject reaction was attached (unhandled-rejection tracking) */
+    JsValue value;     /* fulfillment value or rejection reason */
+    JsReaction *reactions; /* non-empty only while PENDING */
+} JsPromise;
+
+/* A queued microtask. Raw allocation; the VM's queue is a GC root. */
+typedef struct JsJob JsJob;
+struct JsJob {
+    JsJob *next;
+    uint8_t kind;   /* 0 = then, 1 = await */
+    bool fulfilled; /* settlement branch */
+    JsValue value;  /* settlement value */
+    /* then */
+    JsValue on_fulfilled, on_rejected;
+    struct JsPromise *result;
+    /* await */
+    struct JsFiber *fiber;
+    bool is_throw;
+};
+
+typedef enum JsRunStatus {
+    JS_RUN_DONE = 0,
+    JS_RUN_ERROR = 1,
+    JS_RUN_SUSPENDED = 2, /* parked at await */
+} JsRunStatus;
+
+/* ---- ES modules ---- */
+
+typedef enum JsImportKind {
+    JS_IMPORT_NAMED = 0,   /* import { x } / { x as y } */
+    JS_IMPORT_DEFAULT = 1, /* import d from */
+    JS_IMPORT_NS = 2,      /* import * as ns */
+    JS_IMPORT_SIDE = 3,    /* import 'm' (no bindings) */
+} JsImportKind;
+
+typedef struct JsModuleImport {
+    JsString *specifier;     /* module to import from */
+    JsString *imported_name; /* export name in source (NULL for ns/side) */
+    uint8_t kind;            /* JsImportKind */
+    JsModule *source;        /* resolved at link */
+} JsModuleImport;
+
+/*
+ * A re-export: `export * from`, `export * as ns from`, or
+ * `export { x as y } from`. Applied at evaluation once `source` has run.
+ */
+typedef enum JsReExpKind {
+    JS_REEXP_ALL = 0,   /* export * from 'm'  -> copy all named exports */
+    JS_REEXP_NS = 1,    /* export * as ns from 'm' -> exports[ns] = m namespace */
+    JS_REEXP_NAMED = 2, /* export { x as y } from 'm' -> exports[y] = m.exports[x] */
+} JsReExpKind;
+
+typedef struct JsStarExport {
+    JsString *specifier;
+    JsModule *source;
+    uint8_t kind;
+    JsString *imported; /* NAMED: source export name */
+    JsString *exported; /* NS: binding name; NAMED: exported name */
+} JsStarExport;
+
+typedef enum JsModuleStatus {
+    JS_MOD_UNLINKED = 0,
+    JS_MOD_LINKING = 1,
+    JS_MOD_LINKED = 2,
+    JS_MOD_EVALUATING = 3,
+    JS_MOD_EVALUATED = 4,
+    JS_MOD_ERRORED = 5,
+} JsModuleStatus;
+
+struct JsModule {
+    JsGcCell gc;
+    JsString *specifier;      /* resolved specifier (cache/identity key) */
+    JsFunctionCell *body;     /* compiled module body (NULL until compiled) */
+    JsObject *exports;        /* namespace/exports object (live bindings) */
+    JsModuleImport *imports;  /* import descriptors (indexed by GET_IMPORT) */
+    uint32_t import_count;
+    JsStarExport *stars;      /* export * from sources */
+    uint32_t star_count;
+    JsString **dep_specs;     /* all distinct dependency specifiers (raw) */
+    uint32_t dep_spec_count;
+    JsModule **deps;          /* resolved dependency modules (parallel to dep_specs) */
+    uint32_t dep_count;
+    uint8_t status;
+    JsValue eval_error;
+};
 
 typedef struct JsFrame {
     JsClosure *closure;
@@ -164,8 +289,10 @@ struct JsFiber {
     uint32_t try_count, try_cap;
     JsUpvalue *open_upvals;
     JsFiber *caller; /* fiber that invoked a native that re-entered; GC root */
+    JsPromise *result_promise; /* async fiber: promise to settle on completion */
     JsValue error;
     bool failed;
+    bool is_async;   /* body may suspend at await */
     uint32_t err_pos;
     uint64_t fuel; /* 0 = unlimited */
 };
@@ -188,6 +315,12 @@ struct JsContext {
     JsObject *string_methods;
     JsObject *array_methods;
     JsObject *number_methods;
+    JsObject *promise_methods;
+    /* module registry (cache by specifier; all GC roots) */
+    JsModule **modules;
+    uint32_t module_count, module_cap;
+    JsModuleResolver resolver;
+    void *resolver_ud;
     JsFiber *fiber;     /* current/last fiber; GC root */
     uint64_t fuel;      /* budget for new runs; 0 = unlimited */
     uint32_t error_pos; /* source offset of last runtime error */
@@ -215,6 +348,11 @@ struct JsVm {
 
     JsAtomTable atoms;
     JsContext *contexts;
+
+    /* microtask FIFO queue (raw allocations; a GC root) */
+    JsJob *jobs_head, *jobs_tail;
+    JsJob *jobs_free;    /* recycled job nodes */
+    JsJob *running_job;  /* dequeued job currently executing; a GC root */
 };
 
 /* ---- value <-> cell ---- */
@@ -227,6 +365,7 @@ static inline JsValue js_value_from_cell(JsGcCell *c) {
     case JS_KIND_FUNCTION:
     case JS_KIND_CLOSURE:
     case JS_KIND_NATIVE: tag = JS_TAG_FUNCTION; break;
+    case JS_KIND_PROMISE: tag = JS_TAG_PROMISE; break;
     default: tag = JS_TAG_OBJECT; break;
     }
     v.bits = tag | ((uint64_t)(uintptr_t)c & JS_PAYLOAD_MASK);
@@ -239,7 +378,8 @@ static inline JsGcCell *js_value_cell(JsValue v) {
 
 static inline bool js_value_is_cell(JsValue v) {
     uint64_t tag = v.bits & JS_TAG_MASK;
-    return tag == JS_TAG_STRING || tag == JS_TAG_OBJECT || tag == JS_TAG_FUNCTION;
+    return tag == JS_TAG_STRING || tag == JS_TAG_OBJECT || tag == JS_TAG_FUNCTION ||
+           tag == JS_TAG_PROMISE;
 }
 
 static inline JsString *js_value_string(JsValue v) { return (JsString *)js_value_cell(v); }
@@ -247,6 +387,7 @@ static inline JsObject *js_value_object(JsValue v) { return (JsObject *)js_value
 static inline JsFunctionCell *js_value_function(JsValue v) {
     return (JsFunctionCell *)js_value_cell(v);
 }
+static inline JsPromise *js_value_promise(JsValue v) { return (JsPromise *)js_value_cell(v); }
 
 /* js_object.c: array helpers used by the interpreter */
 JsObject *js_array_new_cell(JsVm *vm, uint32_t reserve);

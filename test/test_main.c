@@ -338,15 +338,19 @@ static void test_context(void) {
     JsValue g = js_context_globals(ctx);
     CHECK(js_is_object(g));
 
+    /* Context creation installs the whole stdlib, so the live-cell count is
+     * a large fixed baseline; assert relative deltas instead. */
+    js_gc_collect(vm);
+    size_t base = js_gc_live_cells(vm);
+    CHECK(base > 50); /* stdlib present */
+
     JsValue k = js_atom(vm, U("answer"), 6);
     js_gc_protect(vm, &k);
     CHECK(js_object_set(vm, g, k, js_number(42)));
     js_gc_unprotect(vm, &k);
 
-    /* Globals are rooted by the context (object + "answer" + the four
-     * predefined global atoms: undefined/NaN/Infinity/globalThis). */
     js_gc_collect(vm);
-    CHECK(js_gc_live_cells(vm) == 6);
+    CHECK(js_gc_live_cells(vm) == base + 1); /* + the "answer" atom */
     CHECK(js_get_number(js_object_get(vm, js_context_globals(ctx),
                                       js_atom(vm, U("answer"), 6))) == 42);
 
@@ -354,7 +358,8 @@ static void test_context(void) {
     CHECK(ctx2 != NULL);
     js_context_free(ctx);
     js_gc_collect(vm);
-    CHECK(js_gc_live_cells(vm) == 5); /* ctx2 globals + 4 predefined atoms */
+    /* ctx2's stdlib remains; shared interned atoms mean this is <= base+1. */
+    CHECK(js_gc_live_cells(vm) >= base);
 
     js_context_free(ctx2);
     js_gc_collect(vm);

@@ -1,3 +1,4 @@
+#include "js_bytecode.h" /* js_gc_mark_jobs */
 #include "jsvm_internal.h"
 
 /*
@@ -59,8 +60,13 @@ static void js_gc_trace(JsVm *vm) {
                 js_gc_mark_value(vm, f->consts[i]);
             if (f->name)
                 js_gc_mark_cell(vm, &f->name->gc);
+            if (f->module)
+                js_gc_mark_cell(vm, &f->module->gc);
             break;
         }
+        case JS_KIND_MODULE:
+            js_gc_mark_module(vm, (JsModule *)c);
+            break;
         case JS_KIND_FIBER: {
             JsFiber *fb = (JsFiber *)c;
             for (uint32_t i = 0; i < fb->sp; i++)
@@ -71,7 +77,22 @@ static void js_gc_trace(JsVm *vm) {
                 js_gc_mark_cell(vm, &uv->gc);
             if (fb->caller)
                 js_gc_mark_cell(vm, &fb->caller->gc);
+            if (fb->result_promise)
+                js_gc_mark_cell(vm, &fb->result_promise->gc);
             js_gc_mark_value(vm, fb->error);
+            break;
+        }
+        case JS_KIND_PROMISE: {
+            JsPromise *p = (JsPromise *)c;
+            js_gc_mark_value(vm, p->value);
+            for (JsReaction *rx = p->reactions; rx; rx = rx->next) {
+                js_gc_mark_value(vm, rx->on_fulfilled);
+                js_gc_mark_value(vm, rx->on_rejected);
+                if (rx->result)
+                    js_gc_mark_cell(vm, &rx->result->gc);
+                if (rx->fiber)
+                    js_gc_mark_cell(vm, &rx->fiber->gc);
+            }
             break;
         }
         case JS_KIND_CLOSURE: {
@@ -96,6 +117,10 @@ static void js_gc_trace(JsVm *vm) {
             JsNative *nf = (JsNative *)c;
             if (nf->name)
                 js_gc_mark_cell(vm, &nf->name->gc);
+            if (nf->statics)
+                js_gc_mark_cell(vm, &nf->statics->gc);
+            if (nf->is_bound)
+                js_gc_mark_value(vm, nf->bound);
             break;
         }
         case JS_KIND_STRING:
@@ -149,6 +174,20 @@ void js_gc_free_cell(JsVm *vm, JsGcCell *c, bool remove_atoms) {
     case JS_KIND_NATIVE:
         size = sizeof(JsNative);
         break;
+    case JS_KIND_PROMISE: {
+        JsPromise *p = (JsPromise *)c;
+        while (p->reactions) {
+            JsReaction *rx = p->reactions;
+            p->reactions = rx->next;
+            js_realloc_raw(vm, rx, sizeof *rx, 0);
+        }
+        size = sizeof(JsPromise);
+        break;
+    }
+    case JS_KIND_MODULE:
+        js_module_free_cell(vm, (JsModule *)c);
+        size = sizeof(JsModule);
+        break;
     }
     vm->cell_count--;
     js_realloc_raw(vm, c, size, 0);
@@ -170,9 +209,13 @@ void js_gc_collect(JsVm *vm) {
             js_gc_mark_cell(vm, &ctx->array_methods->gc);
         if (ctx->number_methods)
             js_gc_mark_cell(vm, &ctx->number_methods->gc);
+        if (ctx->promise_methods)
+            js_gc_mark_cell(vm, &ctx->promise_methods->gc);
+        js_gc_mark_module_registry(ctx);
         if (ctx->fiber)
             js_gc_mark_cell(vm, &ctx->fiber->gc);
     }
+    js_gc_mark_jobs(vm);
     js_gc_trace(vm);
 
     if (vm->mark_overflow) {

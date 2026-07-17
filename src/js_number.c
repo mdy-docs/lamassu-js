@@ -299,6 +299,13 @@ size_t js_dtoa(double d, char *buf) {
     if (d > 1.7976931348623157e308)
         return put_ascii(buf, n, "Infinity");
 
+    /* Exact fast path for safe integers (|d| < 2^53): the float-scaling dtoa
+     * below loses precision once the scaled mantissa exceeds 2^53, so format
+     * these by exact 64-bit integer division instead. */
+    if (d < 9007199254740992.0 && d == (double)(uint64_t)d) {
+        return put_u64(buf, n, (uint64_t)d);
+    }
+
     union { double dd; uint64_t u; } orig;
     orig.dd = d;
 
