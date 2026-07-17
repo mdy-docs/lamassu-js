@@ -156,6 +156,14 @@ JsValue js_compile_module(JsContext *ctx, const uint16_t *src, size_t len,
                           const char **err_msg, uint32_t *err_pos);
 
 /*
+ * Like js_compile_module, but top-level let/const/function declarations
+ * become persistent globals on the context — so successive evaluations in
+ * the same context share state (a REPL session).
+ */
+JsValue js_compile_module_repl(JsContext *ctx, const uint16_t *src, size_t len,
+                               const char **err_msg, uint32_t *err_pos);
+
+/*
  * Runs a compiled module function. Returns true with *result = completion
  * value (the value of the last expression statement), or false with
  * *result = the error value; js_context_error_pos() gives its source offset.

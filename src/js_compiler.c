@@ -76,6 +76,7 @@ typedef struct JsFuncState {
     uint16_t upname_cap;
     JsFinallyInfo finallys[JS_MAX_FINALLY];
     int finally_count;
+    int scope_depth; /* nesting of blocks/loops within this function */
     uint32_t last_line_pos;
 } JsFuncState;
 
@@ -84,6 +85,7 @@ typedef struct JsCompiler {
     JsVm *vm;
     JsArena arena;
     JsFuncState *cur;
+    bool repl; /* REPL: top-level declarations become persistent globals */
     const char *err_msg;
     uint32_t err_pos;
     int func_depth;
@@ -278,12 +280,14 @@ static bool units_equal(const uint16_t *a, uint32_t alen, const uint16_t *b,
 
 static JsScopeMark scope_enter(JsCompiler *cx) {
     JsScopeMark m = {cx->cur->local_count, cx->cur->slot_count};
+    cx->cur->scope_depth++;
     return m;
 }
 
 /* Emits CLOSE_UPVALS if any local being discarded was captured. */
 static bool scope_leave(JsCompiler *cx, JsScopeMark m) {
     JsFuncState *fs = cx->cur;
+    fs->scope_depth--;
     bool captured = false;
     for (uint32_t i = m.local_count; i < fs->local_count; i++) {
         if (fs->locals[i].captured) {
@@ -296,6 +300,11 @@ static bool scope_leave(JsCompiler *cx, JsScopeMark m) {
     if (captured)
         return emit_op_u16(cx, JS_OP_CLOSE_UPVALS, m.slot_count, 0);
     return true;
+}
+
+/* REPL top-level scope: declarations here become persistent globals. */
+static bool is_repl_top(JsCompiler *cx) {
+    return cx->repl && cx->cur->is_module && cx->cur->scope_depth == 1;
 }
 
 static int resolve_local_in(JsFuncState *fs, const uint16_t *name, uint32_t len) {
@@ -414,6 +423,9 @@ static bool pattern_declare(JsCompiler *cx, const JsAstNode *pat, bool is_const,
                             uint32_t scope_floor, bool tdz) {
     switch ((JsAstKind)pat->kind) {
     case JS_AST_IDENT: {
+        /* REPL top-level: the binding is a persistent global, not a local */
+        if (is_repl_top(cx))
+            return true;
         /* module-top-level exported names live in the exports object, not a
          * local slot — skip declaring them here (SET_EXPORT initializes). */
         if (cx->module && cx->cur->is_module) {
@@ -475,6 +487,9 @@ static bool prescan_declarations(JsCompiler *cx, JsAstNode *const *stmts,
                     return false;
             }
         } else if (s->kind == JS_AST_FUNC_DECL) {
+            /* REPL top-level function -> persistent global (not a local) */
+            if (is_repl_top(cx))
+                continue;
             /* exported functions become export bindings, not locals */
             if (cx->module && cx->cur->is_module) {
                 JsModBinding *b = resolve_module_binding(cx, s->units, s->len);
@@ -743,6 +758,14 @@ static bool store_target(JsCompiler *cx, const JsAstNode *tgt, bool declaring) {
     if (declaring) {
         int idx = resolve_local_in(cx->cur, tgt->units, tgt->len);
         if (idx < 0) {
+            /* REPL top-level declaration -> define a persistent global */
+            if (is_repl_top(cx)) {
+                uint16_t c;
+                if (!atom_const(cx, tgt->units, tgt->len, tgt->pos, &c))
+                    return false;
+                return emit_op_u16(cx, JS_OP_DEFINE_GLOBAL, c, 0) &&
+                       emit_op(cx, JS_OP_POP, -1);
+            }
             /* an exported top-level binding: initialize the export */
             if (cx->module && cx->cur->is_module) {
                 int m = emit_module_init(cx, tgt);
@@ -1567,6 +1590,14 @@ static bool hoist_functions(JsCompiler *cx, JsAstNode *const *stmts, uint32_t co
             continue;
         if (!compile_function(cx, s))
             return false;
+        if (!exported && is_repl_top(cx)) {
+            /* REPL top-level function -> persistent global */
+            uint16_t c;
+            if (!atom_const(cx, s->units, s->len, s->pos, &c) ||
+                !emit_op_u16(cx, JS_OP_DEFINE_GLOBAL, c, 0) || !emit_op(cx, JS_OP_POP, -1))
+                return false;
+            continue;
+        }
         if (exported ||
             (cx->module && cx->cur->is_module && resolve_module_binding(cx, s->units, s->len) &&
              resolve_module_binding(cx, s->units, s->len)->kind == JS_MB_EXPORT)) {
@@ -2033,13 +2064,14 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
 
 /* ---- entry point ---- */
 
-JsFunctionCell *js_compile_ast(JsContext *ctx, const JsAstNode *module,
+JsFunctionCell *js_compile_ast(JsContext *ctx, const JsAstNode *module, bool repl,
                                JsCompileError *err) {
     JsVm *vm = ctx->vm;
     JsCompiler cx;
     memset(&cx, 0, sizeof cx);
     cx.ctx = ctx;
     cx.vm = vm;
+    cx.repl = repl;
     js_arena_init(&cx.arena, vm);
 
     JsGcCell *cell = js_gc_new_cell(vm, JS_KIND_FUNCTION, sizeof(JsFunctionCell));

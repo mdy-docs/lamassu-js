@@ -179,7 +179,8 @@ EXPORT const char *jsvm_eval(const char *src_utf8) {
 
     const char *err_msg;
     uint32_t err_pos;
-    JsValue fn = js_compile_module(g_ctx, u, ulen, &err_msg, &err_pos);
+    /* REPL mode: top-level declarations persist as globals across evals */
+    JsValue fn = js_compile_module_repl(g_ctx, u, ulen, &err_msg, &err_pos);
     if (!js_is_function(fn)) {
         buf_cstr("SyntaxError: ");
         buf_cstr(err_msg ? err_msg : "compile error");

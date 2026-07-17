@@ -923,6 +923,13 @@ run:; /* (re)load the top frame */
                     RT_THROW("out of memory");
                 break;
             }
+            case JS_OP_DEFINE_GLOBAL: {
+                /* REPL top-level declaration: create/overwrite a global */
+                JsString *name = js_value_string(K[READ_U16()]);
+                if (!js_map_set(vm, &ctx->globals->props, name, PEEK(0)))
+                    RT_THROW("out of memory");
+                break;
+            }
             case JS_OP_ADD: {
                 JsValue a = PEEK(1), b = PEEK(0);
                 if (js_is_number(a) && js_is_number(b)) {
@@ -1722,8 +1729,8 @@ bool js_call(JsContext *ctx, JsValue fn, JsValue this_val, const JsValue *args,
 
 /* ---- public API ---- */
 
-JsValue js_compile_module(JsContext *ctx, const uint16_t *src, size_t len,
-                          const char **err_msg, uint32_t *err_pos) {
+static JsValue compile_module_impl(JsContext *ctx, const uint16_t *src, size_t len,
+                                   bool repl, const char **err_msg, uint32_t *err_pos) {
     *err_msg = NULL;
     *err_pos = 0;
     JsArena arena;
@@ -1736,7 +1743,7 @@ JsValue js_compile_module(JsContext *ctx, const uint16_t *src, size_t len,
         return js_undefined();
     }
     JsCompileError ce;
-    JsFunctionCell *fn = js_compile_ast(ctx, pr.module, &ce);
+    JsFunctionCell *fn = js_compile_ast(ctx, pr.module, repl, &ce);
     js_arena_free(&arena);
     if (!fn) {
         *err_msg = ce.msg;
@@ -1744,6 +1751,16 @@ JsValue js_compile_module(JsContext *ctx, const uint16_t *src, size_t len,
         return js_undefined();
     }
     return js_value_from_cell(&fn->gc);
+}
+
+JsValue js_compile_module(JsContext *ctx, const uint16_t *src, size_t len,
+                          const char **err_msg, uint32_t *err_pos) {
+    return compile_module_impl(ctx, src, len, false, err_msg, err_pos);
+}
+
+JsValue js_compile_module_repl(JsContext *ctx, const uint16_t *src, size_t len,
+                               const char **err_msg, uint32_t *err_pos) {
+    return compile_module_impl(ctx, src, len, true, err_msg, err_pos);
 }
 
 bool js_run_module(JsContext *ctx, JsValue fnv, JsValue *result) {

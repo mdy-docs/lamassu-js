@@ -25,6 +25,7 @@ typedef enum JsOp {
     JS_OP_GET_GLOBAL,      /* u16 const idx (atom); ReferenceError if absent */
     JS_OP_GET_GLOBAL_SOFT, /* u16; undefined if absent (typeof) */
     JS_OP_SET_GLOBAL,      /* u16; peeks; ReferenceError if undeclared */
+    JS_OP_DEFINE_GLOBAL,   /* u16; peeks; creates-or-sets a global (REPL decls) */
     JS_OP_ADD, JS_OP_SUB, JS_OP_MUL, JS_OP_DIV, JS_OP_MOD, JS_OP_POW,
     JS_OP_NEG, JS_OP_POS, JS_OP_NOT, JS_OP_BITNOT,
     JS_OP_BITAND, JS_OP_BITOR, JS_OP_BITXOR,
@@ -87,8 +88,9 @@ typedef struct JsCompileError {
     uint32_t pos;    /* source offset */
 } JsCompileError;
 
-/* AST -> function cell; NULL on error. The result must be rooted by caller. */
-JsFunctionCell *js_compile_ast(JsContext *ctx, const JsAstNode *module,
+/* AST -> function cell; NULL on error. The result must be rooted by caller.
+ * repl=true makes top-level declarations persistent globals (REPL sessions). */
+JsFunctionCell *js_compile_ast(JsContext *ctx, const JsAstNode *module, bool repl,
                                JsCompileError *err);
 
 /* Runs fn on a fresh fiber. False -> *result is the error value. */

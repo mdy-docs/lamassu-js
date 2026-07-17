@@ -8,7 +8,7 @@
   :root {
     --bg: #0f1420; --panel: #161c2b; --panel-2: #1c2436; --edge: #2a3550;
     --fg: #e6ebf5; --muted: #93a1bd; --accent: #6ea8fe; --accent-2: #7ee0c0;
-    --err: #ff8a8a; --ok: #7ee0c0; --shadow: rgba(0,0,0,.35);
+    --err: #ff8a8a; --ok: #7ee0c0; --dim: #6b7a99;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
     --sans: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
   }
@@ -16,7 +16,7 @@
     :root {
       --bg: #f4f6fb; --panel: #ffffff; --panel-2: #eef2fa; --edge: #d7deee;
       --fg: #1a2233; --muted: #5a6784; --accent: #2f6fed; --accent-2: #159a75;
-      --err: #c0392b; --ok: #159a75; --shadow: rgba(20,30,60,.10);
+      --err: #c0392b; --ok: #159a75; --dim: #8794ac;
     }
   }
   * { box-sizing: border-box; }
@@ -25,21 +25,19 @@
     background: var(--bg); color: var(--fg); font-family: var(--sans);
     display: flex; flex-direction: column; min-height: 100vh; line-height: 1.5;
   }
-  header {
-    padding: 20px 24px 12px; border-bottom: 1px solid var(--edge);
-  }
+  header { padding: 20px 24px 12px; border-bottom: 1px solid var(--edge); }
   h1 { margin: 0; font-size: 20px; letter-spacing: .2px; }
   h1 .tag {
     font: 600 11px/1 var(--mono); color: var(--bg); background: var(--accent-2);
     padding: 4px 7px; border-radius: 6px; vertical-align: 2px; margin-left: 8px;
   }
-  .sub { color: var(--muted); font-size: 13.5px; margin-top: 4px; }
+  .sub { color: var(--muted); font-size: 13.5px; margin-top: 4px; max-width: 90ch; }
   .sub code { font-family: var(--mono); color: var(--fg); }
   main {
     flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 1px;
     background: var(--edge); min-height: 0;
   }
-  @media (max-width: 820px) { main { grid-template-columns: 1fr; } }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
   .col { background: var(--bg); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
   .bar {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
@@ -61,8 +59,7 @@
     background: var(--panel); border-bottom: 1px solid var(--edge); }
   .chip {
     font-size: 12.5px; padding: 4px 10px; border-radius: 999px;
-    background: transparent; border: 1px solid var(--edge); color: var(--muted);
-    cursor: pointer;
+    background: transparent; border: 1px solid var(--edge); color: var(--muted); cursor: pointer;
   }
   .chip:hover { color: var(--fg); border-color: var(--accent); }
   .chip.active { color: var(--bg); background: var(--accent); border-color: transparent; font-weight: 600; }
@@ -71,14 +68,38 @@
     background: var(--bg); color: var(--fg); font-family: var(--mono);
     font-size: 13.5px; line-height: 1.55; tab-size: 2; min-height: 220px;
   }
-  .out-wrap { flex: 1; overflow: auto; min-height: 0; }
-  pre.out {
-    margin: 0; padding: 16px; font-family: var(--mono); font-size: 13.5px;
-    line-height: 1.55; white-space: pre-wrap; word-break: break-word; color: var(--fg);
+  /* REPL transcript */
+  .transcript { flex: 1; overflow: auto; min-height: 0; padding: 8px 0; }
+  .entry { padding: 6px 16px; border-bottom: 1px solid color-mix(in srgb, var(--edge) 50%, transparent); }
+  .entry .src {
+    font-family: var(--mono); font-size: 13px; white-space: pre-wrap; word-break: break-word;
+    color: var(--fg); display: flex; gap: 8px;
   }
-  pre.out .result { color: var(--ok); }
-  pre.out .error { color: var(--err); }
+  .entry .src .caret { color: var(--accent); font-weight: 700; user-select: none; }
+  .entry .badge {
+    font: 600 10px/1 var(--mono); text-transform: uppercase; letter-spacing: .6px;
+    color: var(--muted); border: 1px solid var(--edge); border-radius: 5px;
+    padding: 3px 6px; user-select: none;
+  }
+  .entry .out {
+    font-family: var(--mono); font-size: 13px; white-space: pre-wrap; word-break: break-word;
+    margin-top: 4px; color: var(--fg);
+  }
+  .entry .out .result { color: var(--ok); }
+  .entry .out .error { color: var(--err); }
+  .entry .out .print { color: var(--fg); }
+  .prompt-row {
+    display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+    background: var(--panel); border-top: 1px solid var(--edge);
+  }
+  .prompt-caret { color: var(--accent); font: 700 15px/1 var(--mono); }
+  input.prompt {
+    flex: 1; border: 0; outline: 0; background: transparent; color: var(--fg);
+    font-family: var(--mono); font-size: 13.5px; padding: 6px 0;
+  }
+  input.prompt::placeholder { color: var(--dim); }
   .hint { color: var(--muted); font-size: 12px; }
+  .empty { color: var(--dim); font-size: 13px; padding: 16px; font-style: italic; }
   kbd {
     font: 600 11px/1 var(--mono); background: var(--panel-2); border: 1px solid var(--edge);
     border-bottom-width: 2px; border-radius: 5px; padding: 3px 5px;
@@ -97,33 +118,44 @@
   <h1>jsvm playground <span class="tag">C → WASM</span></h1>
   <div class="sub">
     A JavaScript engine written from scratch in C — bytecode compiler, mark-sweep GC,
-    closures, <code>async</code>/<code>await</code>, and ES modules — compiled to WebAssembly and
-    running entirely in your browser. Everything below executes in the C&nbsp;VM, not your browser's JS engine.
+    closures, <code>async</code>/<code>await</code>, and ES modules — compiled to WebAssembly.
+    The editor and the REPL on the right share <strong>one engine instance</strong>:
+    load a sample, run it, then poke at its functions and variables live in the REPL.
+    Everything executes in the C&nbsp;VM, not your browser's JS engine.
   </div>
 </header>
 
 <main>
   <section class="col">
     <div class="bar">
-      <span class="label">Source</span>
+      <span class="label">Editor</span>
       <button class="run" id="run">Run ▶</button>
-      <button id="reset" title="Discard REPL state and start a fresh VM">Reset</button>
-      <span class="hint">or press <kbd id="kbd">⌘↵</kbd></span>
+      <button id="reset" title="Discard all session state and start a fresh VM">Reset</button>
+      <span class="hint">or <kbd id="kbd">⌘↵</kbd></span>
     </div>
     <div class="samples" id="samples"></div>
     <textarea id="code" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
   </section>
+
   <section class="col">
-    <div class="bar"><span class="label">Output</span>
-      <span class="hint">print() output, then <span style="color:var(--ok)">⇒ the value of the last expression</span></span>
+    <div class="bar">
+      <span class="label">REPL</span>
+      <span class="hint">shares the VM with the editor — top-level <code style="font-family:var(--mono)">let</code>/<code style="font-family:var(--mono)">const</code>/<code style="font-family:var(--mono)">function</code> persist</span>
     </div>
-    <div class="out-wrap"><pre class="out" id="out"></pre></div>
+    <div class="transcript" id="transcript">
+      <div class="empty" id="empty">Run a sample, or type an expression below — state carries over.</div>
+    </div>
+    <div class="prompt-row">
+      <span class="prompt-caret">›</span>
+      <input id="prompt" class="prompt" spellcheck="false" autocomplete="off"
+             placeholder="type an expression and press Enter  ·  ↑ / ↓ for history">
+    </div>
   </section>
 </main>
 
 <footer>
   <span id="engine">Loading WebAssembly…</span>
-  <a href="https://github.com/" id="repo" target="_blank" rel="noopener">source on GitHub</a>
+  <a href="https://github.com/mdy-docs/lamassu" target="_blank" rel="noopener">source on GitHub</a>
   <span class="status" id="status"></span>
 </footer>
 
@@ -135,10 +167,11 @@
   var SAMPLES = [
     ["Welcome",
 `// Everything here runs in a C-based JS engine compiled to WASM.
+// Try running this, then type  greet('you')  in the REPL →
+function greet(who) { return \`Hello, \${who}, from jsvm!\`; }
 const engine = { name: 'jsvm', lang: 'C', target: 'WebAssembly' };
-print(\`Hello from \${engine.name} — written in \${engine.lang}!\`);
-for (const [k, v] of Object.entries(engine)) print(\`  \${k}: \${v}\`);
-2 ** 10;`],
+for (const [k, v] of Object.entries(engine)) print(\`\${k}: \${v}\`);
+greet('world');`],
 
     ["Closures",
 `// Each counter keeps its own private state (real upvalue capture).
@@ -146,102 +179,72 @@ function makeCounter(start = 0) {
   let n = start;
   return { inc: () => ++n, dec: () => --n, value: () => n };
 }
+// makeCounter persists — call it again from the REPL: makeCounter(100)
 const c = makeCounter(10);
 c.inc(); c.inc(); c.dec();
-print('counter =', c.value());
-
-// per-iteration loop bindings
-const fns = [];
-for (let i = 0; i < 3; i++) fns.push(() => i);
-fns.map(f => f()).join(',');`],
+c.value();`],
 
     ["Arrays",
 `const nums = [5, 2, 8, 1, 9, 3, 7];
-print('sorted   :', [...nums].sort((a, b) => a - b).join(', '));
-print('evens    :', nums.filter(n => n % 2 === 0).join(', '));
-print('squares  :', nums.map(n => n * n).join(', '));
-print('sum      :', nums.reduce((a, b) => a + b, 0));
-print('max      :', Math.max(...nums));
-nums.filter(n => n > 4).map(n => n * 10).join(', ');`],
+print('sorted :', [...nums].sort((a, b) => a - b).join(', '));
+print('evens  :', nums.filter(n => n % 2 === 0).join(', '));
+print('squares:', nums.map(n => n * n).join(', '));
+print('sum    :', nums.reduce((a, b) => a + b, 0));
+nums.filter(n => n > 4).map(n => n * 10);`],
 
     ["Destructuring",
 `const user = { name: 'Ada', roles: ['admin', 'dev'], age: 36 };
 const { name, roles: [primary, ...rest], age = 0 } = user;
 print(\`\${name} (\${age}) — \${primary}, also \${rest.join('/')}\`);
-
 const [first, , third, ...tail] = [10, 20, 30, 40, 50];
-[first, third, tail].map(String).join(' | ');`],
+[first, third, tail];`],
 
     ["async / await",
 `// The suspendable-fiber design makes await nearly free.
-function delay(v) { return Promise.resolve(v); }
-
-async function pipeline() {
-  const a = await delay(2);
-  const b = await delay(3);
-  const all = await Promise.all([delay(10), delay(20), delay(30)]);
-  return a * b + all.reduce((x, y) => x + y, 0);
+async function fetchUser(id) { return await Promise.resolve({ id, name: 'user' + id }); }
+async function main() {
+  const users = await Promise.all([fetchUser(1), fetchUser(2), fetchUser(3)]);
+  return users.map(u => u.name).join(', ');
 }
-
 print('awaiting…');
-await pipeline();`],
+await main();`],
 
     ["Promises",
 `let log = 'start';
-Promise.resolve()
-  .then(() => log += ' → then1')
-  .then(() => log += ' → then2');
-
+Promise.resolve().then(() => log += ' → t1').then(() => log += ' → t2');
 Promise.reject('oops').catch(e => print('caught:', e));
-
-const settled = await Promise.allSettled([
-  Promise.resolve('ok'),
-  Promise.reject('bad'),
-]);
+const settled = await Promise.allSettled([Promise.resolve('ok'), Promise.reject('bad')]);
 print('statuses:', settled.map(s => s.status).join(', '));
-
-await Promise.resolve();  // let microtasks flush
+await Promise.resolve();
 log;`],
 
     ["JSON",
-`const data = {
-  title: 'jsvm',
-  features: ['closures', 'async', 'modules'],
-  meta: { version: 1, wasm: true },
-};
+`const data = { title: 'jsvm', features: ['closures', 'async', 'modules'], meta: { v: 1, wasm: true } };
 const text = JSON.stringify(data, null, 2);
 print(text);
-
 const parsed = JSON.parse(text);
-\`round-trip ok: \${parsed.features.length} features, wasm=\${parsed.meta.wasm}\`;`],
+\`round-trip: \${parsed.features.length} features, wasm=\${parsed.meta.wasm}\`;`],
 
     ["Errors",
 `function risky(n) {
-  if (n < 0) throw new_error_like('negative not allowed');
+  if (n < 0) throw { message: 'negative not allowed' };
   return Math.sqrt(n);
 }
-function new_error_like(msg) { return { message: msg }; }
-
 let log = '';
 for (const n of [16, -4, 9]) {
-  try {
-    log += \`√\${n}=\${risky(n)} \`;
-  } catch (e) {
-    log += \`[error: \${e.message}] \`;
-  } finally {
-    log += '· ';
-  }
+  try { log += \`√\${n}=\${risky(n)} \`; }
+  catch (e) { log += \`[\${e.message}] \`; }
+  finally { log += '· '; }
 }
 log.trim();`],
 
     ["Recursion",
 `// Deep call stacks live on the fiber's heap, not the C stack.
 function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
+function fact(n) { return n <= 1 ? 1 : n * fact(n - 1); }
 const seq = [];
 for (let i = 0; i < 12; i++) seq.push(fib(i));
 print('fibonacci:', seq.join(', '));
-
-function fact(n) { return n <= 1 ? 1 : n * fact(n - 1); }
 \`10! = \${fact(10)}\`;`],
 
     ["Text",
@@ -249,26 +252,26 @@ function fact(n) { return n <= 1 ? 1 : n * fact(n - 1); }
 print('trimmed :', JSON.stringify(s.trim()));
 print('upper   :', s.trim().toUpperCase());
 print('words   :', s.trim().split(' ').length);
-print('reversed:', s.trim().split('').reverse().join(''));
 print('slug    :', s.trim().toLowerCase().split(' ').join('-'));
-'padded'.padStart(10, '·').padEnd(14, '·');`],
+s.trim().split('').reverse().join('');`],
 
     ["Math",
 `print('π       =', Math.PI.toFixed(6));
-print('e        =', Math.E.toFixed(6));
-print('√2       =', Math.sqrt(2).toFixed(6));
-print('sin(π/6) =', Math.sin(Math.PI / 6).toFixed(4));
-print('2^0.5    =', Math.pow(2, 0.5).toFixed(6));
-print('(255)₁₆  =', (255).toString(16));
-print('parseInt =', parseInt('0xFF'), parseInt('101', 2));
+print('√2      =', Math.sqrt(2).toFixed(6));
+print('sin(π/6)=', Math.sin(Math.PI / 6).toFixed(4));
+print('2^0.5   =', Math.pow(2, 0.5).toFixed(6));
+print('(255)₁₆ =', (255).toString(16));
+print('parseInt=', parseInt('0xFF'), parseInt('101', 2));
 Math.hypot(3, 4);`],
   ];
 
   var codeEl = document.getElementById('code');
-  var outEl = document.getElementById('out');
   var runBtn = document.getElementById('run');
   var resetBtn = document.getElementById('reset');
   var samplesEl = document.getElementById('samples');
+  var transcriptEl = document.getElementById('transcript');
+  var emptyEl = document.getElementById('empty');
+  var promptEl = document.getElementById('prompt');
   var engineEl = document.getElementById('engine');
   var statusEl = document.getElementById('status');
   var kbdEl = document.getElementById('kbd');
@@ -277,6 +280,7 @@ Math.hypot(3, 4);`],
   kbdEl.textContent = isMac ? '⌘↵' : 'Ctrl+↵';
 
   var evalFn = null, resetFn = null, ready = false, activeChip = null;
+  var history = [], histIdx = 0;
 
   SAMPLES.forEach(function (s, i) {
     var b = document.createElement('button');
@@ -290,44 +294,76 @@ Math.hypot(3, 4);`],
     codeEl.value = SAMPLES[i][1];
     if (activeChip) activeChip.classList.remove('active');
     activeChip = chip; chip.classList.add('active');
-    if (ready) run();
+    if (ready) runSource(codeEl.value, 'editor');
   }
 
-  function setOut(text) {
-    outEl.textContent = '';
-    // color the last "⇒ …" result line or an error/uncaught line
-    var lines = text.split('\n');
-    lines.forEach(function (line, idx) {
+  // Build the colored output lines for one eval result.
+  function renderOutput(text) {
+    var out = document.createElement('div');
+    out.className = 'out';
+    (text || '').split('\n').forEach(function (line, idx, arr) {
       var span = document.createElement('span');
       if (line.indexOf('⇒') === 0) span.className = 'result';
       else if (/^(Uncaught|SyntaxError|internal:)/.test(line)) span.className = 'error';
-      span.textContent = line + (idx < lines.length - 1 ? '\n' : '');
-      outEl.appendChild(span);
+      else span.className = 'print';
+      span.textContent = line + (idx < arr.length - 1 ? '\n' : '');
+      out.appendChild(span);
     });
+    return out;
   }
 
-  function run() {
-    if (!ready) return;
+  function appendEntry(source, label, output) {
+    if (emptyEl) { emptyEl.remove(); emptyEl = null; }
+    var entry = document.createElement('div');
+    entry.className = 'entry';
+    var src = document.createElement('div');
+    src.className = 'src';
+    if (label) {
+      var badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = label;
+      src.appendChild(badge);
+      var pre = document.createElement('span');
+      pre.textContent = source.length > 200 ? source.slice(0, 200) + ' …' : source;
+      src.appendChild(pre);
+    } else {
+      var caret = document.createElement('span');
+      caret.className = 'caret'; caret.textContent = '›';
+      src.appendChild(caret);
+      var expr = document.createElement('span');
+      expr.textContent = source;
+      src.appendChild(expr);
+    }
+    entry.appendChild(src);
+    entry.appendChild(renderOutput(output));
+    transcriptEl.appendChild(entry);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  function runSource(code, label) {
+    if (!ready || !code.trim()) return;
     var t0 = performance.now();
     var out;
-    try {
-      out = evalFn(codeEl.value);
-    } catch (e) {
-      out = 'internal: ' + (e && e.message ? e.message : e);
-    }
-    var ms = (performance.now() - t0);
-    setOut(out || '(no output)');
-    statusEl.textContent = ms < 1 ? '<1 ms' : ms.toFixed(1) + ' ms';
+    try { out = evalFn(code); }
+    catch (e) { out = 'internal: ' + (e && e.message ? e.message : e); }
+    var ms = performance.now() - t0;
+    appendEntry(code, label, out || '(no output)');
+    statusEl.textContent = (ms < 1 ? '<1' : ms.toFixed(1)) + ' ms';
   }
 
-  runBtn.onclick = run;
+  runBtn.onclick = function () { runSource(codeEl.value, 'editor'); };
   resetBtn.onclick = function () {
     if (resetFn) resetFn();
-    outEl.textContent = '';
+    transcriptEl.innerHTML = '';
+    emptyEl = document.createElement('div');
+    emptyEl.className = 'empty';
+    emptyEl.textContent = 'Session reset — a fresh VM. Run a sample or type below.';
+    transcriptEl.appendChild(emptyEl);
     statusEl.textContent = 'VM reset';
   };
+
   codeEl.addEventListener('keydown', function (e) {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); run(); }
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); runSource(codeEl.value, 'editor'); }
     if (e.key === 'Tab') {
       e.preventDefault();
       var s = codeEl.selectionStart, en = codeEl.selectionEnd;
@@ -336,12 +372,29 @@ Math.hypot(3, 4);`],
     }
   });
 
+  promptEl.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') {
+      var code = promptEl.value;
+      if (!code.trim()) return;
+      history.push(code); histIdx = history.length;
+      runSource(code, null);
+      promptEl.value = '';
+    } else if (e.key === 'ArrowUp') {
+      if (histIdx > 0) { histIdx--; promptEl.value = history[histIdx]; e.preventDefault(); }
+    } else if (e.key === 'ArrowDown') {
+      if (histIdx < history.length - 1) { histIdx++; promptEl.value = history[histIdx]; }
+      else { histIdx = history.length; promptEl.value = ''; }
+      e.preventDefault();
+    }
+  });
+
   createJsvm().then(function (M) {
     evalFn = M.cwrap('jsvm_eval', 'string', ['string']);
     resetFn = M.cwrap('jsvm_reset', null, []);
     ready = true;
-    engineEl.textContent = 'jsvm engine ready — ' + (SAMPLES.length) + ' samples';
+    engineEl.textContent = 'jsvm engine ready — ' + SAMPLES.length + ' samples';
     loadSample(0, samplesEl.firstChild);
+    promptEl.focus();
   }).catch(function (e) {
     engineEl.textContent = 'failed to load engine: ' + e;
   });
