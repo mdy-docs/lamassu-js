@@ -18,6 +18,9 @@ import createLamassuModule from "./dist/lamassu.mjs";
  *   native ESM, where the sibling .wasm is found via import.meta.url.
  * @param {(text: string) => void} [options.print]  Sink for the engine's
  *   internal stdout (rarely needed; script output is returned by `eval`).
+ * @param {Record<string, (...args: any[]) => any>} [options.natives]  Host
+ *   functions callable from guest code (may be async — see below). Can be
+ *   swapped later with `setNatives`.
  */
 export async function createLamassu(options = {}) {
   const moduleArg = {};
@@ -31,20 +34,50 @@ export async function createLamassu(options = {}) {
   }
 
   const M = await createLamassuModule(moduleArg);
-  const evalRaw = M.cwrap("jsvm_eval", "string", ["string"]);
+
+  /*
+   * Host calls: guest code calls `__hostcall(name, argsJson)`, which
+   * suspends the entire wasm execution (Asyncify) until the named native
+   * settles — so a native may be async (a database query, a fetch, …) while
+   * the guest sees an ordinary synchronous call. Arguments arrive as a JSON
+   * string; the native's resolved value is JSON-encoded and returned to the
+   * guest as a string (guest-side wrappers JSON.parse it). A native throwing
+   * rethrows inside the guest at the call site.
+   *
+   * CAUTION: while an eval is suspended in a host call this instance must
+   * not be re-entered (Asyncify is not reentrant). Embedders that nest evals
+   * (an eval whose native triggers another eval) use one instance per level.
+   */
+  let natives = { ...(options.natives ?? {}) };
+  M.lamassuHostCall = async (name, argsJson) => {
+    const fn = natives[name];
+    if (typeof fn !== "function") throw new Error(`unknown native "${name}"`);
+    const args = argsJson === "" ? [] : JSON.parse(argsJson);
+    const value = await fn(...(Array.isArray(args) ? args : [args]));
+    return JSON.stringify(value === undefined ? null : value);
+  };
+
+  const evalRaw = M.cwrap("jsvm_eval", "string", ["string"], { async: true });
   const resetRaw = M.cwrap("jsvm_reset", null, []);
 
   return {
     /**
      * Evaluate a chunk of source in the persistent REPL context. Top-level
-     * `let`/`const`/`function` declarations carry across calls. Returns the
-     * combined `print()` output followed by the completion value (prefixed
-     * with "⇒ ") or an error line — never throws.
+     * `let`/`const`/`function` declarations carry across calls. Resolves to
+     * the combined `print()` output followed by the completion value
+     * (prefixed with "⇒ ") or an error line — never rejects for guest
+     * errors. Async because a guest `__hostcall` may suspend execution while
+     * a native runs.
      * @param {string} source
-     * @returns {string}
+     * @returns {Promise<string>}
      */
     eval(source) {
-      return evalRaw(String(source ?? ""));
+      return Promise.resolve(evalRaw(String(source ?? "")));
+    },
+
+    /** Replace the natives table (e.g. per embedder task). */
+    setNatives(next) {
+      natives = { ...(next ?? {}) };
     },
 
     /** Discard all REPL state and start from a fresh VM + context. */

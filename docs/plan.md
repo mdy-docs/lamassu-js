@@ -9,7 +9,13 @@ language.
 - Run scripts written in a practical subset of modern JavaScript.
 - Compile source to bytecode once; execute compiled functions repeatedly with no
   re-parse/re-compile cost.
-- Support async/await for calling out to native (host) functions that may take time.
+- Support async/await for calling out to native (host) functions that may take
+  time. **Landed** for the npm package (`src/wasm_api.c` `__hostcall` +
+  Emscripten Asyncify + the shim's `natives` option): a guest calls
+  `__hostcall(name, argsJson)` synchronously, the whole VM execution suspends
+  while the host's (possibly async) native runs, and resumes with its result.
+  Guest-level `await` of natives-as-promises remains open for the freestanding
+  core.
 - Support ECMAScript modules (`import` / `export`).
 - Be safe against hostile scripts: bounded CPU (fuel), bounded memory, bounded
   stack depth.

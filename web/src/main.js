@@ -193,12 +193,12 @@ function appendEntry(source, label, output) {
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
-function runSource(code, label) {
+async function runSource(code, label) {
   if (!ready || !code.trim()) return;
   const t0 = performance.now();
   let out;
   try {
-    out = engine.eval(code);
+    out = await engine.eval(code); // async: a __hostcall native may suspend
   } catch (e) {
     out = "internal: " + (e && e.message ? e.message : e);
   }

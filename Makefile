@@ -206,7 +206,8 @@ $(PKG_DIST)/lamassu.mjs: $(SRC) src/wasm_api.c $(HDR) $(RE_SRC) $(RE_HDR)
 	  -sSTACK_SIZE=8388608 -sSTACK_OVERFLOW_CHECK=2 \
 	  -sEXPORTED_FUNCTIONS=_jsvm_eval,_jsvm_reset,_malloc,_free \
 	  -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,stringToUTF8,lengthBytesUTF8 \
-	  -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=33554432 \
+	  -sASYNCIFY -sASYNCIFY_STACK_SIZE=262144 \
+	  -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=16777216 \
 	  -o $(PKG_DIST)/lamassu.mjs
 
 # Back-compat alias: `make web` now means "build the package artifact".
