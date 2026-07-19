@@ -84,8 +84,9 @@ bool js_regexp_prop_set(JsContext *ctx, JsObject *o, JsValue key, JsValue val,
 /* "/source/flags" for ToString; NULL on OOM. */
 JsString *js_regexp_repr(JsContext *ctx, JsObject *o);
 
-/* Installs the RegExp global and the hidden regexp method table
- * (exec/test/toString). Called from js_builtins_init. */
+/* Installs the RegExp global and a real, script-visible RegExp.prototype
+ * (exec/test/toString) — every instance's [[Prototype]] points there.
+ * Called from js_builtins_init. */
 bool js_regexp_builtins_init(JsContext *ctx);
 
 /* Regex-aware String methods (registered/delegated from js_builtins.c).

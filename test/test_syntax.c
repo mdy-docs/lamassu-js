@@ -397,6 +397,12 @@ static void dump_node(Sb *sb, const JsAstNode *n) {
         dump_list(sb, n->items, n->count);
         sb_printf(sb, ")");
         break;
+    case JS_AST_NEW:
+        sb_printf(sb, "(new");
+        dump_child(sb, n->a);
+        dump_list(sb, n->items, n->count);
+        sb_printf(sb, ")");
+        break;
     case JS_AST_MEMBER:
         if (n->flags & JS_F_COMPUTED) {
             sb_printf(sb, (n->flags & JS_F_OPTIONAL) ? "(?idx" : "(idx");
@@ -672,6 +678,17 @@ static void test_members_calls(void) {
                "(module (expr (= (. obj default) 1)))");
 }
 
+static void test_new(void) {
+    check_dump("new Foo();", "(module (expr (new Foo)))");
+    check_dump("new Foo;", "(module (expr (new Foo)))");
+    check_dump("new Foo(1, 2);", "(module (expr (new Foo 1 2)))");
+    check_dump("new a.b.C(1);", "(module (expr (new (. (. a b) C) 1)))");
+    check_dump("new Foo().bar();", "(module (expr (call (. (new Foo) bar))))");
+    /* both () bind to `new`: `new (new Foo())()`, not a trailing call */
+    check_dump("new new Foo()();", "(module (expr (new (new Foo))))");
+    check_dump("new Foo(...args);", "(module (expr (new Foo (... args))))");
+}
+
 static void test_destructuring_assign(void) {
     check_dump("[a, b.c] = xs;",
                "(module (expr (= (apat a (. b c)) xs)))");
@@ -728,7 +745,7 @@ static void test_errors(void) {
     check_err("let x = yield;", "reserved word", -1);
     check_err("for (let k in o) {}", "for-in is not supported", -1);
     check_err("for (k in o) {}", "for-in is not supported", -1);
-    check_err("new Foo();", "'new' is not supported", 0);
+    check_err("new.target;", "'new.target' is not supported", -1);
     check_err("x instanceof y;", "'instanceof' is not supported", -1);
     check_err("function f() { await g(); }", "'await' is only valid in async", -1);
     check_err("a ?? b || c;", "'?\?' cannot be mixed", -1);
@@ -814,6 +831,7 @@ int main(void) {
     test_literals();
     test_control_flow();
     test_members_calls();
+    test_new();
     test_destructuring_assign();
     test_modules();
     test_asi();

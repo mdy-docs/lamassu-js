@@ -37,6 +37,7 @@ typedef struct JsNodeVec {
 static JsAstNode *parse_statement(JsParser *p);
 static JsAstNode *parse_block(JsParser *p);
 static JsAstNode *parse_expression(JsParser *p);
+static JsAstNode *parse_new_expr(JsParser *p);
 static JsAstNode *parse_assign(JsParser *p);
 static JsAstNode *parse_binding_target(JsParser *p);
 static JsAstNode *parse_binding_element(JsParser *p);
@@ -1019,7 +1020,9 @@ static JsAstNode *parse_primary(JsParser *p) {
     case JS_T_RESERVED:
         return perr_here(p, reserved_message(t));
     case JS_T_NEW:
-        return perr_here(p, "'new' is not supported (no classes or constructors)");
+        /* reachable only via covers/edge paths that bypass parse_call_member's
+         * dedicated new-expression handling (see parse_new_expr) */
+        return perr_here(p, "'new' is not supported here");
     case JS_T_IMPORT: {
         JsToken nx = peek(p);
         if (nx.kind == JS_T_LPAREN)
@@ -1056,8 +1059,88 @@ static JsAstNode *parse_arguments(JsParser *p, JsNodeVec *out) {
     return advance(p) ? (JsAstNode *)1 : NULL;
 }
 
+/*
+ * `new`'s callee: a MemberExpression (., []; no calls, no optional
+ * chaining — `new a?.b()` is a syntax error in real JS too), recursing into
+ * a nested `new` at the head (`new new Foo()` / `new Foo.Bar` etc).
+ */
+static JsAstNode *parse_new_callee(JsParser *p) {
+    JsAstNode *base;
+    if (TOK(p).kind == JS_T_NEW) {
+        base = parse_new_expr(p);
+        if (!base)
+            return NULL;
+    } else {
+        base = parse_primary(p);
+        if (!base)
+            return NULL;
+    }
+    for (;;) {
+        if (p->err_msg)
+            return NULL;
+        if (base->kind == JS_AST_COVER) {
+            base = collapse_cover(p, base);
+            if (!base)
+                return NULL;
+        }
+        JsTokKind k = TOK(p).kind;
+        if (k == JS_T_DOT) {
+            if (!advance(p))
+                return NULL;
+            JsAstNode *name = parse_name_any(p, "expected property name");
+            if (!name)
+                return NULL;
+            JsAstNode *m = new_node(p, JS_AST_MEMBER, base->pos);
+            if (!m)
+                return NULL;
+            m->a = base;
+            m->units = name->units;
+            m->len = name->len;
+            base = m;
+        } else if (k == JS_T_LBRACK) {
+            JsAstNode *m = new_node(p, JS_AST_MEMBER, base->pos);
+            if (!m || !advance(p))
+                return NULL;
+            m->flags |= JS_F_COMPUTED;
+            m->a = base;
+            m->b = parse_expression(p);
+            if (!m->b || !expect(p, JS_T_RBRACK, "expected ']'"))
+                return NULL;
+            base = m;
+        } else {
+            return base;
+        }
+    }
+}
+
+/* `new` NewExpression | `new` MemberExpression Arguments — the Arguments
+ * are consumed here (bind to the nearest `new`); further `.`/`[]`/`()` on
+ * the result are left for the caller's postfix loop. */
+static JsAstNode *parse_new_expr(JsParser *p) {
+    uint32_t pos = TOK(p).pos;
+    if (!advance(p)) /* consume 'new' */
+        return NULL;
+    if (TOK(p).kind == JS_T_DOT)
+        return perr_here(p, "'new.target' is not supported");
+    JsAstNode *callee = parse_new_callee(p);
+    if (!callee)
+        return NULL;
+    JsAstNode *n = new_node(p, JS_AST_NEW, pos);
+    if (!n)
+        return NULL;
+    n->a = callee;
+    if (TOK(p).kind == JS_T_LPAREN) {
+        JsNodeVec args = {0};
+        if (!parse_arguments(p, &args))
+            return NULL;
+        n->items = args.items;
+        n->count = args.count;
+    }
+    return n;
+}
+
 static JsAstNode *parse_call_member(JsParser *p) {
-    JsAstNode *base = parse_primary(p);
+    JsAstNode *base = TOK(p).kind == JS_T_NEW ? parse_new_expr(p) : parse_primary(p);
     if (!base)
         return NULL;
     for (;;) {

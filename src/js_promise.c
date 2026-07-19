@@ -545,7 +545,7 @@ static bool all_impl(JsContext *ctx, const JsValue *args, int argc, JsValue *r, 
     JsValue inputv = iterable;
     js_gc_protect(ctx->vm, &inputv);
 
-    JsObject *results = js_array_new_cell(ctx->vm, n);
+    JsObject *results = js_array_new_cell(ctx, n);
     JsValue resultsv = results ? js_value_from_cell(&results->gc) : js_undefined();
     js_gc_protect(ctx->vm, &resultsv);
     JsValue statev = js_object_new(ctx->vm);
@@ -573,7 +573,7 @@ static bool all_impl(JsContext *ctx, const JsValue *args, int argc, JsValue *r, 
             JsValue epv = js_value_from_cell(&ep->gc);
             js_gc_protect(ctx->vm, &epv);
             /* bound pair [state, i] */
-            JsObject *pair = js_array_new_cell(ctx->vm, 2);
+            JsObject *pair = js_array_new_cell(ctx, 2);
             if (pair) {
                 pair->elems[0] = statev;
                 pair->elems[1] = js_number(i);

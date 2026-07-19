@@ -1270,6 +1270,28 @@ static bool compile_call(JsCompiler *cx, const JsAstNode *n) {
     return true;
 }
 
+static bool compile_new(JsCompiler *cx, const JsAstNode *n) {
+    note_pos(cx, n->pos);
+    if (!compile_expr(cx, n->a)) /* callee value (member chains ok) */
+        return false;
+    if (!emit_op(cx, JS_OP_UNDEFINED, +1)) /* this placeholder; NEW overwrites it */
+        return false;
+    bool varargs;
+    if (!compile_args(cx, n->items, n->count, &varargs))
+        return false;
+    if (varargs) {
+        if (!emit_op(cx, JS_OP_NEW_VARARGS, -2)) /* [callee this arr] -> [res] */
+            return false;
+    } else {
+        if (n->count > 255)
+            return cerr(cx, n->pos, "too many constructor arguments");
+        if (!emit_op(cx, JS_OP_NEW, -(1 + (int)n->count)) ||
+            !emit8(cx, (uint8_t)n->count))
+            return false;
+    }
+    return true;
+}
+
 /* ---- expressions ---- */
 
 static bool compile_expr(JsCompiler *cx, const JsAstNode *n) {
@@ -1296,6 +1318,8 @@ static bool compile_expr(JsCompiler *cx, const JsAstNode *n) {
         return compile_member_expr(cx, n);
     case JS_AST_CALL:
         return compile_call(cx, n);
+    case JS_AST_NEW:
+        return compile_new(cx, n);
     case JS_AST_FUNC_EXPR:
         return compile_function(cx, n);
     case JS_AST_SEQUENCE:

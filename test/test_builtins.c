@@ -97,6 +97,18 @@ static void eq_s(const char *src, const char *expected) {
     eq_mode(src, expected, true);
 }
 
+static void err(const char *src, const char *prefix) {
+    bool ok;
+    char *out = run(src, false, &ok);
+    checks_run++;
+    if (ok || strncmp(out, prefix, strlen(prefix)) != 0) {
+        checks_failed++;
+        fprintf(stderr, "FAIL %s\n  expected error: %s...\n  actual:   %s%s\n", src,
+                prefix, out, ok ? " (no error)" : "");
+    }
+    free(out);
+}
+
 static void test_string(void) {
     eq("'hello'.length;", "5");
     eq("'hello'.charAt(1);", "e");
@@ -126,6 +138,10 @@ static void test_string(void) {
     eq("String.fromCharCode(72, 105);", "Hi");
     eq("String(42);", "42");
     eq("String(true);", "true");
+    /* `new String(...)`: no boxed-primitive type here, so `new` on a native
+     * conversion function just calls it and returns the primitive. */
+    eq("new String(42);", "42");
+    eq("typeof new String('x');", "string");
     /* the test harness maps input bytes to code units (no UTF-8 decode), so
      * the two UTF-8 bytes of 'é' count as two units here. */
     eq("'caf\xc3\xa9'.length;", "5");
@@ -178,6 +194,8 @@ static void test_number(void) {
     eq("(255).toString(2);", "11111111");
     eq("(-42).toFixed(0);", "-42");
     eq("(1.005).toFixed(2);", "1.00"); /* binary repr < 1.005 */
+    eq("new Number(5) + 1;", "6");
+    eq("typeof new Boolean(false);", "boolean");
     eq("Number('42');", "42");
     eq("Number('  3.5  ');", "3.5");
     eq("Number.isInteger(5);", "true");
@@ -264,6 +282,188 @@ static void test_object(void) {
     eq("Object.fromEntries(Object.entries({a:1,b:2}).map(([k,v]) => [k, v*10])).a;", "10");
 }
 
+/* No time zone support: every value is UTC (each getX()/getUTCX() pair and
+ * each setX()/setUTCX() pair is literally the same function), so these use
+ * explicit millisecond/component/ISO-string forms rather than the host
+ * clock. */
+static void test_date(void) {
+    /* component construction + getters */
+    eq("new Date(2024, 0, 15, 10, 30, 45, 500).getFullYear();", "2024");
+    eq("new Date(2024, 0, 15).getMonth();", "0");
+    eq("new Date(2024, 0, 15).getDate();", "15");
+    eq("new Date(2024, 0, 15).getDay();", "1"); /* Monday */
+    eq("new Date(2024, 0, 15, 10, 30, 45, 500).getHours();", "10");
+    eq("new Date(2024, 0, 15, 10, 30, 45, 500).getMinutes();", "30");
+    eq("new Date(2024, 0, 15, 10, 30, 45, 500).getSeconds();", "45");
+    eq("new Date(2024, 0, 15, 10, 30, 45, 500).getMilliseconds();", "500");
+    eq("new Date(0).getDay();", "4"); /* 1970-01-01 was a Thursday */
+    eq("new Date(0).getTimezoneOffset();", "0");
+    /* numeric timestamp construction */
+    eq("new Date(0).toISOString();", "1970-01-01T00:00:00.000Z");
+    eq("new Date(0).getTime();", "0");
+    /* month/day overflow normalization (calendar carry, not clamping) */
+    eq("new Date(2024, 12, 1).getFullYear();", "2025");
+    eq("new Date(2024, 12, 1).getMonth();", "0");
+    eq("new Date(2024, 0, 0).getFullYear() + '-' + new Date(2024, 0, 0).getMonth() +"
+       " '-' + new Date(2024, 0, 0).getDate();", "2023-11-31");
+    /* leap year */
+    eq("new Date(2024, 1, 29).getDate();", "29");
+    eq("new Date(2024, 1, 29, 12, 0, 0, 0).getTime() -"
+       " new Date(2024, 0, 1).getTime();", "5140800000"); /* 59.5 days */
+    /* ISO 8601 parsing */
+    eq("new Date('2024-03-05T12:00:00.250Z').getTime();", "1709640000250");
+    eq("new Date('2024-03-05').toISOString();", "2024-03-05T00:00:00.000Z");
+    eq("new Date('2024-03-05T00:00:00+02:00').getTime() -"
+       " new Date('2024-03-05T00:00:00Z').getTime();", "-7200000");
+    /* Date.now / Date.UTC / Date.parse */
+    eq("typeof Date.now();", "number");
+    eq("Date.UTC(2024, 0, 1);", "1704067200000");
+    eq("Date.parse('1970-01-01T00:00:00.000Z');", "0");
+    /* invalid dates */
+    eq("isNaN(new Date('not a date').getTime());", "true");
+    eq("new Date('not a date').toString();", "Invalid Date");
+    err("new Date('bad').toISOString();", "RangeError");
+    /* setters (return the new time value; mutate in place) */
+    eq("let d = new Date(2024, 0, 1); d.setFullYear(2025); d.getFullYear();", "2025");
+    eq("let d = new Date(2024, 0, 1); d.setMonth(5); d.getMonth();", "5");
+    eq("let d = new Date(2024, 0, 1); d.setMonth(5); d.getDate();", "1"); /* day untouched */
+    eq("let d = new Date(2024, 0, 1); d.setDate(15); d.getDate();", "15");
+    eq("let d = new Date(0); d.setHours(5, 30); d.getHours() + '/' + d.getMinutes();",
+       "5/30");
+    /* implicit ToString coercion (+, template literals) is special-cased,
+     * same mechanism as RegExp, since this engine has no general
+     * toString/valueOf lookup for objects */
+    eq("'' + new Date(0);", "Thu Jan 01 1970 00:00:00 GMT+0000 (UTC)");
+    eq("new Date(0).toUTCString();", "Thu, 01 Jan 1970 00:00:00 GMT");
+    /* Date instances are ordinary objects: expandos, typeof, toJSON */
+    eq("let d = new Date(0); d.custom = 42; d.custom;", "42");
+    eq("typeof new Date();", "object");
+    eq("new Date(0).toJSON();", "1970-01-01T00:00:00.000Z");
+    eq("new Date('bad').toJSON();", "null");
+    /* Date -> Date construction copies the time value */
+    eq("let a = new Date(12345); let b = new Date(a); b.getTime();", "12345");
+}
+
+/* Map: O(n) linear-scan storage (documented in js_mapobj.h, same tradeoff
+ * as Array.prototype.sort's O(n^2)); keys() / values() / entries() return
+ * real (materialized) arrays rather than a lazy MapIterator, and `for...of`
+ * on a Map substitutes an entries() snapshot at JS_OP_ITER_NEW. */
+static void test_map(void) {
+    /* basic mutators + size */
+    eq("let m = new Map(); m.set('a', 1); m.set('b', 2); m.size;", "2");
+    eq("let m = new Map(); m.get('missing');", "undefined");
+    eq("let m = new Map(); m.set('a', 1); m.get('a');", "1");
+    eq("let m = new Map(); m.set('a', 1); m.has('a') + '/' + m.has('z');",
+       "true/false");
+    eq("let m = new Map(); m.set('a', 1); m.delete('a') + '/' + m.size;", "true/0");
+    eq("let m = new Map(); m.delete('missing');", "false");
+    eq("let m = new Map(); m.set('a',1); m.set('b',2); m.clear(); m.size;", "0");
+    /* set() is chainable and returns the map */
+    eq("let m = new Map(); m.set('a', 1).set('b', 2).size;", "2");
+    /* re-setting an existing key updates the value without moving it */
+    eq("let m = new Map(); m.set('a',1).set('b',2); m.set('a',9);"
+       " [...m.keys()].join(',');", "a,b");
+    eq("let m = new Map(); m.set('a',1); m.set('a',9); m.get('a');", "9");
+
+    /* SameValueZero key equality */
+    eq("let m = new Map(); m.set(NaN, 'x'); m.get(NaN);", "x"); /* NaN === NaN here */
+    eq("let m = new Map(); m.set(0, 'z'); m.get(-0);", "z");    /* +0 === -0 */
+    eq("let m = new Map(); m.set('a' + '', 1); m.get('a');", "1"); /* strings: by content */
+    eq("let m = new Map(); let o = {}; m.set(o, 1); m.get({});", "undefined"); /* objects: by identity */
+    eq("let m = new Map(); let o = {}; m.set(o, 1); m.get(o);", "1");
+    eq("let m = new Map(); m.set(1, 'num'); m.set('1', 'str'); m.size;", "2"); /* type matters */
+
+    /* construction from an iterable of pairs, and from another Map */
+    eq("new Map([['a',1],['b',2]]).size;", "2");
+    eq("new Map([['a',1],['b',2]]).get('b');", "2");
+    eq("new Map().size;", "0");
+    eq("new Map(null).size;", "0");
+    eq("let a = new Map([['x',1]]); let b = new Map(a); b.set('x', 2);"
+       " a.get('x') + '/' + b.get('x');", "1/2"); /* independent copies */
+
+    /* snapshot views: real, iterable arrays in insertion order */
+    eq("[...new Map([['a',1],['b',2]]).keys()].join(',');", "a,b");
+    eq("[...new Map([['a',1],['b',2]]).values()].join(',');", "1,2");
+    eq("JSON.stringify(new Map([['a',1]]).entries());", "[[\"a\",1]]");
+
+    /* forEach(value, key, map) in insertion order */
+    eq("let s = ''; new Map([['a',1],['b',2]]).forEach((v,k) => s += k+v); s;",
+       "a1b2");
+    /* third forEach callback arg is the map itself */
+    eq("let m = new Map([['a',1]]); let seen; m.forEach((v,k,mm) => seen = mm);"
+       " seen === m;", "true");
+
+    /* for...of on the Map itself yields [key, value] pairs */
+    eq("let out = []; for (const [k, v] of new Map([['a',1],['b',2]]))"
+       " out.push(k + ':' + v); out.join(',');", "a:1,b:2");
+
+    /* generic object behavior: expandos, typeof, ToString tag */
+    eq("typeof new Map();", "object");
+    eq("'' + new Map();", "[object Map]");
+    eq("let m = new Map(); m.custom = 5; m.custom;", "5");
+
+    /* error paths */
+    err("new Map().forEach(5);", "TypeError: callback is not a function");
+    err("new Map([1, 2]);", "TypeError: iterable for new Map() must yield");
+    err("let s = new Map().set; s();", "TypeError: Map.prototype method called on a non-Map value");
+}
+
+/* Set: same O(n) linear-scan storage and SameValueZero equality as Map
+ * (js_setobj.h). keys() === values(); entries() yields [v,v] pairs
+ * (spec'd, kept symmetric with Map); `for...of` on a Set yields its values
+ * directly (unlike Map, whose default iterator is its entries). */
+static void test_set(void) {
+    /* basic mutators + size */
+    eq("let s = new Set(); s.add(1); s.add(2); s.size;", "2");
+    eq("let s = new Set(); s.add(1); s.has(1) + '/' + s.has(9);", "true/false");
+    eq("let s = new Set(); s.add(1); s.delete(1) + '/' + s.size;", "true/0");
+    eq("let s = new Set(); s.delete('missing');", "false");
+    eq("let s = new Set(); s.add(1); s.add(2); s.clear(); s.size;", "0");
+    /* add() is chainable; re-adding is a no-op */
+    eq("let s = new Set(); s.add(1).add(2).size;", "2");
+    eq("let s = new Set(); s.add(1); s.add(1); s.size;", "1");
+
+    /* SameValueZero */
+    eq("let s = new Set(); s.add(NaN); s.add(NaN); s.size;", "1");
+    eq("let s = new Set(); s.add(NaN); s.has(NaN);", "true");
+    eq("let s = new Set(); s.add(0); s.add(-0); s.size;", "1"); /* +0 === -0 */
+    eq("let s = new Set(); s.add('a' + ''); s.has('a');", "true"); /* strings: by content */
+    eq("let s = new Set(); let o = {}; s.add(o); s.has({});", "false"); /* objects: by identity */
+    eq("let s = new Set(); let o = {}; s.add(o); s.has(o);", "true");
+    eq("let s = new Set(); s.add(1); s.add('1'); s.size;", "2"); /* type matters */
+
+    /* construction dedupes; from another Set; empty forms */
+    eq("new Set([1, 2, 2, 3, 1]).size;", "3");
+    eq("[...new Set([1, 2, 2, 3]).values()].join(',');", "1,2,3");
+    eq("new Set().size;", "0");
+    eq("new Set(null).size;", "0");
+    eq("let a = new Set([1]); let b = new Set(a); b.add(2);"
+       " a.size + '/' + b.size;", "1/2"); /* independent copies */
+
+    /* keys() is the same view as values(); entries() is [v,v] pairs */
+    eq("[...new Set([1,2]).keys()].join(',');", "1,2");
+    eq("JSON.stringify(new Set([1,2]).entries());", "[[1,1],[2,2]]");
+
+    /* forEach(value, value, set) in insertion order */
+    eq("let s = ''; new Set([1,2]).forEach((v,v2) => s += v+''+v2); s;", "1122");
+    eq("let s = new Set([1]); let seen; s.forEach((v,v2,ss) => seen = ss);"
+       " seen === s;", "true");
+
+    /* for...of on the Set itself yields values, not [v,v] pairs */
+    eq("let out = []; for (const x of new Set([1,2,3])) out.push(x);"
+       " out.join(',');", "1,2,3");
+
+    /* generic object behavior */
+    eq("typeof new Set();", "object");
+    eq("'' + new Set();", "[object Set]");
+    eq("let s = new Set(); s.custom = 5; s.custom;", "5");
+
+    /* error paths */
+    err("new Set().forEach(5);", "TypeError: callback is not a function");
+    err("new Set(5);", "TypeError: value is not iterable");
+    err("let a = new Set().add; a();", "TypeError: Set.prototype method called on a non-Set value");
+}
+
 /* GC-sensitive cases: allocation-heavy methods and callbacks that call back
  * into user code (js_call) while building results — exercises rooting. */
 static void test_stress(void) {
@@ -309,6 +509,9 @@ int main(void) {
     test_math();
     test_json();
     test_object();
+    test_date();
+    test_map();
+    test_set();
     test_stress();
     test_integration();
     if (checks_failed) {

@@ -68,6 +68,9 @@ typedef enum JsObjKind {
     JS_OBJ_PLAIN = 0,
     JS_OBJ_ARRAY = 1,
     JS_OBJ_REGEXP = 2, /* JsRegExp (js_regexp.h); only when JSVM_HAS_REGEX */
+    JS_OBJ_DATE = 3,   /* JsDateObject (js_date.h) */
+    JS_OBJ_MAP = 4,    /* JsMapObj (js_mapobj.h) */
+    JS_OBJ_SET = 5,    /* JsSetObj (js_setobj.h) */
 } JsObjKind;
 
 typedef struct JsObject {
@@ -77,6 +80,10 @@ typedef struct JsObject {
     /* JS_OBJ_ARRAY: dense elements; sparse writes fall back to props. */
     JsValue *elems;
     uint32_t elem_count, elem_cap;
+    /* [[Prototype]]: undefined = none. Only ever an object (see `new` in
+     * js_interp.c); there is no script-facing way to set it to anything
+     * else or to create a cycle. */
+    JsValue proto;
 } JsObject;
 
 /* Compiled function. code/consts/lines are raw allocations owned by the
@@ -137,6 +144,9 @@ typedef struct JsClosure {
     JsValue this_val; /* arrows: lexically captured `this` */
     bool has_this;
     uint16_t n_upvals;
+    /* `new`: lazily-created .prototype object (constructor pattern); NULL
+     * until first accessed via `fn.prototype` or `new fn()`. */
+    JsObject *prototype_obj;
     JsUpvalue *upvals[];
 } JsClosure;
 
@@ -151,6 +161,10 @@ typedef struct JsNative {
     void *ud;
     JsString *name;      /* may be NULL */
     JsObject *statics;   /* namespace statics (String.fromCharCode, ...); may be NULL */
+    /* lazily-created .prototype object (mirrors JsClosure's prototype_obj);
+     * instances of builtin types (RegExp, Date, Map, Set, ...) point their
+     * [[Prototype]] here. NULL until first accessed via `Ctor.prototype`. */
+    JsObject *prototype;
     JsValue bound;       /* captured value for bound natives */
     bool is_bound;
 } JsNative;
@@ -271,6 +285,8 @@ typedef struct JsFrame {
     uint32_t ip;
     uint32_t base; /* stack offset: locals at base..base+n_locals;
                       callee at base-2, this at base-1 */
+    bool is_construct; /* frame entered via `new`: RETURN substitutes `this`
+                           for a non-object return value */
 } JsFrame;
 
 typedef struct JsTryEntry {
@@ -311,13 +327,28 @@ struct JsContext {
     JsContext *next;
     JsContext **prev_link;
     JsObject *globals;
-    /* hidden builtin method tables; property lookup falls back to these
-     * (prototype-lite: invisible and immutable from scripts) */
+    /* String/Number/Promise are primitives or a distinct GC kind (no
+     * [[Prototype]] slot to hang a real chain off yet), so their methods
+     * still live in a hidden per-context table that property lookup falls
+     * back to directly (prototype-lite: invisible and immutable from
+     * scripts). Array/RegExp/Date/Map/Set instances are JS_KIND_OBJECT
+     * cells with a real `proto` field, so those use genuine, script-visible
+     * X.prototype objects instead — see array_proto etc. below. */
     JsObject *string_methods;
-    JsObject *array_methods;
     JsObject *number_methods;
     JsObject *promise_methods;
-    JsObject *regexp_methods; /* NULL unless built with JSVM_HAS_REGEX */
+    /* Real, script-visible prototype objects — Ctor.prototype is this same
+     * object, and instances' [[Prototype]] is set to it at allocation, so
+     * property lookup reaches methods purely via the normal own-prop-miss
+     * -> proto-chain walk in get_property, with no per-kind special case.
+     * Cached here so allocation sites (js_array_new_cell, alloc_mapobj, ...)
+     * don't need to look "Ctor.prototype" up through a property read on
+     * every single instance they create. */
+    JsObject *array_proto;
+    JsObject *regexp_proto; /* NULL unless built with JSVM_HAS_REGEX */
+    JsObject *date_proto;
+    JsObject *map_proto;
+    JsObject *set_proto;
     /* persistent REPL lexical scope: top-level let/const/function bindings
      * that survive across evaluations. repl_scope holds values (TDZ sentinel
      * for uninitialized); repl_const marks the const names. Both lazily
@@ -400,8 +431,11 @@ static inline JsFunctionCell *js_value_function(JsValue v) {
 }
 static inline JsPromise *js_value_promise(JsValue v) { return (JsPromise *)js_value_cell(v); }
 
-/* js_object.c: array helpers used by the interpreter */
-JsObject *js_array_new_cell(JsVm *vm, uint32_t reserve);
+/* js_object.c: array helpers used by the interpreter. new_cell takes the
+ * context (not just the VM) so it can set the new array's [[Prototype]] to
+ * ctx->array_proto — real arrays, not the "no [[Prototype]] at all" that a
+ * bare vm-only allocator would leave them with. */
+JsObject *js_array_new_cell(JsContext *ctx, uint32_t reserve);
 bool js_array_append(JsVm *vm, JsObject *arr, JsValue v);
 bool js_array_set_index(JsVm *vm, JsObject *arr, uint32_t idx, JsValue v);
 

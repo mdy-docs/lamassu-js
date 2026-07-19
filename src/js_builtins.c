@@ -1,8 +1,12 @@
 /*
- * Standard library. Methods live on hidden per-context tables
- * (ctx->string_methods / array_methods / number_methods) that property
- * lookup falls back to; statics live on global objects (Math, JSON,
- * Object, ...). Everything is a JS_KIND_NATIVE.
+ * Standard library. Array instance methods live on a real, script-visible
+ * Array.prototype (ctx->array_proto is a construction-time cache of it, not
+ * a lookup shortcut — see jsvm_internal.h). String/Number don't have a
+ * [[Prototype]] slot to hang a real chain off (they're primitives, not
+ * JS_KIND_OBJECT), so their methods still live on a hidden per-context
+ * table (ctx->string_methods / number_methods) that property lookup falls
+ * back to directly. Statics live on global objects (Math, JSON, Object,
+ * ...). Everything is a JS_KIND_NATIVE.
  *
  * GC discipline: a native runs with the calling fiber rooted, so `args`
  * and `this` survive. Any JS cell we create and then hold across a further
@@ -15,6 +19,9 @@
  */
 #include "js_bytecode.h"
 #include "jsvm_internal.h"
+#include "js_date.h"
+#include "js_mapobj.h"
+#include "js_setobj.h"
 #ifdef JSVM_HAS_REGEX
 #include "js_regexp.h"
 #endif
@@ -532,7 +539,7 @@ static bool sm_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
-    JsObject *out = js_array_new_cell(ctx->vm, 0);
+    JsObject *out = js_array_new_cell(ctx, 0);
     if (!out)
         return oom(ctx, r);
     JsValue outv = js_value_from_cell(&out->gc);
@@ -741,7 +748,7 @@ static bool am_slice(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
     uint32_t end = argc > 1 && !js_is_undefined(ARG(1))
                        ? clamp_index(js_to_number_value(ctx, ARG(1)), a->elem_count)
                        : a->elem_count;
-    JsObject *out = js_array_new_cell(ctx->vm, end > start ? end - start : 0);
+    JsObject *out = js_array_new_cell(ctx, end > start ? end - start : 0);
     if (!out)
         return oom(ctx, r);
     for (uint32_t i = start; i < end; i++)
@@ -828,7 +835,7 @@ static bool am_concat(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     JsObject *a;
     if (!array_this(ctx, tv, &a, r))
         return false;
-    JsObject *out = js_array_new_cell(ctx->vm, a->elem_count);
+    JsObject *out = js_array_new_cell(ctx, a->elem_count);
     if (!out)
         return oom(ctx, r);
     JsValue outv = js_value_from_cell(&out->gc);
@@ -879,7 +886,7 @@ static bool array_iterate(JsContext *ctx, JsValue tv, const JsValue *args, int a
     JsObject *out = NULL;
     JsValue outv = js_undefined();
     if (kind == IT_MAP || kind == IT_FILTER) {
-        out = js_array_new_cell(ctx->vm, kind == IT_MAP ? a->elem_count : 0);
+        out = js_array_new_cell(ctx, kind == IT_MAP ? a->elem_count : 0);
         if (!out) {
             js_gc_unprotect(ctx->vm, &thisArg);
             js_gc_unprotect(ctx->vm, &cb);
@@ -1094,7 +1101,7 @@ static bool am_flat(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     if (!array_this(ctx, tv, &a, r))
         return false;
     double depth = argc > 0 && !js_is_undefined(ARG(0)) ? to_int(js_to_number_value(ctx, ARG(0))) : 1;
-    JsObject *out = js_array_new_cell(ctx->vm, 0);
+    JsObject *out = js_array_new_cell(ctx, 0);
     if (!out)
         return oom(ctx, r);
     JsValue outv = js_value_from_cell(&out->gc);
@@ -1711,7 +1718,7 @@ static bool json_value(JsonP *p, JsValue *out) {
     }
     if (c == '[') {
         p->pos++;
-        JsObject *a = js_array_new_cell(p->ctx->vm, 0);
+        JsObject *a = js_array_new_cell(p->ctx, 0);
         if (!a) {
             p->error = true;
             return false;
@@ -1803,7 +1810,7 @@ static bool obj_keys_impl(JsContext *ctx, JsValue tv, const JsValue *args, int a
                           JsValue *r, int mode /*0 keys,1 values,2 entries*/) {
     (void)tv;
     JsValue v = ARG(0);
-    JsObject *out = js_array_new_cell(ctx->vm, 0);
+    JsObject *out = js_array_new_cell(ctx, 0);
     if (!out)
         return oom(ctx, r);
     JsValue outv = js_value_from_cell(&out->gc);
@@ -1821,7 +1828,7 @@ static bool obj_keys_impl(JsContext *ctx, JsValue tv, const JsValue *args, int a
                 } else if (mode == 1) {
                     entry = o->elems[i];
                 } else {
-                    JsObject *pair = js_array_new_cell(ctx->vm, 2);
+                    JsObject *pair = js_array_new_cell(ctx, 2);
                     JsString *k = js_number_to_string(ctx->vm, i);
                     if (!pair || !k) { ok = false; break; }
                     pair->elems[0] = js_value_from_cell(&k->gc);
@@ -1843,7 +1850,7 @@ static bool obj_keys_impl(JsContext *ctx, JsValue tv, const JsValue *args, int a
                 } else if (mode == 1) {
                     entry = e->value;
                 } else {
-                    JsObject *pair = js_array_new_cell(ctx->vm, 2);
+                    JsObject *pair = js_array_new_cell(ctx, 2);
                     if (!pair) { ok = false; break; }
                     pair->elems[0] = js_value_from_cell(&e->key->gc);
                     pair->elems[1] = e->value;
@@ -1958,6 +1965,39 @@ static bool obj_hasOwn(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     return true;
 }
 
+/* Functions (closures/natives) aren't JS_KIND_OBJECT and so have no [[Prototype]]
+ * slot of their own in this engine (no Function.prototype either) — reported
+ * as null rather than throwing, a pragmatic fallback rather than a full
+ * per-kind spec match. */
+static bool obj_getPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
+                               JsValue *r) {
+    (void)tv;
+    JsValue v = ARG(0);
+    if (js_is_undefined(v) || js_is_null(v))
+        return native_throw(ctx, r, "TypeError: Object.getPrototypeOf called on null or undefined");
+    if (js_is_object(v)) {
+        JsValue proto = js_value_object(v)->proto;
+        *r = js_is_object(proto) ? proto : js_null();
+        return true;
+    }
+    *r = js_null();
+    return true;
+}
+
+static bool obj_setPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
+                               JsValue *r) {
+    (void)tv;
+    JsValue v = ARG(0), proto = ARG(1);
+    if (js_is_undefined(v) || js_is_null(v))
+        return native_throw(ctx, r, "TypeError: Object.setPrototypeOf called on null or undefined");
+    if (!js_is_object(proto) && !js_is_null(proto))
+        return native_throw(ctx, r, "TypeError: prototype must be an object or null");
+    if (js_is_object(v))
+        js_value_object(v)->proto = js_is_object(proto) ? proto : js_undefined();
+    *r = v;
+    return true;
+}
+
 static bool arr_isArray(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)ctx;
     (void)tv;
@@ -1969,7 +2009,7 @@ static bool arr_isArray(JsContext *ctx, JsValue tv, const JsValue *args, int arg
 
 static bool arr_of(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
-    JsObject *out = js_array_new_cell(ctx->vm, (uint32_t)argc);
+    JsObject *out = js_array_new_cell(ctx, (uint32_t)argc);
     if (!out)
         return oom(ctx, r);
     for (int i = 0; i < argc; i++)
@@ -1983,7 +2023,7 @@ static bool arr_from(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
     JsValue src = ARG(0);
     JsValue mapfn = ARG(1);
     bool has_map = js_is_function(mapfn);
-    JsObject *out = js_array_new_cell(ctx->vm, 0);
+    JsObject *out = js_array_new_cell(ctx, 0);
     if (!out)
         return oom(ctx, r);
     JsValue outv = js_value_from_cell(&out->gc);
@@ -2334,10 +2374,15 @@ bool js_builtins_init(JsContext *ctx) {
     if (!js_is_object(sm))
         return false;
     ctx->string_methods = js_value_object(sm);
+    /* Array.prototype: a real object, exposed below as Array's own
+     * "prototype" property; ctx->array_proto is just a fast-path cache so
+     * js_array_new_cell doesn't need a property lookup on every array it
+     * creates — property access on array instances never consults it
+     * directly, it goes through the normal [[Prototype]] walk. */
     JsValue am = js_object_new(vm);
     if (!js_is_object(am))
         return false;
-    ctx->array_methods = js_value_object(am);
+    ctx->array_proto = js_value_object(am);
     JsValue num = js_object_new(vm);
     if (!js_is_object(num))
         return false;
@@ -2373,7 +2418,7 @@ bool js_builtins_init(JsContext *ctx) {
         {"toFixed", nm_toFixed}, {"toString", nm_toString}, {"valueOf", nm_toString},
         {NULL, NULL}};
     if (!install_methods(ctx, ctx->string_methods, string_methods) ||
-        !install_methods(ctx, ctx->array_methods, array_methods) ||
+        !install_methods(ctx, ctx->array_proto, array_methods) ||
         !install_methods(ctx, ctx->number_methods, number_methods))
         return false;
 
@@ -2424,7 +2469,9 @@ bool js_builtins_init(JsContext *ctx) {
     if (!def_fn(ctx, object, "keys", obj_keys) || !def_fn(ctx, object, "values", obj_values) ||
         !def_fn(ctx, object, "entries", obj_entries) || !def_fn(ctx, object, "assign", obj_assign) ||
         !def_fn(ctx, object, "freeze", obj_freeze) || !def_fn(ctx, object, "fromEntries", obj_fromEntries) ||
-        !def_fn(ctx, object, "hasOwn", obj_hasOwn))
+        !def_fn(ctx, object, "hasOwn", obj_hasOwn) ||
+        !def_fn(ctx, object, "getPrototypeOf", obj_getPrototypeOf) ||
+        !def_fn(ctx, object, "setPrototypeOf", obj_setPrototypeOf))
         return false;
 
     /* Array */
@@ -2434,6 +2481,9 @@ bool js_builtins_init(JsContext *ctx) {
     JsObject *array = js_value_object(arrv);
     if (!def_fn(ctx, array, "isArray", arr_isArray) || !def_fn(ctx, array, "of", arr_of) ||
         !def_fn(ctx, array, "from", arr_from))
+        return false;
+    if (!js_object_set_ascii(ctx, array, "prototype", js_value_from_cell(&ctx->array_proto->gc)) ||
+        !js_object_set_ascii(ctx, ctx->array_proto, "constructor", arrv))
         return false;
 
     /* Number: callable conversion + statics */
@@ -2474,10 +2524,22 @@ bool js_builtins_init(JsContext *ctx) {
         return false;
 
 #ifdef JSVM_HAS_REGEX
-    /* RegExp global + hidden regexp method table (js_regexp.c) */
+    /* RegExp global + real RegExp.prototype (js_regexp.c) */
     if (!js_regexp_builtins_init(ctx))
         return false;
 #endif
+
+    /* Date global + real Date.prototype (js_date.c) */
+    if (!js_date_builtins_init(ctx))
+        return false;
+
+    /* Map global + real Map.prototype (js_mapobj.c) */
+    if (!js_mapobj_builtins_init(ctx))
+        return false;
+
+    /* Set global + real Set.prototype (js_setobj.c) */
+    if (!js_setobj_builtins_init(ctx))
+        return false;
 
     /* global functions */
     static const uint16_t n_parseInt[] = {'p','a','r','s','e','I','n','t'};

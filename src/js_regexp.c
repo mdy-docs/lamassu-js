@@ -134,6 +134,7 @@ JsValue js_regexp_new(JsContext *ctx, const uint16_t *pat, uint32_t pat_len,
     js_map_init(&re->obj.props);
     re->obj.elems = NULL;
     re->obj.elem_count = re->obj.elem_cap = 0;
+    re->obj.proto = ctx->regexp_proto ? js_value_from_cell(&ctx->regexp_proto->gc) : js_undefined();
     re->source = NULL;
     re->flags = NULL;
     re->last_index = 0;
@@ -381,12 +382,12 @@ static JsValue substr_or_undef(JsVm *vm, const JsString *s, int32_t a, int32_t b
 }
 
 /* [start, end] pair for /d results */
-static JsValue pair_or_undef(JsVm *vm, int32_t a, int32_t b, bool *oom) {
+static JsValue pair_or_undef(JsContext *ctx, int32_t a, int32_t b, bool *oom) {
     if (a < 0)
         return js_undefined();
-    JsObject *arr = js_array_new_cell(vm, 2);
-    if (!arr || !js_array_append(vm, arr, js_number(a)) ||
-        !js_array_append(vm, arr, js_number(b))) {
+    JsObject *arr = js_array_new_cell(ctx, 2);
+    if (!arr || !js_array_append(ctx->vm, arr, js_number(a)) ||
+        !js_array_append(ctx->vm, arr, js_number(b))) {
         *oom = true;
         return js_undefined();
     }
@@ -469,7 +470,7 @@ static bool named_groups_obj(JsContext *ctx, JsRegExp *re, const JsString *s,
     for (int g = 1; ok && g <= re->prog.group_count; g++) {
         if (!re->prog.group_names[g][0])
             continue;
-        vv = indices ? pair_or_undef(vm, caps[g * 2], caps[g * 2 + 1], &oom)
+        vv = indices ? pair_or_undef(ctx, caps[g * 2], caps[g * 2 + 1], &oom)
                      : substr_or_undef(vm, s, caps[g * 2], caps[g * 2 + 1], &oom);
         if (oom) {
             ok = false;
@@ -503,7 +504,7 @@ static bool build_exec_result(JsContext *ctx, JsRegExp *re, JsValue sv,
     JsString *s = js_value_string(sv);
     int ng = re->prog.group_count;
 
-    JsObject *arr = js_array_new_cell(vm, (uint32_t)ng + 1);
+    JsObject *arr = js_array_new_cell(ctx, (uint32_t)ng + 1);
     if (!arr)
         return false;
     JsValue arrv = js_value_from_cell(&arr->gc);
@@ -529,13 +530,13 @@ static bool build_exec_result(JsContext *ctx, JsRegExp *re, JsValue sv,
     }
 
     if (ok && re->prog.has_indices) {
-        JsObject *ind = js_array_new_cell(vm, (uint32_t)ng + 1);
+        JsObject *ind = js_array_new_cell(ctx, (uint32_t)ng + 1);
         JsValue indv = ind ? js_value_from_cell(&ind->gc) : js_undefined();
         ok = ind != NULL;
         if (ok)
             js_gc_protect(vm, &indv);
         for (int g = 0; ok && g <= ng; g++) {
-            JsValue el = pair_or_undef(vm, caps[g * 2], caps[g * 2 + 1], &oom);
+            JsValue el = pair_or_undef(ctx, caps[g * 2], caps[g * 2 + 1], &oom);
             ok = !oom && js_array_append(vm, js_value_object(indv), el);
         }
         if (ok) {
@@ -744,7 +745,7 @@ bool js_re_str_match(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
         else
             ok = build_exec_result(ctx, re, sv, caps, r);
     } else {
-        JsObject *arr = js_array_new_cell(vm, 0);
+        JsObject *arr = js_array_new_cell(ctx, 0);
         JsValue arrv = arr ? js_value_from_cell(&arr->gc) : js_undefined();
         ok = arr != NULL;
         if (ok) {
@@ -791,7 +792,7 @@ bool js_re_str_matchAll(JsContext *ctx, JsValue tv, const JsValue *args, int arg
         js_gc_unprotect(vm, &sv);
         return false;
     }
-    JsObject *arr = js_array_new_cell(vm, 0);
+    JsObject *arr = js_array_new_cell(ctx, 0);
     JsValue arrv = arr ? js_value_from_cell(&arr->gc) : js_undefined();
     bool ok = arr != NULL, budget = false;
     if (ok) {
@@ -987,7 +988,7 @@ static JsValue replacer_args(JsContext *ctx, JsRegExp *re, JsValue sv,
     JsVm *vm = ctx->vm;
     JsString *s = js_value_string(sv);
     int ng = re->prog.group_count;
-    JsObject *arr = js_array_new_cell(vm, (uint32_t)ng + 3);
+    JsObject *arr = js_array_new_cell(ctx, (uint32_t)ng + 3);
     if (!arr)
         return js_undefined();
     JsValue arrv = js_value_from_cell(&arr->gc);
@@ -1114,7 +1115,7 @@ bool js_re_str_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     JsValue sv = js_value_from_cell(&s->gc);
     js_gc_protect(vm, &sv);
 
-    JsObject *arr = js_array_new_cell(vm, 0);
+    JsObject *arr = js_array_new_cell(ctx, 0);
     if (!arr) {
         js_gc_unprotect(vm, &sv);
         return re_oom(ctx, r);
@@ -1181,18 +1182,23 @@ static bool def_method(JsContext *ctx, JsObject *table, const char *name,
 }
 
 bool js_regexp_builtins_init(JsContext *ctx) {
+    /* RegExp.prototype: a real object, set before any regexp (literal or
+     * constructed) exists — js_regexp_new reads ctx->regexp_proto — and
+     * also assigned as the constructor's `.prototype` below. */
     JsValue t = js_object_new(ctx->vm);
     if (!js_is_object(t))
         return false;
-    ctx->regexp_methods = js_value_object(t); /* rooted via the context now */
-    if (!def_method(ctx, ctx->regexp_methods, "exec", rexp_exec) ||
-        !def_method(ctx, ctx->regexp_methods, "test", rexp_test) ||
-        !def_method(ctx, ctx->regexp_methods, "toString", rexp_toString))
+    ctx->regexp_proto = js_value_object(t); /* rooted via the context now */
+    if (!def_method(ctx, ctx->regexp_proto, "exec", rexp_exec) ||
+        !def_method(ctx, ctx->regexp_proto, "test", rexp_test) ||
+        !def_method(ctx, ctx->regexp_proto, "toString", rexp_toString))
         return false;
     JsValue ctor = js_native_new(ctx, "RegExp", g_RegExp, NULL);
     if (!js_is_function(ctor) ||
+        !js_object_set_ascii(ctx, ctx->regexp_proto, "constructor", ctor) ||
         !js_object_set_ascii(ctx, ctx->globals, "RegExp", ctor))
         return false;
+    ((JsNative *)js_value_cell(ctor))->prototype = ctx->regexp_proto;
     return true;
 }
 

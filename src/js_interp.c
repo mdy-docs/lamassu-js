@@ -1,4 +1,7 @@
 #include "js_bytecode.h"
+#include "js_date.h"
+#include "js_mapobj.h"
+#include "js_setobj.h"
 #ifdef JSVM_HAS_REGEX
 #include "js_regexp.h"
 #endif
@@ -84,6 +87,12 @@ JsString *js_to_string_cell(JsContext *ctx, JsValue v, int depth) {
         if (o->obj_kind == JS_OBJ_REGEXP)
             return js_regexp_repr(ctx, o);
 #endif
+        if (o->obj_kind == JS_OBJ_DATE)
+            return js_date_repr(ctx, o);
+        if (o->obj_kind == JS_OBJ_MAP)
+            return js_ascii_cell(vm, "[object Map]");
+        if (o->obj_kind == JS_OBJ_SET)
+            return js_ascii_cell(vm, "[object Set]");
         if (o->obj_kind != JS_OBJ_ARRAY)
             return js_ascii_cell(vm, "[object Object]");
         if (depth >= JS_TOSTRING_MAX_DEPTH)
@@ -322,6 +331,47 @@ static JsString *single_unit_string(JsVm *vm, uint16_t u) {
     return js_string_cell_new(vm, &u, 1);
 }
 
+/* Bound on [[Prototype]] chain walks; script code has no way to construct a
+ * cycle (no __proto__/setPrototypeOf), so this only guards hostile/corrupt
+ * bytecode. */
+#define JS_PROTO_CHAIN_LIMIT 1000
+
+/* Lazily creates cl's `.prototype` object (the constructor-function pattern
+ * `new` relies on). NULL on OOM. */
+static JsObject *closure_prototype(JsContext *ctx, JsClosure *cl) {
+    if (cl->prototype_obj)
+        return cl->prototype_obj;
+    JsValue pv = js_object_new(ctx->vm);
+    if (!js_is_object(pv))
+        return NULL;
+    cl->prototype_obj = js_value_object(pv); /* reachable via cl from here */
+    if (!js_object_set_ascii(ctx, cl->prototype_obj, "constructor",
+                             js_value_from_cell(&cl->gc))) {
+        cl->prototype_obj = NULL;
+        return NULL;
+    }
+    return cl->prototype_obj;
+}
+
+/* Same lazy-create-on-first-access shape as closure_prototype, for natives
+ * that don't already have one set up eagerly (js_mapobj_builtins_init and
+ * friends set RegExp/Date/Map/Set's up front, since instance allocation
+ * needs it before any script could have touched `.prototype` — this path
+ * only fires for some other native someone registered by hand). */
+static JsObject *native_prototype(JsContext *ctx, JsNative *nf) {
+    if (nf->prototype)
+        return nf->prototype;
+    JsValue pv = js_object_new(ctx->vm);
+    if (!js_is_object(pv))
+        return NULL;
+    nf->prototype = js_value_object(pv);
+    if (!js_object_set_ascii(ctx, nf->prototype, "constructor", js_value_from_cell(&nf->gc))) {
+        nf->prototype = NULL;
+        return NULL;
+    }
+    return nf->prototype;
+}
+
 typedef enum { JS_PROP_OK, JS_PROP_OOM, JS_PROP_TYPE_ERROR } JsPropStatus;
 
 /* Builtin method lookup on the hidden per-type tables. */
@@ -376,6 +426,19 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
                 return JS_PROP_OK;
         }
 #endif
+        if (o->obj_kind == JS_OBJ_MAP) {
+            /* synthesized `size` shadows everything, like RegExp's props */
+            bool handled = false;
+            js_mapobj_prop_get(o, key, out, &handled);
+            if (handled)
+                return JS_PROP_OK;
+        }
+        if (o->obj_kind == JS_OBJ_SET) {
+            bool handled = false;
+            js_setobj_prop_get(o, key, out, &handled);
+            if (handled)
+                return JS_PROP_OK;
+        }
         if (o->obj_kind == JS_OBJ_ARRAY) {
             uint32_t idx;
             if (key_to_index(key, &idx)) {
@@ -399,12 +462,22 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
             *out = v;
             return JS_PROP_OK;
         }
-        if (o->obj_kind == JS_OBJ_ARRAY)
-            return method_lookup(ctx, ctx->array_methods, key, out);
-#ifdef JSVM_HAS_REGEX
-        if (o->obj_kind == JS_OBJ_REGEXP)
-            return method_lookup(ctx, ctx->regexp_methods, key, out);
-#endif
+        /* own prop miss: walk the [[Prototype]] chain. This is the ONLY
+         * path builtin instance methods (Array/RegExp/Date/Map/Set) reach
+         * their methods through — X.prototype is a real, script-visible
+         * object and instances' .proto was set to it at allocation, same
+         * mechanism `new Foo()` uses for user-defined constructors. */
+        JsValue proto = o->proto;
+        for (int depth = 0; depth < JS_PROTO_CHAIN_LIMIT && js_is_object(proto); depth++) {
+            JsObject *po = js_value_object(proto);
+            bool pfound;
+            JsValue pv = js_map_get(&po->props, k, &pfound);
+            if (pfound) {
+                *out = pv;
+                return JS_PROP_OK;
+            }
+            proto = po->proto;
+        }
         return JS_PROP_OK;
     }
     if (js_is_number(base))
@@ -413,6 +486,18 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
         return method_lookup(ctx, ctx->promise_methods, key, out);
     if (js_is_function(base)) {
         JsGcCell *c = js_value_cell(base);
+        bool is_proto_key = js_is_string(key) && units_is_ascii_str(js_value_string(key), "prototype");
+        if (is_proto_key) {
+            JsObject *proto = c->kind == JS_KIND_CLOSURE
+                ? closure_prototype(ctx, (JsClosure *)c)
+                : c->kind == JS_KIND_NATIVE ? native_prototype(ctx, (JsNative *)c) : NULL;
+            if (proto) {
+                *out = js_value_from_cell(&proto->gc);
+                return JS_PROP_OK;
+            }
+            if (c->kind == JS_KIND_CLOSURE || c->kind == JS_KIND_NATIVE)
+                return JS_PROP_OOM;
+        }
         if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->statics)
             return method_lookup(ctx, ((JsNative *)c)->statics, key, out);
     }
@@ -425,6 +510,23 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
     JsVm *vm = ctx->vm;
     if (is_nullish(base)) {
         *errmsg = "TypeError: cannot set properties of undefined or null";
+        return JS_PROP_TYPE_ERROR;
+    }
+    if (js_is_function(base)) {
+        JsGcCell *c = js_value_cell(base);
+        if ((c->kind == JS_KIND_CLOSURE || c->kind == JS_KIND_NATIVE) && js_is_string(key) &&
+            units_is_ascii_str(js_value_string(key), "prototype")) {
+            /* assigning a non-object leaves the auto-created prototype in
+             * place, matching real JS's "F.prototype must be an Object". */
+            if (js_is_object(val)) {
+                if (c->kind == JS_KIND_CLOSURE)
+                    ((JsClosure *)c)->prototype_obj = js_value_object(val);
+                else
+                    ((JsNative *)c)->prototype = js_value_object(val);
+            }
+            return JS_PROP_OK;
+        }
+        *errmsg = "TypeError: cannot create property on a primitive value";
         return JS_PROP_TYPE_ERROR;
     }
     if (!js_is_object(base)) {
@@ -501,7 +603,20 @@ static JsPropStatus has_property(JsContext *ctx, JsValue base, JsValue key,
         return JS_PROP_OOM;
     bool found;
     js_map_get(&o->props, k, &found);
-    *out = found;
+    if (found) {
+        *out = true;
+        return JS_PROP_OK;
+    }
+    JsValue proto = o->proto;
+    for (int depth = 0; depth < JS_PROTO_CHAIN_LIMIT && js_is_object(proto); depth++) {
+        JsObject *po = js_value_object(proto);
+        js_map_get(&po->props, k, &found);
+        if (found) {
+            *out = true;
+            return JS_PROP_OK;
+        }
+        proto = po->proto;
+    }
     return JS_PROP_OK;
 }
 
@@ -624,6 +739,7 @@ static JsClosure *closure_new(JsVm *vm, JsFunctionCell *fn) {
     cl->fn = fn;
     cl->this_val = js_undefined();
     cl->has_this = false;
+    cl->prototype_obj = NULL;
     cl->n_upvals = fn->n_upvals;
     for (uint16_t i = 0; i < fn->n_upvals; i++)
         cl->upvals[i] = NULL;
@@ -681,6 +797,7 @@ JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *ud)
     nf->ud = ud;
     nf->name = js_is_string(nmv) ? js_value_string(nmv) : NULL;
     nf->statics = NULL;
+    nf->prototype = NULL;
     nf->bound = js_undefined();
     nf->is_bound = false;
     return js_value_from_cell(c);
@@ -700,6 +817,7 @@ JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound) {
     nf->ud = NULL;
     nf->name = NULL;
     nf->statics = NULL;
+    nf->prototype = NULL;
     nf->bound = bound;
     nf->is_bound = true;
     return js_value_from_cell(c);
@@ -732,6 +850,7 @@ bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
     nf->bound_fn = NULL;
     nf->ud = userdata;
     nf->statics = NULL;
+    nf->prototype = NULL;
     nf->name = js_value_string(key);
     nf->bound = js_undefined();
     nf->is_bound = false;
@@ -777,7 +896,7 @@ static bool frames_ensure(JsVm *vm, JsFiber *fb, uint32_t need) {
  * -1 on OOM, -2 on stack overflow (caller throws the right error).
  */
 static int frame_setup(JsContext *ctx, JsFiber *fb, JsClosure *cl, uint32_t base,
-                       uint32_t argc) {
+                       uint32_t argc, bool is_construct) {
     JsVm *vm = ctx->vm;
     JsFunctionCell *fn = cl->fn;
     if (fb->frame_count >= JS_MAX_FRAMES)
@@ -790,7 +909,7 @@ static int frame_setup(JsContext *ctx, JsFiber *fb, JsClosure *cl, uint32_t base
     JsObject *rest = NULL;
     if (has_rest) {
         uint32_t rn = argc > fixed ? argc - fixed : 0;
-        rest = js_array_new_cell(vm, rn);
+        rest = js_array_new_cell(ctx, rn);
         if (!rest)
             return -1;
         for (uint32_t i = 0; i < rn; i++)
@@ -812,6 +931,7 @@ static int frame_setup(JsContext *ctx, JsFiber *fb, JsClosure *cl, uint32_t base
     fr->closure = cl;
     fr->ip = 0;
     fr->base = base;
+    fr->is_construct = is_construct;
     fb->sp = base + fn->n_locals;
     return 0;
 }
@@ -1278,7 +1398,7 @@ run:; /* (re)load the top frame */
             }
             case JS_OP_NEW_ARRAY: {
                 uint16_t count = READ_U16();
-                JsObject *a = js_array_new_cell(vm, count);
+                JsObject *a = js_array_new_cell(ctx, count);
                 if (!a)
                     RT_THROW("out of memory");
                 for (uint16_t i = 0; i < count; i++)
@@ -1335,7 +1455,7 @@ run:; /* (re)load the top frame */
             case JS_OP_ARRAY_REST: {
                 uint32_t from = (uint32_t)js_get_number(PEEK(0));
                 JsValue src = PEEK(1);
-                JsObject *out = js_array_new_cell(vm, 0);
+                JsObject *out = js_array_new_cell(ctx, 0);
                 if (!out)
                     RT_THROW("out of memory");
                 if (js_is_object(src) && js_value_object(src)->obj_kind == JS_OBJ_ARRAY) {
@@ -1450,6 +1570,20 @@ run:; /* (re)load the top frame */
             }
             case JS_OP_ITER_NEW: {
                 JsValue it = PEEK(0);
+                if (js_mapobj_is(it) || js_setobj_is(it)) {
+                    /* no lazy MapIterator/SetIterator: substitute a real
+                     * (and thus array-iterable) snapshot right here — a
+                     * Map's default iterator is its entries, a Set's is
+                     * its values */
+                    fr->ip = ip; /* GC-safe point before allocating it */
+                    JsObject *snap = js_mapobj_is(it)
+                        ? js_mapobj_entries_array(ctx, js_value_object(it))
+                        : js_setobj_values_array(ctx, js_value_object(it));
+                    if (!snap)
+                        RT_THROW("out of memory");
+                    it = js_value_from_cell(&snap->gc);
+                    PEEK(0) = it;
+                }
                 bool ok = js_is_string(it) ||
                           (js_is_object(it) && js_value_object(it)->obj_kind == JS_OBJ_ARRAY);
                 if (!ok)
@@ -1576,7 +1710,7 @@ run:; /* (re)load the top frame */
                             PUSH(promise);
                             break;
                         }
-                        int rc = frame_setup(ctx, fb, callee_cl, nb, argc);
+                        int rc = frame_setup(ctx, fb, callee_cl, nb, argc, false);
                         if (rc == -1)
                             RT_THROW("out of memory");
                         if (rc == -2)
@@ -1585,6 +1719,70 @@ run:; /* (re)load the top frame */
                     }
                 }
                 RT_THROW("TypeError: value is not a function");
+            }
+            case JS_OP_NEW:
+            case JS_OP_NEW_VARARGS: {
+                uint32_t argc;
+                if (op == JS_OP_NEW) {
+                    argc = code[ip++];
+                } else {
+                    JsValue arrv = PEEK(0);
+                    if (!is_array(arrv))
+                        RT_THROW("internal error: varargs new on non-array");
+                    JsObject *arr = js_value_object(arrv);
+                    argc = arr->elem_count;
+                    fb->sp--; /* drop the array */
+                    if (!stack_ensure(vm, fb, fb->sp + argc + 8))
+                        RT_THROW("out of memory");
+                    for (uint32_t i = 0; i < argc; i++)
+                        S[fb->sp++] = arr->elems[i];
+                }
+                uint32_t nb = fb->sp - argc; /* callee=nb-2, this(placeholder)=nb-1 */
+                JsValue callee = S[nb - 2];
+                if (!js_is_function(callee))
+                    RT_THROW("TypeError: value is not a constructor");
+                JsGcCell *cc = js_value_cell(callee);
+                if (cc->kind == JS_KIND_NATIVE) {
+                    /* Builtins (Array, Object, RegExp, ...) are factory
+                     * functions that already return a suitable object;
+                     * `new` on them just calls them. String/Number/Boolean
+                     * return their primitive form rather than a wrapper
+                     * object — this engine has no boxed-primitive type. */
+                    JsNative *nf = (JsNative *)cc;
+                    fr->ip = ip;
+                    JsValue res;
+                    bool ok = nf->is_bound
+                        ? nf->bound_fn(ctx, nf->bound, S[nb - 1], &S[nb], (int)argc, &res)
+                        : nf->fn(ctx, S[nb - 1], &S[nb], (int)argc, &res);
+                    fb->sp = nb - 2;
+                    if (!ok) {
+                        fb->error = res;
+                        fb->failed = true;
+                        RT_RAISE();
+                    }
+                    PUSH(res);
+                    break;
+                }
+                if (cc->kind != JS_KIND_CLOSURE)
+                    RT_THROW("TypeError: value is not a constructor");
+                JsClosure *ctor = (JsClosure *)cc;
+                if (ctor->fn->fn_flags & (JS_FN_ARROW | JS_FN_ASYNC))
+                    RT_THROW("TypeError: value is not a constructor");
+                fr->ip = ip; /* GC-safe point before allocations below */
+                JsObject *proto = closure_prototype(ctx, ctor);
+                if (!proto)
+                    RT_THROW("out of memory");
+                JsValue instv = js_object_new(vm);
+                if (!js_is_object(instv))
+                    RT_THROW("out of memory");
+                js_value_object(instv)->proto = js_value_from_cell(&proto->gc);
+                S[nb - 1] = instv; /* this */
+                int rc = frame_setup(ctx, fb, ctor, nb, argc, true);
+                if (rc == -1)
+                    RT_THROW("out of memory");
+                if (rc == -2)
+                    RT_THROW("RangeError: maximum call stack size exceeded");
+                goto run;
             }
             case JS_OP_TRY_PUSH: {
                 uint32_t target = READ_U32();
@@ -1675,6 +1873,10 @@ run:; /* (re)load the top frame */
                 RT_RAISE();
             case JS_OP_RETURN: {
                 JsValue ret = POPV();
+                /* `new`: a non-object return value is discarded in favor of
+                 * the constructed `this` (still live at base-1). */
+                if (fr->is_construct && !js_is_object(ret))
+                    ret = S[base - 1];
                 upvalues_close_from(fb, base);
                 /* drop try entries owned by this frame */
                 while (fb->try_count && fb->trys[fb->try_count - 1].frame_count >= fb->frame_count)
@@ -1767,7 +1969,7 @@ static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
     for (int i = 0; i < argc; i++)
         fb->stack[2 + i] = args[i];
     fb->sp = (uint32_t)(2 + argc);
-    int rc = frame_setup(ctx, fb, cl, 2, (uint32_t)argc);
+    int rc = frame_setup(ctx, fb, cl, 2, (uint32_t)argc, false);
     if (rc != 0) {
         *err = rc == -2 ? "RangeError: maximum call stack size exceeded" : "out of memory";
         return NULL;

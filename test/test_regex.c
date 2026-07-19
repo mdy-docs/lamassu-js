@@ -153,6 +153,10 @@ static void test_constructor(void) {
     err("RegExp('(');", "SyntaxError:");
     err("RegExp('a', 'q');", "SyntaxError: invalid regular expression flags");
     err("RegExp('a', 'gg');", "SyntaxError: invalid regular expression flags");
+    /* `new RegExp(...)`: natives are factories, so `new` behaves like a call */
+    eq("new RegExp('ab+c').source;", "ab+c");
+    eq("new RegExp('a', 'gi').flags;", "gi");
+    eq("new RegExp('x').test('yxz');", "true");
 }
 
 static void test_exec_and_test(void) {

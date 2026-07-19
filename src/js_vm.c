@@ -112,10 +112,13 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->vm = vm;
     ctx->globals = js_value_object(globals);
     ctx->string_methods = NULL;
-    ctx->array_methods = NULL;
     ctx->number_methods = NULL;
     ctx->promise_methods = NULL;
-    ctx->regexp_methods = NULL;
+    ctx->array_proto = NULL;
+    ctx->regexp_proto = NULL;
+    ctx->date_proto = NULL;
+    ctx->map_proto = NULL;
+    ctx->set_proto = NULL;
     ctx->repl_scope = NULL;
     ctx->repl_const = NULL;
     ctx->modules = NULL;

@@ -354,6 +354,93 @@ static void test_functions(void) {
     expect_result("function add3(a, b, c) { return a + b + c; } add3(...[1, 2, 3]);", "6");
 }
 
+static void test_new(void) {
+    /* basic construction: fresh object, `this` bound, fields visible */
+    expect_result("function P(x, y) { this.x = x; this.y = y; }"
+                  " let p = new P(3, 4); p.x + '/' + p.y;", "3/4");
+    /* no-parens form */
+    expect_result("function E() { this.tag = 'e'; } new E().tag;", "e");
+    /* each instance gets its own object */
+    expect_result("function P(x) { this.x = x; } let a = new P(1), b = new P(2);"
+                  " a === b;", "false");
+    expect_result("function P(x) { this.x = x; } let a = new P(1), b = new P(2);"
+                  " a.x + '/' + b.x;", "1/2");
+    /* fn.prototype: auto-created, shared, writable, backs inherited lookups */
+    expect_result("function F() {} typeof F.prototype;", "object");
+    expect_result("function F() {} F.prototype === F.prototype;", "true");
+    expect_result("function F() {} F.prototype.constructor === F;", "true");
+    expect_result("function C() { this.n = 0; }"
+                  " C.prototype.inc = function() { this.n++; return this; };"
+                  " new C().inc().inc().inc().n;", "3");
+    expect_result("function C() {} C.prototype.greet = function() { return 'hi'; };"
+                  " let a = new C(), b = new C(); a.greet() + b.greet();", "hihi");
+    /* own property shadows an inherited one */
+    expect_result("function C() {} C.prototype.v = 1;"
+                  " let a = new C(); a.v = 2; a.v + '/' + new C().v;", "2/1");
+    /* prototype-chain inheritance across constructors */
+    expect_result("function Animal(n) { this.name = n; }"
+                  " Animal.prototype.speak = function() { return this.name + ' speaks'; };"
+                  " function Dog(n) { this.name = n; } Dog.prototype = new Animal('proto');"
+                  " new Dog('Rex').speak();", "Rex speaks");
+    /* constructor return-value override: object wins, primitive is discarded */
+    expect_result("function W() { this.a = 1; return {b: 2}; }"
+                  " let w = new W(); (w.a === undefined) + '/' + w.b;", "true/2");
+    expect_result("function P() { this.a = 42; return 99; }"
+                  " let r = new P(); r.a + '/' + (typeof r);", "42/object");
+    /* member-expression callees and chaining */
+    expect_result("let ns = {}; ns.P = function(x) { this.x = x; };"
+                  " new ns.P(7).x;", "7");
+    expect_result("function C() { this.n = 1; } new C().n + 1;", "2");
+    /* spread constructor args */
+    expect_result("function P(a, b, c) { this.s = a + b + c; }"
+                  " new P(...[1, 2, 3]).s;", "6");
+    /* not constructible */
+    expect_error("let f = x => x; new f();", RUN_RUNTIME_ERR, "not a constructor");
+    expect_error("async function f() {} new f();", RUN_RUNTIME_ERR, "not a constructor");
+    expect_error("new (5)();", RUN_RUNTIME_ERR, "not a constructor");
+    expect_error("new NoSuchThing();", RUN_RUNTIME_ERR, "is not defined");
+    /* assigning a non-object to .prototype is a harmless no-op */
+    expect_result("function F() {} F.prototype = 5; typeof F.prototype;", "object");
+}
+
+/* Array/RegExp/Date/Map/Set instance methods are reached purely through a
+ * real, script-visible X.prototype and a genuine [[Prototype]] chain (the
+ * same mechanism `new Foo()` uses) — no hidden per-kind method table. */
+static void test_real_prototypes(void) {
+    expect_result("typeof Array.prototype;", "object");
+    expect_result("Object.getPrototypeOf([]) === Array.prototype;", "true");
+    expect_result("[].constructor === Array;", "true");
+    expect_result("Array.prototype.push === [].push;", "true");
+    /* arrays built deep inside other builtins get the real prototype too */
+    expect_result("Object.getPrototypeOf([1,2].map(x => x)) === Array.prototype;", "true");
+    expect_result("Object.getPrototypeOf(JSON.parse('[1]')) === Array.prototype;", "true");
+    /* monkey-patching the real prototype reaches existing instances */
+    expect_result("Array.prototype.double = function() { return this.map(x => x * 2); };"
+                  " [1,2,3].double().join(',');", "2,4,6");
+    expect_result("let a = [1]; Array.prototype.tag = 'x'; a.tag;", "x");
+    /* Map/Set: same deal */
+    expect_result("Object.getPrototypeOf(new Map()) === Map.prototype;", "true");
+    expect_result("new Map().constructor === Map;", "true");
+    expect_result("Map.prototype.get === new Map().get;", "true");
+    expect_result("Object.getPrototypeOf(new Set()) === Set.prototype;", "true");
+    expect_result("new Set().constructor === Set;", "true");
+    /* Object.setPrototypeOf rewires lookup for plain objects too */
+    expect_result("function Base() {} Base.prototype.hi = function() { return 'hi'; };"
+                  " let o = {}; Object.setPrototypeOf(o, Base.prototype); o.hi();", "hi");
+    expect_result("function Base() {} let o = {};"
+                  " Object.setPrototypeOf(o, Base.prototype);"
+                  " Object.getPrototypeOf(o) === Base.prototype;", "true");
+    /* getPrototypeOf on values with no [[Prototype]] slot: null, not a crash */
+    expect_result("Object.getPrototypeOf(5);", "null");
+    expect_result("Object.getPrototypeOf(function(){});", "null");
+    /* user-defined `new` prototype chains are unaffected by any of this */
+    expect_result("function Animal(n) { this.name = n; }"
+                  " Animal.prototype.speak = function() { return this.name + ' speaks'; };"
+                  " new Animal('Rex').speak();", "Rex speaks");
+    expect_error("Object.getPrototypeOf(null);", RUN_RUNTIME_ERR, "TypeError");
+    expect_error("Object.setPrototypeOf({}, 5);", RUN_RUNTIME_ERR, "TypeError");
+}
+
 static void test_closures(void) {
     expect_result("function counter() { let n = 0; return () => ++n; }"
                   " let c = counter(); c(); c(); c();", "3");
@@ -485,6 +572,8 @@ int main(void) {
     test_update_ops();
     test_errors();
     test_functions();
+    test_new();
+    test_real_prototypes();
     test_closures();
     test_exceptions();
     test_fuel();

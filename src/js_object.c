@@ -9,10 +9,12 @@ JsValue js_object_new(JsVm *vm) {
     js_map_init(&o->props);
     o->elems = NULL;
     o->elem_count = o->elem_cap = 0;
+    o->proto = js_undefined();
     return js_value_from_cell(c);
 }
 
-JsObject *js_array_new_cell(JsVm *vm, uint32_t reserve) {
+JsObject *js_array_new_cell(JsContext *ctx, uint32_t reserve) {
+    JsVm *vm = ctx->vm;
     JsGcCell *c = js_gc_new_cell(vm, JS_KIND_OBJECT, sizeof(JsObject));
     if (!c)
         return NULL;
@@ -21,6 +23,7 @@ JsObject *js_array_new_cell(JsVm *vm, uint32_t reserve) {
     js_map_init(&o->props);
     o->elems = NULL;
     o->elem_count = o->elem_cap = 0;
+    o->proto = ctx->array_proto ? js_value_from_cell(&ctx->array_proto->gc) : js_undefined();
     if (reserve) {
         o->elems = js_realloc_raw(vm, NULL, 0, (size_t)reserve * sizeof(JsValue));
         if (!o->elems)

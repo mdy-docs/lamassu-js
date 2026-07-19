@@ -136,6 +136,8 @@ const JsOpInfo js_op_info[JS_OP__COUNT] = {
     OP(JS_OP_GET_CALLEE, OPF_NONE, CF_NEXT, +1, 0, 0),
     OP(JS_OP_CALL, OPF_U8, CF_NEXT, 0, 0, 1),  /* delta/min_in: special */
     OP(JS_OP_CALL_VARARGS, OPF_NONE, CF_NEXT, -2, 3, 0),
+    OP(JS_OP_NEW, OPF_U8, CF_NEXT, 0, 0, 1),   /* delta/min_in: special (== CALL) */
+    OP(JS_OP_NEW_VARARGS, OPF_NONE, CF_NEXT, -2, 3, 0),
     OP(JS_OP_OPT_CALL_CHECK, OPF_JUMP, CF_BRANCH, 0, 2, 4), /* taken: -2 */
     OP(JS_OP_TRY_PUSH, OPF_JUMP, CF_BRANCH, 0, 0, 4),       /* handler: +1 */
     OP(JS_OP_TRY_POP, OPF_NONE, CF_NEXT, 0, 0, 0),
@@ -837,7 +839,7 @@ static bool verify_pass2(JsFunctionCell *fn, const uint8_t *boundary,
 
                 uint32_t min_in = oi->min_in;
                 int32_t delta = oi->delta;
-                if (opb == JS_OP_CALL) {
+                if (opb == JS_OP_CALL || opb == JS_OP_NEW) {
                     uint32_t argc = code[off + 1];
                     min_in = argc + 2;
                     delta = -(int32_t)(argc + 1);

@@ -1,5 +1,8 @@
 #include "js_bytecode.h" /* js_gc_mark_jobs */
 #include "jsvm_internal.h"
+#include "js_date.h"
+#include "js_mapobj.h"
+#include "js_setobj.h"
 #ifdef JSVM_HAS_REGEX
 #include "js_regexp.h"
 #endif
@@ -55,10 +58,15 @@ static void js_gc_trace(JsVm *vm) {
             }
             for (uint32_t i = 0; i < o->elem_count; i++)
                 js_gc_mark_value(vm, o->elems[i]);
+            js_gc_mark_value(vm, o->proto);
 #ifdef JSVM_HAS_REGEX
             if (o->obj_kind == JS_OBJ_REGEXP)
                 js_regexp_mark(vm, o);
 #endif
+            if (o->obj_kind == JS_OBJ_MAP)
+                js_mapobj_mark(vm, o);
+            if (o->obj_kind == JS_OBJ_SET)
+                js_setobj_mark(vm, o);
             break;
         }
         case JS_KIND_FUNCTION: {
@@ -106,6 +114,8 @@ static void js_gc_trace(JsVm *vm) {
             JsClosure *cl = (JsClosure *)c;
             js_gc_mark_cell(vm, &cl->fn->gc);
             js_gc_mark_value(vm, cl->this_val);
+            if (cl->prototype_obj)
+                js_gc_mark_cell(vm, &cl->prototype_obj->gc);
             for (uint16_t i = 0; i < cl->n_upvals; i++) {
                 if (cl->upvals[i])
                     js_gc_mark_cell(vm, &cl->upvals[i]->gc);
@@ -126,6 +136,8 @@ static void js_gc_trace(JsVm *vm) {
                 js_gc_mark_cell(vm, &nf->name->gc);
             if (nf->statics)
                 js_gc_mark_cell(vm, &nf->statics->gc);
+            if (nf->prototype)
+                js_gc_mark_cell(vm, &nf->prototype->gc);
             if (nf->is_bound)
                 js_gc_mark_value(vm, nf->bound);
             break;
@@ -155,6 +167,12 @@ void js_gc_free_cell(JsVm *vm, JsGcCell *c, bool remove_atoms) {
         if (o->obj_kind == JS_OBJ_REGEXP)
             size = js_regexp_release(vm, o);
 #endif
+        if (o->obj_kind == JS_OBJ_DATE)
+            size = sizeof(JsDateObject);
+        if (o->obj_kind == JS_OBJ_MAP)
+            size = js_mapobj_release(vm, o);
+        if (o->obj_kind == JS_OBJ_SET)
+            size = js_setobj_release(vm, o);
         break;
     }
     case JS_KIND_FUNCTION: {
@@ -216,14 +234,20 @@ void js_gc_collect(JsVm *vm) {
         js_gc_mark_cell(vm, &ctx->globals->gc);
         if (ctx->string_methods)
             js_gc_mark_cell(vm, &ctx->string_methods->gc);
-        if (ctx->array_methods)
-            js_gc_mark_cell(vm, &ctx->array_methods->gc);
         if (ctx->number_methods)
             js_gc_mark_cell(vm, &ctx->number_methods->gc);
         if (ctx->promise_methods)
             js_gc_mark_cell(vm, &ctx->promise_methods->gc);
-        if (ctx->regexp_methods)
-            js_gc_mark_cell(vm, &ctx->regexp_methods->gc);
+        if (ctx->array_proto)
+            js_gc_mark_cell(vm, &ctx->array_proto->gc);
+        if (ctx->regexp_proto)
+            js_gc_mark_cell(vm, &ctx->regexp_proto->gc);
+        if (ctx->date_proto)
+            js_gc_mark_cell(vm, &ctx->date_proto->gc);
+        if (ctx->map_proto)
+            js_gc_mark_cell(vm, &ctx->map_proto->gc);
+        if (ctx->set_proto)
+            js_gc_mark_cell(vm, &ctx->set_proto->gc);
         if (ctx->repl_scope)
             js_gc_mark_cell(vm, &ctx->repl_scope->gc);
         if (ctx->repl_const)
