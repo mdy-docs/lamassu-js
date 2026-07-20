@@ -1,5 +1,5 @@
-#ifndef JSVM_INTERNAL_H
-#define JSVM_INTERNAL_H
+#ifndef LAMASSU_INTERNAL_H
+#define LAMASSU_INTERNAL_H
 
 #include "lamassu.h"
 
@@ -469,4 +469,4 @@ JsString *js_intern_cell(JsVm *vm, JsString *s); /* canonical string, or NULL on
 void      js_atoms_remove(JsVm *vm, JsString *s);
 void      js_atoms_free(JsVm *vm);
 
-#endif /* JSVM_INTERNAL_H */
+#endif /* LAMASSU_INTERNAL_H */

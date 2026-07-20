@@ -1,5 +1,5 @@
 /*
- * The JS-level Map collection (distinct from JsMap in jsvm_internal.h,
+ * The JS-level Map collection (distinct from JsMap in lamassu_internal.h,
  * which is the internal string-keyed map object property storage uses).
  * Always available, no libc dependency.
  *
@@ -17,7 +17,7 @@
 #ifndef JS_MAPOBJ_H
 #define JS_MAPOBJ_H
 
-#include "jsvm_internal.h"
+#include "lamassu_internal.h"
 
 typedef struct JsMapObj {
     JsObject obj; /* obj_kind == JS_OBJ_MAP; props hold expandos only */

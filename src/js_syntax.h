@@ -11,7 +11,7 @@
 #ifndef JS_SYNTAX_H
 #define JS_SYNTAX_H
 
-#include "jsvm_internal.h"
+#include "lamassu_internal.h"
 
 /* ---- arena ---- */
 

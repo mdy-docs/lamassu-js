@@ -11,7 +11,7 @@
 #ifndef JS_DATE_H
 #define JS_DATE_H
 
-#include "jsvm_internal.h"
+#include "lamassu_internal.h"
 
 typedef struct JsDateObject {
     JsObject obj;  /* obj_kind == JS_OBJ_DATE; props hold expandos only */

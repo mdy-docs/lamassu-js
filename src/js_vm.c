@@ -1,5 +1,5 @@
 #include "js_bytecode.h" /* js_builtins_init */
-#include "jsvm_internal.h"
+#include "lamassu_internal.h"
 
 #define JS_GC_DEFAULT_THRESHOLD ((size_t)256 * 1024)
 

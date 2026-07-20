@@ -15,7 +15,7 @@ SRC := src/js_vm.c src/js_gc.c src/js_string.c src/js_map.c src/js_object.c \
        src/js_compiler.c src/js_interp.c src/js_mathkernel.c src/js_builtins.c \
        src/js_promise.c src/js_module.c src/js_regexp.c src/js_serialize.c \
        src/js_date.c src/js_mapobj.c src/js_setobj.c
-HDR := include/lamassu.h src/jsvm_internal.h src/js_syntax.h src/js_bytecode.h \
+HDR := include/lamassu.h src/lamassu_internal.h src/js_syntax.h src/js_bytecode.h \
        src/js_regexp.h src/js_date.h src/js_mapobj.h src/js_setobj.h
 INC := -Iinclude -Isrc
 

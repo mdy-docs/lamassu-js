@@ -1,4 +1,4 @@
-#include "jsvm_internal.h"
+#include "lamassu_internal.h"
 
 JsValue js_object_new(JsContext *ctx) {
     JsGcCell *c = js_gc_new_cell(ctx->vm, JS_KIND_OBJECT, sizeof(JsObject));

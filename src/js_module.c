@@ -14,7 +14,7 @@
  * re-exports are snapshot-copied once the source has evaluated.
  */
 #include "js_bytecode.h"
-#include "jsvm_internal.h"
+#include "lamassu_internal.h"
 
 /* ---- GC helpers ---- */
 

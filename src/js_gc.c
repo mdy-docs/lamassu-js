@@ -1,5 +1,5 @@
 #include "js_bytecode.h" /* js_gc_mark_jobs */
-#include "jsvm_internal.h"
+#include "lamassu_internal.h"
 #include "js_date.h"
 #include "js_mapobj.h"
 #include "js_setobj.h"

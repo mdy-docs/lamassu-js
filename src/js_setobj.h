@@ -10,7 +10,7 @@
 #ifndef JS_SETOBJ_H
 #define JS_SETOBJ_H
 
-#include "jsvm_internal.h"
+#include "lamassu_internal.h"
 
 typedef struct JsSetObj {
     JsObject obj; /* obj_kind == JS_OBJ_SET; props hold expandos only */

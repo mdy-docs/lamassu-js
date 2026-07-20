@@ -1,4 +1,4 @@
-#include "jsvm_internal.h"
+#include "lamassu_internal.h"
 
 void js_map_init(JsMap *m) {
     m->entries = NULL;

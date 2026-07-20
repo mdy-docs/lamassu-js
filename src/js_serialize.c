@@ -22,7 +22,7 @@
  * and nested functions recursively inlined (tag 6).
  */
 #include "js_bytecode.h"
-#include "jsvm_internal.h"
+#include "lamassu_internal.h"
 
 #define JSBC_VERSION 2u
 #define JSBC_FLAG_HAS_REGEX 1u /* producer had regex enabled (informational) */

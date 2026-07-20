@@ -246,7 +246,7 @@ Strings/Numbers/Promises don't participate — they're primitives or a
 distinct GC kind with no `.proto` field to hang a chain off. Property
 lookup falls back to a hidden per-context table instead
 (`ctx->string_methods`/`number_methods`/`promise_methods` in
-`src/jsvm_internal.h`) — invisible and immutable from scripts, unlike the
+`src/lamassu_internal.h`) — invisible and immutable from scripts, unlike the
 real prototype chain above.
 
 ## Security considerations

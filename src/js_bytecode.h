@@ -1,7 +1,7 @@
 /*
  * Bytecode: stack machine, u8 opcodes, little-endian u16/u32 immediates,
  * absolute u32 jump targets. Compiled functions and fibers are GC cells
- * (layouts in jsvm_internal.h) so everything the interpreter touches is
+ * (layouts in lamassu_internal.h) so everything the interpreter touches is
  * always reachable — the fiber's stack roots all intermediate values, which
  * is what makes GC at any allocation site safe.
  */

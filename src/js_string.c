@@ -1,4 +1,4 @@
-#include "jsvm_internal.h"
+#include "lamassu_internal.h"
 
 uint32_t js_units_hash(const uint16_t *units, size_t len) {
     uint32_t h = 2166136261u; /* FNV-1a over code units */

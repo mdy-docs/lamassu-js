@@ -12,7 +12,7 @@
  * reachable by one of those, or protected explicitly.
  */
 #include "js_bytecode.h"
-#include "jsvm_internal.h"
+#include "lamassu_internal.h"
 
 #define RX_THEN 0
 #define RX_AWAIT 1

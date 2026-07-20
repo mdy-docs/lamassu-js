@@ -1,7 +1,7 @@
 /*
  * Standard library. Array instance methods live on a real, script-visible
  * Array.prototype (ctx->array_proto is a construction-time cache of it, not
- * a lookup shortcut — see jsvm_internal.h). String/Number don't have a
+ * a lookup shortcut — see lamassu_internal.h). String/Number don't have a
  * [[Prototype]] slot to hang a real chain off (they're primitives, not
  * JS_KIND_OBJECT), so their methods still live on a hidden per-context
  * table (ctx->string_methods / number_methods) that property lookup falls
@@ -18,7 +18,7 @@
  * only; sort is a stable O(n^2) binary insertion sort.
  */
 #include "js_bytecode.h"
-#include "jsvm_internal.h"
+#include "lamassu_internal.h"
 #include "js_date.h"
 #include "js_mapobj.h"
 #include "js_setobj.h"
@@ -1997,7 +1997,7 @@ static bool obj_hasOwn(JsContext *ctx, JsValue tv, const JsValue *args, int argc
 
 /* ---- Object.prototype: hasOwnProperty/toString/valueOf ----
  * Reached via the normal own-prop-miss -> [[Prototype]] walk (see
- * ctx->object_proto in jsvm_internal.h) for any object whose own chain
+ * ctx->object_proto in lamassu_internal.h) for any object whose own chain
  * doesn't shadow these first — Array/Map/Set/Date/RegExp all define their
  * own `toString`, so this generic one is only ever actually reached for
  * plain objects (and anything else that doesn't override it). */

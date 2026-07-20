@@ -13,7 +13,7 @@
 #ifndef JS_REGEXP_H
 #define JS_REGEXP_H
 
-#include "jsvm_internal.h"
+#include "lamassu_internal.h"
 
 #ifdef JSVM_HAS_REGEX
 
