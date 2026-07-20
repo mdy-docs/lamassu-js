@@ -13,6 +13,24 @@ JsValue js_object_new(JsVm *vm) {
     return js_value_from_cell(c);
 }
 
+JsObject *js_object_new_cell(JsContext *ctx) {
+    JsGcCell *c = js_gc_new_cell(ctx->vm, JS_KIND_OBJECT, sizeof(JsObject));
+    if (!c)
+        return NULL;
+    JsObject *o = (JsObject *)c;
+    o->obj_kind = JS_OBJ_PLAIN;
+    js_map_init(&o->props);
+    o->elems = NULL;
+    o->elem_count = o->elem_cap = 0;
+    /* Bootstrap case: while js_builtins_init is creating ctx->object_proto
+     * itself, ctx->object_proto is still NULL here, so this correctly
+     * produces the one object with no [[Prototype]] — matching real JS's
+     * `Object.getPrototypeOf(Object.prototype) === null`. Every other call,
+     * made after that assignment, chains to it normally. */
+    o->proto = ctx->object_proto ? js_value_from_cell(&ctx->object_proto->gc) : js_undefined();
+    return o;
+}
+
 JsObject *js_array_new_cell(JsContext *ctx, uint32_t reserve) {
     JsVm *vm = ctx->vm;
     JsGcCell *c = js_gc_new_cell(vm, JS_KIND_OBJECT, sizeof(JsObject));

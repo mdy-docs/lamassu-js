@@ -311,10 +311,9 @@ bool js_setobj_builtins_init(JsContext *ctx) {
      * set before any instance exists (alloc_setobj reads it) and is also
      * the constructor's `.prototype`, so `Set.prototype` and every
      * instance's [[Prototype]] are the same reachable object. */
-    JsValue t = js_object_new(ctx->vm);
-    if (!js_is_object(t))
+    ctx->set_proto = js_object_new_cell(ctx); /* rooted via the context now */
+    if (!ctx->set_proto)
         return false;
-    ctx->set_proto = js_value_object(t); /* rooted via the context now */
 
     static const struct {
         const char *name;

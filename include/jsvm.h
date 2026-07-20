@@ -137,8 +137,17 @@ const uint16_t *js_string_units(JsValue str, size_t *len);          /* NULL if n
 size_t  js_string_length(JsValue str);
 bool    js_string_equals(JsValue a, JsValue b);                     /* content equality */
 
-/* ---- objects (phase 1: string-keyed property bag) ---- */
-
+/*
+ * ---- objects (phase 1: string-keyed property bag) ----
+ *
+ * js_object_new is context-free and deliberately has no [[Prototype]] — it
+ * predates contexts/realms. It is NOT what a guest `{}` literal produces:
+ * scripts get a real, script-visible Object.prototype (hasOwnProperty,
+ * toString, valueOf), reachable via Object.getPrototypeOf. A native that
+ * wants to hand guest code an object indistinguishable from one it wrote
+ * itself needs that prototype too; there is currently no public function
+ * for it (only an internal one, scoped to the engine's own natives).
+ */
 JsValue js_object_new(JsVm *vm);                                    /* undefined on OOM */
 JsValue js_object_get(JsVm *vm, JsValue obj, JsValue key);          /* undefined if absent */
 bool    js_object_set(JsVm *vm, JsValue obj, JsValue key, JsValue value); /* false on OOM/bad args */

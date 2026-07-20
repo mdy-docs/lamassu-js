@@ -218,6 +218,36 @@ is too large a win to forgo. That split is keyed on key *shape* (canonical
 index vs. name), is invisible semantically, and string-named properties on
 arrays still use the same unified table.
 
+### The [[Prototype]] chain
+
+One mechanism, uniformly: `JsObject.proto` is walked on every own-prop-miss
+in `get_property` (`src/js_interp.c`), with no per-kind special case. Every
+prototype object a script can see is real and script-visible — `Ctor.prototype`
+*is* the object every instance's `.proto` points to, not a synthetic view.
+
+`ctx->object_proto` (`Object.prototype`: `hasOwnProperty`/`toString`/
+`valueOf`) is the root every other prototype chains to — `Array.prototype`,
+`Date.prototype`, `Map.prototype`, `Set.prototype`, `RegExp.prototype`,
+every user-defined constructor's `.prototype`, and `ctx->globals`
+(`globalThis`) itself. It has to be created first, before anything else in
+`js_builtins_init`, since object creation (`js_object_new_cell`, the
+internal, context-aware constructor everything above uses — not the public
+`js_object_new(JsVm*)`, which predates contexts and stays deliberately
+prototype-less) sets `[[Prototype]]` to whatever `ctx->object_proto`
+currently is. The one call this resolves to `undefined` (this engine's
+"no [[Prototype]]", surfaced as `null` via `Object.getPrototypeOf`) is
+`object_proto`'s own creation, when `ctx->object_proto` is still unset —
+the correct bootstrap, matching real JS's
+`Object.getPrototypeOf(Object.prototype) === null`, not a special case
+bolted on.
+
+Strings/Numbers/Promises don't participate — they're primitives or a
+distinct GC kind with no `.proto` field to hang a chain off. Property
+lookup falls back to a hidden per-context table instead
+(`ctx->string_methods`/`number_methods`/`promise_methods` in
+`src/jsvm_internal.h`) — invisible and immutable from scripts, unlike the
+real prototype chain above.
+
 ## Security considerations
 
 Users are untrusted; this shapes several choices:

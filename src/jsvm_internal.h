@@ -331,6 +331,10 @@ struct JsContext {
      * Cached here so allocation sites (js_array_new_cell, alloc_mapobj, ...)
      * don't need to look "Ctor.prototype" up through a property read on
      * every single instance they create. */
+    JsObject *object_proto; /* root of the chain; its own ->proto is undefined
+                             * (no [[Prototype]]), matching real JS's `null`.
+                             * Created first in js_builtins_init, before
+                             * anything below — see js_object_new_cell. */
     JsObject *array_proto;
     JsObject *regexp_proto; /* NULL unless built with JSVM_HAS_REGEX */
     JsObject *date_proto;
@@ -425,6 +429,25 @@ static inline JsPromise *js_value_promise(JsValue v) { return (JsPromise *)js_va
  * one call allocate. Shared by js_interp.c (property-set path) and
  * js_builtins.c (the Array constructor). */
 #define JS_MAX_ARRAY_GAP 4096u
+
+/*
+ * js_object.c: the context-aware plain-object constructor, same shape and
+ * rationale as js_array_new_cell below — [[Prototype]] is ctx->object_proto,
+ * so property lookup reaches hasOwnProperty/toString/valueOf via the normal
+ * proto-chain walk, no special-casing. This is what a script `{}` literal
+ * actually produces (JS_OP_NEW_OBJECT), and what every built-in that hands a
+ * guest script a fresh plain object uses (JSON.parse, Object.fromEntries,
+ * Object(), RegExp match .groups, Promise.allSettled results, every
+ * Ctor.prototype/statics object, ...).
+ *
+ * The PUBLIC js_object_new(JsVm *vm) in jsvm.h is deliberately unchanged and
+ * stays prototype-less — it predates contexts (a context-free VM-level
+ * primitive) and native embedders and the phase-1 unit tests
+ * (test/test_main.c) rely on that. The two are not interchangeable: an
+ * object built via the public API does not match what a guest `{}` produces
+ * unless the embedder is fine with that difference.
+ */
+JsObject *js_object_new_cell(JsContext *ctx);
 
 /* js_object.c: array helpers used by the interpreter. new_cell takes the
  * context (not just the VM) so it can set the new array's [[Prototype]] to

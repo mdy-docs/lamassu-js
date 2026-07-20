@@ -663,11 +663,11 @@ static bool def_method(JsContext *ctx, JsObject *table, const char *name, JsNati
 bool js_date_builtins_init(JsContext *ctx) {
     /* Date.prototype: a real object, set before any instance exists (so
      * alloc_date can point new instances at it) and also assigned as the
-     * constructor's `.prototype` below. */
-    JsValue t = js_object_new(ctx->vm);
-    if (!js_is_object(t))
+     * constructor's `.prototype` below. Chains to Object.prototype like any
+     * other real prototype object (js_object_new_cell). */
+    ctx->date_proto = js_object_new_cell(ctx); /* rooted via the context now */
+    if (!ctx->date_proto)
         return false;
-    ctx->date_proto = js_value_object(t); /* rooted via the context now */
 
     static const struct {
         const char *name;
@@ -710,13 +710,13 @@ bool js_date_builtins_init(JsContext *ctx) {
         return false;
     js_gc_protect(ctx->vm, &ctor); /* keep rooted through statics + global set */
     ((JsNative *)js_value_cell(ctor))->prototype = ctx->date_proto;
-    JsValue statics = js_object_new(ctx->vm);
-    bool ok = js_is_object(statics);
+    JsObject *statics = js_object_new_cell(ctx);
+    bool ok = statics != NULL;
     if (ok) {
-        ((JsNative *)js_value_cell(ctor))->statics = js_value_object(statics);
-        ok = def_method(ctx, js_value_object(statics), "now", date_now) &&
-            def_method(ctx, js_value_object(statics), "UTC", date_UTC) &&
-            def_method(ctx, js_value_object(statics), "parse", date_parse) &&
+        ((JsNative *)js_value_cell(ctor))->statics = statics;
+        ok = def_method(ctx, statics, "now", date_now) &&
+            def_method(ctx, statics, "UTC", date_UTC) &&
+            def_method(ctx, statics, "parse", date_parse) &&
             js_object_set_ascii(ctx, ctx->date_proto, "constructor", ctor) &&
             js_object_set_ascii(ctx, ctx->globals, "Date", ctor);
     }

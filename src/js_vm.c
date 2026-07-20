@@ -108,6 +108,7 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->string_methods = NULL;
     ctx->number_methods = NULL;
     ctx->promise_methods = NULL;
+    ctx->object_proto = NULL;
     ctx->array_proto = NULL;
     ctx->regexp_proto = NULL;
     ctx->date_proto = NULL;
@@ -142,6 +143,11 @@ JsContext *js_context_new(JsVm *vm) {
         js_context_free(ctx);
         return NULL;
     }
+    /* globalThis is ctx->globals itself, allocated above before ctx (and so
+     * before ctx->object_proto) existed — real JS has it inherit
+     * Object.prototype like any other ordinary object, so wire it up now
+     * that js_builtins_init has created one. */
+    ctx->globals->proto = js_value_from_cell(&ctx->object_proto->gc);
     return ctx;
 }
 

@@ -469,9 +469,10 @@ static bool all_element_resolve(JsContext *ctx, JsValue bound, JsValue tv,
     JsObject *results = js_value_object(state_get(ctx, state, "results"));
     int mode = (int)js_to_number_value(ctx, state_get(ctx, state, "mode"));
     if (mode == ALL_MODE_SETTLED) {
-        JsValue ov = js_object_new(ctx->vm);
-        if (!js_is_object(ov))
+        JsObject *ov_cell = js_object_new_cell(ctx);
+        if (!ov_cell)
             return nthrow(ctx, r, "out of memory");
+        JsValue ov = js_value_from_cell(&ov_cell->gc);
         js_gc_protect(ctx->vm, &ov); /* root across the ascii/set allocations */
         JsString *status = js_ascii_cell(ctx->vm, "fulfilled");
         bool sok = status &&
@@ -504,9 +505,10 @@ static bool all_element_reject(JsContext *ctx, JsValue bound, JsValue tv,
     int mode = (int)js_to_number_value(ctx, state_get(ctx, state, "mode"));
     if (mode == ALL_MODE_SETTLED) {
         JsObject *results = js_value_object(state_get(ctx, state, "results"));
-        JsValue ov = js_object_new(ctx->vm);
-        if (!js_is_object(ov))
+        JsObject *ov_cell = js_object_new_cell(ctx);
+        if (!ov_cell)
             return nthrow(ctx, r, "out of memory");
+        JsValue ov = js_value_from_cell(&ov_cell->gc);
         js_gc_protect(ctx->vm, &ov);
         JsString *status = js_ascii_cell(ctx->vm, "rejected");
         bool sok = status &&
@@ -732,13 +734,13 @@ bool js_promise_builtins_init(JsContext *ctx) {
     if (!js_is_function(ctor))
         return false;
     js_gc_protect(vm, &ctor);
-    JsValue statics = js_object_new(vm);
-    if (!js_is_object(statics)) {
+    JsObject *statics = js_object_new_cell(ctx);
+    if (!statics) {
         js_gc_unprotect(vm, &ctor);
         return false;
     }
     JsNative *native = (JsNative *)js_value_cell(ctor);
-    native->statics = js_value_object(statics);
+    native->statics = statics;
     bool ok = js_object_set_ascii(ctx, ctx->globals, "Promise", ctor);
     js_gc_unprotect(vm, &ctor);
     if (!ok)

@@ -27,11 +27,15 @@ object but does not enforce immutability — see
 [Deviations](/guide/deviations)), `fromEntries`, `hasOwn`,
 `getPrototypeOf`, `setPrototypeOf`.
 
-Plain objects have no `[[Prototype]]` at all in this engine (no
-`Object.prototype` to inherit from), unlike `Array`/`Date`/`Map`/`Set`/
-`RegExp` instances — so `{}.toString`, `{}.hasOwnProperty`, etc. are
-`undefined`, not inherited methods. Use the `Object.*` statics above
-instead.
+**`Object.prototype`**: `hasOwnProperty`, `toString` (`"[object Object]"`),
+`valueOf` (returns the object itself). This is the root of *every*
+`[[Prototype]]` chain in the engine — a plain object literal's own
+`[[Prototype]]` is `Object.prototype`, and `Array.prototype`/
+`Date.prototype`/`Map.prototype`/`Set.prototype`/`RegExp.prototype`, every
+user-defined constructor's `.prototype`, and even `globalThis` itself all
+chain up to it in turn (`Object.getPrototypeOf(Array.prototype) ===
+Object.prototype`). `Object.prototype`'s own `[[Prototype]]` is `null`,
+matching spec.
 
 ## `Array`
 

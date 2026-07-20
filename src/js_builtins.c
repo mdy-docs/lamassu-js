@@ -1641,12 +1641,12 @@ static bool json_value(JsonP *p, JsValue *out) {
     uint16_t c = p->u[p->pos];
     if (c == '{') {
         p->pos++;
-        JsValue ov = js_object_new(p->ctx->vm);
-        if (!js_is_object(ov)) {
+        JsObject *o = js_object_new_cell(p->ctx);
+        if (!o) {
             p->error = true;
             return false;
         }
-        JsObject *o = js_value_object(ov);
+        JsValue ov = js_value_from_cell(&o->gc);
         js_gc_protect(p->ctx->vm, &ov);
         json_ws(p);
         bool okc = true;
@@ -1909,7 +1909,7 @@ static bool obj_fromEntries(JsContext *ctx, JsValue tv, const JsValue *args, int
     JsValue src = ARG(0);
     if (!js_is_object(src) || js_value_object(src)->obj_kind != JS_OBJ_ARRAY)
         return native_throw(ctx, r, "TypeError: Object.fromEntries expects an array of pairs");
-    JsObject *out = js_value_object(js_object_new(ctx->vm));
+    JsObject *out = js_object_new_cell(ctx);
     if (!out)
         return oom(ctx, r);
     JsValue outv = js_value_from_cell(&out->gc);
@@ -1936,6 +1936,29 @@ static bool obj_fromEntries(JsContext *ctx, JsValue tv, const JsValue *args, int
     return true;
 }
 
+/* Shared by Object.hasOwn(obj, key) and Object.prototype.hasOwnProperty
+ * (this.hasOwnProperty(key)) below. *out is only meaningful when this
+ * returns true; false means OOM (caller throws). */
+static bool object_has_own_key(JsContext *ctx, JsObject *ob, JsValue key, bool *out) {
+    uint32_t idx;
+    JsString *ks = js_to_string_cell(ctx, key, 0);
+    if (!ks)
+        return false;
+    if (ob->obj_kind == JS_OBJ_ARRAY) {
+        /* index check */
+        double d = js_units_to_number(ks->units, ks->length);
+        if (d >= 0 && d == __builtin_floor(d) && (idx = (uint32_t)d) < ob->elem_count) {
+            *out = true;
+            return true;
+        }
+    }
+    JsString *ik = js_intern_cell(ctx->vm, ks);
+    if (!ik)
+        return false;
+    js_map_get(&ob->props, ik, out);
+    return true;
+}
+
 static bool obj_hasOwn(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     JsValue o = ARG(0);
@@ -1943,25 +1966,49 @@ static bool obj_hasOwn(JsContext *ctx, JsValue tv, const JsValue *args, int argc
         *r = js_bool(false);
         return true;
     }
-    JsObject *ob = js_value_object(o);
-    uint32_t idx;
-    JsString *ks = js_to_string_cell(ctx, ARG(1), 0);
-    if (!ks)
-        return oom(ctx, r);
-    if (ob->obj_kind == JS_OBJ_ARRAY) {
-        /* index check */
-        double d = js_units_to_number(ks->units, ks->length);
-        if (d >= 0 && d == __builtin_floor(d) && (idx = (uint32_t)d) < ob->elem_count) {
-            *r = js_bool(true);
-            return true;
-        }
-    }
-    JsString *ik = js_intern_cell(ctx->vm, ks);
-    if (!ik)
-        return oom(ctx, r);
     bool found;
-    js_map_get(&ob->props, ik, &found);
+    if (!object_has_own_key(ctx, js_value_object(o), ARG(1), &found))
+        return oom(ctx, r);
     *r = js_bool(found);
+    return true;
+}
+
+/* ---- Object.prototype: hasOwnProperty/toString/valueOf ----
+ * Reached via the normal own-prop-miss -> [[Prototype]] walk (see
+ * ctx->object_proto in jsvm_internal.h) for any object whose own chain
+ * doesn't shadow these first — Array/Map/Set/Date/RegExp all define their
+ * own `toString`, so this generic one is only ever actually reached for
+ * plain objects (and anything else that doesn't override it). */
+
+static bool objp_hasOwnProperty(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
+                                JsValue *r) {
+    if (!js_is_object(tv)) {
+        *r = js_bool(false);
+        return true;
+    }
+    bool found;
+    if (!object_has_own_key(ctx, js_value_object(tv), ARG(0), &found))
+        return oom(ctx, r);
+    *r = js_bool(found);
+    return true;
+}
+
+static bool objp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    (void)args;
+    (void)argc;
+    JsString *s = js_ascii_cell(ctx->vm, "[object Object]");
+    if (!s)
+        return oom(ctx, r);
+    *r = js_value_from_cell(&s->gc);
+    return true;
+}
+
+static bool objp_valueOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)ctx;
+    (void)args;
+    (void)argc;
+    *r = tv;
     return true;
 }
 
@@ -2009,10 +2056,10 @@ static bool g_Object(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
     (void)tv;
     JsValue v = ARG(0);
     if (argc == 0 || js_is_undefined(v) || js_is_null(v)) {
-        JsValue o = js_object_new(ctx->vm);
-        if (!js_is_object(o))
+        JsObject *o = js_object_new_cell(ctx);
+        if (!o)
             return oom(ctx, r);
-        *r = o;
+        *r = js_value_from_cell(&o->gc);
         return true;
     }
     *r = v;
@@ -2412,7 +2459,8 @@ static JsObject *def_ctor(JsContext *ctx, const char *name, JsNativeFn fn) {
     if (!js_is_function(nf))
         return NULL;
     js_gc_protect(ctx->vm, &nf); /* keep rooted through statics + global set */
-    JsValue statics = js_object_new(ctx->vm);
+    JsObject *statics_o = js_object_new_cell(ctx);
+    JsValue statics = statics_o ? js_value_from_cell(&statics_o->gc) : js_undefined();
     if (!js_is_object(statics)) {
         js_gc_unprotect(ctx->vm, &nf);
         return NULL;
@@ -2427,6 +2475,23 @@ static JsObject *def_ctor(JsContext *ctx, const char *name, JsNativeFn fn) {
 bool js_builtins_init(JsContext *ctx) {
     JsVm *vm = ctx->vm;
 
+    /* Object.prototype: the root of every [[Prototype]] chain in the engine
+     * (js_object_new_cell(ctx) chains everything created after this point to
+     * it automatically — see jsvm_internal.h). Must be first: array_proto
+     * etc. below are themselves created via js_object_new_cell, and this is
+     * the one call where ctx->object_proto is still NULL (the correct,
+     * spec-matching bootstrap — see js_object_new_cell's comment). */
+    ctx->object_proto = js_object_new_cell(ctx);
+    if (!ctx->object_proto)
+        return false;
+    static const MethodDef object_proto_methods[] = {
+        {"hasOwnProperty", objp_hasOwnProperty},
+        {"toString", objp_toString},
+        {"valueOf", objp_valueOf},
+        {NULL, NULL}};
+    if (!install_methods(ctx, ctx->object_proto, object_proto_methods))
+        return false;
+
     /* method tables — assign each into ctx before the next allocation so it
      * is a GC root immediately (gc_stress collects at every allocation) */
     JsValue sm = js_object_new(vm);
@@ -2437,11 +2502,11 @@ bool js_builtins_init(JsContext *ctx) {
      * "prototype" property; ctx->array_proto is just a fast-path cache so
      * js_array_new_cell doesn't need a property lookup on every array it
      * creates — property access on array instances never consults it
-     * directly, it goes through the normal [[Prototype]] walk. */
-    JsValue am = js_object_new(vm);
-    if (!js_is_object(am))
+     * directly, it goes through the normal [[Prototype]] walk. Chains to
+     * Object.prototype automatically (js_object_new_cell, above). */
+    ctx->array_proto = js_object_new_cell(ctx);
+    if (!ctx->array_proto)
         return false;
-    ctx->array_proto = js_value_object(am);
     JsValue num = js_object_new(vm);
     if (!js_is_object(num))
         return false;
@@ -2482,12 +2547,11 @@ bool js_builtins_init(JsContext *ctx) {
         return false;
 
     /* Math */
-    JsValue mathv = js_object_new(vm);
-    if (!js_is_object(mathv))
+    JsObject *math = js_object_new_cell(ctx);
+    if (!math)
         return false;
-    if (!js_object_set_ascii(ctx, ctx->globals, "Math", mathv))
+    if (!js_object_set_ascii(ctx, ctx->globals, "Math", js_value_from_cell(&math->gc)))
         return false;
-    JsObject *math = js_value_object(mathv);
     if (!def_fn(ctx, math, "abs", math_abs) || !def_fn(ctx, math, "floor", math_floor) ||
         !def_fn(ctx, math, "ceil", math_ceil) || !def_fn(ctx, math, "round", math_round) ||
         !def_fn(ctx, math, "trunc", math_trunc) || !def_fn(ctx, math, "sign", math_sign) ||
@@ -2512,20 +2576,31 @@ bool js_builtins_init(JsContext *ctx) {
         return false;
 
     /* JSON */
-    JsValue jsonv = js_object_new(vm);
-    if (!js_is_object(jsonv) || !js_object_set_ascii(ctx, ctx->globals, "JSON", jsonv))
+    JsObject *json = js_object_new_cell(ctx);
+    if (!json || !js_object_set_ascii(ctx, ctx->globals, "JSON", js_value_from_cell(&json->gc)))
         return false;
-    JsObject *json = js_value_object(jsonv);
     if (!def_fn(ctx, json, "stringify", json_stringify) ||
         !def_fn(ctx, json, "parse", json_parse))
         return false;
 
     /* Object: a callable native (Object() / new Object() behave identically —
-     * see JS_OP_NEW's native-constructor dispatch), statics-only like
-     * Number/String/Boolean below (plain objects have no [[Prototype]] slot
-     * to hang a real Object.prototype off in this engine). */
-    JsObject *object = def_ctor(ctx, "Object", g_Object);
-    if (!object)
+     * see JS_OP_NEW's native-constructor dispatch), same "real prototype
+     * object" wiring as Date/Map/Set/RegExp below — Object.prototype is
+     * ctx->object_proto itself, not a separately lazily-created object. */
+    JsValue objv = js_native_new(ctx, "Object", g_Object, NULL);
+    if (!js_is_function(objv))
+        return false;
+    js_gc_protect(vm, &objv); /* keep rooted through statics + global set */
+    ((JsNative *)js_value_cell(objv))->prototype = ctx->object_proto;
+    JsObject *object = js_object_new_cell(ctx);
+    bool obj_ok = object != NULL;
+    if (obj_ok) {
+        ((JsNative *)js_value_cell(objv))->statics = object;
+        obj_ok = js_object_set_ascii(ctx, ctx->object_proto, "constructor", objv) &&
+                js_object_set_ascii(ctx, ctx->globals, "Object", objv);
+    }
+    js_gc_unprotect(vm, &objv);
+    if (!obj_ok)
         return false;
     if (!def_fn(ctx, object, "keys", obj_keys) || !def_fn(ctx, object, "values", obj_values) ||
         !def_fn(ctx, object, "entries", obj_entries) || !def_fn(ctx, object, "assign", obj_assign) ||
@@ -2543,11 +2618,10 @@ bool js_builtins_init(JsContext *ctx) {
         return false;
     js_gc_protect(vm, &arrv); /* keep rooted through statics + global set */
     ((JsNative *)js_value_cell(arrv))->prototype = ctx->array_proto;
-    JsValue arr_statics = js_object_new(vm);
-    bool arr_ok = js_is_object(arr_statics);
+    JsObject *array = js_object_new_cell(ctx);
+    bool arr_ok = array != NULL;
     if (arr_ok) {
-        ((JsNative *)js_value_cell(arrv))->statics = js_value_object(arr_statics);
-        JsObject *array = js_value_object(arr_statics);
+        ((JsNative *)js_value_cell(arrv))->statics = array;
         arr_ok = def_fn(ctx, array, "isArray", arr_isArray) && def_fn(ctx, array, "of", arr_of) &&
                 def_fn(ctx, array, "from", arr_from) &&
                 js_object_set_ascii(ctx, ctx->array_proto, "constructor", arrv) &&

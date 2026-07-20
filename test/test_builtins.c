@@ -302,6 +302,29 @@ static void test_object(void) {
     eq("let a = [1,2]; Object(a) === a;", "true");
     eq("let o = {x:1}; Object(o) === o;", "true");
     eq("typeof Object.keys;", "function"); /* statics survive the callable rewrite */
+    /* Object.prototype: every plain object inherits it, and every other
+     * built-in prototype chains up to it in turn. */
+    eq("typeof ({}).hasOwnProperty;", "function");
+    eq("typeof ({}).toString;", "function");
+    eq("typeof ({}).valueOf;", "function");
+    eq("({}).toString();", "[object Object]");
+    eq("let o = {}; o.valueOf() === o;", "true");
+    eq("({x:1}).hasOwnProperty('x');", "true");
+    eq("({x:1}).hasOwnProperty('y');", "false");
+    eq("[1,2].hasOwnProperty(0);", "true");
+    eq("[1,2].hasOwnProperty(5);", "false");
+    eq("Object.getPrototypeOf({}) === Object.prototype;", "true");
+    eq("Object.getPrototypeOf(Object.prototype);", "null");
+    eq("Object.getPrototypeOf(Array.prototype) === Object.prototype;", "true");
+    eq("Object.getPrototypeOf(Date.prototype) === Object.prototype;", "true");
+    eq("Object.getPrototypeOf(Map.prototype) === Object.prototype;", "true");
+    eq("Object.getPrototypeOf(Set.prototype) === Object.prototype;", "true");
+    eq("Object.getPrototypeOf(RegExp.prototype) === Object.prototype;", "true");
+    eq("function F() {} Object.getPrototypeOf(F.prototype) === Object.prototype;", "true");
+    eq("function F() {} new F().hasOwnProperty('x');", "false");
+    eq("globalThis.hasOwnProperty('Math');", "true");
+    /* own-property semantics still bypass inherited ones */
+    eq("Object.keys({}).length;", "0"); /* inherited methods aren't own/enumerable */
 }
 
 /* No time zone support: every value is UTC (each getX()/getUTCX() pair and

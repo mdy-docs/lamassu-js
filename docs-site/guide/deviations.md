@@ -6,13 +6,14 @@ that's known to differ, so you're not surprised by one in production.
 
 ## Objects
 
-- **Plain objects have no `[[Prototype]]` at all** — there's no
-  `Object.prototype` for `{}` to inherit from, so `{}.toString`,
-  `{}.hasOwnProperty`, etc. are `undefined` rather than inherited methods.
-  Use the `Object.*` statics (`Object.keys`, `Object.hasOwn`, ...) instead.
-  `Array`/`Date`/`Map`/`Set`/`RegExp` instances are unaffected — those have
-  real, script-visible prototype chains to their own constructor's
-  `.prototype`.
+- **`Object.prototype` only has three methods** — `hasOwnProperty`,
+  `toString`, `valueOf`. Real JS also has `isPrototypeOf`,
+  `propertyIsEnumerable`, `toLocaleString`, and the legacy `__proto__`
+  accessor; none of those are implemented. `toString` always returns
+  `"[object Object]"` — there's no per-kind `Symbol.toStringTag`-style
+  internal class tag, though in practice this is only reachable for plain
+  objects, since `Array`/`Map`/`Set`/`Date`/`RegExp` all define their own
+  `toString` that shadows it.
 - **`Object(primitiveValue)` returns the primitive unchanged** rather than
   boxing it into a wrapper object — this engine has no boxed-primitive type
   at all. `Object()`/`Object(null)`/`Object(undefined)` (a new empty

@@ -340,10 +340,9 @@ static JsString *single_unit_string(JsVm *vm, uint16_t u) {
 static JsObject *closure_prototype(JsContext *ctx, JsClosure *cl) {
     if (cl->prototype_obj)
         return cl->prototype_obj;
-    JsValue pv = js_object_new(ctx->vm);
-    if (!js_is_object(pv))
+    cl->prototype_obj = js_object_new_cell(ctx); /* reachable via cl from here */
+    if (!cl->prototype_obj)
         return NULL;
-    cl->prototype_obj = js_value_object(pv); /* reachable via cl from here */
     if (!js_object_set_ascii(ctx, cl->prototype_obj, "constructor",
                              js_value_from_cell(&cl->gc))) {
         cl->prototype_obj = NULL;
@@ -360,10 +359,9 @@ static JsObject *closure_prototype(JsContext *ctx, JsClosure *cl) {
 static JsObject *native_prototype(JsContext *ctx, JsNative *nf) {
     if (nf->prototype)
         return nf->prototype;
-    JsValue pv = js_object_new(ctx->vm);
-    if (!js_is_object(pv))
+    nf->prototype = js_object_new_cell(ctx);
+    if (!nf->prototype)
         return NULL;
-    nf->prototype = js_value_object(pv);
     if (!js_object_set_ascii(ctx, nf->prototype, "constructor", js_value_from_cell(&nf->gc))) {
         nf->prototype = NULL;
         return NULL;
@@ -1374,10 +1372,10 @@ run:; /* (re)load the top frame */
                 break;
             }
             case JS_OP_NEW_OBJECT: {
-                JsValue o = js_object_new(vm);
-                if (!js_is_object(o))
+                JsObject *no = js_object_new_cell(ctx);
+                if (!no)
                     RT_THROW("out of memory");
-                PUSH(o);
+                PUSH(js_value_from_cell(&no->gc));
                 break;
             }
             case JS_OP_NEW_REGEXP: {
