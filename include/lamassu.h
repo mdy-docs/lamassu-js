@@ -157,9 +157,20 @@ size_t  js_object_size(JsValue obj);
 /* ---- compile & run (single module top level; imports arrive in phase 7) ---- */
 
 /*
+ * The exact *err_msg js_compile_module reports when the source uses top-level
+ * import/export (so it must go through the module pipeline, not run as a plain
+ * script). A host distinguishes "this source is a module" by comparing *err_msg
+ * to this string — an exact match on a shared constant, not a brittle substring
+ * search.
+ */
+#define JS_ERR_NEEDS_MODULE_LOADER \
+    "import/export requires the module loader (js_eval_module)"
+
+/*
  * Compiles UTF-16 source as a strict-mode module body. Returns a function
  * value (root it per the GC contract), or undefined on error with *err_msg
- * (static ASCII) and *err_pos (source offset) set.
+ * (static ASCII) and *err_pos (source offset) set. If the source uses top-level
+ * import/export, compilation fails with *err_msg == JS_ERR_NEEDS_MODULE_LOADER.
  */
 JsValue js_compile_module(JsContext *ctx, const uint16_t *src, size_t len,
                           const char **err_msg, uint32_t *err_pos);

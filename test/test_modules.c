@@ -445,6 +445,27 @@ static void test_reexport_named(void) {
               "info", "lamassu 1.0");
 }
 
+static void test_reexport_live(void) {
+    /* A NAMED re-export is a live binding: importing through the re-exporter
+     * observes a mutation the origin module makes later (not a snapshot taken
+     * at evaluation time). */
+    mod_add("counter2", "export let n = 0; export function inc() { n = n + 1; }");
+    mod_add("passthru", "export { n, inc } from 'counter2';");
+    eq_export("import { n, inc } from 'passthru';"
+              "inc(); inc();"
+              "export const result = n;",
+              "result", "2");
+
+    /* Liveness survives a chained + renamed re-export. */
+    mod_add("counter3", "export let c = 0; export function bump() { c = c + 1; }");
+    mod_add("mid1", "export { c as v, bump } from 'counter3';");
+    mod_add("mid2", "export { v, bump } from 'mid1';");
+    eq_export("import { v, bump } from 'mid2';"
+              "bump(); bump(); bump();"
+              "export const result = v;",
+              "result", "3");
+}
+
 static void test_reexport_ns(void) {
     /* export * as ns from 'm' — namespace re-export (live by reference) */
     mod_add("math", "export const pi = 3.14; export function sq(x) { return x * x; }");
@@ -776,6 +797,7 @@ int main(void) {
     test_cycle();
     test_star_reexport();
     test_reexport_named();
+    test_reexport_live();
     test_reexport_ns();
     test_barrel();
     test_async_module();

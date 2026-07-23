@@ -25,7 +25,6 @@ JsPromise *js_promise_alloc(JsContext *ctx) {
         return NULL;
     JsPromise *p = (JsPromise *)c;
     p->state = JS_PROMISE_PENDING;
-    p->handled = false;
     p->value = js_undefined();
     p->reactions = NULL;
     return p;
@@ -215,7 +214,6 @@ void js_promise_resolve_with(JsContext *ctx, JsPromise *p, JsValue value) {
     if (rx) {
         rx->kind = RX_THEN;
         rx->result = js_value_promise(pv);
-        q->handled = true;
         add_reaction(ctx, js_value_promise(qv), rx);
     }
     js_gc_unprotect(ctx->vm, &qv);
@@ -240,7 +238,6 @@ JsPromise *js_promise_then(JsContext *ctx, JsPromise *p, JsValue on_f, JsValue o
             rx->on_fulfilled = on_f;
             rx->on_rejected = on_r;
             rx->result = js_value_promise(rv);
-            js_value_promise(pv)->handled = true;
             add_reaction(ctx, js_value_promise(pv), rx);
             result = js_value_promise(rv);
         }
@@ -258,7 +255,6 @@ bool js_promise_await(JsContext *ctx, JsPromise *p, JsFiber *fiber) {
         return false;
     rx->kind = RX_AWAIT;
     rx->fiber = fiber; /* fiber is ctx->fiber here, so it stays rooted */
-    p->handled = true;
     add_reaction(ctx, p, rx);
     return true;
 }

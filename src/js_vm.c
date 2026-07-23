@@ -63,6 +63,20 @@ JsVm *js_vm_new(const JsVmConfig *cfg) {
     vm->heap_limit = cfg ? cfg->heap_limit : 0;
     vm->rng_state = cfg && cfg->rng_seed ? cfg->rng_seed
                                          : UINT64_C(0x9E3779B97F4A7C15);
+    /* Derive a fixed string-hash seed only when the embedder supplied a seed.
+     * Left 0 by default so hashing (and thus property/atom iteration order) is
+     * byte-for-byte the historical FNV-1a; a supplied seed both randomizes
+     * Math.random and hardens hashing against HashDoS. splitmix64 finalizer
+     * spreads the 64-bit seed into the 32-bit basis. */
+    if (cfg && cfg->rng_seed) {
+        uint64_t z = cfg->rng_seed + UINT64_C(0x9E3779B97F4A7C15);
+        z = (z ^ (z >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)) * UINT64_C(0x94D049BB133111EB);
+        z = z ^ (z >> 31);
+        vm->hash_seed = (uint32_t)z;
+    } else {
+        vm->hash_seed = 0;
+    }
     return vm;
 }
 
@@ -133,6 +147,7 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->repl_const = NULL;
     ctx->modules = NULL;
     ctx->module_count = ctx->module_cap = 0;
+    js_map_init(&ctx->module_index);
     ctx->loader = NULL;
     ctx->canon = NULL;
     ctx->loader_ud = NULL;

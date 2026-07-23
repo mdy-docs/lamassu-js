@@ -9,13 +9,16 @@
 
 ## Implementation status (2026-07-23)
 
-**Done — all P0 and all P1, plus most of P2.** The full test suite (`make test`, plain + ASan/UBSan) is green, with new regression coverage added (see §5).
+**Done — all P0, all P1, all of P2 except `js_dtoa`, and all of P3 except the math-kernel accuracy rewrite.** The full test suite (`make test`, plain + ASan/UBSan) and the wasm package build (`make pkg`) are green, with regression coverage added (see §5).
 
 - **P0 (memory safety & code execution):** all 7 fixed — CTAG_NUMBER type confusion, `toFixed` stack overflow, module reason UAF (×2), `Array.sort` UAF, object-spread-of-string UAF, `Object.entries` UAF (plus a `js_array_append` rooting hardening that covers the whole class), compiler scratch-slot aliasing.
 - **P1:** all fixed — WS-D (RET_SUB runtime boundary check via a retained instruction bitmap on loaded functions, forged root `n_upvals` reject), WS-E (`heap_limit` now enforced in `js_realloc_raw`, Map/Set backed by an open-addressed value-hash **index** in `src/js_valindex.h`, `verify_pass2` is now a worklist fixpoint), WS-C (`**`/nested-`new`/`JSON.parse` depth guards, VM-wide native-reentry counter + shared per-call-tree fuel), promise reactions now FIFO.
-- **P2:** WS-A cast family (one `to_integer_clamped` helper + `js_to_int32`/strict-`<` bound in `js_to_uint32`, UBSan-clean); `Math.round` (half-to-+∞, −0 preserved, no `x+0.5` bug); `parseFloat('5e')`; strict JSON number grammar; `Promise.prototype.finally` thenable adoption; for-of/for-in `continue` per-iteration `CLOSE_UPVALS`.
-- **P3 (selected):** Map/Set store normalized `+0`; `String.lastIndexOf` honors `fromIndex`.
-- **Deferred (documented):** re-exports live bindings (needs a module-binding indirection refactor), `js_dtoa` extreme-magnitude precision (numeric rewrite, high risk), and the remaining P3 spec-lite/hardening tail — including HashDoS seeding, which conflicts with the engine's deterministic-RNG default and needs a design decision.
+- **P2:** WS-A cast family; `Math.round`; `parseFloat('5e')`; strict JSON number grammar; `Promise.prototype.finally` thenable adoption; for-of/for-in `continue` per-iteration `CLOSE_UPVALS`; **re-exports live bindings** (NAMED re-export chains now resolve at link time to the defining module, so `export { x } from` is a live binding — see `resolve_export` in `src/js_module.c`; `export *`/`export * as` names are still materialized as an eval-time snapshot).
+- **P3 spec-lite:** `**` rejects an unparenthesized unary left operand; `Math.hypot` handles ±Infinity/NaN and scales to avoid overflow; `Number.prototype.toString(radix)` no longer truncates large integers; `JSON.stringify` throws on cycles (and drops its per-property probe buffer); `in` sees Map/Set/RegExp synthesized props; `Date` ISO parse range-validates every field; Map/Set store normalized `+0`; `String.lastIndexOf` honors `fromIndex`.
+- **P3 hardening:** the FNV-1a string hash takes an optional per-VM seed (0 by default → byte-identical hashing; a supplied `rng_seed` randomizes it to defeat HashDoS); the UTF-8 decoders (CLI + wasm) now reject overlong/surrogate/truncated forms as U+FFFD instead of accepting them.
+- **P3 maintainability:** removed the dead `JsPromise.handled` field; indexed the module registry with a hash map; the CLI detects modules via a shared `JS_ERR_NEEDS_MODULE_LOADER` sentinel (not `strstr`), uses a proper `.js` suffix test, and passes the file path (not the source) as the emit-bytecode specifier; de-duplicated the wasm UTF-16↔UTF-8 conversions behind shared primitives.
+- **Backlog / latent (hardened):** the two `*_VARARGS` opcodes cap `argc` (no `(int)` truncation / `sp` overflow); `js_arena_alloc`, regexp `ub_reserve`, and builtins `sb_reserve` guard their size arithmetic against `size_t`/`uint32` wrap; `lamassu_reset` refuses to run while a `__hostcall` is suspended in Asyncify (no fiber UAF on resume).
+- **Deferred (documented):** `js_dtoa` extreme-magnitude precision — a correct shortest-round-trip conversion (Ryū/Dragon4-class) is a large, high-risk numeric rewrite that warrants its own focused effort with round-trip fuzzing. The math-kernel ~1e-12 drift is a documented, intentional accuracy tradeoff ("ample for a templating VM, not a numerics library") and is likewise left as-is.
 
 Items below are checked off as implemented.
 
@@ -131,21 +134,21 @@ Priority = severity × reachability × blast radius. Effort: **S** ≤ half-day,
 - [x] **`parseFloat('5e')` → `NaN`** (should be `5`) · `src/js_builtins.c:2314` — dangling exponent consumed. **S**
 - [x] **`JSON.parse` accepts malformed numbers** (`1e`, `--5`, `1.2.3`, `01`, `1.`) · `src/js_builtins.c:1574` — should throw `SyntaxError`. **M**
 - [x] **`Promise.prototype.finally` ignores `onFinally` return** · `src/js_promise.c:394` — no thenable adoption / rejection propagation. **M**
-- [ ] **Re-exports snapshot-copy values, breaking ES live bindings** · `src/js_module.c:646` — direct imports are live via `GET_IMPORT`; re-exports are not. **M**
+- [x] **Re-exports snapshot-copy values, breaking ES live bindings** · `src/js_module.c:646` — direct imports are live via `GET_IMPORT`; re-exports are not. **M**
 - [ ] **`js_dtoa` inexact for extreme-magnitude doubles** · `src/js_number.c:203` — breaks `Number(x.toString())===x`. **L**
 
 ### P3 — Hardening, spec-lite, maintainability
 
-- [ ] Spec-lite correctness: `in` misses Map/Set/RegExp synth props `src/js_interp.c:594`; `**` accepts unary left operand `src/js_parser.c:1405`; `String.lastIndexOf` ignores position `src/js_builtins.c:262`; `Math.hypot` no Infinity/NaN/scaling `:1335`; `Number.toString(radix)` truncates at 79 digits `:1259`; `JSON.stringify` no cycle detection `:1417`; Map/Set store `-0` unnormalized `src/js_mapobj.c:79`; `Date` ISO parse no range validation `src/js_date.c:228`; math kernels drift ~1e-12 `src/js_mathkernel.c:41`.
-- [ ] Security hardening: **seed the FNV-1a hash** (atoms + object props) to defeat HashDoS `src/js_string.c`; UTF-8 decoders should substitute U+FFFD, not accept overlong/surrogate forms `tools/lamassu.c:42`, `src/wasm_api.c`.
-- [ ] Maintainability: remove dead `JsPromise.handled` or implement unhandled-rejection tracking `src/js_promise.c:28`; index the module registry (currently linear `src/js_module.c:105`); stop routing the CLI on `strstr(err_msg,"module loader")` `tools/lamassu.c:363`; fix `.js` suffix test (uses `strstr`) `:177`; `emit_bytecode` passes source, not path, as specifier `:371`; de-duplicate UTF-16↔UTF-8 conversion (5×) `src/wasm_api.c:116`; `json_str` throwaway per-property probe buffer `src/js_builtins.c:1477`.
+- [x] Spec-lite correctness: `in` misses Map/Set/RegExp synth props `src/js_interp.c:594`; `**` accepts unary left operand `src/js_parser.c:1405`; `String.lastIndexOf` ignores position `src/js_builtins.c:262`; `Math.hypot` no Infinity/NaN/scaling `:1335`; `Number.toString(radix)` truncates at 79 digits `:1259`; `JSON.stringify` no cycle detection `:1417`; Map/Set store `-0` unnormalized `src/js_mapobj.c:79`; `Date` ISO parse no range validation `src/js_date.c:228`; math kernels drift ~1e-12 `src/js_mathkernel.c:41`.
+- [x] Security hardening: **seed the FNV-1a hash** (atoms + object props) to defeat HashDoS `src/js_string.c`; UTF-8 decoders should substitute U+FFFD, not accept overlong/surrogate forms `tools/lamassu.c:42`, `src/wasm_api.c`.
+- [x] Maintainability: remove dead `JsPromise.handled` or implement unhandled-rejection tracking `src/js_promise.c:28`; index the module registry (currently linear `src/js_module.c:105`); stop routing the CLI on `strstr(err_msg,"module loader")` `tools/lamassu.c:363`; fix `.js` suffix test (uses `strstr`) `:177`; `emit_bytecode` passes source, not path, as specifier `:371`; de-duplicate UTF-16↔UTF-8 conversion (5×) `src/wasm_api.c:116`; `json_str` throwaway per-property probe buffer `src/js_builtins.c:1477`.
 
 ### Backlog — plausible/latent (hardening; not currently reachable)
 
-- [ ] `CALL_VARARGS`/`NEW_VARARGS` `uint32` overflow + `(int)argc` truncation · `src/js_interp.c:1694-1696` (needs ~34 GB array).
-- [ ] `js_arena_alloc` size-rounding/chunk overflow · `src/js_arena.c:17` (unreachable on 64-bit).
-- [ ] Regexp `ub_reserve`/`sb_reserve` `uint32` overflow · `src/js_regexp.c:870` (~4–8 GiB).
-- [ ] `lamassu_reset()` from inside a suspended `__hostcall` handler → fiber UAF on resume · `src/wasm_api.c:319`.
+- [x] `CALL_VARARGS`/`NEW_VARARGS` `uint32` overflow + `(int)argc` truncation · `src/js_interp.c:1694-1696` (needs ~34 GB array).
+- [x] `js_arena_alloc` size-rounding/chunk overflow · `src/js_arena.c:17` (unreachable on 64-bit).
+- [x] Regexp `ub_reserve`/`sb_reserve` `uint32` overflow · `src/js_regexp.c:870` (~4–8 GiB).
+- [x] `lamassu_reset()` from inside a suspended `__hostcall` handler → fiber UAF on resume · `src/wasm_api.c:319`.
 
 ---
 

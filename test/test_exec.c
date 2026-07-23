@@ -726,6 +726,51 @@ static void test_audit_regressions(void) {
     free(out);
 }
 
+/* Regressions for the P2/P3 spec-lite, hardening, and latent-overflow items. */
+static void test_audit_p2_p3(void) {
+    /* ** requires a parenthesized unary left operand. */
+    expect_error("-2 ** 2;", RUN_COMPILE_ERR, "**");
+    expect_error("typeof x ** 2;", RUN_COMPILE_ERR, "**");
+    expect_result("(-2) ** 2;", "4");
+    expect_result("2 ** -2;", "0.25");
+    expect_result("2 ** 3 ** 2;", "512"); /* right-assoc */
+
+    /* Math.hypot: Inf/NaN priority and overflow-safe scaling. */
+    expect_result("Math.hypot(3, 4);", "5");
+    expect_result("Math.hypot(Infinity, NaN);", "Infinity");
+    expect_result("Math.hypot(NaN, 2);", "NaN");
+    expect_result("Math.hypot();", "0");
+    expect_result("Math.hypot(1e200, 1e200) < Infinity;", "true"); /* no overflow */
+
+    /* Number.prototype.toString(radix) no longer truncates large integers. */
+    expect_result("(2 ** 100).toString(2).length;", "101");
+    expect_result("(255).toString(16);", "ff");
+
+    /* JSON.stringify throws on a cycle; skips undefined/function values. */
+    expect_error("let a = {}; a.self = a; JSON.stringify(a);", RUN_RUNTIME_ERR, "circular");
+    expect_error("let a = []; a.push(a); JSON.stringify(a);", RUN_RUNTIME_ERR, "circular");
+    expect_result("JSON.stringify({b: 1, c: function(){}, d: undefined}) === '{\"b\":1}' ? 'ok' : 'no';",
+                  "ok");
+
+    /* `in` sees synthesized props. */
+    expect_result("'size' in new Map();", "true");
+    expect_result("'size' in new Set();", "true");
+    expect_result("'source' in /x/;", "true");
+    expect_result("'nope' in new Map();", "false");
+
+    /* Date ISO parse range-validates each field. */
+    expect_result("isNaN(new Date('2024-01-15T25:00:00Z').getTime());", "true");
+    expect_result("isNaN(new Date('2024-01-15T24:00:00Z').getTime());", "false"); /* end-of-day */
+    expect_result("isNaN(new Date('2024-13-01').getTime());", "true");
+    expect_result("isNaN(new Date('2024-01-15T10:30:00+05:30').getTime());", "false");
+
+    /* Spread call/new still works after the argc-overflow guard (a 16M-element
+     * array to trip the cap is impractical here; verify the common path). */
+    expect_result("function sum(...xs){ let s=0; for (const x of xs) s+=x; return s; }"
+                  "let a=[]; for (let i=0;i<1000;i++) a[i]=i; sum(...a);",
+                  "499500");
+}
+
 int main(void) {
     test_arithmetic();
     test_strings();
@@ -749,6 +794,7 @@ int main(void) {
     test_host_globals();
     test_completion_value();
     test_audit_regressions();
+    test_audit_p2_p3();
 
     if (checks_failed) {
         fprintf(stderr, "%d/%d exec checks FAILED\n", checks_failed, checks_run);

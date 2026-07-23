@@ -96,17 +96,20 @@ static bool str_is_default(const JsString *s) {
 
 void js_modules_free_registry(JsContext *ctx) {
     js_realloc_raw(ctx->vm, ctx->modules, (size_t)ctx->module_cap * sizeof(JsModule *), 0);
+    js_map_free(ctx->vm, &ctx->module_index);
     ctx->modules = NULL;
     ctx->module_count = ctx->module_cap = 0;
 }
 
 /* ---- registry ---- */
 
+static JsValue module_value(JsModule *m);
+static JsModule *value_module(JsValue v);
+
 static JsModule *registry_find(JsContext *ctx, JsString *specifier) {
-    for (uint32_t i = 0; i < ctx->module_count; i++)
-        if (ctx->modules[i]->specifier == specifier)
-            return ctx->modules[i];
-    return NULL;
+    bool found;
+    JsValue v = js_map_get(&ctx->module_index, specifier, &found);
+    return found ? value_module(v) : NULL;
 }
 
 static bool registry_add(JsContext *ctx, JsModule *m) {
@@ -120,6 +123,10 @@ static bool registry_add(JsContext *ctx, JsModule *m) {
         ctx->modules = na;
         ctx->module_cap = ncap;
     }
+    /* Index first: if this OOMs, leave the array untouched so the two stay in
+     * sync (a half-added module would be invisible to registry_find). */
+    if (!js_map_set(ctx->vm, &ctx->module_index, m->specifier, module_value(m)))
+        return false;
     ctx->modules[ctx->module_count++] = m;
     return true;
 }
@@ -602,20 +609,39 @@ static JsModule *dep_for_spec(JsModule *m, JsString *spec) {
     return NULL;
 }
 
+/*
+ * Follows NAMED re-export chains so an import binds to the module that actually
+ * *defines* the export (and the local name there), giving `export { x } from`
+ * true live-binding semantics: the importer reads the origin module's live slot
+ * rather than a value snapshotted at evaluation time. `export *` / `export * as`
+ * are not followed here (their names are materialized into the exports object at
+ * eval time). Bounded against re-export cycles.
+ */
+static void resolve_export(JsModule *m, JsString *name, JsModule **out_mod,
+                           JsString **out_name, int depth) {
+    if (depth <= 32) {
+        for (uint32_t i = 0; i < m->star_count; i++) {
+            JsStarExport *re = &m->stars[i];
+            if (re->kind == JS_REEXP_NAMED && re->exported == name && re->source) {
+                resolve_export(re->source, re->imported, out_mod, out_name, depth + 1);
+                return;
+            }
+        }
+    }
+    *out_mod = m;
+    *out_name = name;
+}
+
 static bool link_module(JsContext *ctx, JsModule *m, ModError *err) {
     (void)ctx;
     if (m->status >= JS_MOD_LINKED || m->status == JS_MOD_LINKING)
         return true; /* linked or in-progress (cycle) */
     m->status = JS_MOD_LINKING;
-    for (uint32_t i = 0; i < m->import_count; i++) {
-        JsModule *src = dep_for_spec(m, m->imports[i].specifier);
-        if (!src) {
-            err->msg = "unresolved import";
-            err->pos = 0;
+    /* Link dependencies first so their re-export tables are bound before we
+     * resolve this module's imports through them. */
+    for (uint32_t i = 0; i < m->dep_count; i++)
+        if (m->deps[i] && !link_module(ctx, m->deps[i], err))
             return false;
-        }
-        m->imports[i].source = src;
-    }
     for (uint32_t i = 0; i < m->star_count; i++) {
         JsModule *src = dep_for_spec(m, m->stars[i].specifier);
         if (!src) {
@@ -625,9 +651,25 @@ static bool link_module(JsContext *ctx, JsModule *m, ModError *err) {
         }
         m->stars[i].source = src;
     }
-    for (uint32_t i = 0; i < m->dep_count; i++)
-        if (m->deps[i] && !link_module(ctx, m->deps[i], err))
+    for (uint32_t i = 0; i < m->import_count; i++) {
+        JsModule *src = dep_for_spec(m, m->imports[i].specifier);
+        if (!src) {
+            err->msg = "unresolved import";
+            err->pos = 0;
             return false;
+        }
+        /* Named/default imports follow the source's re-export chain to the
+         * defining module; namespace/side imports bind to the source itself. */
+        if (m->imports[i].imported_name) {
+            JsModule *rmod;
+            JsString *rname;
+            resolve_export(src, m->imports[i].imported_name, &rmod, &rname, 0);
+            m->imports[i].source = rmod;
+            m->imports[i].imported_name = rname;
+        } else {
+            m->imports[i].source = src;
+        }
+    }
     m->status = JS_MOD_LINKED;
     return true;
 }

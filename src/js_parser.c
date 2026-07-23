@@ -1397,6 +1397,13 @@ static JsAstNode *parse_binary(JsParser *p, int min_prec) {
         int prec = binop_prec(k);
         if (prec == 0 || prec < min_prec)
             return left;
+        /* `**` takes an UpdateExpression, not a UnaryExpression, on the left:
+         * `-2 ** 2` / `typeof x ** 2` / `await p ** 2` are ambiguous and a
+         * SyntaxError in real JS. A parenthesized operand carries JS_F_PAREN
+         * (set when its cover collapsed), so `(-2) ** 2` is correctly allowed. */
+        if (k == JS_T_POW && !(left->flags & JS_F_PAREN) &&
+            (left->kind == JS_AST_UNARY || left->kind == JS_AST_AWAIT))
+            return perr_here(p, "unary operator before '**' must be parenthesized");
         if (left->kind == JS_AST_COVER) {
             left = collapse_cover(p, left);
             if (!left)

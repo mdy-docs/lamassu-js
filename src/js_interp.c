@@ -597,6 +597,26 @@ static JsPropStatus has_property(JsContext *ctx, JsValue base, JsValue key,
     if (!js_is_object(base))
         return JS_PROP_TYPE_ERROR;
     JsObject *o = js_value_object(base);
+    /* Synthesized props (RegExp source/flags/lastIndex, Map/Set `size`) must be
+     * visible to `in`, exactly as get_property surfaces them for reads. */
+    {
+        bool handled = false;
+        JsValue tmp;
+#ifdef LAMASSU_HAS_REGEX
+        if (o->obj_kind == JS_OBJ_REGEXP) {
+            if (!js_regexp_prop_get(ctx, o, key, &tmp, &handled))
+                return JS_PROP_OOM;
+        }
+#endif
+        if (o->obj_kind == JS_OBJ_MAP)
+            js_mapobj_prop_get(o, key, &tmp, &handled);
+        else if (o->obj_kind == JS_OBJ_SET)
+            js_setobj_prop_get(o, key, &tmp, &handled);
+        if (handled) {
+            *out = true;
+            return JS_PROP_OK;
+        }
+    }
     if (o->obj_kind == JS_OBJ_ARRAY) {
         uint32_t idx;
         if (key_to_index(key, &idx) && idx < o->elem_count) {
@@ -688,7 +708,7 @@ JsString *js_concat_cells(JsVm *vm, const JsString *a, const JsString *b) {
         memcpy(s->units, a->units, (size_t)a->length * sizeof(uint16_t));
     if (b->length)
         memcpy(s->units + a->length, b->units, (size_t)b->length * sizeof(uint16_t));
-    s->hash = js_units_hash(s->units, len);
+    s->hash = js_units_hash(s->units, len, vm->hash_seed);
     return s;
 }
 
@@ -747,6 +767,12 @@ static void fiber_throw_name(JsContext *ctx, JsFiber *fb, const char *prefix,
 /* ---- closures, upvalues, natives ---- */
 
 #define JS_MAX_FRAMES 2000
+
+/* Upper bound on a spread call/new's argument count. A JsValue-per-arg array
+ * this large is unreachable in practice (~128 MB), but the cap keeps argc well
+ * inside int range (so the (int)argc handed to natives can't truncate to a
+ * negative) and keeps fb->sp + argc from overflowing uint32. */
+#define JS_MAX_CALL_ARGS (1u << 24)
 
 /* Bound on nested interpreter entries. A native (e.g. Array.prototype.forEach)
  * that calls back into a JS closure re-enters run_fiber on the C stack with a
@@ -1706,6 +1732,8 @@ run:; /* (re)load the top frame */
                         RT_THROW("internal error: varargs call on non-array");
                     JsObject *arr = js_value_object(arrv);
                     argc = arr->elem_count;
+                    if (argc > JS_MAX_CALL_ARGS)
+                        RT_THROW("RangeError: too many function arguments");
                     fb->sp--; /* drop the array */
                     if (!stack_ensure(vm, fb, fb->sp + argc + 8))
                         RT_THROW("out of memory");
@@ -1767,6 +1795,8 @@ run:; /* (re)load the top frame */
                         RT_THROW("internal error: varargs new on non-array");
                     JsObject *arr = js_value_object(arrv);
                     argc = arr->elem_count;
+                    if (argc > JS_MAX_CALL_ARGS)
+                        RT_THROW("RangeError: too many function arguments");
                     fb->sp--; /* drop the array */
                     if (!stack_ensure(vm, fb, fb->sp + argc + 8))
                         RT_THROW("out of memory");

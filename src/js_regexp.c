@@ -867,11 +867,21 @@ static void ub_init(UBuf *b, JsVm *vm) {
 static bool ub_reserve(UBuf *b, uint32_t extra) {
     if (b->oom)
         return false;
-    if (b->len + extra <= b->cap)
+    if (extra > UINT32_MAX - b->len) { /* len + extra would wrap uint32 */
+        b->oom = true;
+        return false;
+    }
+    uint32_t need = b->len + extra;
+    if (need <= b->cap)
         return true;
     uint32_t ncap = b->cap ? b->cap * 2 : 32;
-    while (ncap < b->len + extra)
+    while (ncap < need) {
+        if (ncap > UINT32_MAX / 2) { /* next doubling would overflow */
+            ncap = need;
+            break;
+        }
         ncap *= 2;
+    }
     uint16_t *nu = js_realloc_raw(b->vm, b->u, (size_t)b->cap * sizeof(uint16_t),
                                   (size_t)ncap * sizeof(uint16_t));
     if (!nu) {

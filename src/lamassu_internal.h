@@ -188,7 +188,6 @@ struct JsReaction {
 typedef struct JsPromise {
     JsGcCell gc;
     uint8_t state;
-    bool handled;      /* a reject reaction was attached (unhandled-rejection tracking) */
     JsValue value;     /* fulfillment value or rejection reason */
     JsReaction *reactions; /* non-empty only while PENDING */
 } JsPromise;
@@ -369,9 +368,14 @@ struct JsContext {
      * created and only used by REPL-mode compilation. */
     JsObject *repl_scope;
     JsObject *repl_const;
-    /* module registry (cache by canonical specifier; all GC roots) */
+    /* module registry (cache by canonical specifier; all GC roots). The array
+     * is the source of truth for iteration/marking; module_index is a lookup
+     * accelerator (interned specifier -> module value) so resolving an import
+     * is O(1) rather than a linear scan. Its keys/values are kept alive via the
+     * array, so it needs no separate marking. */
     JsModule **modules;
     uint32_t module_count, module_cap;
+    JsMap module_index;
     JsModuleLoader loader;          /* async module loader; may be NULL */
     JsModuleCanonicalizer canon;    /* sync specifier canonicalizer; may be NULL */
     void *loader_ud;                /* shared userdata for loader + canon */
@@ -389,6 +393,10 @@ struct JsVm {
     size_t bytes_live; /* all bytes obtained through js_realloc_raw */
     size_t heap_limit; /* 0 = unlimited; enforced at cell allocation */
     uint64_t rng_state; /* Math.random xorshift state */
+    uint32_t hash_seed; /* per-VM string-hash seed; 0 unless the embedder set a
+                         * seed, in which case it randomizes atom/property hashing
+                         * to defeat HashDoS. Fixed for the VM's lifetime (unlike
+                         * rng_state, which Math.random mutates). */
     uint32_t regexp_live; /* live compiled patterns (each ~sizeof(Program)) */
 
     /* GC */
@@ -486,7 +494,7 @@ void    js_map_free(JsVm *vm, JsMap *m);
 
 /* ---- strings / atoms (js_string.c) ---- */
 
-uint32_t  js_units_hash(const uint16_t *units, size_t len);
+uint32_t  js_units_hash(const uint16_t *units, size_t len, uint32_t seed);
 JsString *js_string_cell_new(JsVm *vm, const uint16_t *units, size_t len);
 JsString *js_atoms_find(JsVm *vm, const uint16_t *units, size_t len, uint32_t hash);
 JsString *js_intern_cell(JsVm *vm, JsString *s); /* canonical string, or NULL on OOM */

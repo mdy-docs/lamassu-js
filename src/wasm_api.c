@@ -58,35 +58,58 @@ static void buf_bytes(const char *b, size_t n) {
 
 static void buf_cstr(const char *s) { buf_bytes(s, strlen(s)); }
 
+/*
+ * Shared UTF-16 <-> UTF-8 primitives (used by every conversion below, so the
+ * encoding tables live in exactly one place).
+ *
+ * Decodes the code unit at u[*i] into a scalar value and advances *i: a valid
+ * surrogate pair combines and consumes two units; an unpaired surrogate yields
+ * U+FFFD (so the emitted UTF-8 is always well-formed, never CESU-8).
+ */
+static unsigned utf16_next_cp(const uint16_t *u, size_t n, size_t *i) {
+    unsigned cp = u[*i];
+    if (cp >= 0xD800 && cp <= 0xDBFF) {
+        if (*i + 1 < n && u[*i + 1] >= 0xDC00 && u[*i + 1] <= 0xDFFF) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (u[*i + 1] - 0xDC00);
+            *i += 2;
+            return cp;
+        }
+        cp = 0xFFFD; /* unpaired high surrogate */
+    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+        cp = 0xFFFD; /* unpaired low surrogate */
+    }
+    *i += 1;
+    return cp;
+}
+
+/* Encodes scalar cp into t[0..3]; returns the byte count (1..4). */
+static int utf8_encode_cp(unsigned cp, char t[4]) {
+    if (cp < 0x80) {
+        t[0] = (char)cp;
+        return 1;
+    } else if (cp < 0x800) {
+        t[0] = (char)(0xC0 | (cp >> 6));
+        t[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    } else if (cp < 0x10000) {
+        t[0] = (char)(0xE0 | (cp >> 12));
+        t[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        t[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    t[0] = (char)(0xF0 | (cp >> 18));
+    t[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    t[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    t[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
 /* append UTF-16 code units as UTF-8 */
 static void buf_utf16(const uint16_t *u, size_t n) {
-    for (size_t i = 0; i < n; i++) {
-        unsigned cp = u[i];
-        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < n && u[i + 1] >= 0xDC00 &&
-            u[i + 1] <= 0xDFFF) {
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (u[i + 1] - 0xDC00);
-            i++;
-        }
+    for (size_t i = 0; i < n;) {
         char t[4];
-        if (cp < 0x80) {
-            t[0] = (char)cp;
-            buf_bytes(t, 1);
-        } else if (cp < 0x800) {
-            t[0] = (char)(0xC0 | (cp >> 6));
-            t[1] = (char)(0x80 | (cp & 0x3F));
-            buf_bytes(t, 2);
-        } else if (cp < 0x10000) {
-            t[0] = (char)(0xE0 | (cp >> 12));
-            t[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-            t[2] = (char)(0x80 | (cp & 0x3F));
-            buf_bytes(t, 3);
-        } else {
-            t[0] = (char)(0xF0 | (cp >> 18));
-            t[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
-            t[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
-            t[3] = (char)(0x80 | (cp & 0x3F));
-            buf_bytes(t, 4);
-        }
+        int len = utf8_encode_cp(utf16_next_cp(u, n, &i), t);
+        buf_bytes(t, (size_t)len);
     }
 }
 
@@ -114,33 +137,12 @@ static bool native_print(JsContext *ctx, JsValue this_val, const JsValue *args,
 
 /* UTF-16 -> malloc'd NUL-terminated UTF-8 (caller frees). */
 static char *utf16_to_utf8_dup(const uint16_t *u, size_t n) {
-    char *out = malloc(n * 4 + 1); /* worst case */
+    char *out = malloc(n * 4 + 1); /* worst case: 4 UTF-8 bytes per unit */
     if (!out)
         return NULL;
     size_t len = 0;
-    for (size_t i = 0; i < n; i++) {
-        unsigned cp = u[i];
-        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < n && u[i + 1] >= 0xDC00 &&
-            u[i + 1] <= 0xDFFF) {
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (u[i + 1] - 0xDC00);
-            i++;
-        }
-        if (cp < 0x80) {
-            out[len++] = (char)cp;
-        } else if (cp < 0x800) {
-            out[len++] = (char)(0xC0 | (cp >> 6));
-            out[len++] = (char)(0x80 | (cp & 0x3F));
-        } else if (cp < 0x10000) {
-            out[len++] = (char)(0xE0 | (cp >> 12));
-            out[len++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-            out[len++] = (char)(0x80 | (cp & 0x3F));
-        } else {
-            out[len++] = (char)(0xF0 | (cp >> 18));
-            out[len++] = (char)(0x80 | ((cp >> 12) & 0x3F));
-            out[len++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-            out[len++] = (char)(0x80 | (cp & 0x3F));
-        }
-    }
+    for (size_t i = 0; i < n;)
+        len += (size_t)utf8_encode_cp(utf16_next_cp(u, n, &i), out + len);
     out[len] = 0;
     return out;
 }
@@ -168,6 +170,12 @@ static JsValue string_value_from_utf8(const char *s) {
     free(u);
     return v;
 }
+
+/* Nonzero while a __hostcall is suspended in Asyncify awaiting the host: the
+ * fiber and VM are live on the paused C stack, so lamassu_reset must not free
+ * them. Declared unconditionally so lamassu_reset compiles in any build; only
+ * the Asyncify hostcall path (below) ever raises it. */
+static int g_hostcall_active;
 
 #ifdef __EMSCRIPTEN__
 /*
@@ -199,7 +207,9 @@ static bool native_hostcall(JsContext *ctx, JsValue this_val, const JsValue *arg
     (void)this_val;
     char *name = argc > 0 ? value_to_utf8_dup(ctx, args[0]) : NULL;
     char *json = argc > 1 ? value_to_utf8_dup(ctx, args[1]) : NULL;
+    g_hostcall_active++;
     char *reply = lamassu_host_call_js(name ? name : "", json ? json : "");
+    g_hostcall_active--;
     free(name);
     free(json);
     if (!reply) {
@@ -278,33 +288,42 @@ static void ensure_vm(void) {
 #endif
 }
 
-/* UTF-8 -> UTF-16 (invalid sequences -> U+FFFD); returns unit count. */
+/*
+ * UTF-8 -> UTF-16. Well-formed only: overlong encodings, surrogate codepoints,
+ * values above U+10FFFF, truncated sequences, and bad continuation bytes each
+ * become one U+FFFD and decoding resyncs at the next byte. Returns unit count.
+ */
 static size_t utf8_to_utf16(const char *in, size_t len, uint16_t *out) {
     size_t n = 0, i = 0;
     const unsigned char *b = (const unsigned char *)in;
     while (i < len) {
-        unsigned cp;
         unsigned char c = b[i];
+        unsigned cp;
+        int seqlen;
+        unsigned min; /* smallest value not overlong for this length */
         if (c < 0x80) {
-            cp = c;
-            i += 1;
-        } else if ((c & 0xE0) == 0xC0 && i + 1 < len) {
-            cp = ((unsigned)(c & 0x1F) << 6) | (b[i + 1] & 0x3F);
-            i += 2;
-        } else if ((c & 0xF0) == 0xE0 && i + 2 < len) {
-            cp = ((unsigned)(c & 0x0F) << 12) | ((unsigned)(b[i + 1] & 0x3F) << 6) |
-                 (b[i + 2] & 0x3F);
-            i += 3;
-        } else if ((c & 0xF8) == 0xF0 && i + 3 < len) {
-            cp = ((unsigned)(c & 0x07) << 18) | ((unsigned)(b[i + 1] & 0x3F) << 12) |
-                 ((unsigned)(b[i + 2] & 0x3F) << 6) | (b[i + 3] & 0x3F);
-            i += 4;
+            out[n++] = c; /* ASCII */
+            i++;
+            continue;
+        } else if ((c & 0xE0) == 0xC0) {
+            cp = c & 0x1F; seqlen = 2; min = 0x80;
+        } else if ((c & 0xF0) == 0xE0) {
+            cp = c & 0x0F; seqlen = 3; min = 0x800;
+        } else if ((c & 0xF8) == 0xF0) {
+            cp = c & 0x07; seqlen = 4; min = 0x10000;
         } else {
-            cp = 0xFFFD;
-            i += 1;
+            out[n++] = 0xFFFD; i++; continue;
         }
-        if (cp > 0x10FFFF)
-            cp = 0xFFFD;
+        bool ok = i + (size_t)seqlen <= len;
+        for (int k = 1; ok && k < seqlen; k++) {
+            unsigned char cc = b[i + (size_t)k];
+            if ((cc & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if (!ok || cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            out[n++] = 0xFFFD; i++; continue;
+        }
+        i += (size_t)seqlen;
         if (cp > 0xFFFF) {
             cp -= 0x10000;
             out[n++] = (uint16_t)(0xD800 + (cp >> 10));
@@ -317,6 +336,13 @@ static size_t utf8_to_utf16(const char *in, size_t len, uint16_t *out) {
 }
 
 EXPORT void lamassu_reset(void) {
+    /* Refuse to reset while a __hostcall is suspended in Asyncify: the current
+     * fiber (and the VM) are still live on the paused C stack and will resume
+     * when the host promise settles. Freeing them here would leave that resume
+     * dereferencing freed memory. The host should settle/finish the hostcall
+     * before resetting. */
+    if (g_hostcall_active)
+        return;
     if (g_vm) {
         js_vm_free(g_vm);
         g_vm = NULL;

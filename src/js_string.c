@@ -1,7 +1,11 @@
 #include "lamassu_internal.h"
 
-uint32_t js_units_hash(const uint16_t *units, size_t len) {
-    uint32_t h = 2166136261u; /* FNV-1a over code units */
+uint32_t js_units_hash(const uint16_t *units, size_t len, uint32_t seed) {
+    /* Seeded FNV-1a over code units. seed == 0 (the default) reproduces the
+     * plain FNV hash exactly; a non-zero per-VM seed (set when the embedder
+     * provides rng_seed) perturbs the basis so an attacker cannot precompute a
+     * colliding key set — HashDoS hardening. */
+    uint32_t h = 2166136261u ^ seed; /* FNV-1a over code units */
     for (size_t i = 0; i < len; i++) {
         h ^= units[i];
         h *= 16777619u;
@@ -18,7 +22,7 @@ JsString *js_string_cell_new(JsVm *vm, const uint16_t *units, size_t len) {
         return NULL;
     JsString *s = (JsString *)c;
     s->length = (uint32_t)len;
-    s->hash = js_units_hash(units, len);
+    s->hash = js_units_hash(units, len, vm->hash_seed);
     s->interned = false;
     if (len)
         memcpy(s->units, units, len * sizeof(uint16_t));
@@ -121,7 +125,7 @@ static bool js_atoms_insert(JsVm *vm, JsString *s) {
 }
 
 JsValue js_atom(JsVm *vm, const uint16_t *units, size_t len) {
-    uint32_t hash = js_units_hash(units, len);
+    uint32_t hash = js_units_hash(units, len, vm->hash_seed);
     JsString *found = js_atoms_find(vm, units, len, hash);
     if (found)
         return js_value_from_cell(&found->gc);

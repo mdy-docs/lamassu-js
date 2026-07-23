@@ -14,6 +14,11 @@ void js_arena_init(JsArena *a, JsVm *vm) {
 }
 
 void *js_arena_alloc(JsArena *a, size_t size) {
+    /* Reject sizes so large that the 8-byte round-up or the chunk-header add
+     * below would wrap size_t (unreachable on 64-bit — the parser never asks
+     * for petabyte allocations — but a cheap guard against silent under-alloc). */
+    if (size > SIZE_MAX - 7 - sizeof(JsArenaChunk))
+        return NULL;
     size = (size + 7) & ~(size_t)7;
     JsArenaChunk *c = a->chunks;
     if (!c || c->size - c->used < size) {

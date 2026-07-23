@@ -2105,18 +2105,18 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
     case JS_AST_IMPORT:
     case JS_AST_EXPORT_ALL:
         if (!cx->module)
-            return cerr(cx, n->pos, "import/export requires the module loader (js_eval_module)");
+            return cerr(cx, n->pos, JS_ERR_NEEDS_MODULE_LOADER);
         /* bindings/deps handled at analyze/link/eval time; no runtime code */
         return true;
     case JS_AST_EXPORT_NAMED:
         if (!cx->module)
-            return cerr(cx, n->pos, "import/export requires the module loader (js_eval_module)");
+            return cerr(cx, n->pos, JS_ERR_NEEDS_MODULE_LOADER);
         if (n->a) /* export <declaration> */
             return compile_stmt(cx, n->a);
         return true; /* export { ... }: bindings resolved by name */
     case JS_AST_EXPORT_DEFAULT: {
         if (!cx->module)
-            return cerr(cx, n->pos, "import/export requires the module loader (js_eval_module)");
+            return cerr(cx, n->pos, JS_ERR_NEEDS_MODULE_LOADER);
         /* exports.default = value */
         note_pos(cx, n->pos);
         if (n->a->kind == JS_AST_FUNC_EXPR || n->a->kind == JS_AST_FUNC_DECL) {

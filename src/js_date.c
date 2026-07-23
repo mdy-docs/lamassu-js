@@ -223,9 +223,16 @@ static double parse_iso(const uint16_t *u, size_t len) {
             if (!read_digits(u, len, &i, 2, &om))
                 return dnan();
         }
+        if (oh > 23 || om > 59) /* timezone offset ±HH:mm, HH 00-23, mm 00-59 */
+            return dnan();
         offset_ms = (double)osign * ((double)oh * 3600000.0 + (double)om * 60000.0);
     }
-    if (i != len || mo < 1 || mo > 12 || d < 1 || d > 31)
+    /* Range-validate every field per the ES Date Time String grammar: an
+     * out-of-range component makes the whole string invalid (NaN), it does not
+     * silently overflow into an adjacent unit. Hour 24 is allowed only as the
+     * end-of-day midnight (minutes/seconds/ms all zero). */
+    if (i != len || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 24 ||
+        (h == 24 && (mi != 0 || s != 0 || ms != 0)) || mi > 59 || s > 59)
         return dnan();
     double t = make_date(y, mo - 1, d, h, mi, s, ms, false);
     if (t != t)

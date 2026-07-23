@@ -38,35 +38,46 @@ static uint8_t *read_file(const char *path, size_t *len_out) {
     return buf;
 }
 
-/* UTF-8 -> UTF-16; invalid sequences become U+FFFD. */
+/*
+ * UTF-8 -> UTF-16. Well-formed only: an overlong encoding, a surrogate
+ * codepoint (U+D800..U+DFFF), a value above U+10FFFF, a truncated sequence, or
+ * a bad continuation byte each becomes a single U+FFFD, and decoding resyncs at
+ * the next byte. This rejects the malformed forms a naive decoder would silently
+ * accept (e.g. 0xC0 0x80 for NUL, or CESU-8 surrogate halves).
+ */
 static uint16_t *utf8_to_utf16(const uint8_t *in, size_t len, size_t *out_len) {
-    uint16_t *out = malloc((len + 1) * sizeof(uint16_t)); /* upper bound */
+    uint16_t *out = malloc((len + 1) * sizeof(uint16_t)); /* <=1 unit per byte */
     if (!out)
         return NULL;
     size_t n = 0, i = 0;
     while (i < len) {
-        uint32_t cp;
         uint8_t b = in[i];
+        uint32_t cp;
+        int seqlen;
+        uint32_t min; /* smallest value not overlong for this length */
         if (b < 0x80) {
-            cp = b;
-            i += 1;
-        } else if ((b & 0xE0) == 0xC0 && i + 1 < len) {
-            cp = ((uint32_t)(b & 0x1F) << 6) | (in[i + 1] & 0x3F);
-            i += 2;
-        } else if ((b & 0xF0) == 0xE0 && i + 2 < len) {
-            cp = ((uint32_t)(b & 0x0F) << 12) | ((uint32_t)(in[i + 1] & 0x3F) << 6) |
-                 (in[i + 2] & 0x3F);
-            i += 3;
-        } else if ((b & 0xF8) == 0xF0 && i + 3 < len) {
-            cp = ((uint32_t)(b & 0x07) << 18) | ((uint32_t)(in[i + 1] & 0x3F) << 12) |
-                 ((uint32_t)(in[i + 2] & 0x3F) << 6) | (in[i + 3] & 0x3F);
-            i += 4;
+            out[n++] = b; /* ASCII fast path */
+            i++;
+            continue;
+        } else if ((b & 0xE0) == 0xC0) {
+            cp = b & 0x1F; seqlen = 2; min = 0x80;
+        } else if ((b & 0xF0) == 0xE0) {
+            cp = b & 0x0F; seqlen = 3; min = 0x800;
+        } else if ((b & 0xF8) == 0xF0) {
+            cp = b & 0x07; seqlen = 4; min = 0x10000;
         } else {
-            cp = 0xFFFD;
-            i += 1;
+            out[n++] = 0xFFFD; i++; continue; /* stray continuation / 0xF8+ */
         }
-        if (cp > 0x10FFFF)
-            cp = 0xFFFD;
+        bool ok = i + (size_t)seqlen <= len;
+        for (int k = 1; ok && k < seqlen; k++) {
+            uint8_t c = in[i + (size_t)k];
+            if ((c & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (c & 0x3F);
+        }
+        if (!ok || cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            out[n++] = 0xFFFD; i++; continue; /* malformed: emit U+FFFD, resync */
+        }
+        i += (size_t)seqlen;
         if (cp > 0xFFFF) {
             cp -= 0x10000;
             out[n++] = (uint16_t)(0xD800 + (cp >> 10));
@@ -174,7 +185,10 @@ static JsValue file_loader(void *ud, JsContext *ctx, const uint16_t *spec, size_
     if (rel[0] == '.' && rel[1] == '/')
         rel += 2;
     char path[2048];
-    bool has_ext = strstr(rel, ".js") != NULL;
+    /* Append ".js" only when the specifier doesn't already end in it — a proper
+     * suffix test, not strstr (which would also match "a.jsx" or "x.js.bak"). */
+    size_t rl = strlen(rel);
+    bool has_ext = rl >= 3 && strcmp(rel + rl - 3, ".js") == 0;
     snprintf(path, sizeof path, "%s/%s%s", g_root_dir, rel, has_ext ? "" : ".js");
 
     size_t bl;
@@ -360,15 +374,22 @@ static int emit_bytecode(const char *src_path, const char *out_path) {
     uint32_t err_pos;
     JsValue fn = js_compile_module(ctx, src, len, &err_msg, &err_pos);
     int status = 0;
-    bool is_module = !js_is_function(fn) && err_msg && strstr(err_msg, "module loader");
+    bool is_module = !js_is_function(fn) && err_msg &&
+                     strcmp(err_msg, JS_ERR_NEEDS_MODULE_LOADER) == 0;
     uint8_t *out = NULL;
     size_t out_len = 0;
     bool have = false;
 
     if (is_module) {
-        /* compile as a standalone module (body + link metadata, no deps) */
+        /* compile as a standalone module (body + link metadata, no deps).
+         * The module identity is the *file's* base name, so derive it from
+         * src_path — not from the source text (spec_base wants a path). */
+        uint16_t pathu[512];
+        size_t pn = 0;
+        for (const char *pc = src_path; *pc && pn < 512; pc++)
+            pathu[pn++] = (uint16_t)(unsigned char)*pc;
         uint16_t spec[256];
-        size_t sn = spec_base(src, len, spec, 256); /* identity = file base name */
+        size_t sn = spec_base(pathu, pn, spec, 256);
         have = js_bytecode_compile_module(ctx, spec, sn, src, len, &out, &out_len,
                                           &err_msg, &err_pos);
         if (!have) {
@@ -548,7 +569,8 @@ int main(int argc, char **argv) {
     const char *err_msg;
     uint32_t err_pos;
     JsValue fn = js_compile_module(ctx, src, len, &err_msg, &err_pos);
-    bool is_module = !js_is_function(fn) && err_msg && strstr(err_msg, "module loader");
+    bool is_module = !js_is_function(fn) && err_msg &&
+                     strcmp(err_msg, JS_ERR_NEEDS_MODULE_LOADER) == 0;
 
     if (is_module) {
         /* the file uses import/export: run it through the module pipeline

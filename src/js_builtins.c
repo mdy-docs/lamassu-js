@@ -92,6 +92,7 @@ typedef struct {
     uint16_t *u;
     uint32_t len, cap;
     bool oom;
+    bool circular; /* set by JSON.stringify on a cyclic structure */
 } StrBuf;
 
 static void sb_init(StrBuf *sb, JsVm *vm) {
@@ -99,16 +100,27 @@ static void sb_init(StrBuf *sb, JsVm *vm) {
     sb->u = NULL;
     sb->len = sb->cap = 0;
     sb->oom = false;
+    sb->circular = false;
 }
 
 static bool sb_reserve(StrBuf *sb, uint32_t extra) {
     if (sb->oom)
         return false;
-    if (sb->len + extra <= sb->cap)
+    if (extra > UINT32_MAX - sb->len) { /* len + extra would wrap uint32 */
+        sb->oom = true;
+        return false;
+    }
+    uint32_t need = sb->len + extra;
+    if (need <= sb->cap)
         return true;
     uint32_t ncap = sb->cap ? sb->cap * 2 : 32;
-    while (ncap < sb->len + extra)
+    while (ncap < need) {
+        if (ncap > UINT32_MAX / 2) { /* next doubling would overflow */
+            ncap = need;
+            break;
+        }
         ncap *= 2;
+    }
     uint16_t *nu = js_realloc_raw(sb->vm, sb->u, (size_t)sb->cap * sizeof(uint16_t),
                                   (size_t)ncap * sizeof(uint16_t));
     if (!nu) {
@@ -1294,18 +1306,21 @@ static bool nm_toString(JsContext *ctx, JsValue tv, const JsValue *args, int arg
         return true;
     }
     static const char *digits = "0123456789abcdefghijklmnopqrstuvwxyz";
-    char buf[128];
+    /* A finite double is < 2^1024, so its integer part is at most 1024 binary
+     * digits (radix 2 is the worst case); size the scratch/output for that plus
+     * a sign, '.', the ~20 fraction digits, and a NUL. */
+    char buf[1152];
     int bi = 0;
     bool neg = x < 0;
     if (neg)
         x = -x;
     double ip = __builtin_floor(x);
     double fp = x - ip;
-    char tmp[80];
+    char tmp[1088];
     int ti = 0;
     if (ip == 0)
         tmp[ti++] = '0';
-    while (ip >= 1 && ti < 79) {
+    while (ip >= 1 && ti < (int)sizeof(tmp) - 1) {
         double q = __builtin_floor(ip / radix);
         int dig = (int)(ip - q * radix);
         tmp[ti++] = digits[dig];
@@ -1317,7 +1332,7 @@ static bool nm_toString(JsContext *ctx, JsValue tv, const JsValue *args, int arg
         buf[bi++] = tmp[ti - 1 - i];
     if (fp > 0) {
         buf[bi++] = '.';
-        for (int i = 0; i < 20 && fp > 0 && bi < 120; i++) {
+        for (int i = 0; i < 20 && fp > 0 && bi < (int)sizeof(buf) - 8; i++) {
             fp *= radix;
             int dig = (int)__builtin_floor(fp);
             buf[bi++] = digits[dig];
@@ -1383,12 +1398,54 @@ static bool math_max(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
 
 static bool math_hypot(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
-    double sum = 0;
+    /* Spec order: any ±Infinity argument yields +Infinity (even alongside a
+     * NaN); otherwise any NaN yields NaN. Coerce every argument first (each is
+     * an observable ToNumber). */
+    double inf = __builtin_inf();
+    bool has_inf = false, has_nan = false;
+    double max = 0;
+    /* two passes need the coerced values, but ToNumber may run user code, so
+     * coerce once into a small buffer growing on demand */
+    double stackv[8];
+    double *vals = stackv;
+    if (argc > 8) {
+        vals = js_realloc_raw(ctx->vm, NULL, 0, (size_t)argc * sizeof(double));
+        if (!vals)
+            return oom(ctx, r);
+    }
     for (int i = 0; i < argc; i++) {
         double v = js_to_number_value(ctx, args[i]);
-        sum += v * v;
+        vals[i] = v;
+        if (v == inf || v == -inf)
+            has_inf = true;
+        else if (v != v)
+            has_nan = true;
+        else {
+            double av = v < 0 ? -v : v;
+            if (av > max)
+                max = av;
+        }
     }
-    *r = js_number(__builtin_sqrt(sum));
+    double result;
+    if (has_inf)
+        result = inf;
+    else if (has_nan)
+        result = __builtin_nan("");
+    else if (max == 0)
+        result = 0;
+    else {
+        /* Scale by the largest magnitude to avoid overflow/underflow in the
+         * squares (hypot(1e200, 1e200) must not overflow to Infinity). */
+        double sum = 0;
+        for (int i = 0; i < argc; i++) {
+            double s = vals[i] / max;
+            sum += s * s;
+        }
+        result = max * __builtin_sqrt(sum);
+    }
+    if (vals != stackv)
+        js_realloc_raw(ctx->vm, vals, (size_t)argc * sizeof(double), 0);
+    *r = js_number(result);
     return true;
 }
 
@@ -1448,8 +1505,16 @@ static void json_quote(StrBuf *sb, const uint16_t *u, uint32_t n) {
     sb_unit(sb, '"');
 }
 
+/* Ancestor chain of objects/arrays currently being serialized, threaded on the
+ * C stack so JSON.stringify can detect a cycle and throw instead of recursing. */
+typedef struct JsonSeen {
+    const JsObject *o;
+    const struct JsonSeen *prev;
+} JsonSeen;
+
 static bool json_str(JsContext *ctx, StrBuf *sb, JsValue v, const uint16_t *indent,
-                     uint32_t indent_len, uint32_t depth, bool *emitted);
+                     uint32_t indent_len, uint32_t depth, const JsonSeen *seen,
+                     bool *emitted);
 
 static void json_newline_indent(StrBuf *sb, const uint16_t *indent, uint32_t indent_len,
                                 uint32_t depth) {
@@ -1461,7 +1526,8 @@ static void json_newline_indent(StrBuf *sb, const uint16_t *indent, uint32_t ind
 }
 
 static bool json_str(JsContext *ctx, StrBuf *sb, JsValue v, const uint16_t *indent,
-                     uint32_t indent_len, uint32_t depth, bool *emitted) {
+                     uint32_t indent_len, uint32_t depth, const JsonSeen *seen,
+                     bool *emitted) {
     *emitted = true;
     if (depth > 200) {
         sb->oom = true;
@@ -1499,6 +1565,16 @@ static bool json_str(JsContext *ctx, StrBuf *sb, JsValue v, const uint16_t *inde
         return true;
     }
     JsObject *o = js_value_object(v);
+    /* Cycle detection: a container that is already an ancestor on the current
+     * serialization path makes the structure circular — throw, as real JS does,
+     * rather than recurse to the depth cap. */
+    for (const JsonSeen *s = seen; s; s = s->prev) {
+        if (s->o == o) {
+            sb->circular = true;
+            return false;
+        }
+    }
+    JsonSeen node = {o, seen};
     if (o->obj_kind == JS_OBJ_ARRAY) {
         sb_unit(sb, '[');
         for (uint32_t i = 0; i < o->elem_count; i++) {
@@ -1506,7 +1582,7 @@ static bool json_str(JsContext *ctx, StrBuf *sb, JsValue v, const uint16_t *inde
                 sb_unit(sb, ',');
             json_newline_indent(sb, indent, indent_len, depth + 1);
             bool em;
-            if (!json_str(ctx, sb, o->elems[i], indent, indent_len, depth + 1, &em))
+            if (!json_str(ctx, sb, o->elems[i], indent, indent_len, depth + 1, &node, &em))
                 return false;
             if (!em)
                 sb_ascii(sb, "null");
@@ -1516,35 +1592,32 @@ static bool json_str(JsContext *ctx, StrBuf *sb, JsValue v, const uint16_t *inde
         sb_unit(sb, ']');
         return true;
     }
-    /* plain object: own string keys (hash order — documented deviation) */
+    /* plain object: own string keys (hash order — documented deviation).
+     * Values are written straight into `sb`; a property whose value emits
+     * nothing (undefined/function) is undone by rewinding sb->len, so no
+     * throwaway per-property buffer is needed. */
     sb_unit(sb, '{');
     bool first = true;
     for (uint32_t i = 0; i < o->props.capacity; i++) {
         JsMapEntry *e = &o->props.entries[i];
         if (!e->key || e->key == JS_MAP_TOMBSTONE)
             continue;
-        bool em;
-        StrBuf probe;
-        sb_init(&probe, ctx->vm);
-        if (!json_str(ctx, &probe, e->value, indent, indent_len, depth + 1, &em)) {
-            sb_free(&probe);
-            sb->oom = true;
-            return false;
-        }
-        if (!em) {
-            sb_free(&probe);
-            continue;
-        }
+        uint32_t mark = sb->len; /* rewind point if the value emits nothing */
         if (!first)
             sb_unit(sb, ',');
-        first = false;
         json_newline_indent(sb, indent, indent_len, depth + 1);
         json_quote(sb, e->key->units, e->key->length);
         sb_unit(sb, ':');
         if (indent_len)
             sb_unit(sb, ' ');
-        sb_units(sb, probe.u, probe.len);
-        sb_free(&probe);
+        bool em;
+        if (!json_str(ctx, sb, e->value, indent, indent_len, depth + 1, &node, &em))
+            return false;
+        if (!em) {
+            sb->len = mark; /* drop the comma/key/colon we just wrote */
+            continue;
+        }
+        first = false;
     }
     if (!first)
         json_newline_indent(sb, indent, indent_len, depth);
@@ -1571,8 +1644,11 @@ static bool json_stringify(JsContext *ctx, JsValue tv, const JsValue *args, int 
     StrBuf sb;
     sb_init(&sb, ctx->vm);
     bool em;
-    if (!json_str(ctx, &sb, ARG(0), indent, indent_len, 0, &em)) {
+    if (!json_str(ctx, &sb, ARG(0), indent, indent_len, 0, NULL, &em)) {
+        bool circular = sb.circular;
         sb_free(&sb);
+        if (circular)
+            return native_throw(ctx, r, "TypeError: Converting circular structure to JSON");
         return oom(ctx, r);
     }
     if (!em) {
