@@ -1086,7 +1086,12 @@ static JsAstNode *parse_arguments(JsParser *p, JsNodeVec *out) {
 static JsAstNode *parse_new_callee(JsParser *p) {
     JsAstNode *base;
     if (TOK(p).kind == JS_T_NEW) {
+        /* `new new … Foo()` recurses parse_new_expr/parse_new_callee once per
+         * `new`; account for it against the depth guard. */
+        if (!enter(p))
+            return NULL;
         base = parse_new_expr(p);
+        leave(p);
         if (!base)
             return NULL;
     } else {
@@ -1402,7 +1407,14 @@ static JsAstNode *parse_binary(JsParser *p, int min_prec) {
         uint32_t pos = left->pos;
         if (!advance(p))
             return NULL;
+        /* Right-associative '**' re-enters parse_binary at the same precedence,
+         * so `a**b**c**…` nests one C-stack frame per operator. Account for the
+         * recursion against the depth guard (flat left-assoc chains loop here
+         * and unwind each step, so they don't accumulate). */
+        if (!enter(p))
+            return NULL;
         JsAstNode *right = parse_binary(p, k == JS_T_POW ? prec : prec + 1);
+        leave(p);
         if (!right)
             return NULL;
         bool logical = k == JS_T_ANDAND || k == JS_T_OROR || k == JS_T_QUESQUES;

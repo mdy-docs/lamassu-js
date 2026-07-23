@@ -136,6 +136,19 @@ static void settle(JsContext *ctx, JsPromise *p, uint8_t state, JsValue value) {
     p->value = value; /* rooted via p from here on */
     p->state = state;
     bool fulfilled = state == JS_PROMISE_FULFILLED;
+    /* Reactions are prepended in add_reaction (O(1)), so the list is in reverse
+     * attachment order. Reverse it here — pure pointer surgery, no allocation
+     * and thus no GC safe point — so handlers fire FIFO, as the spec requires.
+     * Every reaction stays on one of the two lists throughout, so all remain
+     * reachable from p. */
+    JsReaction *fifo = NULL;
+    while (p->reactions) {
+        JsReaction *rx = p->reactions;
+        p->reactions = rx->next;
+        rx->next = fifo;
+        fifo = rx;
+    }
+    p->reactions = fifo;
     /* Keep each reaction linked to p (so it stays traced) until its job is
      * enqueued, then unlink and free it. */
     while (p->reactions) {
@@ -380,33 +393,98 @@ static bool pm_catch(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
     return true;
 }
 
-/* finally: run onFinally, then pass the settlement through unchanged */
+/* finally: run onFinally, then pass the settlement through unchanged — unless
+ * onFinally returns a thenable, in which case the original settlement is
+ * deferred until that thenable settles (and its rejection overrides). */
+
+/* After onFinally's returned thenable fulfills, re-emit the captured original
+ * fulfillment value. */
+static bool finally_value_passthrough(JsContext *ctx, JsValue bound, JsValue tv,
+                                      const JsValue *args, int argc, JsValue *r) {
+    (void)ctx; (void)tv; (void)args; (void)argc;
+    *r = bound; /* the original fulfillment value */
+    return true;
+}
+
+/* After onFinally's returned thenable fulfills, re-throw the captured original
+ * rejection reason. */
+static bool finally_reason_rethrow(JsContext *ctx, JsValue bound, JsValue tv,
+                                   const JsValue *args, int argc, JsValue *r) {
+    (void)ctx; (void)tv; (void)args; (void)argc;
+    *r = bound; /* the original rejection reason */
+    return false;
+}
+
+/* Runs onFinally (bound). Returns true if the caller should fall through to
+ * passing the original settlement along; false if *chain has been set to a
+ * derived promise the caller must adopt, or if onFinally threw (in which case
+ * *threw is set and *r holds the thrown value). `passthrough` re-emits the
+ * original settlement once onFinally's returned thenable settles. */
+static bool finally_run(JsContext *ctx, JsValue bound, JsValue orig,
+                        JsBoundFn passthrough, JsValue *chain,
+                        bool *threw, JsValue *r) {
+    JsVm *vm = ctx->vm;
+    *threw = false;
+    *chain = js_undefined();
+    if (!js_is_function(bound))
+        return true; /* no onFinally: pass the original settlement straight through */
+    JsValue result;
+    if (!js_call(ctx, bound, js_undefined(), NULL, 0, &result)) {
+        *threw = true;
+        *r = result; /* onFinally threw — that rejection wins */
+        return false;
+    }
+    if (!js_is_promise(result))
+        return true; /* non-thenable return is ignored; pass original through */
+    /* onFinally returned a thenable: wait for it, then re-emit `orig`. */
+    js_gc_protect(vm, &result);
+    js_gc_protect(vm, &orig);
+    JsValue passer = js_bound_native_new(ctx, passthrough, orig);
+    JsPromise *chained = js_is_function(passer)
+        ? js_promise_then(ctx, js_value_promise(result), passer, js_undefined())
+        : NULL;
+    js_gc_unprotect(vm, &orig);
+    js_gc_unprotect(vm, &result);
+    if (!chained) {
+        JsString *s = js_ascii_cell(vm, "out of memory");
+        *threw = true;
+        *r = s ? js_value_from_cell(&s->gc) : js_undefined();
+        return false;
+    }
+    *chain = js_value_from_cell(&chained->gc);
+    return false;
+}
+
 static bool finally_on_fulfill(JsContext *ctx, JsValue bound, JsValue tv,
                                const JsValue *args, int argc, JsValue *r) {
     (void)tv;
-    if (js_is_function(bound)) {
-        JsValue ignore;
-        if (!js_call(ctx, bound, js_undefined(), NULL, 0, &ignore)) {
-            *r = ignore;
-            return false;
-        }
+    JsValue chain;
+    bool threw;
+    if (finally_run(ctx, bound, ARG(0), finally_value_passthrough, &chain, &threw, r)) {
+        *r = ARG(0); /* pass the fulfillment value through */
+        return true;
     }
-    *r = ARG(0); /* pass the fulfillment value through */
+    if (threw)
+        return false; /* onFinally threw / OOM: reject with *r */
+    *r = chain; /* adopt the derived promise (resolve_with waits on it) */
     return true;
 }
 
 static bool finally_on_reject(JsContext *ctx, JsValue bound, JsValue tv,
                               const JsValue *args, int argc, JsValue *r) {
     (void)tv;
-    if (js_is_function(bound)) {
-        JsValue ignore;
-        if (!js_call(ctx, bound, js_undefined(), NULL, 0, &ignore)) {
-            *r = ignore;
-            return false;
-        }
+    JsValue chain;
+    bool threw;
+    if (finally_run(ctx, bound, ARG(0), finally_reason_rethrow, &chain, &threw, r)) {
+        *r = ARG(0); /* re-throw the rejection reason */
+        return false;
     }
-    *r = ARG(0); /* re-throw the rejection reason */
-    return false;
+    if (threw)
+        return false; /* onFinally threw / OOM: reject with *r */
+    /* Adopt the derived promise: it re-throws the original reason on fulfil, or
+     * forwards onFinally's own rejection — either way the result rejects. */
+    *r = chain;
+    return true;
 }
 
 static bool pm_finally(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {

@@ -183,6 +183,8 @@ void js_gc_free_cell(JsVm *vm, JsGcCell *c, bool remove_atoms) {
         js_realloc_raw(vm, f->consts, (size_t)f->const_cap * sizeof(JsValue), 0);
         js_realloc_raw(vm, f->lines, (size_t)f->line_cap * sizeof(JsLineEntry), 0);
         js_realloc_raw(vm, f->upvals, (size_t)f->upval_cap * sizeof(JsUpvalDesc), 0);
+        if (f->insn_boundary)
+            js_realloc_raw(vm, f->insn_boundary, f->code_len, 0);
         size = sizeof *f;
         break;
     }
@@ -302,11 +304,9 @@ void js_gc_maybe(JsVm *vm) {
 
 JsGcCell *js_gc_new_cell(JsVm *vm, JsGcKind kind, size_t size) {
     js_gc_maybe(vm);
-    if (vm->heap_limit && vm->bytes_live + size > vm->heap_limit) {
-        js_gc_collect(vm);
-        if (vm->bytes_live + size > vm->heap_limit)
-            return NULL;
-    }
+    /* The heap limit is now enforced uniformly in js_realloc_raw (which this
+     * allocation goes through), so it covers cell headers and bulk buffers
+     * alike — no bespoke pre-check needed here. */
     JsGcCell *c = js_realloc_raw(vm, NULL, 0, size);
     if (!c) {
         js_gc_collect(vm);

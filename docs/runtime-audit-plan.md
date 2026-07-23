@@ -5,6 +5,20 @@
 **Method:** 14 subsystem finders + per-finding adversarial verification with ASan/UBSan repros against `build/lamassu_asan`. Headline crashes and the bytecode type-confusion were reproduced independently.
 **Result:** 58 findings — **53 confirmed** (with repros), **5 plausible/latent**, **0 refuted**.
 
+---
+
+## Implementation status (2026-07-23)
+
+**Done — all P0 and all P1, plus most of P2.** The full test suite (`make test`, plain + ASan/UBSan) is green, with new regression coverage added (see §5).
+
+- **P0 (memory safety & code execution):** all 7 fixed — CTAG_NUMBER type confusion, `toFixed` stack overflow, module reason UAF (×2), `Array.sort` UAF, object-spread-of-string UAF, `Object.entries` UAF (plus a `js_array_append` rooting hardening that covers the whole class), compiler scratch-slot aliasing.
+- **P1:** all fixed — WS-D (RET_SUB runtime boundary check via a retained instruction bitmap on loaded functions, forged root `n_upvals` reject), WS-E (`heap_limit` now enforced in `js_realloc_raw`, Map/Set backed by an open-addressed value-hash **index** in `src/js_valindex.h`, `verify_pass2` is now a worklist fixpoint), WS-C (`**`/nested-`new`/`JSON.parse` depth guards, VM-wide native-reentry counter + shared per-call-tree fuel), promise reactions now FIFO.
+- **P2:** WS-A cast family (one `to_integer_clamped` helper + `js_to_int32`/strict-`<` bound in `js_to_uint32`, UBSan-clean); `Math.round` (half-to-+∞, −0 preserved, no `x+0.5` bug); `parseFloat('5e')`; strict JSON number grammar; `Promise.prototype.finally` thenable adoption; for-of/for-in `continue` per-iteration `CLOSE_UPVALS`.
+- **P3 (selected):** Map/Set store normalized `+0`; `String.lastIndexOf` honors `fromIndex`.
+- **Deferred (documented):** re-exports live bindings (needs a module-binding indirection refactor), `js_dtoa` extreme-magnitude precision (numeric rewrite, high risk), and the remaining P3 spec-lite/hardening tail — including HashDoS seeding, which conflicts with the engine's deterministic-RNG default and needs a design decision.
+
+Items below are checked off as implemented.
+
 > The individual bugs cluster into **five root causes**. Fixing each _class_ is cleaner and more durable than swatting sites, and it is how this plan is organised: strategic **workstreams** (the themes) drive the tactical **phases** (the execution order).
 
 ---
@@ -59,64 +73,64 @@ Priority = severity × reachability × blast radius. Effort: **S** ≤ half-day,
 
 ### P0 — Memory safety & code execution — *do before shipping to any untrusted input*
 
-- [ ] **CTAG_NUMBER type confusion → arbitrary pointer deref** · `src/js_serialize.c:528` · WS-D
+- [x] **CTAG_NUMBER type confusion → arbitrary pointer deref** · `src/js_serialize.c:528` · WS-D
   Trigger: tampered `.jsbc` with a boxed-tag (≥`0xFFF9`) constant → `js_value_cell()->kind` on attacker pointer (reproduced: SEGV in `verify_fn:961`).
   Fix: after decoding, reject any pattern where `!js_is_number(v)`. **S**
-- [ ] **`Number.prototype.toFixed` stack-buffer-overflow** · `src/js_builtins.c:1204-1215` · —
+- [x] **`Number.prototype.toFixed` stack-buffer-overflow** · `src/js_builtins.c:1204-1215` · —
   Trigger: `(0).toFixed(100)` — range-checked to `[0,100]` but buffer is `char digs[64]`; pad loop writes to `digs[100]` (reproduced: ASan stack-buffer-overflow).
   Fix: size buffer for ≥100 digits (or cap digits at 20 per real engines); fix the `nd < 63` extraction cap too. **S**
-- [ ] **Module load/eval failure UAF on the error reason** · `src/js_module.c:417` and `:667` · WS-B
+- [x] **Module load/eval failure UAF on the error reason** · `src/js_module.c:417` and `:667` · WS-B
   Trigger: canonicalizer rejects a specifier (or OOM) → unrooted `reason` freed by `mstate_get`'s allocation before `js_promise_reject` stores it (reproduced deterministically under `gc_stress`).
   Fix: protect `reason`, or fetch the promise/module before allocating the reason. **S**
-- [ ] **`Array.prototype.sort` hands an unrooted element to the comparator** · `src/js_builtins.c:1070` · WS-B
+- [x] **`Array.prototype.sort` hands an unrooted element to the comparator** · `src/js_builtins.c:1070` · WS-B
   Trigger: comparator does `arr.length = k` then allocates → freed element read from the pre-shrink range (reproduced: ASan UAF).
   Fix: root elements / re-validate bounds against mutated `elem_count` each step. **M**
-- [ ] **Object-spread-of-string UAF** · `src/js_interp.c:640` · WS-B
+- [x] **Object-spread-of-string UAF** · `src/js_interp.c:640` · WS-B
   Trigger: `{...'abcdef'}` — single-unit string freed by the next `js_number_to_string` (reproduced under stress).
   Fix: root or store the unit string before the index-string allocation. **S**
-- [ ] **`Object.entries` on an array UAF** · `src/js_builtins.c:1849` · WS-B
+- [x] **`Object.entries` on an array UAF** · `src/js_builtins.c:1849` · WS-B
   Trigger: `Object.entries([...])` — `pair` array freed by `js_number_to_string` before its slots are written (reproduced under stress).
   Fix: fill/root `pair` before the key allocation. **S**
-- [ ] **Compiler scratch-slot aliases a sibling block's live local** · `src/js_compiler.c:360` · —
+- [x] **Compiler scratch-slot aliases a sibling block's live local** · `src/js_compiler.c:360` · —
   Trigger: `{let a=99; o.p++;} {let c=42; o.p++; print(c);}` prints `1` not `42` — `fs->scratch_slot` cached function-wide, never reset by `scope_leave` (reproduced).
   Fix: reset `scratch_slot` on `scope_leave`, or allocate the temp in the current scope. **S**
 
 ### P1 — Sandbox integrity, DoS resistance, untrusted-bytecode robustness
 
-- [ ] **`RET_SUB` jumps to an unchecked offset** · `src/js_interp.c:1847` · WS-D
+- [x] **`RET_SUB` jumps to an unchecked offset** · `src/js_interp.c:1847` · WS-D
   Trigger: crafted `CONST <mid-insn-offset>; RET_SUB` resumes mid-instruction → OOB stack access, bypassing all loader validation (reproduced).
   Fix: retain a boundary check (bitmap or recompute) and validate `ret` at runtime. **M**
-- [ ] **Forged root-function `n_upvals` → NULL deref** · `src/js_serialize.c:410` · WS-D
+- [x] **Forged root-function `n_upvals` → NULL deref** · `src/js_serialize.c:410` · WS-D
   Trigger: root header `n_upvals=1` + `GET_UPVAL 0` passes verification (root is never instantiated by `CLOSURE`) → NULL upvalue deref (reproduced).
   Fix: force `n_upvals == 0` for the depth-0 function. **S**
-- [ ] **`heap_limit` bypass — cap only guards cell headers** · `src/js_gc.c:305` (real fix in `src/js_vm.c:18`) · WS-E
+- [x] **`heap_limit` bypass — cap only guards cell headers** · `src/js_gc.c:305` (real fix in `src/js_vm.c:18`) · WS-E
   Trigger: `for(i<1e6) a[i]=i` overran a 200 KB cap to **8.4 MB (~41×)** — bulk allocs skip the check; unboxed numbers allocate zero cells (measured).
   Fix: enforce in `js_realloc_raw` when `new_size>old_size`, collect-then-recheck, guard sweep reentrancy; drop the bespoke `js_gc_new_cell` check. **M**
-- [ ] **Native-mediated / async calls recurse on the C stack; per-fiber fuel reset defeats the budget** · `src/js_interp.c:2027` (reset at `:2003`) · WS-C
+- [x] **Native-mediated / async calls recurse on the C stack; per-fiber fuel reset defeats the budget** · `src/js_interp.c:2027` (reset at `:2003`) · WS-C
   Trigger: `function f(){ [1].forEach(f); } f()` → SIGSEGV, while `f(){return f()}` correctly throws `RangeError`.
   Fix: VM-wide native-reentry depth counter; do not reset `fb->fuel` per fiber (shared budget). **M**
-- [ ] **Parser `**` right-assoc recursion bypasses depth guard** · `src/js_parser.c:1405` · WS-C
+- [x] **Parser `**` right-assoc recursion bypasses depth guard** · `src/js_parser.c:1405` · WS-C
   Trigger: `a**1**1…` ×100k → stack-overflow crash (reproduced). Fix: `enter()/leave()` on the `**` recursion. **S**
-- [ ] **Parser nested-`new` recursion bypasses depth guard** · `src/js_parser.c:1089` · WS-C
+- [x] **Parser nested-`new` recursion bypasses depth guard** · `src/js_parser.c:1089` · WS-C
   Trigger: `new new … F()` ×100k → stack-overflow crash (reproduced). Fix: depth-account each `new`. **S**
-- [ ] **`JSON.parse` has no nesting depth limit** · `src/js_builtins.c:1753` · WS-C
+- [x] **`JSON.parse` has no nesting depth limit** · `src/js_builtins.c:1753` · WS-C
   Trigger: `JSON.parse('['.repeat(200000))` → SIGSEGV `try/catch` cannot recover (reproduced). Fix: depth cap (mirror `JSON.stringify`'s 200). **S**
-- [ ] **Promise reactions run in reverse (LIFO) registration order** · `src/js_promise.c:160` · —
+- [x] **Promise reactions run in reverse (LIFO) registration order** · `src/js_promise.c:160` · —
   Trigger: handlers attached while pending fire in reverse of attachment — violates spec FIFO for all real async flows.
   Fix: append reactions, or reverse on drain. **S**
-- [ ] **Map/Set are O(n) linear scans → O(n²) bulk build (algorithmic DoS)** · `src/js_mapobj.c:61`, `src/js_setobj.c:50` · WS-E
+- [x] **Map/Set are O(n) linear scans → O(n²) bulk build (algorithmic DoS)** · `src/js_mapobj.c:61`, `src/js_setobj.c:50` · WS-E
   Fix: back Map/Set with the existing open-addressed hash map. **L**
-- [ ] **`verify_pass2` fixpoint is O(n²) time + 32× transient memory (untrusted-load DoS)** · `src/js_serialize.c:824` · WS-E
+- [x] **`verify_pass2` fixpoint is O(n²) time + 32× transient memory (untrusted-load DoS)** · `src/js_serialize.c:824` · WS-E
   Fix: worklist-driven fixpoint instead of full re-sweeps. **M**
 
 ### P2 — Correctness / spec conformance
 
-- [ ] **`double`→int cast family (UB)** · WS-A · `delete arr[idx]` `src/js_interp.c:1572`, `parseInt` radix `:2246`, `JSON.stringify` space `src/js_builtins.c:1512`, `Number.toString` radix `:1237`, `js_to_uint32` 2^63 `src/js_number.c:51`. One helper fixes all. **S–M**
-- [ ] **`for-of`/`for-in` `continue` skips per-iteration `CLOSE_UPVALS`** · `src/js_compiler.c:1712` — continued iterations share a stale loop binding. **M**
-- [ ] **`Math.round` uses `floor(x+0.5)`** · `src/js_builtins.c:2461` — wrong at `0.49999999999999994`, loses `-0`. **S**
-- [ ] **`parseFloat('5e')` → `NaN`** (should be `5`) · `src/js_builtins.c:2314` — dangling exponent consumed. **S**
-- [ ] **`JSON.parse` accepts malformed numbers** (`1e`, `--5`, `1.2.3`, `01`, `1.`) · `src/js_builtins.c:1574` — should throw `SyntaxError`. **M**
-- [ ] **`Promise.prototype.finally` ignores `onFinally` return** · `src/js_promise.c:394` — no thenable adoption / rejection propagation. **M**
+- [x] **`double`→int cast family (UB)** · WS-A · `delete arr[idx]` `src/js_interp.c:1572`, `parseInt` radix `:2246`, `JSON.stringify` space `src/js_builtins.c:1512`, `Number.toString` radix `:1237`, `js_to_uint32` 2^63 `src/js_number.c:51`. One helper fixes all. **S–M**
+- [x] **`for-of`/`for-in` `continue` skips per-iteration `CLOSE_UPVALS`** · `src/js_compiler.c:1712` — continued iterations share a stale loop binding. **M**
+- [x] **`Math.round` uses `floor(x+0.5)`** · `src/js_builtins.c:2461` — wrong at `0.49999999999999994`, loses `-0`. **S**
+- [x] **`parseFloat('5e')` → `NaN`** (should be `5`) · `src/js_builtins.c:2314` — dangling exponent consumed. **S**
+- [x] **`JSON.parse` accepts malformed numbers** (`1e`, `--5`, `1.2.3`, `01`, `1.`) · `src/js_builtins.c:1574` — should throw `SyntaxError`. **M**
+- [x] **`Promise.prototype.finally` ignores `onFinally` return** · `src/js_promise.c:394` — no thenable adoption / rejection propagation. **M**
 - [ ] **Re-exports snapshot-copy values, breaking ES live bindings** · `src/js_module.c:646` — direct imports are live via `GET_IMPORT`; re-exports are not. **M**
 - [ ] **`js_dtoa` inexact for extreme-magnitude doubles** · `src/js_number.c:203` — breaks `Number(x.toString())===x`. **L**
 

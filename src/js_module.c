@@ -414,9 +414,13 @@ static bool graph_enqueue(JsContext *ctx, JsValue statev, JsModule *referrer,
                           JsString *raw_spec);
 
 static void graph_fail(JsContext *ctx, JsObject *state, JsValue reason) {
+    /* reason is typically a just-allocated string held only here; mstate_get
+     * allocates and could otherwise collect it before the reject stores it. */
+    js_gc_protect(ctx->vm, &reason);
     JsValue pv = mstate_get(ctx, state, "promise");
     if (js_is_promise(pv))
         js_promise_reject(ctx, js_value_promise(pv), reason); /* re-settle no-ops */
+    js_gc_unprotect(ctx->vm, &reason);
 }
 
 static bool graph_on_fetched(JsContext *ctx, JsValue bound, JsValue tv,
@@ -664,12 +668,16 @@ static JsValue evaluate(JsContext *ctx, JsModule *m);
 static bool eval_step(JsContext *ctx, JsValue statev);
 
 static void eval_fail_state(JsContext *ctx, JsObject *state, JsValue reason) {
+    /* Root reason across the mstate_get allocations below; it is usually a
+     * fresh string held only in this frame until stored/rejected. */
+    js_gc_protect(ctx->vm, &reason);
     JsModule *m = value_module(mstate_get(ctx, state, "module"));
     m->status = JS_MOD_ERRORED;
     m->eval_error = reason;
     JsValue pv = mstate_get(ctx, state, "promise");
     if (js_is_promise(pv))
         js_promise_reject(ctx, js_value_promise(pv), reason);
+    js_gc_unprotect(ctx->vm, &reason);
 }
 
 static bool eval_on_dep_done(JsContext *ctx, JsValue bound, JsValue tv,

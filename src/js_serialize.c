@@ -417,6 +417,13 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
         *err = "SyntaxError: invalid bytecode function header";
         return NULL;
     }
+    /* The root (depth-0) function is invoked directly, never instantiated by a
+     * CLOSURE op, so its upvalue slots are never bound. A forged n_upvals > 0
+     * would leave GET_UPVAL reading an unbound (NULL) upvalue — reject it. */
+    if (depth == 0 && n_upvals != 0) {
+        *err = "SyntaxError: root function cannot have upvalues";
+        return NULL;
+    }
 
     JsGcCell *c = js_gc_new_cell(vm, JS_KIND_FUNCTION, sizeof(JsFunctionCell));
     if (!c) {
@@ -524,8 +531,16 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
                 }
                 JsValue v;
                 v.bits = (uint64_t)lo | ((uint64_t)hi << 32);
+                /* A tampered cache can carry any 64-bit pattern here. Anything
+                 * with a boxed tag (>= JS_TAG_SPECIAL) would be type-confused
+                 * as a pointer/special downstream, so reject it outright — a
+                 * CTAG_NUMBER constant must decode to an actual number. */
+                if (!js_is_number(v)) {
+                    *err = "SyntaxError: non-number number constant";
+                    goto done;
+                }
                 /* canonicalize any non-canonical NaN bit pattern */
-                if (js_is_number(v) && js_get_number(v) != js_get_number(v))
+                if (js_get_number(v) != js_get_number(v))
                     v = js_number(js_get_number(v));
                 fn->consts[i] = v;
                 break;
@@ -761,7 +776,7 @@ static uint32_t branch_target(const uint8_t *code, uint32_t op_off) {
  * op-info notes for the per-edge deltas; CALL/NEW_ARRAY read their count.
  */
 static bool verify_pass2(JsFunctionCell *fn, const uint8_t *boundary,
-                         int32_t *seen, const char **err) {
+                         int32_t *seen, uint32_t *worklist, const char **err) {
     const uint8_t *code = fn->code;
     uint32_t n = fn->code_len;
     const uint32_t K = JSBC_DEPTHS_PER_OFF;
@@ -770,19 +785,22 @@ static bool verify_pass2(JsFunctionCell *fn, const uint8_t *boundary,
         seen[i] = -1;
 
     uint32_t max_depth = 0;
+    uint32_t wl_len = 0; /* pending states, packed as (off, depth) pairs */
 
     /*
      * Records (off, depth) in `seen`, the per-offset depth set (dedup +
-     * subroutine-polymorphism). RES becomes 1 if this is a newly seen state,
-     * 0 if already present; the macro returns false from the enclosing
-     * function on any rejection (target off a boundary, depth out of range,
-     * or more than K distinct depths at one instruction).
+     * subroutine-polymorphism). A newly seen state is also pushed onto the
+     * worklist for later processing; an already-present one is dropped. The
+     * macro returns false from the enclosing function on any rejection (target
+     * off a boundary, depth out of range, or more than K distinct depths at
+     * one instruction). Because a state is enqueued only on its first sighting,
+     * the worklist holds at most n*K entries over the whole run — the fixpoint
+     * touches each state once instead of re-sweeping all of them per round.
      */
-#define SEED(TARGET, DEPTH, RES)                                               \
+#define SEED(TARGET, DEPTH)                                                    \
     do {                                                                       \
         int32_t _dp = (DEPTH);                                                 \
         uint32_t _t = (TARGET);                                                \
-        (RES) = 0;                                                             \
         if (_dp < 0 || _dp > (int32_t)JSBC_MAX_STACK) {                        \
             *err = "SyntaxError: bytecode stack out of range";                 \
             return false;                                                      \
@@ -804,104 +822,81 @@ static bool verify_pass2(JsFunctionCell *fn, const uint8_t *boundary,
                 return false;                                                  \
             }                                                                  \
             _slot[_free] = _dp;                                                \
-            (RES) = 1;                                                         \
+            worklist[2 * wl_len] = _t;                                         \
+            worklist[2 * wl_len + 1] = (uint32_t)_dp;                          \
+            wl_len++;                                                          \
         }                                                                      \
     } while (0)
 
-    int r;
-    SEED(0, 0, r); /* entry state: empty operand stack at offset 0 */
-    (void)r;
+    SEED(0, 0); /* entry state: empty operand stack at offset 0 */
 
     /*
-     * Fixpoint: sweep the code, propagating from every (off, depth) already in
-     * `seen` to its successors, until a sweep adds nothing. Each (off, depth)
-     * state is added at most once, so productive sweeps are bounded by the
-     * total state count (n*K); `max_sweeps` guards against any non-convergence
-     * on hostile input rather than looping forever.
+     * Worklist fixpoint: pop a discovered (off, depth) state, propagate it to
+     * its successors, and enqueue any that are new. Each state is processed
+     * exactly once, so the whole pass is O(n*K) rather than the O((n*K)^2) of
+     * repeated full sweeps.
      */
-    bool changed = true;
-    uint32_t sweeps = 0;
-    uint32_t max_sweeps = n * K + 4;
-    while (changed) {
-        if (++sweeps > max_sweeps) {
-            *err = "SyntaxError: bytecode control flow does not converge";
+    while (wl_len) {
+        wl_len--;
+        uint32_t off = worklist[2 * wl_len];
+        int32_t d = (int32_t)worklist[2 * wl_len + 1];
+        uint8_t opb = code[off];
+        const JsOpInfo *oi = &js_op_info[opb];
+        uint32_t next = off + 1 + oi->operand_bytes;
+
+        uint32_t min_in = oi->min_in;
+        int32_t delta = oi->delta;
+        if (opb == JS_OP_CALL || opb == JS_OP_NEW) {
+            uint32_t argc = code[off + 1];
+            min_in = argc + 2;
+            delta = -(int32_t)(argc + 1);
+        } else if (opb == JS_OP_NEW_ARRAY) {
+            uint32_t count = code_u16(code, off + 1);
+            min_in = count;
+            delta = 1 - (int32_t)count;
+        }
+        if ((uint32_t)d < min_in) {
+            *err = "SyntaxError: bytecode stack underflow";
             return false;
         }
-        changed = false;
-        uint32_t off = 0;
-        while (off < n) {
-            uint8_t opb = code[off];
-            const JsOpInfo *oi = &js_op_info[opb];
-            uint32_t next = off + 1 + oi->operand_bytes;
-            int32_t *slot = &seen[(size_t)off * K];
-            for (uint32_t si = 0; si < K; si++) {
-                int32_t d = slot[si];
-                if (d < 0)
-                    continue;
+        if ((uint32_t)d > max_depth)
+            max_depth = (uint32_t)d;
+        int32_t ft = d + delta;
 
-                uint32_t min_in = oi->min_in;
-                int32_t delta = oi->delta;
-                if (opb == JS_OP_CALL || opb == JS_OP_NEW) {
-                    uint32_t argc = code[off + 1];
-                    min_in = argc + 2;
-                    delta = -(int32_t)(argc + 1);
-                } else if (opb == JS_OP_NEW_ARRAY) {
-                    uint32_t count = code_u16(code, off + 1);
-                    min_in = count;
-                    delta = 1 - (int32_t)count;
-                }
-                if ((uint32_t)d < min_in) {
-                    *err = "SyntaxError: bytecode stack underflow";
-                    return false;
-                }
-                if ((uint32_t)d > max_depth)
-                    max_depth = (uint32_t)d;
-                int32_t ft = d + delta;
-
-                int res = 0;
-                switch (oi->cf) {
-                case CF_NEXT:
-                    SEED(next, ft, res);
-                    changed |= res;
-                    break;
-                case CF_JUMP:
-                    SEED(branch_target(code, off), ft, res);
-                    changed |= res;
-                    break;
-                case CF_BRANCH: {
-                    SEED(next, ft, res); /* fall-through edge */
-                    changed |= res;
-                    /* Taken edge. Most branches carry the fall-through delta;
-                     * the asymmetric ones override it: CASE/OPT_CALL_CHECK/
-                     * ITER_NEXT pop two on the taken path, TRY_PUSH's handler
-                     * is entered with the thrown value pushed. */
-                    int32_t taken;
-                    if (opb == JS_OP_CASE || opb == JS_OP_OPT_CALL_CHECK ||
-                        opb == JS_OP_ITER_NEXT)
-                        taken = d - 2;
-                    else if (opb == JS_OP_TRY_PUSH)
-                        taken = d + 1;
-                    else
-                        taken = ft;
-                    SEED(branch_target(code, off), taken, res);
-                    changed |= res;
-                    break;
-                }
-                case CF_GOSUB:
-                    /* fall-through resumes at d (RET_SUB pops the return
-                     * address); the subroutine body starts at d+1 */
-                    SEED(next, d, res);
-                    changed |= res;
-                    SEED(branch_target(code, off), d + 1, res);
-                    changed |= res;
-                    break;
-                case CF_RETSUB:
-                case CF_RETURN:
-                case CF_THROW:
-                    break; /* no static successor */
-                }
-            }
-            off = next;
+        switch (oi->cf) {
+        case CF_NEXT:
+            SEED(next, ft);
+            break;
+        case CF_JUMP:
+            SEED(branch_target(code, off), ft);
+            break;
+        case CF_BRANCH: {
+            SEED(next, ft); /* fall-through edge */
+            /* Taken edge. Most branches carry the fall-through delta; the
+             * asymmetric ones override it: CASE/OPT_CALL_CHECK/ITER_NEXT pop
+             * two on the taken path, TRY_PUSH's handler is entered with the
+             * thrown value pushed. */
+            int32_t taken;
+            if (opb == JS_OP_CASE || opb == JS_OP_OPT_CALL_CHECK ||
+                opb == JS_OP_ITER_NEXT)
+                taken = d - 2;
+            else if (opb == JS_OP_TRY_PUSH)
+                taken = d + 1;
+            else
+                taken = ft;
+            SEED(branch_target(code, off), taken);
+            break;
+        }
+        case CF_GOSUB:
+            /* fall-through resumes at d (RET_SUB pops the return address); the
+             * subroutine body starts at d+1 */
+            SEED(next, d);
+            SEED(branch_target(code, off), d + 1);
+            break;
+        case CF_RETSUB:
+        case CF_RETURN:
+        case CF_THROW:
+            break; /* no static successor */
         }
     }
 #undef SEED
@@ -946,14 +941,29 @@ static bool verify_fn(JsContext *ctx, JsFunctionCell *fn, bool is_module,
         *err = "out of memory";
         return false;
     }
+    /* the pass-2 worklist: at most one (off, depth) pair per distinct state,
+     * i.e. n*K states, each two uint32 wide */
+    size_t wl_bytes = (size_t)fn->code_len * JSBC_DEPTHS_PER_OFF * 2 * sizeof(uint32_t);
+    uint32_t *worklist = js_realloc_raw(vm, NULL, 0, wl_bytes);
+    if (!worklist) {
+        js_realloc_raw(vm, seen, seen_bytes, 0);
+        js_realloc_raw(vm, boundary, fn->code_len, 0);
+        *err = "out of memory";
+        return false;
+    }
 
     bool ok = verify_pass1(fn, boundary, is_module, import_count, err) &&
-              verify_pass2(fn, boundary, seen, err);
+              verify_pass2(fn, boundary, seen, worklist, err);
 
-    js_realloc_raw(vm, boundary, fn->code_len, 0);
+    js_realloc_raw(vm, worklist, wl_bytes, 0);
     js_realloc_raw(vm, seen, seen_bytes, 0);
-    if (!ok)
+    if (!ok) {
+        js_realloc_raw(vm, boundary, fn->code_len, 0);
         return false;
+    }
+    /* Retain the instruction-start bitmap so RET_SUB can validate its (runtime,
+     * attacker-influenced) return address lands on an instruction boundary. */
+    fn->insn_boundary = boundary;
 
     /* recurse into nested functions */
     for (uint32_t i = 0; i < fn->const_count; i++) {

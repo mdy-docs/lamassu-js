@@ -243,15 +243,14 @@ static void test_vs_direct(void) {
 
 /* ---- validation / tamper resistance ---- */
 
-/* Serializes a representative program; caller frees *out. */
-static uint8_t *make_valid_bc(size_t *out_len) {
+static void expect_reject(uint8_t *buf, size_t len, const char *what);
+
+/* Serializes `src`; caller frees the returned buffer. */
+static uint8_t *make_valid_bc_src(const char *src, size_t *out_len) {
     CountAlloc ca = {0, 0};
     JsVmConfig cfg = {.realloc_fn = count_realloc, .alloc_ud = &ca};
     JsVm *vm = js_vm_new(&cfg);
     JsContext *ctx = js_context_new(vm);
-    const char *src =
-        "function fact(n){ return n<=1 ? 1 : n*fact(n-1); }"
-        "let s=0; for (const x of [1,2,3,4]) s += fact(x); s;";
     size_t len;
     uint16_t *u = widen(src, &len);
     const char *em;
@@ -271,6 +270,55 @@ static uint8_t *make_valid_bc(size_t *out_len) {
     js_gc_unprotect(vm, &fn);
     js_vm_free(vm);
     return copy;
+}
+
+/* Serializes a representative program; caller frees the returned buffer. */
+static uint8_t *make_valid_bc(size_t *out_len) {
+    return make_valid_bc_src(
+        "function fact(n){ return n<=1 ? 1 : n*fact(n-1); }"
+        "let s=0; for (const x of [1,2,3,4]) s += fact(x); s;",
+        out_len);
+}
+
+/*
+ * WS-D / P0: a CTAG_NUMBER constant whose 8 payload bytes are tampered into a
+ * boxed (non-number) NaN pattern must be rejected at load, not accepted and
+ * later dereferenced as an attacker-controlled pointer. We compile a program
+ * with the distinctive double 1.5 as a constant, find its little-endian bytes
+ * in the serialized buffer, and overwrite the high 16 bits with a boxed tag
+ * (>= 0xFFF9) so js_is_number() becomes false.
+ */
+static void test_ws_d_number_typeconfusion(void) {
+    size_t len;
+    uint8_t *bc = make_valid_bc_src("let x = 1.5; x + 1;", &len);
+    checks_run++;
+    if (!bc) {
+        checks_failed++;
+        fprintf(stderr, "FAIL: could not build bytecode for CTAG_NUMBER test\n");
+        return;
+    }
+    /* 1.5 == 0x3FF8000000000000, little-endian: 00 00 00 00 00 00 F8 3F */
+    const uint8_t pat[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x3F};
+    bool found = false;
+    for (size_t i = 0; i + 8 <= len; i++) {
+        if (memcmp(bc + i, pat, 8) == 0) {
+            uint8_t *t = malloc(len);
+            memcpy(t, bc, len);
+            /* set the top 16 bits (the NaN-box tag) to 0xFFFB (object tag) */
+            t[i + 6] = 0xFB;
+            t[i + 7] = 0xFF;
+            expect_reject(t, len, "CTAG_NUMBER boxed-pointer type confusion");
+            free(t);
+            found = true;
+            break;
+        }
+    }
+    checks_run++;
+    if (!found) {
+        checks_failed++;
+        fprintf(stderr, "FAIL: 1.5 constant not found in bytecode (test needs updating)\n");
+    }
+    free(bc);
 }
 
 /*
@@ -398,6 +446,7 @@ int main(void) {
     test_roundtrip();
     test_vs_direct();
     test_validation();
+    test_ws_d_number_typeconfusion();
     if (checks_failed) {
         fprintf(stderr, "%d/%d bytecode checks FAILED\n", checks_failed, checks_run);
         return 1;

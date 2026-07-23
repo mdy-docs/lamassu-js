@@ -55,10 +55,16 @@ static bool js_array_reserve(JsVm *vm, JsObject *arr, uint32_t want) {
 }
 
 bool js_array_append(JsVm *vm, JsObject *arr, JsValue v) {
-    if (!js_array_reserve(vm, arr, arr->elem_count + 1))
+    /* Root v across the reserve: growth reallocates through js_realloc_raw,
+     * which can collect, and callers routinely pass a freshly-allocated cell
+     * that is otherwise only held in a C local. */
+    if (!js_gc_protect(vm, &v))
         return false;
-    arr->elems[arr->elem_count++] = v;
-    return true;
+    bool ok = js_array_reserve(vm, arr, arr->elem_count + 1);
+    if (ok)
+        arr->elems[arr->elem_count++] = v;
+    js_gc_unprotect(vm, &v);
+    return ok;
 }
 
 bool js_array_set_index(JsVm *vm, JsObject *arr, uint32_t idx, JsValue v) {

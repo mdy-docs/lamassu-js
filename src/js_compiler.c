@@ -301,6 +301,12 @@ static bool scope_leave(JsCompiler *cx, JsScopeMark m) {
     }
     fs->local_count = m.local_count;
     fs->slot_count = m.slot_count;
+    /* The function-wide scratch slot is allocated on demand via slot_count++.
+     * If it was allocated inside the scope now being left, its slot index is
+     * reclaimed here and a sibling scope's local would reuse it — so drop the
+     * cache and let the next scratch use re-allocate above the live locals. */
+    if (fs->scratch_slot >= (int)m.slot_count)
+        fs->scratch_slot = -1;
     if (captured)
         return emit_op_u16(cx, JS_OP_CLOSE_UPVALS, m.slot_count, 0);
     return true;
@@ -2061,8 +2067,18 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
         }
         if (!emit_pops_to(cx, l->continue_depth))
             return false;
-        if (l->continue_target != 0xFFFFFFFF)
+        if (l->continue_target != 0xFFFFFFFF) {
+            /* A direct-jump continue (for-of/for-in) bypasses the body scope's
+             * scope_leave, which is where the per-iteration loop binding is
+             * closed. Close it here too, or a closure captured before the
+             * continue would share the next iteration's binding. (do/while set
+             * a continue_target but have no per-iteration binding, so their
+             * loopvar_slot is -1 and this is skipped.) */
+            if (l->loopvar_slot >= 0 &&
+                !emit_op_u16(cx, JS_OP_CLOSE_UPVALS, (uint16_t)l->loopvar_slot, 0))
+                return false;
             return emit_jump_to(cx, JS_OP_JUMP, 0, l->continue_target);
+        }
         uint32_t patch;
         if (!emit_jump(cx, JS_OP_JUMP, 0, &patch))
             return false;

@@ -24,6 +24,10 @@ typedef struct JsMapObj {
     JsValue *keys;
     JsValue *values; /* parallel to keys; same length/capacity */
     uint32_t count, cap;
+    /* Open-addressed hash index over `keys` (hash(key) -> position); makes
+     * get/has/set O(1). See js_valindex.h. NULL/0 until the first insert. */
+    int32_t *index;
+    uint32_t index_cap;
 } JsMapObj;
 
 static inline bool js_mapobj_is(JsValue v) {

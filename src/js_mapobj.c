@@ -5,6 +5,7 @@
  */
 #include "js_bytecode.h"
 #include "js_mapobj.h"
+#include "js_valindex.h"
 
 #define ARG(i) ((i) < argc ? args[i] : js_undefined())
 
@@ -12,23 +13,6 @@ static bool nthrow(JsContext *ctx, JsValue *r, const char *msg) {
     JsString *s = js_ascii_cell(ctx->vm, msg);
     *r = s ? js_value_from_cell(&s->gc) : js_undefined();
     return false;
-}
-
-/* SameValueZero: like ===, but NaN equals NaN and +0 equals -0; strings
- * compare by content (not every string is interned in this engine, only
- * property keys), objects/functions/booleans/undefined/null by identity
- * (js_same_value is a raw bit compare, which is exactly reference/fixed-
- * pattern equality for those). */
-static bool same_value_zero(JsValue a, JsValue b) {
-    if (js_is_number(a) && js_is_number(b)) {
-        double da = js_get_number(a), db = js_get_number(b);
-        if (da != da)
-            return db != db; /* NaN */
-        return da == db;     /* also true for +0 == -0 */
-    }
-    if (js_is_string(a) && js_is_string(b))
-        return js_string_equals(a, b);
-    return js_same_value(a, b);
 }
 
 static bool is_pair_like(JsValue v) {
@@ -59,16 +43,13 @@ static bool mapobj_reserve(JsVm *vm, JsMapObj *m, uint32_t want) {
 }
 
 static int64_t mapobj_find(const JsMapObj *m, JsValue key) {
-    for (uint32_t i = 0; i < m->count; i++) {
-        if (same_value_zero(m->keys[i], key))
-            return (int64_t)i;
-    }
-    return -1;
+    return js_valindex_find(m->index, m->index_cap, m->keys, key);
 }
 
 /* Existing key: value updated in place, insertion order unchanged (matches
- * spec). New key: appended. */
+ * spec). New key: appended to the ordered arrays and recorded in the index. */
 static bool mapobj_set(JsVm *vm, JsMapObj *m, JsValue key, JsValue value) {
+    key = js_normalize_map_key(key); /* store +0, never -0 */
     int64_t idx = mapobj_find(m, key);
     if (idx >= 0) {
         m->values[(uint32_t)idx] = value;
@@ -79,6 +60,10 @@ static bool mapobj_set(JsVm *vm, JsMapObj *m, JsValue key, JsValue value) {
     m->keys[m->count] = key;
     m->values[m->count] = value;
     m->count++;
+    if (!js_valindex_add(vm, &m->index, &m->index_cap, m->keys, m->count, m->count - 1)) {
+        m->count--; /* roll back the append; index unchanged */
+        return false;
+    }
     return true;
 }
 
@@ -95,6 +80,9 @@ static bool mapobj_delete(JsMapObj *m, JsValue key) {
         m->values[k] = m->values[k + 1];
     }
     m->count--;
+    /* The shift renumbered every entry from i on, so the position index must
+     * be rebuilt against the new ordering. */
+    js_valindex_rebuild(m->index, m->index_cap, m->keys, m->count);
     return true;
 }
 
@@ -111,6 +99,8 @@ static bool alloc_mapobj(JsContext *ctx, JsValue *out) {
     m->keys = NULL;
     m->values = NULL;
     m->count = m->cap = 0;
+    m->index = NULL;
+    m->index_cap = 0;
     *out = js_value_from_cell(c);
     return true;
 }
@@ -199,6 +189,7 @@ static bool map_clear(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     if (!this_map(ctx, tv, &m, r))
         return false;
     m->count = 0;
+    js_valindex_rebuild(m->index, m->index_cap, m->keys, 0); /* empty the index */
     *r = js_undefined();
     return true;
 }
@@ -338,6 +329,7 @@ size_t js_mapobj_release(JsVm *vm, JsObject *o) {
     JsMapObj *m = (JsMapObj *)o;
     js_realloc_raw(vm, m->keys, (size_t)m->cap * sizeof(JsValue), 0);
     js_realloc_raw(vm, m->values, (size_t)m->cap * sizeof(JsValue), 0);
+    js_realloc_raw(vm, m->index, (size_t)m->index_cap * sizeof(int32_t), 0);
     return sizeof(JsMapObj);
 }
 

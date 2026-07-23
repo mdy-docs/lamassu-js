@@ -16,6 +16,10 @@ typedef struct JsSetObj {
     JsObject obj; /* obj_kind == JS_OBJ_SET; props hold expandos only */
     JsValue *items;
     uint32_t count, cap;
+    /* Open-addressed hash index over `items` (hash(value) -> position); makes
+     * add/has O(1). See js_valindex.h. NULL/0 until the first insert. */
+    int32_t *index;
+    uint32_t index_cap;
 } JsSetObj;
 
 static inline bool js_setobj_is(JsValue v) {

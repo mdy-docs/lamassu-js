@@ -638,8 +638,16 @@ bool js_spread_into_object(JsContext *ctx, JsObject *dst, JsValue src) {
         JsString *s = js_value_string(src);
         for (uint32_t i = 0; i < s->length; i++) {
             JsString *c = single_unit_string(vm, s->units[i]);
-            JsString *k = c ? js_intern_cell(vm, js_number_to_string(vm, i)) : NULL;
-            if (!c || !k || !js_map_set(vm, &dst->props, k, js_value_from_cell(&c->gc)))
+            if (!c)
+                return false;
+            /* Root the freshly-made unit string across the key allocation
+             * below (js_number_to_string can collect it otherwise). */
+            JsValue cv = js_value_from_cell(&c->gc);
+            js_gc_protect(vm, &cv);
+            JsString *k = js_intern_cell(vm, js_number_to_string(vm, i));
+            bool ok = k && js_map_set(vm, &dst->props, k, cv);
+            js_gc_unprotect(vm, &cv);
+            if (!ok)
                 return false;
         }
         return true;
@@ -739,6 +747,13 @@ static void fiber_throw_name(JsContext *ctx, JsFiber *fb, const char *prefix,
 /* ---- closures, upvalues, natives ---- */
 
 #define JS_MAX_FRAMES 2000
+
+/* Bound on nested interpreter entries. A native (e.g. Array.prototype.forEach)
+ * that calls back into a JS closure re-enters run_fiber on the C stack with a
+ * fresh fiber, so the per-fiber JS_MAX_FRAMES limit cannot see the depth. This
+ * caps the real C-stack recursion; kept well under JS_MAX_FRAMES since each
+ * level here also nests a full native + interpreter C frame. */
+#define JS_MAX_REENTRY 200
 
 static JsClosure *closure_new(JsVm *vm, JsFunctionCell *fn) {
     size_t sz = sizeof(JsClosure) + (size_t)fn->n_upvals * sizeof(JsUpvalue *);
@@ -1568,8 +1583,7 @@ run:; /* (re)load the top frame */
                 if (js_is_object(b)) {
                     JsObject *o = js_value_object(b);
                     uint32_t idx;
-                    if (o->obj_kind == JS_OBJ_ARRAY && js_is_number(key) &&
-                        (idx = (uint32_t)js_get_number(key)) == js_get_number(key)) {
+                    if (o->obj_kind == JS_OBJ_ARRAY && value_to_index(key, &idx)) {
                         if (idx < o->elem_count)
                             o->elems[idx] = js_undefined();
                     } else {
@@ -1844,7 +1858,8 @@ run:; /* (re)load the top frame */
                  * target need guarding, unlike GOSUB's own target (a static
                  * bytecode field, already validated at load time). */
                 uint32_t ret;
-                if (!value_to_index(POPV(), &ret) || ret >= fn->code_len)
+                if (!value_to_index(POPV(), &ret) || ret >= fn->code_len ||
+                    (fn->insn_boundary && !fn->insn_boundary[ret]))
                     RT_THROW("internal error: bad subroutine return address");
                 ip = ret;
                 break;
@@ -2000,7 +2015,11 @@ static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
     JsFiber *fb = (JsFiber *)fc;
     memset((char *)fb + sizeof(JsGcCell), 0, sizeof *fb - sizeof(JsGcCell));
     fb->error = js_undefined();
-    fb->fuel = ctx->fuel ? ctx->fuel : UINT64_MAX;
+    /* Fuel is a shared budget, not a per-fiber allowance: a fiber spawned by a
+     * native re-entering the interpreter inherits the caller's *remaining*
+     * fuel so a script cannot refill the budget by making nested calls. Only a
+     * fresh top-level run (no current fiber) starts from ctx->fuel. */
+    fb->fuel = ctx->fiber ? ctx->fiber->fuel : (ctx->fuel ? ctx->fuel : UINT64_MAX);
 
     if (!stack_ensure(vm, fb, (uint32_t)(2 + argc) + cl->fn->n_locals +
                                   cl->fn->max_stack + 8)) {
@@ -2027,9 +2046,27 @@ static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
 static JsRunStatus advance_fiber(JsContext *ctx, JsFiber *fb, JsValue *out) {
     JsFiber *saved = ctx->fiber;
     fb->caller = saved;
-    ctx->fiber = fb;
-    JsRunStatus st = run_fiber(ctx, fb, out);
+    ctx->fiber = fb; /* roots fb across any allocation below */
+    JsRunStatus st;
+    /* Bound nested interpreter entries so native-mediated recursion (a native
+     * calling back into JS) cannot exhaust the C stack — the per-fiber frame
+     * limit can't see across the fresh fibers each re-entry spawns. */
+    if (ctx->reentry_depth >= JS_MAX_REENTRY) {
+        JsString *s = js_ascii_cell(ctx->vm, "RangeError: maximum call stack size exceeded");
+        fb->error = s ? js_value_from_cell(&s->gc) : js_undefined();
+        fb->failed = true;
+        *out = fb->error;
+        st = JS_RUN_ERROR;
+    } else {
+        ctx->reentry_depth++;
+        st = run_fiber(ctx, fb, out);
+        ctx->reentry_depth--;
+    }
     ctx->fiber = saved;
+    /* Return the fiber's remaining fuel to its caller so the shared budget
+     * keeps decreasing across the whole call tree. */
+    if (saved)
+        saved->fuel = fb->fuel;
     if (fb->result_promise) {
         if (st == JS_RUN_DONE)
             js_promise_resolve_with(ctx, fb->result_promise, *out);

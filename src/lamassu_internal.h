@@ -107,6 +107,12 @@ typedef struct JsFunctionCell {
     uint32_t n_locals, max_stack;
     JsString *name;     /* may be NULL */
     JsModule *module;   /* module this fn belongs to (exports/imports); may be NULL */
+    /* Retained instruction-start bitmap (one byte per code byte), populated by
+     * the bytecode verifier and kept ONLY for functions loaded from an
+     * untrusted cache. NULL for compiler-emitted functions, whose RET_SUB
+     * return addresses cannot be forged. Lets RET_SUB reject a return address
+     * that lands mid-instruction. */
+    uint8_t *insn_boundary;
 } JsFunctionCell;
 
 typedef struct JsFiber JsFiber;
@@ -372,6 +378,9 @@ struct JsContext {
     JsFiber *fiber;     /* current/last fiber; GC root */
     uint64_t fuel;      /* budget for new runs; 0 = unlimited */
     uint32_t error_pos; /* source offset of last runtime error */
+    uint32_t reentry_depth; /* nested interpreter entries (native re-entry);
+                             * bounds C-stack recursion the per-fiber frame
+                             * limit can't see */
 };
 
 struct JsVm {

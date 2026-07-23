@@ -23,6 +23,20 @@ void *js_realloc_raw(JsVm *vm, void *ptr, size_t old_size, size_t new_size) {
         }
         return NULL;
     }
+    /* Enforce the heap limit at the single byte-accounting choke point so that
+     * bulk allocations (array/string buffers, hash tables) are capped too, not
+     * just cell headers. Only net growth can breach the limit; a shrink or a
+     * move to a smaller size never does. Skip while the collector is running:
+     * its own bookkeeping must not recurse into a collect, and sweep only frees
+     * (shrinks) anyway. */
+    if (vm->heap_limit && new_size > old_size && !vm->gc_running) {
+        size_t grow = new_size - old_size;
+        if (vm->bytes_live + grow > vm->heap_limit) {
+            js_gc_collect(vm);
+            if (vm->bytes_live + grow > vm->heap_limit)
+                return NULL;
+        }
+    }
     void *p = vm->realloc_fn(vm->alloc_ud, ptr, old_size, new_size);
     if (p)
         vm->bytes_live = vm->bytes_live - old_size + new_size;
@@ -125,6 +139,7 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->fiber = NULL;
     ctx->fuel = 0;
     ctx->error_pos = 0;
+    ctx->reentry_depth = 0;
 
     JsValue globals = js_object_new(ctx); /* safe point; ctx->object_proto is
                                            * still NULL, so this correctly

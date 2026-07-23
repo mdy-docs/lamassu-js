@@ -47,8 +47,11 @@ int32_t js_to_int32(double d) {
 uint32_t js_to_uint32(double d) {
     if (d != d)
         return 0;
-    /* Fast path: representable in int64 (covers |d| < 2^63). */
-    if (d >= -9.2233720368547758e18 && d <= 9.2233720368547758e18)
+    /* Fast path: representable in int64 (covers |d| < 2^63). The upper bound is
+     * strict: the literal rounds to exactly 2^63, which is INT64_MAX+1, so
+     * casting it to int64 is UB — leave d == 2^63 to the slow path below. The
+     * lower bound may be inclusive since -2^63 == INT64_MIN is representable. */
+    if (d >= -9.2233720368547758e18 && d < 9.2233720368547758e18)
         return (uint32_t)(uint64_t)(int64_t)d;
     union { double d; uint64_t u; } pun;
     pun.d = d;

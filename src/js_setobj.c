@@ -5,6 +5,7 @@
  */
 #include "js_bytecode.h"
 #include "js_setobj.h"
+#include "js_valindex.h"
 
 #define ARG(i) ((i) < argc ? args[i] : js_undefined())
 
@@ -12,22 +13,6 @@ static bool nthrow(JsContext *ctx, JsValue *r, const char *msg) {
     JsString *s = js_ascii_cell(ctx->vm, msg);
     *r = s ? js_value_from_cell(&s->gc) : js_undefined();
     return false;
-}
-
-/* SameValueZero, same as Map's: NaN equals NaN, +0 equals -0, strings by
- * content (not every string is interned here, only property keys),
- * everything else (objects/functions/booleans/undefined/null) by identity
- * via js_same_value's raw bit compare. */
-static bool same_value_zero(JsValue a, JsValue b) {
-    if (js_is_number(a) && js_is_number(b)) {
-        double da = js_get_number(a), db = js_get_number(b);
-        if (da != da)
-            return db != db;
-        return da == db;
-    }
-    if (js_is_string(a) && js_is_string(b))
-        return js_string_equals(a, b);
-    return js_same_value(a, b);
 }
 
 /* ---- storage ---- */
@@ -48,21 +33,22 @@ static bool setobj_reserve(JsVm *vm, JsSetObj *s, uint32_t want) {
 }
 
 static int64_t setobj_find(const JsSetObj *s, JsValue value) {
-    for (uint32_t i = 0; i < s->count; i++) {
-        if (same_value_zero(s->items[i], value))
-            return (int64_t)i;
-    }
-    return -1;
+    return js_valindex_find(s->index, s->index_cap, s->items, value);
 }
 
 /* Already present: no-op (insertion order is unchanged, matching spec).
- * New: appended. */
+ * New: appended to the ordered array and recorded in the index. */
 static bool setobj_add(JsVm *vm, JsSetObj *s, JsValue value) {
+    value = js_normalize_map_key(value); /* store +0, never -0 */
     if (setobj_find(s, value) >= 0)
         return true;
     if (!setobj_reserve(vm, s, s->count + 1))
         return false;
     s->items[s->count++] = value;
+    if (!js_valindex_add(vm, &s->index, &s->index_cap, s->items, s->count, s->count - 1)) {
+        s->count--; /* roll back the append; index unchanged */
+        return false;
+    }
     return true;
 }
 
@@ -76,6 +62,8 @@ static bool setobj_delete(JsSetObj *s, JsValue value) {
     for (uint32_t k = i; k + 1 < s->count; k++)
         s->items[k] = s->items[k + 1];
     s->count--;
+    /* The shift renumbered every entry from i on; rebuild the position index. */
+    js_valindex_rebuild(s->index, s->index_cap, s->items, s->count);
     return true;
 }
 
@@ -91,6 +79,8 @@ static bool alloc_setobj(JsContext *ctx, JsValue *out) {
     s->obj.proto = ctx->set_proto ? js_value_from_cell(&ctx->set_proto->gc) : js_undefined();
     s->items = NULL;
     s->count = s->cap = 0;
+    s->index = NULL;
+    s->index_cap = 0;
     *out = js_value_from_cell(c);
     return true;
 }
@@ -169,6 +159,7 @@ static bool set_clear(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     if (!this_set(ctx, tv, &s, r))
         return false;
     s->count = 0;
+    js_valindex_rebuild(s->index, s->index_cap, s->items, 0); /* empty the index */
     *r = js_undefined();
     return true;
 }
@@ -296,6 +287,7 @@ void js_setobj_mark(JsVm *vm, JsObject *o) {
 size_t js_setobj_release(JsVm *vm, JsObject *o) {
     JsSetObj *s = (JsSetObj *)o;
     js_realloc_raw(vm, s->items, (size_t)s->cap * sizeof(JsValue), 0);
+    js_realloc_raw(vm, s->index, (size_t)s->index_cap * sizeof(int32_t), 0);
     return sizeof(JsSetObj);
 }
 

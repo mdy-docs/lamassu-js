@@ -38,6 +38,28 @@ static double to_int(double d) {
     return __builtin_trunc(d);
 }
 
+/*
+ * ES ToInteger, then saturate into [lo, hi]. The result is guaranteed to lie
+ * in [lo, hi], so the caller may cast it to a bounded integer type without the
+ * undefined behavior of casting a NaN/Infinity/out-of-range double directly.
+ * NaN maps to lo; ±Infinity and out-of-range finite values clamp to the nearer
+ * bound. Every radix/count/space cast routes through here.
+ */
+static double to_integer_clamped(double d, double lo, double hi) {
+    if (d != d)
+        return lo; /* NaN */
+    if (d == __builtin_inf())
+        return hi;
+    if (d == -__builtin_inf())
+        return lo;
+    d = __builtin_trunc(d);
+    if (d < lo)
+        return lo;
+    if (d > hi)
+        return hi;
+    return d;
+}
+
 /* clamp a relative index (negative counts from end) into [0, len] */
 static uint32_t clamp_index(double d, uint32_t len) {
     d = to_int(d);
@@ -266,8 +288,18 @@ static bool sm_lastIndexOf(JsContext *ctx, JsValue tv, const JsValue *args, int 
     JsString *n = arg_string(ctx, ARG(0));
     if (!n)
         return oom(ctx, r);
+    /* fromIndex: the last match whose start index is <= fromIndex. Defaults to
+     * +Infinity (whole string); NaN is also treated as +Infinity per spec. */
+    double posd = argc > 1 ? js_to_number_value(ctx, ARG(1)) : __builtin_inf();
+    uint32_t limit;
+    if (posd != posd || posd >= (double)s->length)
+        limit = s->length;
+    else if (posd < 0)
+        limit = 0;
+    else
+        limit = (uint32_t)posd;
     long found = -1;
-    for (long i = 0; i + (long)n->length <= (long)s->length; i++) {
+    for (long i = 0; i + (long)n->length <= (long)s->length && i <= (long)limit; i++) {
         uint32_t j = 0;
         while (j < n->length && s->units[i + j] == n->units[j])
             j++;
@@ -444,8 +476,10 @@ static bool sm_pad(JsContext *ctx, JsValue tv, const JsValue *args, int argc, Js
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
-    double td = to_int(js_to_number_value(ctx, ARG(0)));
-    uint32_t target = td > 0 ? (uint32_t)td : 0;
+    /* Clamp the target length into [0, UINT32_MAX] before the cast so an
+     * Infinity/huge argument can't UB; an oversized target still means "pad a
+     * lot" and is bounded by allocation limits downstream. */
+    uint32_t target = (uint32_t)to_integer_clamped(js_to_number_value(ctx, ARG(0)), 0, 4294967295.0);
     if (target <= s->length)
         return make_substr(ctx, s, 0, s->length, r);
     JsString *pad;
@@ -1066,8 +1100,12 @@ static bool am_sort(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
         while (lo < hi) {
             uint32_t mid = (lo + hi) / 2;
             int c; /* c>0 means a->elems[mid] should come after key */
+            /* A user comparator (or a user toString) may mutate — even shrink —
+             * the array, freeing the slot `mid` used to name. Re-read against
+             * the current elem_count so we never touch a freed element. */
+            JsValue midv = mid < a->elem_count ? a->elems[mid] : js_undefined();
             if (has_cmp) {
-                JsValue argv[2] = {a->elems[mid], key};
+                JsValue argv[2] = {midv, key};
                 JsValue res;
                 if (!js_call(ctx, cmp, js_undefined(), argv, 2, &res)) {
                     *r = res;
@@ -1077,7 +1115,7 @@ static bool am_sort(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
                 double d = js_to_number_value(ctx, res);
                 c = d > 0 ? 1 : (d < 0 ? -1 : 0);
             } else {
-                JsString *sa = js_to_string_cell(ctx, a->elems[mid], 0);
+                JsString *sa = js_to_string_cell(ctx, midv, 0);
                 JsString *sk = js_to_string_cell(ctx, key, 0);
                 if (!sa || !sk) {
                     failed = true;
@@ -1101,6 +1139,10 @@ static bool am_sort(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
         }
         if (failed)
             break;
+        /* If the comparator shrank the array below i, the insertion slot no
+         * longer exists — skip placing this key rather than writing OOB. */
+        if (i >= a->elem_count)
+            continue;
         for (uint32_t j = i; j > lo; j--)
             a->elems[j] = a->elems[j - 1];
         a->elems[lo] = key;
@@ -1181,7 +1223,10 @@ static bool nm_toFixed(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     if (dd < 0 || dd > 100)
         return native_throw(ctx, r, "RangeError: toFixed() digits out of range");
     int d = (int)dd;
-    char buf[128];
+    /* x < 1e21 gives <=21 integer digits; plus up to 100 fraction digits, a
+     * sign, a '.', and a NUL. Size both scratch buffers for the worst case so
+     * neither the digit extraction nor the assembly can overrun. */
+    char buf[160];
     if (x != x) {
         *r = js_value_from_cell(&js_ascii_cell(ctx->vm, "NaN")->gc);
         return true;
@@ -1201,11 +1246,11 @@ static bool nm_toFixed(JsContext *ctx, JsValue tv, const JsValue *args, int argc
         scale *= 10.0;
     double scaled = __builtin_floor(x * scale + 0.5);
     /* build digits of `scaled` (an integer) */
-    char digs[64];
+    char digs[160];
     int nd = 0;
     if (scaled == 0)
         digs[nd++] = '0';
-    while (scaled >= 1 && nd < 63) {
+    while (scaled >= 1 && nd < (int)sizeof(digs) - 1) {
         double q = __builtin_floor(scaled / 10.0);
         int dig = (int)(scaled - q * 10.0);
         digs[nd++] = (char)('0' + dig);
@@ -1234,7 +1279,11 @@ static bool nm_toFixed(JsContext *ctx, JsValue tv, const JsValue *args, int argc
 
 static bool nm_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     double x = js_to_number_value(ctx, tv);
-    int radix = argc > 0 && !js_is_undefined(ARG(0)) ? (int)to_int(js_to_number_value(ctx, ARG(0))) : 10;
+    /* Clamp to [0,37] before the cast (avoids UB on Infinity/NaN/huge); an
+     * out-of-range radix lands outside 2..36 and is rejected just below. */
+    int radix = argc > 0 && !js_is_undefined(ARG(0))
+                    ? (int)to_integer_clamped(js_to_number_value(ctx, ARG(0)), 0, 37)
+                    : 10;
     if (radix < 2 || radix > 36)
         return native_throw(ctx, r, "RangeError: toString() radix must be 2..36");
     if (radix == 10 || x != x || x == __builtin_inf() || x == -__builtin_inf()) {
@@ -1509,9 +1558,9 @@ static bool json_stringify(JsContext *ctx, JsValue tv, const JsValue *args, int 
     uint32_t indent_len = 0;
     JsValue space = ARG(2);
     if (js_is_number(space)) {
-        int n = (int)to_int(js_to_number_value(ctx, space));
-        if (n > 10)
-            n = 10;
+        /* space count is clamped to [0,10]; route through to_integer_clamped so
+         * an Infinity/NaN/huge argument can't UB on the cast to int */
+        int n = (int)to_integer_clamped(js_to_number_value(ctx, space), 0, 10);
         for (int i = 0; i < n; i++)
             indent[indent_len++] = ' ';
     } else if (js_is_string(space)) {
@@ -1542,7 +1591,12 @@ typedef struct {
     const uint16_t *u;
     uint32_t len, pos;
     bool error;
+    int depth;
 } JsonP;
+
+/* Nesting cap for JSON.parse — bounds C-stack recursion on hostile input like
+ * `[`.repeat(N). Mirrors JSON.stringify's own depth limit. */
+#define JSON_PARSE_MAX_DEPTH 200
 
 static void json_ws(JsonP *p) {
     while (p->pos < p->len) {
@@ -1555,6 +1609,7 @@ static void json_ws(JsonP *p) {
 }
 
 static bool json_value(JsonP *p, JsValue *out);
+static bool json_value_body(JsonP *p, JsValue *out);
 
 static bool json_lit(JsonP *p, const char *word, JsValue v, JsValue *out) {
     for (uint32_t i = 0; word[i]; i++) {
@@ -1571,19 +1626,49 @@ static bool json_lit(JsonP *p, const char *word, JsValue v, JsValue *out) {
     return true;
 }
 
+/* Strict JSON number grammar (RFC 8259):
+ *   number = [ "-" ] int [ frac ] [ exp ]
+ *   int    = "0" / (digit1-9 *digit)     -- no leading zeros
+ *   frac   = "." 1*digit                 -- no bare trailing dot
+ *   exp    = ("e"/"E") ["+"/"-"] 1*digit -- no dangling exponent
+ * Rejects the lenient forms the old greedy scan let through: 01, 1., 1e,
+ * --5, 1.2.3 (the trailing ".3" is left for the caller to reject). */
 static bool json_number(JsonP *p, JsValue *out) {
     uint32_t start = p->pos;
+#define JN_DIGIT(pos) ((pos) < p->len && p->u[(pos)] >= '0' && p->u[(pos)] <= '9')
     if (p->pos < p->len && p->u[p->pos] == '-')
         p->pos++;
-    while (p->pos < p->len && ((p->u[p->pos] >= '0' && p->u[p->pos] <= '9') ||
-                              p->u[p->pos] == '.' || p->u[p->pos] == 'e' ||
-                              p->u[p->pos] == 'E' || p->u[p->pos] == '+' ||
-                              p->u[p->pos] == '-'))
-        p->pos++;
-    if (p->pos == start) {
+    if (!JN_DIGIT(p->pos)) {
         p->error = true;
         return false;
     }
+    if (p->u[p->pos] == '0') {
+        p->pos++; /* a leading zero stands alone — no further integer digits */
+    } else {
+        while (JN_DIGIT(p->pos))
+            p->pos++;
+    }
+    if (p->pos < p->len && p->u[p->pos] == '.') {
+        p->pos++;
+        if (!JN_DIGIT(p->pos)) {
+            p->error = true;
+            return false;
+        }
+        while (JN_DIGIT(p->pos))
+            p->pos++;
+    }
+    if (p->pos < p->len && (p->u[p->pos] == 'e' || p->u[p->pos] == 'E')) {
+        p->pos++;
+        if (p->pos < p->len && (p->u[p->pos] == '+' || p->u[p->pos] == '-'))
+            p->pos++;
+        if (!JN_DIGIT(p->pos)) {
+            p->error = true;
+            return false;
+        }
+        while (JN_DIGIT(p->pos))
+            p->pos++;
+    }
+#undef JN_DIGIT
     *out = js_number(js_units_to_number(p->u + start, p->pos - start));
     return true;
 }
@@ -1650,7 +1735,20 @@ static bool json_string_raw(JsonP *p, JsString **out) {
     return false;
 }
 
+/* Depth-guarded entry: bounds recursion before descending into json_value_body,
+ * which recurses back through json_value for nested arrays/objects. */
 static bool json_value(JsonP *p, JsValue *out) {
+    if (++p->depth > JSON_PARSE_MAX_DEPTH) {
+        p->error = true;
+        p->depth--;
+        return false;
+    }
+    bool ok = json_value_body(p, out);
+    p->depth--;
+    return ok;
+}
+
+static bool json_value_body(JsonP *p, JsValue *out) {
     json_ws(p);
     if (p->pos >= p->len) {
         p->error = true;
@@ -1805,7 +1903,7 @@ static bool json_parse(JsContext *ctx, JsValue tv, const JsValue *args, int argc
         return oom(ctx, r);
     JsValue sv = js_value_from_cell(&s->gc);
     js_gc_protect(ctx->vm, &sv);
-    JsonP p = {ctx, s->units, s->length, 0, false};
+    JsonP p = {ctx, s->units, s->length, 0, false, 0};
     JsValue out;
     bool ok = json_value(&p, &out);
     if (ok) {
@@ -1847,12 +1945,18 @@ static bool obj_keys_impl(JsContext *ctx, JsValue tv, const JsValue *args, int a
                     entry = o->elems[i];
                 } else {
                     JsObject *pair = js_array_new_cell(ctx, 2);
+                    if (!pair) { ok = false; break; }
+                    /* Root pair across the key allocation before its slots are
+                     * written — js_number_to_string can otherwise collect it. */
+                    JsValue pairv = js_value_from_cell(&pair->gc);
+                    js_gc_protect(ctx->vm, &pairv);
                     JsString *k = js_number_to_string(ctx->vm, i);
-                    if (!pair || !k) { ok = false; break; }
+                    if (!k) { js_gc_unprotect(ctx->vm, &pairv); ok = false; break; }
                     pair->elems[0] = js_value_from_cell(&k->gc);
                     pair->elems[1] = o->elems[i];
                     pair->elem_count = 2;
-                    entry = js_value_from_cell(&pair->gc);
+                    js_gc_unprotect(ctx->vm, &pairv);
+                    entry = pairv;
                 }
                 if (ok)
                     ok = js_array_append(ctx->vm, out, entry);
@@ -2243,7 +2347,10 @@ static bool g_parseInt(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     JsString *s = arg_string(ctx, ARG(0));
     if (!s)
         return oom(ctx, r);
-    int radix = argc > 1 && !js_is_undefined(ARG(1)) ? (int)to_int(js_to_number_value(ctx, ARG(1))) : 0;
+    /* Spec: radix = ToInt32(arg). js_to_int32 is UB-free (unlike a raw
+     * (int)-cast of an Infinity/huge double) and wraps mod 2^32 as ToInt32
+     * requires; an out-of-2..36 result is rejected below. */
+    int radix = argc > 1 && !js_is_undefined(ARG(1)) ? (int)js_to_int32(js_to_number_value(ctx, ARG(1))) : 0;
     uint32_t i = 0;
     while (i < s->length && is_ws(s->units[i]))
         i++;
@@ -2312,10 +2419,18 @@ static bool g_parseFloat(JsContext *ctx, JsValue tv, const JsValue *args, int ar
             dot = true;
             i++;
         } else if ((c == 'e' || c == 'E') && any && !exp) {
-            exp = true;
-            i++;
-            if (i < s->length && (s->units[i] == '+' || s->units[i] == '-'))
-                i++;
+            /* Only absorb the exponent if it is well-formed (e[+/-]?digit).
+             * A dangling 'e' as in "5e" is not part of the number — parseFloat
+             * takes the longest valid prefix, so it stops before the 'e'. */
+            uint32_t j = i + 1;
+            if (j < s->length && (s->units[j] == '+' || s->units[j] == '-'))
+                j++;
+            if (j < s->length && s->units[j] >= '0' && s->units[j] <= '9') {
+                exp = true;
+                i = j; /* the digit is consumed by the digit branch next */
+            } else {
+                break;
+            }
         } else {
             break;
         }
@@ -2457,8 +2572,20 @@ static bool math_round(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     (void)tv;
     (void)argc;
     double x = js_to_number_value(ctx, ARG(0));
-    /* JS rounds half toward +Infinity (not away from zero) */
-    *r = js_number(__builtin_floor(x + 0.5));
+    double result;
+    if (x != x || x == __builtin_inf() || x == -__builtin_inf()) {
+        result = x;
+    } else {
+        /* JS rounds half toward +Infinity (not away from zero). Compute from
+         * floor(x) + a half test rather than floor(x + 0.5): the latter is
+         * wrong at 0.49999999999999994, where x + 0.5 rounds up to 1.0. */
+        double f = __builtin_floor(x);
+        result = (x - f >= 0.5) ? f + 1.0 : f;
+        /* Preserve the sign of zero: inputs in [-0.5, -0] round to -0. */
+        if (result == 0.0 && __builtin_signbit(x))
+            result = -0.0;
+    }
+    *r = js_number(result);
     return true;
 }
 

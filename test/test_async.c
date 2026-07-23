@@ -218,6 +218,13 @@ static void test_then(void) {
     eq("let log = ''; await Promise.resolve(1).finally(() => log += 'F').then(v => log += v); log;",
        "F1");
     eq("await Promise.reject('x').catch(() => 'ok').finally(() => {});", "ok");
+    /* finally whose onFinally returns a thenable: the settlement waits for it,
+     * and its rejection overrides the original fulfillment (spec adoption). */
+    eq("await Promise.resolve(2).finally(() => Promise.reject('fin')).then(v => 'f' + v, e => 'r' + e);",
+       "rfin");
+    eq("await Promise.resolve(3).finally(() => Promise.resolve('ignored'));", "3");
+    eq("await Promise.reject('orig').finally(() => Promise.resolve('ignored')).catch(e => 'c' + e);",
+       "corig");
 }
 
 static void test_async_await(void) {
@@ -293,6 +300,12 @@ static void test_ordering(void) {
        "async function f() { log += '1'; await Promise.resolve(); log += '3'; }"
        "f(); log += '2'; await Promise.resolve().then(()=>{}); log;",
        "123");
+    /* multiple reactions attached to one *pending* promise fire in FIFO
+       attachment order (regression: they used to fire LIFO). */
+    eq("let log = ''; let r; let p = Promise((res) => { r = res; });"
+       "p.then(() => log += 'a'); p.then(() => log += 'b'); p.then(() => log += 'c');"
+       "r(1); await p; log;",
+       "abc");
 }
 
 /*

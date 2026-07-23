@@ -571,6 +571,161 @@ static void test_completion_value(void) {
     expect_result("if (true) { 'taken'; }", "taken");
 }
 
+/* Builds prefix + n copies of unit + suffix into a malloc'd string. */
+static char *repeat_src(const char *prefix, const char *unit, int n, const char *suffix) {
+    size_t pl = strlen(prefix), ul = strlen(unit), sl = strlen(suffix);
+    char *b = malloc(pl + (size_t)n * ul + sl + 1);
+    memcpy(b, prefix, pl);
+    char *p = b + pl;
+    for (int i = 0; i < n; i++) {
+        memcpy(p, unit, ul);
+        p += ul;
+    }
+    memcpy(p, suffix, sl);
+    p[sl] = '\0';
+    return b;
+}
+
+/*
+ * Regressions for docs/runtime-audit-plan.md. Under the _asan build these also
+ * assert no ASan use-after-free / UBSan report fired along the way.
+ */
+static void test_audit_regressions(void) {
+    char *out, *src;
+    RunStatus st;
+
+    /* WS-C: deep '**' / nested 'new' hit the parser depth guard cleanly
+     * (previously overflowed the C stack). */
+    src = repeat_src("1", "**1", 400, ";");
+    st = run_src_opts(src, NULL, &out);
+    CHECK(st == RUN_COMPILE_ERR);
+    CHECK(strstr(out, "nesting too deep") != NULL);
+    free(out);
+    free(src);
+    src = repeat_src("", "new ", 400, "F();");
+    st = run_src_opts(src, NULL, &out);
+    CHECK(st == RUN_COMPILE_ERR);
+    free(out);
+    free(src);
+    /* right-associative ** still evaluates correctly */
+    st = run_src_opts("2 ** 3 ** 2;", NULL, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "512") == 0);
+    free(out);
+
+    /* WS-C: JSON.parse nesting is depth-capped and catchable, not a crash. */
+    src = repeat_src("try { JSON.parse('", "[", 400, "'); 'ok'; } catch (e) { 'caught'; }");
+    st = run_src_opts(src, NULL, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "caught") == 0);
+    free(out);
+    free(src);
+
+    /* WS-C: native-mediated recursion throws RangeError instead of SIGSEGV. */
+    st = run_src_opts("function f() { [1].forEach(f); } f();", NULL, &out);
+    CHECK(st == RUN_RUNTIME_ERR);
+    CHECK(strstr(out, "call stack") != NULL);
+    free(out);
+
+    /* P0: toFixed no longer overflows its digit buffer at the max precision. */
+    st = run_src_opts("(0).toFixed(100).length;", NULL, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "102") == 0); /* "0." + 100 zeros */
+    free(out);
+
+    /* P0: sibling-scope scratch slot no longer aliases a live local. */
+    st = run_src_opts("let o = {p:0};"
+                      "{ let a = 99; o.p++; }"
+                      "{ let b = 1; let c = 42; o.p++; c; }",
+                      NULL, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "42") == 0);
+    free(out);
+
+    /* WS-A: numeric-cast corpus — no UB (UBSan build asserts), correct values. */
+    st = run_src_opts("parseInt('100', Infinity);", NULL, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "100") == 0);
+    free(out);
+    st = run_src_opts("parseInt('10', -1);", NULL, &out); /* ToInt32 -> radix -1 -> NaN */
+    CHECK(strcmp(out, "NaN") == 0);
+    free(out);
+    st = run_src_opts("JSON.stringify(5, null, Infinity) === '5' ? 'ok' : 'no';", NULL, &out);
+    CHECK(strcmp(out, "ok") == 0);
+    free(out);
+    st = run_src_opts("let a = [1,2,3]; delete a[1e30]; delete a[-1]; a.length;", NULL, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "3") == 0);
+    free(out);
+
+    /* P2 spec fixes. */
+    st = run_src_opts("Math.round(0.49999999999999994);", NULL, &out);
+    CHECK(strcmp(out, "0") == 0);
+    free(out);
+    st = run_src_opts("1 / Math.round(-0.4);", NULL, &out); /* -0 -> -Infinity */
+    CHECK(strcmp(out, "-Infinity") == 0);
+    free(out);
+    st = run_src_opts("parseFloat('5e');", NULL, &out);
+    CHECK(strcmp(out, "5") == 0);
+    free(out);
+    expect_error("JSON.parse('01');", RUN_RUNTIME_ERR, "JSON");
+    expect_error("JSON.parse('1.');", RUN_RUNTIME_ERR, "JSON");
+    expect_error("JSON.parse('1e');", RUN_RUNTIME_ERR, "JSON");
+    /* for-of continue: a closure captured before `continue` keeps its own
+     * per-iteration binding. */
+    st = run_src_opts("let fns = [];"
+                      "for (const x of [1,2,3]) { fns.push(() => x); if (x < 3) continue; }"
+                      "fns.map(f => f()).join(',');",
+                      NULL, &out);
+    CHECK(strcmp(out, "1,2,3") == 0);
+    free(out);
+
+    /* Map/Set value-keyed hash index: correctness incl. -0/NaN/object keys. */
+    st = run_src_opts("let m = new Map(); for (let i = 0; i < 500; i++) m.set(i, i*2);"
+                      "m.delete(100); m.get(200) + ',' + m.has(100) + ',' + m.size;",
+                      NULL, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "400,false,499") == 0);
+    free(out);
+    st = run_src_opts("let m = new Map(); m.set(-0, 'z'); m.set(NaN, 'n');"
+                      "m.get(0) + m.get(NaN) + ',' + m.has(-0);",
+                      NULL, &out);
+    CHECK(strcmp(out, "zn,true") == 0);
+    free(out);
+    st = run_src_opts("let s = new Set(); for (let i = 0; i < 200; i++) s.add(i % 10); s.size;",
+                      NULL, &out);
+    CHECK(strcmp(out, "10") == 0);
+    free(out);
+
+    /* WS-B: UAF sites, exercised under gc_stress (ASan build is the assertion). */
+    RunOpts gs = {0};
+    gs.cfg.gc_stress = true;
+    st = run_src_opts("let o = {...'abcdef'}; Object.keys(o).length;", &gs, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "6") == 0);
+    free(out);
+    st = run_src_opts("Object.entries([10, 20, 30]).map(e => e[0] + ':' + e[1]).join(',');", &gs, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "0:10,1:20,2:30") == 0);
+    free(out);
+    st = run_src_opts("let a = [5,4,3,2,1];"
+                      "a.sort((x, y) => { if (a.length > 2) a.length = 2; return x - y; });"
+                      "'survived';",
+                      &gs, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "survived") == 0);
+    free(out);
+
+    /* WS-E: heap_limit now bounds bulk (non-cell) growth, not just cell
+     * headers — a large array build is stopped instead of overrunning. */
+    RunOpts hl = {0};
+    hl.cfg.heap_limit = 200 * 1024;
+    st = run_src_opts("let a = []; for (let i = 0; i < 1000000; i++) a[i] = i; a.length;", &hl, &out);
+    CHECK(st == RUN_RUNTIME_ERR);
+    CHECK(strstr(out, "memory") != NULL);
+    free(out);
+}
+
 int main(void) {
     test_arithmetic();
     test_strings();
@@ -593,6 +748,7 @@ int main(void) {
     test_gc_stress_run();
     test_host_globals();
     test_completion_value();
+    test_audit_regressions();
 
     if (checks_failed) {
         fprintf(stderr, "%d/%d exec checks FAILED\n", checks_failed, checks_run);
