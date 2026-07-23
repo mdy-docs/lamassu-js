@@ -47,7 +47,7 @@ check(
 // jsvm_settle_deferred settles it from a real JS timer callback, mirroring
 // how a browser/Node host would resolve a promise from its own event loop.
 {
-  const settleDeferred = engine.module.cwrap("jsvm_settle_deferred", null, ["number", "string"]);
+  const settleDeferred = engine.module.cwrap("lamassu_settle_deferred", null, ["number", "string"]);
   await engine.eval("let OUT;");
   // Module suspends on the await; __nativeDefer's promise never auto-settles,
   // so this returns with the guest fiber still pending.
@@ -61,6 +61,45 @@ check(
   await engine.eval("/(a+)+$/.test('a'.repeat(200) + 'b');"),
   "Uncaught RangeError: regular expression step budget exhausted",
 );
+
+// ES modules through the host loader: every module (root included) is
+// fetched via loadModule/setModuleLoader; the canonicalizer resolves
+// "./util.js" against its referrer so relative imports get distinct
+// registry identities per directory. Loading is async on purpose — same
+// Asyncify suspension as __hostcall.
+{
+  const modules = {
+    "/main.js": "import { double } from './util.js'; print('loading main'); export default double(21);",
+    "/util.js": "export const double = (n) => n * 2;",
+  };
+  engine.setModuleLoader(
+    async (specifier) => {
+      await new Promise((r) => setTimeout(r, 10));
+      return modules[specifier];
+    },
+    (specifier, referrer) =>
+      specifier.startsWith("./")
+        ? referrer.slice(0, referrer.lastIndexOf("/") + 1) + specifier.slice(2)
+        : specifier,
+  );
+  check("ES module graph (evalModule)", await engine.evalModule("/main.js"), "loading main\n⇒ 42");
+  check(
+    "module registry persists (no re-evaluation)",
+    await engine.evalModule("/main.js"),
+    "⇒ 42",
+  );
+  check(
+    "dynamic import() from plain eval",
+    await engine.eval("const m = await import('/util.js'); m.double(5);"),
+    "⇒ 10",
+  );
+  check(
+    "missing module rejects",
+    await engine.evalModule("/nope.js"),
+    'Uncaught module not found: "/nope.js"',
+  );
+}
+
 engine.reset();
 check("reset clears state", await engine.eval("typeof x;"), "⇒ undefined");
 

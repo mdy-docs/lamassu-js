@@ -6,6 +6,8 @@
  *
  * Exposed to JS (see the Makefile `pkg` target):
  *   const char *lamassu_eval(const char *src_utf8);  // output + result/error
+ *   const char *lamassu_eval_module(const char *specifier_utf8); // ES-module
+ *               // graph rooted at specifier, loaded via Module.lamassuLoadModule
  *   void        lamassu_reset(void);                 // fresh VM
  *
  * HOST CALLS: guest code can call `__hostcall(name, argsJson)` — a native
@@ -268,6 +270,118 @@ EXPORT void lamassu_settle_deferred(int id, const char *value_utf8) {
     g_deferred_live[id] = false;
     js_run_jobs(g_ctx);
 }
+
+/*
+ * ES MODULES: a guest `import` — static (via lamassu_eval_module below) or
+ * dynamic `import()` from any eval — delegates to the embedder. The C-side
+ * loader suspends wasm execution (Asyncify, same mechanism as __hostcall)
+ * while the embedder's async `Module.lamassuLoadModule(specifier, referrer)`
+ * runs; the string it returns is compiled as that module's source, and its
+ * own imports arrive back through this same loader. An optional synchronous
+ * `Module.lamassuCanonicalizeModule(specifier, referrer)` maps a raw
+ * specifier to its registry identity first, so "./a.js" imported from two
+ * different referrers can be two different modules (and the same module
+ * reached by two spellings dedupes to one instance).
+ */
+EM_ASYNC_JS(char *, lamassu_load_module_js, (const char *spec, const char *ref), {
+    let reply;
+    try {
+        const loader = Module["lamassuLoadModule"];
+        if (!loader)
+            throw new Error("no module loader installed (createLamassu loadModule option / setModuleLoader)");
+        const src = await loader(UTF8ToString(spec), UTF8ToString(ref));
+        if (typeof src !== "string")
+            throw new Error('module not found: "' + UTF8ToString(spec) + '"');
+        reply = "V" + src;
+    } catch (e) {
+        reply = "E" + String(e && e.message !== undefined ? e.message : e);
+    }
+    const n = lengthBytesUTF8(reply) + 1;
+    const p = _malloc(n);
+    stringToUTF8(reply, p, n);
+    return p;
+});
+
+/* Synchronous by contract (the engine's canonicalizer hook is sync); returns
+ * a wasm-malloc'd UTF-8 string or 0 for "raw specifier is the identity". */
+EM_JS(char *, lamassu_canonicalize_module_js, (const char *spec, const char *ref), {
+    const canon = Module["lamassuCanonicalizeModule"];
+    if (!canon)
+        return 0;
+    let out;
+    try {
+        out = canon(UTF8ToString(spec), UTF8ToString(ref));
+    } catch (e) {
+        out = undefined;
+    }
+    if (typeof out !== "string")
+        return 0;
+    const n = lengthBytesUTF8(out) + 1;
+    const p = _malloc(n);
+    stringToUTF8(out, p, n);
+    return p;
+});
+
+static JsValue wasm_module_load(void *ud, JsContext *ctx,
+                                const uint16_t *spec, size_t spec_len,
+                                const uint16_t *ref, size_t ref_len) {
+    (void)ud;
+    char *spec8 = utf16_to_utf8_dup(spec, spec_len);
+    char *ref8 = utf16_to_utf8_dup(ref, ref_len);
+    char *reply =
+        (spec8 && ref8) ? lamassu_load_module_js(spec8, ref8) : NULL;
+    free(spec8);
+    free(ref8);
+    /* Settle only after every allocation: string_value_from_utf8 can GC,
+     * and the promise is unrooted until the engine adopts it. */
+    JsValue promise = js_promise_new(ctx);
+    js_gc_protect(g_vm, &promise);
+    JsValue v = string_value_from_utf8(
+        reply ? reply + 1 : "module load failed (out of memory)");
+    if (reply && reply[0] == 'V')
+        js_resolve(ctx, promise, v);
+    else
+        js_reject(ctx, promise, v);
+    free(reply);
+    js_gc_unprotect(g_vm, &promise);
+    return promise;
+}
+
+/* reused UTF-16 buffer for canonicalized specifiers (engine copies out) */
+static uint16_t *g_canon_buf;
+static size_t g_canon_cap;
+
+static bool wasm_module_canon(void *ud, const uint16_t *spec, size_t spec_len,
+                              const uint16_t *ref, size_t ref_len,
+                              const uint16_t **out, size_t *out_len) {
+    (void)ud;
+    char *spec8 = utf16_to_utf8_dup(spec, spec_len);
+    char *ref8 = utf16_to_utf8_dup(ref, ref_len);
+    char *canon =
+        (spec8 && ref8) ? lamassu_canonicalize_module_js(spec8, ref8) : NULL;
+    free(spec8);
+    free(ref8);
+    if (!canon || !canon[0]) { /* no JS canonicalizer (or it declined): identity */
+        free(canon);
+        *out = spec;
+        *out_len = spec_len;
+        return true;
+    }
+    size_t blen = strlen(canon); /* UTF-16 unit count is always <= blen */
+    if (blen > g_canon_cap) {
+        uint16_t *nb = realloc(g_canon_buf, blen * sizeof(uint16_t));
+        if (!nb) {
+            free(canon);
+            return false;
+        }
+        g_canon_buf = nb;
+        g_canon_cap = blen;
+    }
+    *out_len = utf8_to_utf16(canon, blen, g_canon_buf);
+    *out = g_canon_buf;
+    free(canon);
+    return true;
+}
 #endif
 
 static void ensure_vm(void) {
@@ -285,6 +399,7 @@ static void ensure_vm(void) {
                                           'e', 'D', 'e', 'f', 'e', 'r'};
     js_register_native(g_ctx, defer_name, 13, native_native_defer, NULL);
     memset(g_deferred_live, 0, sizeof g_deferred_live);
+    js_set_module_loader(g_ctx, wasm_module_load, wasm_module_canon, NULL);
 #endif
 }
 
@@ -397,3 +512,57 @@ EXPORT const char *lamassu_eval(const char *src_utf8) {
     free(u);
     return g_buf ? g_buf : "";
 }
+
+#ifdef __EMSCRIPTEN__
+/*
+ * Load, link, and evaluate the ES-module graph rooted at `spec_utf8`. Every
+ * module — the root included — arrives through Module.lamassuLoadModule (see
+ * the loader bridge above). Same buffer contract as lamassu_eval: print()
+ * output, then "⇒ " + the root module's default export (its namespace object
+ * when there is no default), or an "Uncaught ..." error line. The module
+ * registry persists across calls (same specifier -> same instance) until
+ * lamassu_reset.
+ */
+EXPORT const char *lamassu_eval_module(const char *spec_utf8) {
+    ensure_vm();
+    buf_reset();
+    if (!g_buf)
+        buf_bytes("", 0); /* allocate at least the NUL */
+
+    size_t blen = spec_utf8 ? strlen(spec_utf8) : 0;
+    uint16_t *u = malloc((blen + 1) * sizeof(uint16_t));
+    if (!u) {
+        buf_cstr("internal: out of memory");
+        return g_buf ? g_buf : "";
+    }
+    size_t ulen = utf8_to_utf16(spec_utf8 ? spec_utf8 : "", blen, u);
+
+    JsValue p = js_eval_module(g_ctx, u, ulen);
+    free(u);
+    if (js_promise_state(p) == -1) { /* undefined: OOM */
+        buf_cstr("internal: out of memory");
+        return g_buf ? g_buf : "";
+    }
+    js_gc_protect(g_vm, &p);
+    js_run_jobs(g_ctx);
+    int st = js_promise_state(p);
+    JsValue result = js_promise_result(p);
+    js_gc_protect(g_vm, &result);
+    if (st == 2) {
+        buf_cstr("Uncaught ");
+        buf_value(g_ctx, result);
+    } else {
+        /* fulfilled (or pending on an unsettled host promise, like
+         * lamassu_eval): show the default export when there is one, the
+         * namespace object otherwise */
+        static const uint16_t default_name[] = {'d', 'e', 'f', 'a', 'u',
+                                                'l', 't'};
+        JsValue def = js_module_get_export(g_ctx, result, default_name, 7);
+        buf_cstr("\xE2\x87\x92 "); /* U+21D2 rightwards double arrow */
+        buf_value(g_ctx, js_is_undefined(def) ? result : def);
+    }
+    js_gc_unprotect(g_vm, &result);
+    js_gc_unprotect(g_vm, &p);
+    return g_buf ? g_buf : "";
+}
+#endif

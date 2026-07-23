@@ -201,7 +201,7 @@ $(PKG_DIST)/lamassu.mjs: $(SRC) src/wasm_api.c $(HDR) $(RE_SRC) $(RE_HDR)
 	  -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=createLamassuModule \
 	  -sENVIRONMENT=web,node \
 	  -sSTACK_SIZE=8388608 -sSTACK_OVERFLOW_CHECK=2 \
-	  -sEXPORTED_FUNCTIONS=_lamassu_eval,_lamassu_reset,_lamassu_settle_deferred,_malloc,_free \
+	  -sEXPORTED_FUNCTIONS=_lamassu_eval,_lamassu_eval_module,_lamassu_reset,_lamassu_settle_deferred,_malloc,_free \
 	  -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,stringToUTF8,lengthBytesUTF8 \
 	  -sASYNCIFY -sASYNCIFY_STACK_SIZE=262144 \
 	  -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=16777216 \
