@@ -94,8 +94,7 @@ const char *js_regexp_validate(JsVm *vm, const uint16_t *pat, uint32_t pat_len,
     pbuf[pat_len] = 0;
     compile_into(prog, pbuf, mask);
     const char *err = prog->error; /* engine errors are static literals */
-    for (int i = 0; i < prog->class_count; i++)
-        class_strings_free(&prog->classes[i]);
+    program_release(prog);
     js_realloc_raw(vm, pbuf, ((size_t)pat_len + 1) * sizeof(uint16_t), 0);
     js_realloc_raw(vm, prog, sizeof *prog, 0);
     return err;
@@ -148,7 +147,7 @@ JsValue js_regexp_new(JsContext *ctx, const uint16_t *pat, uint32_t pat_len,
     js_realloc_raw(vm, pbuf, ((size_t)pat_len + 1) * sizeof(uint16_t), 0);
     if (re->prog.error) {
         /* the cell stays on the GC list and is swept as a normal regexp;
-         * release() frees whatever class strings the failed compile left */
+         * release() frees whatever buffers the failed compile left */
         *err = re->prog.error;
         js_gc_unprotect(vm, &rev);
         return js_undefined();
@@ -197,8 +196,7 @@ void js_regexp_mark(JsVm *vm, JsObject *o) {
 
 size_t js_regexp_release(JsVm *vm, JsObject *o) {
     JsRegExp *re = (JsRegExp *)o;
-    for (int i = 0; i < re->prog.class_count; i++)
-        class_strings_free(&re->prog.classes[i]);
+    program_release(&re->prog);
     vm->regexp_live--;
     return sizeof *re;
 }
