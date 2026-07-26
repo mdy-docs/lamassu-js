@@ -7,7 +7,9 @@
 
 CC ?= cc
 
-WARNINGS = -std=c11 -Wall -Wextra -Werror -Wshadow -Wvla
+# -D_POSIX_C_SOURCE: -std=c11 makes glibc hide POSIX declarations (strdup
+# in the tests, gettimeofday in js_date.c); macOS exposes them regardless.
+WARNINGS = -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Wshadow -Wvla
 CFLAGS  ?= -O2 -g
 # The math kernel is freestanding, but a few builtins (fmod, sqrt/hypot)
 # use compiler-native ops that gcc lowers to libm calls on Linux; macOS
