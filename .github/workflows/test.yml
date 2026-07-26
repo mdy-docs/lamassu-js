@@ -1,0 +1,29 @@
+name: Test
+
+# Builds and runs the native test suite — every suite twice, plain and
+# ASan/UBSan — on each push and pull request. Needs nothing but a C
+# compiler, so this is the fast always-on gate; the wasm artifact is
+# exercised separately by the npm-publish workflow's smoke test.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build and run tests (plain + ASan/UBSan)
+        run: make test
+
+      - name: Build the CLI and run benchmarks
+        run: make bench
