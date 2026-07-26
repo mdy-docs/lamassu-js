@@ -481,7 +481,7 @@ static bool sm_repeat(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     for (uint32_t i = 0; i < n; i++)
         sb_units(&sb, s->units, s->length);
     *r = sb_finish(&sb);
-    return js_is_undefined(*r) && (n * s->length) ? oom(ctx, r) : true;
+    return js_is_undefined(*r) && n * s->length != 0 ? oom(ctx, r) : true;
 }
 
 static bool sm_pad(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r, bool start) {
