@@ -9,6 +9,10 @@ CC ?= cc
 
 WARNINGS = -std=c11 -Wall -Wextra -Werror -Wshadow -Wvla
 CFLAGS  ?= -O2 -g
+# The math kernel is freestanding, but a few builtins (fmod, sqrt/hypot)
+# use compiler-native ops that gcc lowers to libm calls on Linux; macOS
+# bundles libm into libSystem so this is a no-op there.
+LIBS = -lm
 
 SRC := src/js_vm.c src/js_gc.c src/js_string.c src/js_map.c src/js_object.c \
        src/js_arena.c src/js_lexer.c src/js_parser.c src/js_number.c \
@@ -45,98 +49,98 @@ build/re_%.o: third_party/baru-re/src/re_%.c $(RE_HDR)
 
 build/test_runner: $(SRC) test/test_main.c $(HDR) $(RE_OBJ)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_main.c -o $@
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_main.c -o $@ $(LIBS)
 
 build/test_runner_asan: $(SRC) test/test_main.c $(HDR) $(RE_OBJ_ASAN)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_main.c -o $@
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_main.c -o $@ $(LIBS)
 
 build/test_syntax: $(SRC) test/test_syntax.c $(HDR) $(RE_OBJ)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_syntax.c -o $@
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_syntax.c -o $@ $(LIBS)
 
 build/test_syntax_asan: $(SRC) test/test_syntax.c $(HDR) $(RE_OBJ_ASAN)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_syntax.c -o $@
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_syntax.c -o $@ $(LIBS)
 
 build/test_exec: $(SRC) test/test_exec.c $(HDR) $(RE_OBJ)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_exec.c -o $@
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_exec.c -o $@ $(LIBS)
 
 build/test_exec_asan: $(SRC) test/test_exec.c $(HDR) $(RE_OBJ_ASAN)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_exec.c -o $@
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_exec.c -o $@ $(LIBS)
 
 build/test_builtins: $(SRC) test/test_builtins.c $(HDR) $(RE_OBJ)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_builtins.c -o $@
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_builtins.c -o $@ $(LIBS)
 
 build/test_builtins_asan: $(SRC) test/test_builtins.c $(HDR) $(RE_OBJ_ASAN)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_builtins.c -o $@
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_builtins.c -o $@ $(LIBS)
 
 build/test_async: $(SRC) test/test_async.c $(HDR) $(RE_OBJ)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_async.c -o $@
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_async.c -o $@ $(LIBS)
 
 build/test_async_asan: $(SRC) test/test_async.c $(HDR) $(RE_OBJ_ASAN)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_async.c -o $@
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_async.c -o $@ $(LIBS)
 
 build/test_modules: $(SRC) test/test_modules.c $(HDR) $(RE_OBJ)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_modules.c -o $@
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_modules.c -o $@ $(LIBS)
 
 build/test_modules_asan: $(SRC) test/test_modules.c $(HDR) $(RE_OBJ_ASAN)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_modules.c -o $@
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_modules.c -o $@ $(LIBS)
 
 build/test_repl: $(SRC) test/test_repl.c $(HDR) $(RE_OBJ)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_repl.c -o $@
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_repl.c -o $@ $(LIBS)
 
 build/test_repl_asan: $(SRC) test/test_repl.c $(HDR) $(RE_OBJ_ASAN)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_repl.c -o $@
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_repl.c -o $@ $(LIBS)
 
 build/test_regex: $(SRC) test/test_regex.c $(HDR) $(RE_OBJ)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_regex.c -o $@
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_regex.c -o $@ $(LIBS)
 
 build/test_regex_asan: $(SRC) test/test_regex.c $(HDR) $(RE_OBJ_ASAN)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_regex.c -o $@
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_regex.c -o $@ $(LIBS)
 
 build/test_bytecode: $(SRC) test/test_bytecode.c $(HDR) $(RE_OBJ)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_bytecode.c -o $@
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_bytecode.c -o $@ $(LIBS)
 
 build/test_bytecode_asan: $(SRC) test/test_bytecode.c $(HDR) $(RE_OBJ_ASAN)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_bytecode.c -o $@
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_bytecode.c -o $@ $(LIBS)
 
 build/test_dynamic_import: $(SRC) test/test_dynamic_import.c $(HDR) $(RE_OBJ)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_dynamic_import.c -o $@
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_dynamic_import.c -o $@ $(LIBS)
 
 build/test_dynamic_import_asan: $(SRC) test/test_dynamic_import.c $(HDR) $(RE_OBJ_ASAN)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_dynamic_import.c -o $@
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_dynamic_import.c -o $@ $(LIBS)
 
 build/test_module_bc: $(SRC) test/test_module_bc.c $(HDR) $(RE_OBJ)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_module_bc.c -o $@
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) test/test_module_bc.c -o $@ $(LIBS)
 
 build/test_module_bc_asan: $(SRC) test/test_module_bc.c $(HDR) $(RE_OBJ_ASAN)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_module_bc.c -o $@
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ_ASAN) test/test_module_bc.c -o $@ $(LIBS)
 
 # the lamassu CLI: compile + run a .js file
 .PHONY: cli
 cli: build/lamassu
 build/lamassu: $(SRC) tools/lamassu.c $(HDR) $(RE_OBJ)
 	@mkdir -p build
-	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) tools/lamassu.c -o $@
+	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) $(SRC) $(RE_OBJ) tools/lamassu.c -o $@ $(LIBS)
 
 .PHONY: test
 test: build/test_runner build/test_runner_asan build/test_syntax build/test_syntax_asan \
