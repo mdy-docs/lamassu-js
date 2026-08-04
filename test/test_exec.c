@@ -716,6 +716,29 @@ static void test_audit_regressions(void) {
     CHECK(st == RUN_OK);
     CHECK(strcmp(out, "survived") == 0);
     free(out);
+    /* Default (comparator-less) sort compares elements by their string form.
+     * Converting the second operand allocates, which is a GC safe point, so
+     * the first operand's freshly-made string has to be rooted across it —
+     * it was not, and the comparison then read a collected cell. Numbers make
+     * every comparison allocate two strings, which is what exposes it. */
+    st = run_src_opts("let a = [];"
+                      "for (let i = 0; i < 40; i++) a.push(40 - i);"
+                      "a.sort(); a[0] + ',' + a[39];",
+                      &gs, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "1,9") == 0);
+    free(out);
+
+    /* A fiber is reachable from nothing between its allocation and the moment
+     * the caller installs it as ctx->fiber, yet setting it up allocates: the
+     * rest-parameter array is built while the fiber's own stack is half filled
+     * in. Async calls spawn a fiber on that path, so this collected the fiber
+     * mid-setup and read it back. */
+    st = run_src_opts("async function f(...args) { return args.length; } f(1,2,3); 'ok';",
+                      &gs, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "ok") == 0);
+    free(out);
 
     /* WS-E: heap_limit now bounds bulk (non-cell) growth, not just cell
      * headers — a large array build is stopped instead of overrunning. */

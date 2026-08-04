@@ -107,13 +107,23 @@ typedef struct JsFunctionCell {
     uint32_t n_locals, max_stack;
     JsString *name;     /* may be NULL */
     JsModule *module;   /* module this fn belongs to (exports/imports); may be NULL */
-    /* Retained instruction-start bitmap (one byte per code byte), populated by
-     * the bytecode verifier and kept ONLY for functions loaded from an
-     * untrusted cache. NULL for compiler-emitted functions, whose RET_SUB
-     * return addresses cannot be forged. Lets RET_SUB reject a return address
-     * that lands mid-instruction. */
+    /* Retained per-code-byte bitmap (see JSBC_B_* below), populated by the
+     * bytecode verifier and kept ONLY for functions loaded from an untrusted
+     * cache. NULL for compiler-emitted functions, whose RET_SUB return
+     * addresses cannot be forged. Lets RET_SUB reject any return address that
+     * is not a real GOSUB resume point. */
     uint8_t *insn_boundary;
+    /* (GOSUB resume offset, verified operand depth) pairs, also verifier-built
+     * and loaded-functions-only. RET_SUB requires its popped return address and
+     * the depth it arrives at to match one of these. NULL/0 when the function
+     * has no subroutines, or for compiler-emitted code. */
+    uint32_t *gosub_rets;
+    uint32_t gosub_ret_count;
 } JsFunctionCell;
+
+/* JsFunctionCell.insn_boundary bits. */
+#define JSBC_B_INSN 1u      /* an instruction starts at this offset */
+#define JSBC_B_GOSUB_RET 2u /* a GOSUB resumes here — the only legal RET_SUB target */
 
 typedef struct JsFiber JsFiber;
 
@@ -406,7 +416,12 @@ struct JsContext {
      * called; see the seam comment in js_bytecode.h. */
     JsModuleCompileFn compile_source;
     JsFiber *fiber;     /* current/last fiber; GC root */
-    uint64_t fuel;      /* budget for new runs; 0 = unlimited */
+    uint64_t fuel;      /* budget armed by js_context_set_fuel; 0 = unlimited */
+    /* What remains of `fuel` for the current turn — the top-level run PLUS the
+     * microtask drain it feeds. Every top-level fiber draws from this and
+     * writes its remainder back, so a script that keeps re-queueing microtasks
+     * cannot mint a fresh budget per job. Re-armed by js_context_set_fuel. */
+    uint64_t fuel_left;
     uint32_t error_pos; /* source offset of last runtime error */
     uint32_t reentry_depth; /* nested interpreter entries (native re-entry);
                              * bounds C-stack recursion the per-fiber frame
@@ -488,6 +503,13 @@ static inline JsPromise *js_value_promise(JsValue v) { return (JsPromise *)js_va
  * one call allocate. Shared by js_interp.c (property-set path) and
  * js_builtins.c (the Array constructor). */
 #define JS_MAX_ARRAY_GAP 4096u
+
+/* Longest string, in UTF-16 code units, any operation may produce. Bounds what
+ * one call from an untrusted script can be made to allocate AND — just as
+ * importantly — how long it can spend filling it, since natives run without
+ * consuming fuel. Shared by concat (js_interp.c) and repeat/pad
+ * (js_builtins.c) so the ceiling is one number, not several. */
+#define JS_MAX_STRING_UNITS (64u * 1024 * 1024)
 
 /* js_object.c: array helpers used by the interpreter. new_cell takes the
  * context (not just the VM) so it can set the new array's [[Prototype]] to

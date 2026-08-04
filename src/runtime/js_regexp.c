@@ -277,8 +277,12 @@ static uint32_t advance_index(const JsString *s, uint32_t i, bool uni) {
     return i + 1;
 }
 
-/* re_run results: a tri-state so budget exhaustion is distinguishable from
- * an ordinary no-match and can be thrown as a catchable RangeError. */
+/* re_run results: a tri-state so a match the engine ABANDONED is
+ * distinguishable from an ordinary no-match and can be thrown as a
+ * catchable RangeError. Abandonment is almost always the step budget; an
+ * engine-side allocation failure during matching lands here too, and is
+ * reported with the same message rather than earning a fourth state, since
+ * guest JS can do nothing different with the distinction. */
 #define RE_RUN_MATCH 1
 #define RE_RUN_NOMATCH 0
 #define RE_RUN_BUDGET (-1)
@@ -305,7 +309,8 @@ static int re_run(JsRegExp *re, const JsString *s, uint32_t start, bool anchored
 
     VMContext *vctx = vm_context_new(prog);
     if (!vctx)
-        return RE_RUN_NOMATCH; /* OOM: report as no-match rather than crash */
+        return RE_RUN_BUDGET; /* OOM: the match was never evaluated, so it
+                               * must throw, not report a bogus non-match */
     vm_context_set_step_budget(vctx, JS_REGEXP_STEP_BASE +
                                          (uint64_t)s->length * JS_REGEXP_STEPS_PER_UNIT);
     if (anchored || prog->sticky) {

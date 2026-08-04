@@ -384,7 +384,57 @@ static void test_pending_promise_exposed(bool stress) {
     }
 }
 
+/*
+ * The execution budget must cover the microtask drain, not just the top-level
+ * run. Each job the queue runs enters the interpreter as a top-level fiber, so
+ * charging those to the configured budget rather than to what remains of it
+ * handed every job a full tank — and a handler that re-queues itself then ran
+ * forever under any budget, with js_run_jobs looping until the process died.
+ *
+ * If this regresses the test HANGS rather than failing, which is the honest
+ * shape of the bug: nothing else bounds the drain.
+ */
+static void test_fuel_covers_microtasks(void) {
+    CountAlloc ca = {0, 0};
+    JsVmConfig cfg = {.realloc_fn = count_realloc, .alloc_ud = &ca};
+    JsVm *vm = js_vm_new(&cfg);
+    JsContext *ctx = js_context_new(vm);
+    js_context_set_fuel(ctx, 200000);
+
+    const char *src = "function f() { Promise.resolve().then(f); while (true) {} }\n"
+                      "Promise.resolve().then(f);\n"
+                      "1;";
+    size_t len = strlen(src);
+    uint16_t *u = malloc(len * sizeof(uint16_t));
+    for (size_t i = 0; i < len; i++)
+        u[i] = (uint16_t)(unsigned char)src[i];
+    const char *em;
+    uint32_t ep;
+    JsValue fn = js_compile_module(ctx, u, len, &em, &ep);
+    free(u);
+    checks_run++;
+    if (!js_is_function(fn)) {
+        checks_failed++;
+        fprintf(stderr, "FAIL: fuel/microtask source did not compile: %s\n", em);
+        js_vm_free(vm);
+        return;
+    }
+    js_gc_protect(vm, &fn);
+    JsValue p = js_run_module(ctx, fn);
+    js_gc_protect(vm, &p);
+    js_run_jobs(ctx); /* must terminate */
+    checks_run++;
+    if (js_has_pending_jobs(ctx)) {
+        checks_failed++;
+        fprintf(stderr, "FAIL: jobs still pending after the budget was spent\n");
+    }
+    js_gc_unprotect(vm, &p);
+    js_gc_unprotect(vm, &fn);
+    js_vm_free(vm);
+}
+
 int main(void) {
+    test_fuel_covers_microtasks();
     test_then();
     test_async_await();
     test_host_defer();

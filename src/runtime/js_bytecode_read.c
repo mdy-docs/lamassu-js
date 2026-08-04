@@ -226,8 +226,16 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
         *err = "SyntaxError: truncated bytecode header";
         return NULL;
     }
+    /*
+     * The rest parameter occupies the LAST param slot, so a rest function has
+     * at least one param. Without this check, frame_setup's
+     * `fixed = n_params - 1` underflows to 4 billion on a forged
+     * HAS_REST-with-zero-params header and its "fill missing params with
+     * undefined" loop runs off the end of the fiber stack.
+     */
     if ((fn_flags & ~(uint8_t)(JS_FN_ARROW | JS_FN_HAS_REST | JS_FN_ASYNC)) ||
-        n_locals > JSBC_MAX_LOCALS || n_params > n_locals) {
+        n_locals > JSBC_MAX_LOCALS || n_params > n_locals ||
+        ((fn_flags & JS_FN_HAS_REST) && n_params == 0)) {
         *err = "SyntaxError: invalid bytecode function header";
         return NULL;
     }
@@ -441,6 +449,14 @@ static bool const_is_function(JsFunctionCell *fn, uint16_t idx) {
  * are absent, and records instruction-start offsets in `boundary`. Nested
  * closures are verified recursively (their upvalue descriptors are checked
  * against this function here, where the counts are known).
+ *
+ * `boundary` is a bitmap, not a flag: JSBC_B_INSN marks an instruction start,
+ * JSBC_B_GOSUB_RET marks the offset a GOSUB resumes at. RET_SUB pops a
+ * *runtime* value as its return address, so "lands on an instruction" is not a
+ * strong enough guard — it would let a forged address reach any instruction at
+ * any operand depth, including code the pass-2 fixpoint never visited and
+ * therefore never depth-checked. Only a real GOSUB resume point is a legal
+ * target, and pass 2 proves the depth at each of those.
  */
 /* True for the four opcodes that dereference fn->module. */
 static bool is_module_opcode(uint8_t opb) {
@@ -454,7 +470,7 @@ static bool verify_pass1(JsFunctionCell *fn, uint8_t *boundary, bool is_module,
     uint32_t n = fn->code_len;
     uint32_t off = 0;
     while (off < n) {
-        boundary[off] = 1;
+        boundary[off] |= JSBC_B_INSN;
         uint8_t opb = code[off];
         if (opb >= JS_OP__COUNT || !js_op_info[opb].valid) {
             *err = "SyntaxError: unknown opcode in bytecode";
@@ -555,6 +571,9 @@ static bool verify_pass1(JsFunctionCell *fn, uint8_t *boundary, bool is_module,
             break;
         }
         off += 1 + ob;
+        /* The offset a GOSUB resumes at is the only legal RET_SUB target. */
+        if (opb == JS_OP_GOSUB && off < n)
+            boundary[off] |= JSBC_B_GOSUB_RET;
     }
     if (off != n) {
         *err = "SyntaxError: bytecode does not end on an instruction boundary";
@@ -582,67 +601,104 @@ static uint32_t branch_target(const uint8_t *code, uint32_t op_off) {
 #define JSBC_DEPTHS_PER_OFF 8
 
 /*
+ * Deepest TRY_PUSH nesting a function body may reach. Structured try/catch/
+ * finally from the compiler nests a handful deep at most; the cap keeps the
+ * (depth, try_depth) state space small and bounds fiber->trys growth.
+ */
+#define JSBC_MAX_TRY_DEPTH 256
+
+/*
+ * Cap on (GOSUB resume point, verified depth) pairs retained per function for
+ * RET_SUB to check against. One finally block contributes a handful.
+ */
+#define JSBC_MAX_GOSUB_RETS 4096
+
+/*
  * Pass 2: control flow + stack dataflow. Verifies every jump/branch/gosub
  * target lands on an instruction boundary, that the final instruction cannot
  * fall off the end, and — the load-bearing safety pass — propagates the
  * operand-stack depth along every edge to prove no underflow/overflow and to
  * recompute max_stack (the stored value is never trusted). See js_bytecode.h's
  * op-info notes for the per-edge deltas; CALL/NEW_ARRAY read their count.
+ *
+ * The abstract state is a PAIR of depths: the operand stack and the TRY stack.
+ * Both must be proven, because the interpreter trusts both. TRY_POP decrements
+ * fiber->try_count with no runtime check, so a buffer whose TRY_POPs outnumber
+ * its TRY_PUSHes on some path underflows that unsigned counter to ~4e9; the
+ * unwinder then reads fb->trys[try_count-1] wildly out of bounds and jumps to
+ * the .target it finds there. Proving try-stack balance here is what makes
+ * that unreachable.
  */
-static bool verify_pass2(JsFunctionCell *fn, const uint8_t *boundary,
+static bool verify_pass2(JsVm *fn_vm, JsFunctionCell *fn, const uint8_t *boundary,
                          int32_t *seen, uint32_t *worklist, const char **err) {
     const uint8_t *code = fn->code;
     uint32_t n = fn->code_len;
     const uint32_t K = JSBC_DEPTHS_PER_OFF;
 
-    for (size_t i = 0; i < (size_t)n * K; i++)
+    /* Two int32 per state slot: operand depth, then try depth. */
+    for (size_t i = 0; i < (size_t)n * K * 2; i++)
         seen[i] = -1;
 
     uint32_t max_depth = 0;
-    uint32_t wl_len = 0; /* pending states, packed as (off, depth) pairs */
+    uint32_t wl_len = 0; /* pending states, packed as (off, depth, try) triples */
 
     /*
-     * Records (off, depth) in `seen`, the per-offset depth set (dedup +
-     * subroutine-polymorphism). A newly seen state is also pushed onto the
-     * worklist for later processing; an already-present one is dropped. The
+     * Records (off, depth, try_depth) in `seen`, the per-offset state set
+     * (dedup + subroutine-polymorphism). A newly seen state is also pushed onto
+     * the worklist for later processing; an already-present one is dropped. The
      * macro returns false from the enclosing function on any rejection (target
-     * off a boundary, depth out of range, or more than K distinct depths at
-     * one instruction). Because a state is enqueued only on its first sighting,
-     * the worklist holds at most n*K entries over the whole run — the fixpoint
-     * touches each state once instead of re-sweeping all of them per round.
+     * off a boundary, either depth out of range, or more than K distinct states
+     * at one instruction). Because a state is enqueued only on its first
+     * sighting, the worklist holds at most n*K entries over the whole run — the
+     * fixpoint touches each state once instead of re-sweeping all of them per
+     * round.
      */
-#define SEED(TARGET, DEPTH)                                                    \
+#define SEED(TARGET, DEPTH, TRY)                                               \
     do {                                                                       \
         int32_t _dp = (DEPTH);                                                 \
+        int32_t _tr = (TRY);                                                   \
         uint32_t _t = (TARGET);                                                \
         if (_dp < 0 || _dp > (int32_t)JSBC_MAX_STACK) {                        \
             *err = "SyntaxError: bytecode stack out of range";                 \
             return false;                                                      \
         }                                                                      \
-        if (_t >= n || !boundary[_t]) {                                        \
+        if (_tr < 0) {                                                         \
+            *err = "SyntaxError: bytecode pops an unmatched try handler";      \
+            return false;                                                      \
+        }                                                                      \
+        if (_tr > (int32_t)JSBC_MAX_TRY_DEPTH) {                               \
+            *err = "SyntaxError: bytecode try nesting too deep";               \
+            return false;                                                      \
+        }                                                                      \
+        if (_t >= n || !(boundary[_t] & JSBC_B_INSN)) {                        \
             *err = "SyntaxError: control-flow target off instruction boundary"; \
             return false;                                                      \
         }                                                                      \
-        int32_t *_slot = &seen[(size_t)_t * K];                                \
+        int32_t *_slot = &seen[(size_t)_t * K * 2];                            \
         bool _found = false;                                                   \
         uint32_t _free = K;                                                    \
         for (uint32_t _i = 0; _i < K; _i++) {                                  \
-            if (_slot[_i] == _dp) { _found = true; break; }                    \
-            if (_slot[_i] < 0 && _free == K) _free = _i;                       \
+            if (_slot[2 * _i] == _dp && _slot[2 * _i + 1] == _tr) {            \
+                _found = true;                                                 \
+                break;                                                         \
+            }                                                                  \
+            if (_slot[2 * _i] < 0 && _free == K) _free = _i;                   \
         }                                                                      \
         if (!_found) {                                                         \
             if (_free == K) {                                                  \
                 *err = "SyntaxError: too many stack shapes at one instruction"; \
                 return false;                                                  \
             }                                                                  \
-            _slot[_free] = _dp;                                                \
-            worklist[2 * wl_len] = _t;                                         \
-            worklist[2 * wl_len + 1] = (uint32_t)_dp;                          \
+            _slot[2 * _free] = _dp;                                            \
+            _slot[2 * _free + 1] = _tr;                                        \
+            worklist[3 * wl_len] = _t;                                         \
+            worklist[3 * wl_len + 1] = (uint32_t)_dp;                          \
+            worklist[3 * wl_len + 2] = (uint32_t)_tr;                          \
             wl_len++;                                                          \
         }                                                                      \
     } while (0)
 
-    SEED(0, 0); /* entry state: empty operand stack at offset 0 */
+    SEED(0, 0, 0); /* entry: empty operand stack, no handler installed */
 
     /*
      * Worklist fixpoint: pop a discovered (off, depth) state, propagate it to
@@ -652,8 +708,9 @@ static bool verify_pass2(JsFunctionCell *fn, const uint8_t *boundary,
      */
     while (wl_len) {
         wl_len--;
-        uint32_t off = worklist[2 * wl_len];
-        int32_t d = (int32_t)worklist[2 * wl_len + 1];
+        uint32_t off = worklist[3 * wl_len];
+        int32_t d = (int32_t)worklist[3 * wl_len + 1];
+        int32_t tr = (int32_t)worklist[3 * wl_len + 2];
         uint8_t opb = code[off];
         const JsOpInfo *oi = &js_op_info[opb];
         uint32_t next = off + 1 + oi->operand_bytes;
@@ -676,16 +733,26 @@ static bool verify_pass2(JsFunctionCell *fn, const uint8_t *boundary,
         if ((uint32_t)d > max_depth)
             max_depth = (uint32_t)d;
         int32_t ft = d + delta;
+        /* Try-stack transitions. TRY_PUSH installs a handler on the
+         * fall-through edge; the handler itself is entered by the unwinder,
+         * which has already popped that entry, so the taken edge carries the
+         * incoming depth. TRY_POP removes one — SEED rejects the negative
+         * result, which is what makes an unmatched TRY_POP unloadable. */
+        int32_t ft_try = tr;
+        if (opb == JS_OP_TRY_PUSH)
+            ft_try = tr + 1;
+        else if (opb == JS_OP_TRY_POP)
+            ft_try = tr - 1;
 
         switch (oi->cf) {
         case CF_NEXT:
-            SEED(next, ft);
+            SEED(next, ft, ft_try);
             break;
         case CF_JUMP:
-            SEED(branch_target(code, off), ft);
+            SEED(branch_target(code, off), ft, ft_try);
             break;
         case CF_BRANCH: {
-            SEED(next, ft); /* fall-through edge */
+            SEED(next, ft, ft_try); /* fall-through edge */
             /* Taken edge. Most branches carry the fall-through delta; the
              * asymmetric ones override it: CASE/OPT_CALL_CHECK/ITER_NEXT pop
              * two on the taken path, TRY_PUSH's handler is entered with the
@@ -698,16 +765,25 @@ static bool verify_pass2(JsFunctionCell *fn, const uint8_t *boundary,
                 taken = d + 1;
             else
                 taken = ft;
-            SEED(branch_target(code, off), taken);
+            SEED(branch_target(code, off), taken, tr);
             break;
         }
         case CF_GOSUB:
             /* fall-through resumes at d (RET_SUB pops the return address); the
              * subroutine body starts at d+1 */
-            SEED(next, d);
-            SEED(branch_target(code, off), d + 1);
+            SEED(next, d, tr);
+            SEED(branch_target(code, off), d + 1, tr);
             break;
         case CF_RETSUB:
+            /*
+             * RET_SUB's successor is a runtime value, so there is no static
+             * edge to follow here. Safety comes from the pair of checks the
+             * interpreter applies instead (see the JS_OP_RET_SUB comment):
+             * the address must be a GOSUB resume point, and the operand depth
+             * on arrival must be one this fixpoint proved for that offset.
+             * Those verified depths are harvested into fn->gosub_rets below.
+             */
+            break;
         case CF_RETURN:
         case CF_THROW:
             break; /* no static successor */
@@ -729,6 +805,49 @@ static bool verify_pass2(JsFunctionCell *fn, const uint8_t *boundary,
     }
 
     fn->max_stack = max_depth + 8; /* mirror the compiler's headroom */
+
+    /*
+     * Harvest the operand depths proven for each GOSUB resume point. RET_SUB
+     * jumps to a value it pops off the operand stack; a forged one that merely
+     * lands on an instruction would run that instruction at a depth nothing
+     * verified, leaving stale (already-unreachable, collectable) JsValues below
+     * the new stack top. Recording (offset, depth) lets the interpreter demand
+     * the arriving depth be one this pass actually proved.
+     */
+    uint32_t pairs = 0;
+    for (uint32_t r = 0; r < n; r++) {
+        if (!(boundary[r] & JSBC_B_GOSUB_RET))
+            continue;
+        for (uint32_t i = 0; i < K; i++)
+            if (seen[(size_t)r * K * 2 + 2 * i] >= 0)
+                pairs++;
+    }
+    if (pairs > JSBC_MAX_GOSUB_RETS) {
+        *err = "SyntaxError: too many subroutine resume points";
+        return false;
+    }
+    if (pairs) {
+        uint32_t *tbl = js_realloc_raw(fn_vm, NULL, 0, (size_t)pairs * 2 * sizeof(uint32_t));
+        if (!tbl) {
+            *err = "out of memory";
+            return false;
+        }
+        uint32_t w = 0;
+        for (uint32_t r = 0; r < n; r++) {
+            if (!(boundary[r] & JSBC_B_GOSUB_RET))
+                continue;
+            for (uint32_t i = 0; i < K; i++) {
+                int32_t dep = seen[(size_t)r * K * 2 + 2 * i];
+                if (dep < 0)
+                    continue;
+                tbl[2 * w] = r;
+                tbl[2 * w + 1] = (uint32_t)dep;
+                w++;
+            }
+        }
+        fn->gosub_rets = tbl;
+        fn->gosub_ret_count = pairs;
+    }
     return true;
 }
 
@@ -747,17 +866,17 @@ static bool verify_fn(JsContext *ctx, JsFunctionCell *fn, bool is_module,
         return false;
     }
     memset(boundary, 0, fn->code_len);
-    /* the depth set: JSBC_DEPTHS_PER_OFF int32 slots per code offset */
-    size_t seen_bytes = (size_t)fn->code_len * JSBC_DEPTHS_PER_OFF * sizeof(int32_t);
+    /* the state set: JSBC_DEPTHS_PER_OFF (depth, try_depth) pairs per offset */
+    size_t seen_bytes = (size_t)fn->code_len * JSBC_DEPTHS_PER_OFF * 2 * sizeof(int32_t);
     int32_t *seen = js_realloc_raw(vm, NULL, 0, seen_bytes);
     if (!seen) {
         js_realloc_raw(vm, boundary, fn->code_len, 0);
         *err = "out of memory";
         return false;
     }
-    /* the pass-2 worklist: at most one (off, depth) pair per distinct state,
-     * i.e. n*K states, each two uint32 wide */
-    size_t wl_bytes = (size_t)fn->code_len * JSBC_DEPTHS_PER_OFF * 2 * sizeof(uint32_t);
+    /* the pass-2 worklist: at most one entry per distinct state, i.e. n*K
+     * states, each an (off, depth, try_depth) triple of uint32 */
+    size_t wl_bytes = (size_t)fn->code_len * JSBC_DEPTHS_PER_OFF * 3 * sizeof(uint32_t);
     uint32_t *worklist = js_realloc_raw(vm, NULL, 0, wl_bytes);
     if (!worklist) {
         js_realloc_raw(vm, seen, seen_bytes, 0);
@@ -767,7 +886,7 @@ static bool verify_fn(JsContext *ctx, JsFunctionCell *fn, bool is_module,
     }
 
     bool ok = verify_pass1(fn, boundary, is_module, import_count, err) &&
-              verify_pass2(fn, boundary, seen, worklist, err);
+              verify_pass2(vm, fn, boundary, seen, worklist, err);
 
     js_realloc_raw(vm, worklist, wl_bytes, 0);
     js_realloc_raw(vm, seen, seen_bytes, 0);
@@ -775,8 +894,9 @@ static bool verify_fn(JsContext *ctx, JsFunctionCell *fn, bool is_module,
         js_realloc_raw(vm, boundary, fn->code_len, 0);
         return false;
     }
-    /* Retain the instruction-start bitmap so RET_SUB can validate its (runtime,
-     * attacker-influenced) return address lands on an instruction boundary. */
+    /* Retain the bitmap so RET_SUB can validate its (runtime, attacker-
+     * influenced) return address against the GOSUB resume points pass 2
+     * proved a depth for. */
     fn->insn_boundary = boundary;
 
     /* recurse into nested functions */

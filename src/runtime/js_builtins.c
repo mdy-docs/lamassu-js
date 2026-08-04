@@ -474,7 +474,7 @@ static bool sm_repeat(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     if (d > 4294967295.0)
         return native_throw(ctx, r, "RangeError: repeat count too large");
     uint32_t n = (uint32_t)d;
-    if ((uint64_t)n * s->length > (64u * 1024 * 1024))
+    if ((uint64_t)n * s->length > JS_MAX_STRING_UNITS)
         return native_throw(ctx, r, "RangeError: repeat count too large");
     StrBuf sb;
     sb_init(&sb, ctx->vm);
@@ -508,6 +508,12 @@ static bool sm_pad(JsContext *ctx, JsValue tv, const JsValue *args, int argc, Js
     if (pn == 0)
         return make_substr(ctx, s, 0, s->length, r);
     uint32_t need = target - s->length;
+    /* Reject an impossible length up front, the way repeat() does. sb_unit is
+     * a no-op once the builder has hit OOM, but the loop itself is not: a bare
+     * `"x".padStart(4294967295)` would still spin four billion times inside
+     * this one native, where no fuel is charged. */
+    if ((uint64_t)need + s->length > JS_MAX_STRING_UNITS)
+        return native_throw(ctx, r, "RangeError: pad length too large");
     StrBuf sb;
     sb_init(&sb, ctx->vm);
     if (!start)
@@ -1100,10 +1106,11 @@ static bool am_sort(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     bool has_cmp = js_is_function(cmp);
     if (argc > 0 && !has_cmp && !js_is_undefined(cmp))
         return native_throw(ctx, r, "TypeError: comparator is not a function");
-    JsValue arrv = tv, key = js_undefined();
+    JsValue arrv = tv, key = js_undefined(), midstr = js_undefined();
     js_gc_protect(ctx->vm, &arrv);
     js_gc_protect(ctx->vm, &cmp);
     js_gc_protect(ctx->vm, &key);
+    js_gc_protect(ctx->vm, &midstr);
     bool failed = false;
 
     for (uint32_t i = 1; i < a->elem_count && !failed; i++) {
@@ -1127,9 +1134,18 @@ static bool am_sort(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
                 double d = js_to_number_value(ctx, res);
                 c = d > 0 ? 1 : (d < 0 ? -1 : 0);
             } else {
+                /* Converting `key` allocates, which is a GC safe point — so
+                 * `sa` must be rooted across it or the collector can reclaim
+                 * the string this comparison is about to read. */
                 JsString *sa = js_to_string_cell(ctx, midv, 0);
+                if (!sa) {
+                    failed = true;
+                    oom(ctx, r);
+                    break;
+                }
+                midstr = js_value_from_cell(&sa->gc);
                 JsString *sk = js_to_string_cell(ctx, key, 0);
-                if (!sa || !sk) {
+                if (!sk) {
                     failed = true;
                     oom(ctx, r);
                     break;
@@ -1159,6 +1175,7 @@ static bool am_sort(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
             a->elems[j] = a->elems[j - 1];
         a->elems[lo] = key;
     }
+    js_gc_unprotect(ctx->vm, &midstr);
     js_gc_unprotect(ctx->vm, &key);
     js_gc_unprotect(ctx->vm, &cmp);
     js_gc_unprotect(ctx->vm, &arrv);

@@ -181,7 +181,23 @@ bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
                         JsNativeFn fn, void *userdata);
 
 uint32_t js_context_error_pos(const JsContext *ctx);
-void     js_context_set_fuel(JsContext *ctx, uint64_t fuel); /* 0 = unlimited */
+/*
+ * Arms an execution budget, in bytecode instructions, for the next TURN — a
+ * top-level run (js_run_module / js_call / js_eval_module) together with the
+ * microtask drain it feeds, including every job js_run_jobs runs. The budget
+ * is shared, not per-fiber or per-job: nested calls and queued microtasks all
+ * draw from the same remainder, so no amount of re-queueing extends it. Once
+ * spent, every further instruction throws a RangeError that re-arms itself, so
+ * guest code cannot catch it and keep running.
+ *
+ * Call it again to arm the next turn — a host running untrusted code should do
+ * so per request, not once at startup. 0 = unlimited.
+ *
+ * It counts instructions, not time: a single instruction may enter a builtin
+ * that runs long (see the notes on sort/replace/regex in the security docs), so
+ * a host that must bound wall-clock should also cap execution from outside.
+ */
+void     js_context_set_fuel(JsContext *ctx, uint64_t fuel);
 
 /* ---- promises / async (phase 6) ---- */
 

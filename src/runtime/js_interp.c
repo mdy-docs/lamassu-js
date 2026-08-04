@@ -20,7 +20,6 @@
  * - delete on array elements writes undefined instead of making a hole.
  */
 
-#define JS_MAX_CONCAT_UNITS (64u * 1024 * 1024)
 #define JS_TOSTRING_MAX_DEPTH 8
 
 /* ---- small helpers ---- */
@@ -110,7 +109,7 @@ JsString *js_to_string_cell(JsContext *ctx, JsValue v, int depth) {
                 }
             }
             size_t need = len + (part ? part->length : 0) + 1;
-            if (need > JS_MAX_CONCAT_UNITS) {
+            if (need > JS_MAX_STRING_UNITS) {
                 js_realloc_raw(vm, buf, cap * sizeof(uint16_t), 0);
                 return NULL;
             }
@@ -694,7 +693,7 @@ bool js_spread_into_object(JsContext *ctx, JsObject *dst, JsValue src) {
 /* ---- string ops ---- */
 
 JsString *js_concat_cells(JsVm *vm, const JsString *a, const JsString *b) {
-    if ((uint64_t)a->length + b->length > JS_MAX_CONCAT_UNITS)
+    if ((uint64_t)a->length + b->length > JS_MAX_STRING_UNITS)
         return NULL;
     uint32_t len = a->length + b->length;
     JsGcCell *c = js_gc_new_cell(vm, JS_KIND_STRING,
@@ -1869,6 +1868,12 @@ run:; /* (re)load the top frame */
                 break;
             }
             case JS_OP_TRY_POP:
+                /* The verifier proves try-stack balance, so this can only fire
+                 * on a bug in it — but the cost of being wrong is an unsigned
+                 * underflow that turns fb->trys[] into a wild pointer whose
+                 * contents become `sp` and `ip`, so it is checked anyway. */
+                if (fb->try_count == 0)
+                    RT_THROW("internal error: try stack underflow");
                 fb->try_count--;
                 break;
             case JS_OP_GOSUB: {
@@ -1886,11 +1891,34 @@ run:; /* (re)load the top frame */
                  * not that this runtime value is actually a legitimate
                  * previously-pushed ip — so both the cast and the jump
                  * target need guarding, unlike GOSUB's own target (a static
-                 * bytecode field, already validated at load time). */
+                 * bytecode field, already validated at load time).
+                 *
+                 * "On an instruction boundary" is not enough. It admits a jump
+                 * to any instruction at any operand depth — including code the
+                 * verifier's fixpoint never reached, which was therefore never
+                 * depth-checked and never counted towards max_stack. Landing
+                 * high also leaves stale JsValues below the new top: slots the
+                 * GC stopped tracing at the old sp, so they may name cells it
+                 * has already freed. Both are avoided by demanding the pair the
+                 * verifier actually proved — a GOSUB resume point, reached at
+                 * one of the depths recorded for it. */
                 uint32_t ret;
-                if (!value_to_index(POPV(), &ret) || ret >= fn->code_len ||
-                    (fn->insn_boundary && !fn->insn_boundary[ret]))
+                if (!value_to_index(POPV(), &ret) || ret >= fn->code_len)
                     RT_THROW("internal error: bad subroutine return address");
+                if (fn->insn_boundary) {
+                    if (!(fn->insn_boundary[ret] & JSBC_B_GOSUB_RET))
+                        RT_THROW("internal error: bad subroutine return address");
+                    uint32_t depth = fb->sp - base - fn->n_locals;
+                    bool ok_depth = false;
+                    for (uint32_t i = 0; i < fn->gosub_ret_count; i++)
+                        if (fn->gosub_rets[2 * i] == ret &&
+                            fn->gosub_rets[2 * i + 1] == depth) {
+                            ok_depth = true;
+                            break;
+                        }
+                    if (!ok_depth)
+                        RT_THROW("internal error: bad subroutine return depth");
+                }
                 ip = ret;
                 break;
             }
@@ -1940,7 +1968,12 @@ run:; /* (re)load the top frame */
             }
             case JS_OP_GET_IMPORT: {
                 JsModuleImport *imp = &fn->module->imports[READ_U16()];
-                if (!imp->source || !imp->source->exports)
+                /* imported_name is legitimately NULL for a side-effect-only or
+                 * namespace import, which GET_IMPORT is never emitted against
+                 * — but a tampered module buffer can pair the two, and
+                 * js_map_get dereferences the key to hash it. The verifier
+                 * bounds the import INDEX; the record's shape is checked here. */
+                if (!imp->source || !imp->source->exports || !imp->imported_name)
                     RT_THROW("ReferenceError: module binding is not available");
                 bool found;
                 JsValue v = js_map_get(&imp->source->exports->props, imp->imported_name,
@@ -2047,14 +2080,40 @@ static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
     fb->error = js_undefined();
     /* Fuel is a shared budget, not a per-fiber allowance: a fiber spawned by a
      * native re-entering the interpreter inherits the caller's *remaining*
-     * fuel so a script cannot refill the budget by making nested calls. Only a
-     * fresh top-level run (no current fiber) starts from ctx->fuel. */
-    fb->fuel = ctx->fiber ? ctx->fiber->fuel : (ctx->fuel ? ctx->fuel : UINT64_MAX);
+     * fuel so a script cannot refill the budget by making nested calls.
+     *
+     * A top-level fiber (no current fiber) draws from ctx->fuel_left rather
+     * than ctx->fuel, because every microtask the job queue runs arrives here
+     * as a top-level fiber too. Charging those to ctx->fuel would hand each one
+     * a full tank, and `function f(){ Promise.resolve().then(f); }` would then
+     * run forever under any budget. A remainder of 0 means the turn is spent:
+     * start at 1 so the very first instruction throws (0 would underflow into
+     * an unlimited budget). */
+    if (ctx->fiber)
+        fb->fuel = ctx->fiber->fuel;
+    else if (!ctx->fuel)
+        fb->fuel = UINT64_MAX;
+    else
+        fb->fuel = ctx->fuel_left ? ctx->fuel_left : 1;
 
+    /*
+     * Root the new fiber for the rest of setup. Until the caller installs it as
+     * ctx->fiber it is reachable from nothing, and the work below allocates:
+     * stack_ensure can collect once a heap_limit is set, and frame_setup builds
+     * the rest-parameter array outright. Collecting here frees the fiber whose
+     * stack frame_setup is in the middle of filling in — `async function
+     * f(...args) {}` was enough to turn that into a use-after-free.
+     */
+    JsValue fb_val = js_value_from_cell(fc);
+    if (!js_gc_protect(vm, &fb_val)) {
+        *err = "out of memory";
+        return NULL;
+    }
+    JsFiber *result = NULL;
     if (!stack_ensure(vm, fb, (uint32_t)(2 + argc) + cl->fn->n_locals +
                                   cl->fn->max_stack + 8)) {
         *err = "out of memory";
-        return NULL;
+        goto done;
     }
     fb->stack[0] = js_value_from_cell(&cl->gc);
     fb->stack[1] = this_val;
@@ -2064,9 +2123,12 @@ static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
     int rc = frame_setup(ctx, fb, cl, 2, (uint32_t)argc, false);
     if (rc != 0) {
         *err = rc == -2 ? "RangeError: maximum call stack size exceeded" : "out of memory";
-        return NULL;
+        goto done;
     }
-    return fb;
+    result = fb;
+done:
+    js_gc_unprotect(vm, &fb_val);
+    return result;
 }
 
 /*
@@ -2094,9 +2156,13 @@ static JsRunStatus advance_fiber(JsContext *ctx, JsFiber *fb, JsValue *out) {
     }
     ctx->fiber = saved;
     /* Return the fiber's remaining fuel to its caller so the shared budget
-     * keeps decreasing across the whole call tree. */
+     * keeps decreasing across the whole call tree — or, at top level, back to
+     * the context, so the microtasks this run queued inherit what is left
+     * instead of restarting from the full budget. */
     if (saved)
         saved->fuel = fb->fuel;
+    else if (ctx->fuel)
+        ctx->fuel_left = fb->fuel;
     if (fb->result_promise) {
         if (st == JS_RUN_DONE)
             js_promise_resolve_with(ctx, fb->result_promise, *out);

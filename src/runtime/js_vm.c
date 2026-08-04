@@ -158,6 +158,7 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->loader_ud = NULL;
     ctx->fiber = NULL;
     ctx->fuel = 0;
+    ctx->fuel_left = 0;
     ctx->error_pos = 0;
     ctx->reentry_depth = 0;
 
@@ -223,4 +224,5 @@ uint32_t js_context_error_pos(const JsContext *ctx) {
 
 void js_context_set_fuel(JsContext *ctx, uint64_t fuel) {
     ctx->fuel = fuel;
+    ctx->fuel_left = fuel; /* arms a fresh turn */
 }

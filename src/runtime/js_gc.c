@@ -185,6 +185,9 @@ void js_gc_free_cell(JsVm *vm, JsGcCell *c, bool remove_atoms) {
         js_realloc_raw(vm, f->upvals, (size_t)f->upval_cap * sizeof(JsUpvalDesc), 0);
         if (f->insn_boundary)
             js_realloc_raw(vm, f->insn_boundary, f->code_len, 0);
+        if (f->gosub_rets)
+            js_realloc_raw(vm, f->gosub_rets,
+                           (size_t)f->gosub_ret_count * 2 * sizeof(uint32_t), 0);
         size = sizeof *f;
         break;
     }

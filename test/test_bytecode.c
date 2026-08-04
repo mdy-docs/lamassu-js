@@ -443,11 +443,69 @@ static void test_validation(void) {
     free(bc);
 }
 
+/*
+ * Exhaustive single-byte substitution: every offset, every one of the 256
+ * values. The invariant is not "the loader rejects these" — many substitutions
+ * are harmless — but "whatever the loader ACCEPTS, the interpreter survives".
+ * ASan/UBSan is what actually enforces it; this sweep just supplies the inputs.
+ *
+ * A one-byte edit is enough to have reached three separate memory-safety bugs,
+ * which is why the sweep is exhaustive rather than sampled:
+ *   - JS_OP_TRY_POP anywhere in the code section underflowed the unsigned
+ *     fiber->try_count, so the unwinder read a JsTryEntry from far out of
+ *     bounds and jumped to the .target it found there. The verifier tracked
+ *     operand-stack depth but not try-stack depth.
+ *   - JS_OP_RET_SUB jumped to any instruction boundary, including code the
+ *     verifier's reachability fixpoint never visited and so never depth-checked
+ *     or counted towards max_stack.
+ *   - JS_FN_HAS_REST in a function header with n_params == 0 underflowed
+ *     frame_setup's `fixed = n_params - 1` to 4 billion, and its fill loop ran
+ *     off the end of the fiber stack.
+ */
+static void test_byte_substitution_sweep(void) {
+    size_t len;
+    uint8_t *bc = make_valid_bc(&len);
+    checks_run++;
+    if (!bc) {
+        checks_failed++;
+        fprintf(stderr, "FAIL: could not build bytecode for substitution sweep\n");
+        return;
+    }
+    CountAlloc ca = {0, 0};
+    JsVmConfig cfg = {.realloc_fn = count_realloc, .alloc_ud = &ca};
+    JsVm *vm = js_vm_new(&cfg);
+    JsContext *ctx = js_context_new(vm);
+    uint8_t *t = malloc(len);
+    long loaded = 0;
+    for (size_t off = 0; off < len; off++) {
+        uint8_t orig = bc[off];
+        for (unsigned v = 0; v < 256; v++) {
+            if ((uint8_t)v == orig)
+                continue;
+            memcpy(t, bc, len);
+            t[off] = (uint8_t)v;
+            if (try_load_and_run_on(ctx, vm, t, len))
+                loaded++;
+        }
+    }
+    free(t);
+    js_vm_free(vm);
+    free(bc);
+    /* Sanity: the sweep must actually exercise the interpreter, not just the
+     * reject path — otherwise it would silently stop testing anything. */
+    checks_run++;
+    if (loaded == 0) {
+        checks_failed++;
+        fprintf(stderr, "FAIL: substitution sweep loaded nothing (test is inert)\n");
+    }
+}
+
 int main(void) {
     test_roundtrip();
     test_vs_direct();
     test_validation();
     test_ws_d_number_typeconfusion();
+    test_byte_substitution_sweep();
     if (checks_failed) {
         fprintf(stderr, "%d/%d bytecode checks FAILED\n", checks_failed, checks_run);
         return 1;

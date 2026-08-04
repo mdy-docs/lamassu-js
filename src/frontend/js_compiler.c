@@ -94,6 +94,7 @@ typedef struct JsCompiler {
     const char *err_msg;
     uint32_t err_pos;
     int func_depth;
+    int expr_depth; /* compile_expr recursion; see JS_COMPILE_MAX_EXPR_DEPTH */
     /* module compilation (NULL if compiling a plain script) */
     JsModule *module;
     JsModBinding *mbind; /* top-level module bindings (exports/imports) */
@@ -1301,7 +1302,34 @@ static bool compile_new(JsCompiler *cx, const JsAstNode *n) {
 
 /* ---- expressions ---- */
 
+/*
+ * Bound on compile_expr's own recursion, which the parser's JS_PARSE_MAX_DEPTH
+ * does NOT cover. The parser deliberately consumes left-associative chains
+ * iteratively — `a+b+c+…` unwinds each step, so it costs no parser stack — but
+ * the tree it hands back is left-leaning and one node deep per operator, and
+ * this walker descends it recursively. `1+1+1+…` therefore reached the C stack
+ * limit and killed the process, from source alone: ~600 KB of `+1` was enough.
+ * Chains of member accesses, calls, indexing and every binary/logical operator
+ * have the same shape.
+ *
+ * 5000 leaves roughly a 3x margin against the shallowest stack this has been
+ * measured to overflow on (an ASan build, where frames are widest), and is far
+ * past any chain length real source produces.
+ */
+#define JS_COMPILE_MAX_EXPR_DEPTH 5000
+
+static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n);
+
 static bool compile_expr(JsCompiler *cx, const JsAstNode *n) {
+    if (cx->expr_depth >= JS_COMPILE_MAX_EXPR_DEPTH)
+        return cerr(cx, n->pos, "expression nesting too deep");
+    cx->expr_depth++;
+    bool ok = compile_expr_node(cx, n);
+    cx->expr_depth--;
+    return ok;
+}
+
+static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
     switch ((JsAstKind)n->kind) {
     case JS_AST_NUMBER:
         return emit_number(cx, n->number, n->pos);
