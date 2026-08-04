@@ -76,9 +76,17 @@ typedef enum JsObjKind {
     JS_OBJ_SET = 5,    /* JsSetObj (js_setobj.h) */
 } JsObjKind;
 
+/* JsObject.obj_flags. Extensibility only — this engine has no per-property
+ * attributes, so "frozen" is a whole-object state rather than every property
+ * being individually non-writable. That matches what Object.freeze/seal
+ * observably do to an ordinary object, which is all guest code can test. */
+#define JS_OBJ_SEALED 1u /* no adding, no deleting; existing props writable */
+#define JS_OBJ_FROZEN 2u /* sealed, and no writes either */
+
 typedef struct JsObject {
     JsGcCell gc;
     uint8_t obj_kind;
+    uint8_t obj_flags; /* fits in the padding before props; costs nothing */
     JsMap props;
     /* JS_OBJ_ARRAY: dense elements; sparse writes fall back to props. */
     JsValue *elems;

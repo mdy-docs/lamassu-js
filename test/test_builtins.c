@@ -563,7 +563,82 @@ static void test_integration(void) {
     eq("JSON.stringify(Object.keys({x:1,y:2}).sort());", "[\"x\",\"y\"]");
 }
 
+/*
+ * Object.freeze used to return its argument and enforce nothing, which is
+ * worse than not having it: the call succeeds, so guest or host code can
+ * believe an object is protected when every write still lands. These check
+ * the enforcement at each path that can write, because a freeze honoured on
+ * one path and forgotten on another is the same footgun in a smaller box.
+ *
+ * `try { ... } catch (e) { 'threw' }` is the shape throughout: this engine is
+ * strict-mode everywhere, so a refused write is a TypeError, not a silent no-op.
+ */
+static void test_freeze_seal(void) {
+    /* writes, additions and deletions all refused on a frozen object */
+    eq("const o = Object.freeze({ a: 1 });"
+       "try { o.a = 2; 'no'; } catch (e) { 'threw'; }", "threw");
+    eq("const o = Object.freeze({ a: 1 });"
+       "try { o.b = 2; 'no'; } catch (e) { 'threw'; }", "threw");
+    eq("const o = Object.freeze({ a: 1 });"
+       "try { delete o.a; 'no'; } catch (e) { 'threw'; }", "threw");
+    eq("const o = Object.freeze({ a: 1 }); o.a;", "1");
+
+    /* sealed keeps existing properties writable but fixes the shape */
+    eq("const o = Object.seal({ a: 1 }); o.a = 2; o.a;", "2");
+    eq("const o = Object.seal({ a: 1 });"
+       "try { o.b = 1; 'no'; } catch (e) { 'threw'; }", "threw");
+    eq("const o = Object.seal({ a: 1 });"
+       "try { delete o.a; 'no'; } catch (e) { 'threw'; }", "threw");
+
+    /* introspection, including the spec's vacuous answer for primitives */
+    eq("Object.isFrozen(Object.freeze({}));", "true");
+    eq("Object.isSealed(Object.freeze({}));", "true");
+    eq("Object.isSealed(Object.seal({}));", "true");
+    eq("Object.isFrozen(Object.seal({}));", "false");
+    eq("Object.isFrozen({});", "false");
+    eq("Object.isFrozen(1) + ':' + Object.isSealed('s');", "true:true");
+    /* idempotent, and returns its argument so `const o = freeze({...})` reads */
+    eq("const o = {}; Object.freeze(o) === o && Object.isFrozen(Object.freeze(o));", "true");
+
+    /* arrays: indexed writes and length go through the same gate */
+    eq("const a = Object.freeze([1, 2]);"
+       "try { a[0] = 9; 'no'; } catch (e) { 'threw'; }", "threw");
+    eq("const a = Object.freeze([1, 2]);"
+       "try { a.length = 0; 'no'; } catch (e) { 'threw'; }", "threw");
+    /* ...and the mutators that write the element buffer directly, which never
+     * reach set_property at all */
+    eq("const a = Object.freeze([1, 2]);"
+       "try { a.push(3); 'no'; } catch (e) { 'threw'; }", "threw");
+    eq("const a = Object.freeze([1, 2]);"
+       "try { a.pop(); 'no'; } catch (e) { 'threw'; }", "threw");
+    eq("const a = Object.freeze([2, 1]);"
+       "try { a.sort(); 'no'; } catch (e) { 'threw'; }", "threw");
+    eq("const a = Object.freeze([1, 2]);"
+       "try { a.reverse(); 'no'; } catch (e) { 'threw'; }", "threw");
+    eq("const a = Object.freeze([1, 2]);"
+       "try { a.fill(0); 'no'; } catch (e) { 'threw'; }", "threw");
+    eq("const a = Object.freeze([1, 2]);"
+       "try { a.shift(); 'no'; } catch (e) { 'threw'; }", "threw");
+    eq("const a = Object.freeze([1, 2]);"
+       "try { a.unshift(0); 'no'; } catch (e) { 'threw'; }", "threw");
+    /* a sealed array may rearrange what it has, but not resize */
+    eq("const a = Object.seal([2, 1]); a.sort(); a.join(',');", "1,2");
+    eq("const a = Object.seal([1, 2]); a[0] = 9; a[0];", "9");
+    eq("const a = Object.seal([1, 2]);"
+       "try { a.push(3); 'no'; } catch (e) { 'threw'; }", "threw");
+
+    /* The point of the exercise: a host can now harden the prototypes a
+     * reused context shares between tenants. */
+    eq("Object.freeze(Object.prototype);"
+       "try { Object.prototype.polluted = 1; 'no'; } catch (e) { 'threw'; }", "threw");
+    eq("Object.freeze(Array.prototype);"
+       "try { Array.prototype.map = null; 'no'; } catch (e) { 'threw'; }", "threw");
+    eq("Object.freeze(Array.prototype); [1, 2].map(function (v) { return v * 2; }).join(',');",
+       "2,4");
+}
+
 int main(void) {
+    test_freeze_seal();
     test_string();
     test_array();
     test_number();

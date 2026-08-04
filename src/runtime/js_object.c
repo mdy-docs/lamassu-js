@@ -6,6 +6,7 @@ JsValue js_object_new(JsContext *ctx) {
         return js_undefined();
     JsObject *o = (JsObject *)c;
     o->obj_kind = JS_OBJ_PLAIN;
+    o->obj_flags = 0;
     js_map_init(&o->props);
     o->elems = NULL;
     o->elem_count = o->elem_cap = 0;
@@ -25,6 +26,7 @@ JsObject *js_array_new_cell(JsContext *ctx, uint32_t reserve) {
         return NULL;
     JsObject *o = (JsObject *)c;
     o->obj_kind = JS_OBJ_ARRAY;
+    o->obj_flags = 0;
     js_map_init(&o->props);
     o->elems = NULL;
     o->elem_count = o->elem_cap = 0;
@@ -106,6 +108,22 @@ JsValue js_object_get(JsVm *vm, JsValue obj, JsValue key) {
 bool js_object_set(JsVm *vm, JsValue obj, JsValue key, JsValue value) {
     if (!js_is_object(obj) || !js_is_string(key))
         return false;
+    /* The host API honours freeze/seal as well. A host that froze an object to
+     * keep guest code out would otherwise be able to defeat its own guarantee
+     * by accident, and natives share this entry point with guest writes. */
+    JsObject *o = js_value_object(obj);
+    if (o->obj_flags & JS_OBJ_FROZEN)
+        return false;
+    if (o->obj_flags & JS_OBJ_SEALED) {
+        bool found = false;
+        JsString *ek = js_atoms_find(vm, js_value_string(key)->units,
+                                     js_value_string(key)->length,
+                                     js_value_string(key)->hash);
+        if (ek)
+            js_map_get(&o->props, ek, &found);
+        if (!found)
+            return false;
+    }
     js_gc_maybe(vm); /* safe point: obj/key/value are caller-rooted */
     JsString *k = js_intern_cell(vm, js_value_string(key));
     if (!k)
@@ -115,6 +133,8 @@ bool js_object_set(JsVm *vm, JsValue obj, JsValue key, JsValue value) {
 
 bool js_object_delete(JsVm *vm, JsValue obj, JsValue key) {
     if (!js_is_object(obj))
+        return false;
+    if (js_value_object(obj)->obj_flags)
         return false;
     JsString *k = js_object_key_lookup(vm, key);
     if (!k)

@@ -248,6 +248,7 @@ static bool alloc_date(JsContext *ctx, double time, JsValue *out) {
         return false;
     JsDateObject *d = (JsDateObject *)c;
     d->obj.obj_kind = JS_OBJ_DATE;
+    d->obj.obj_flags = 0;
     js_map_init(&d->obj.props);
     d->obj.elems = NULL;
     d->obj.elem_count = d->obj.elem_cap = 0;

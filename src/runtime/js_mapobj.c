@@ -92,6 +92,7 @@ static bool alloc_mapobj(JsContext *ctx, JsValue *out) {
         return false;
     JsMapObj *m = (JsMapObj *)c;
     m->obj.obj_kind = JS_OBJ_MAP;
+    m->obj.obj_flags = 0;
     js_map_init(&m->obj.props);
     m->obj.elems = NULL;
     m->obj.elem_count = m->obj.elem_cap = 0;

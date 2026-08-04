@@ -694,9 +694,28 @@ static bool array_this(JsContext *ctx, JsValue tv, JsObject **out, JsValue *r) {
     return true;
 }
 
+/*
+ * The mutating array methods write a->elems and a->elem_count directly, so
+ * they never reach set_property's freeze check and have to make it themselves.
+ * `changes_length` separates the two states: sealing forbids adding and
+ * removing elements, freezing forbids touching them at all, so reverse/fill/
+ * sort are legal on a sealed array but not a frozen one.
+ */
+static bool array_this_mut(JsContext *ctx, JsValue tv, JsObject **out, JsValue *r,
+                           bool changes_length) {
+    if (!array_this(ctx, tv, out, r))
+        return false;
+    uint8_t f = (*out)->obj_flags;
+    if (f & JS_OBJ_FROZEN)
+        return native_throw(ctx, r, "TypeError: cannot modify a frozen array");
+    if (changes_length && (f & JS_OBJ_SEALED))
+        return native_throw(ctx, r, "TypeError: cannot change the length of a sealed array");
+    return true;
+}
+
 static bool am_push(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsObject *a;
-    if (!array_this(ctx, tv, &a, r))
+    if (!array_this_mut(ctx, tv, &a, r, true))
         return false;
     for (int i = 0; i < argc; i++) {
         if (!js_array_append(ctx->vm, a, args[i]))
@@ -710,7 +729,7 @@ static bool am_pop(JsContext *ctx, JsValue tv, const JsValue *args, int argc, Js
     (void)args;
     (void)argc;
     JsObject *a;
-    if (!array_this(ctx, tv, &a, r))
+    if (!array_this_mut(ctx, tv, &a, r, true))
         return false;
     if (a->elem_count == 0) {
         *r = js_undefined();
@@ -724,7 +743,7 @@ static bool am_shift(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
     (void)args;
     (void)argc;
     JsObject *a;
-    if (!array_this(ctx, tv, &a, r))
+    if (!array_this_mut(ctx, tv, &a, r, true))
         return false;
     if (a->elem_count == 0) {
         *r = js_undefined();
@@ -740,7 +759,7 @@ static bool am_shift(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
 
 static bool am_unshift(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsObject *a;
-    if (!array_this(ctx, tv, &a, r))
+    if (!array_this_mut(ctx, tv, &a, r, true))
         return false;
     for (int i = 0; i < argc; i++) {
         if (!js_array_append(ctx->vm, a, js_undefined())) /* grow */
@@ -878,7 +897,7 @@ static bool am_reverse(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     (void)args;
     (void)argc;
     JsObject *a;
-    if (!array_this(ctx, tv, &a, r))
+    if (!array_this_mut(ctx, tv, &a, r, false))
         return false;
     uint32_t n = a->elem_count;
     for (uint32_t i = 0; i < n / 2; i++) {
@@ -892,7 +911,7 @@ static bool am_reverse(JsContext *ctx, JsValue tv, const JsValue *args, int argc
 
 static bool am_fill(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsObject *a;
-    if (!array_this(ctx, tv, &a, r))
+    if (!array_this_mut(ctx, tv, &a, r, false))
         return false;
     uint32_t start = argc > 1 ? clamp_index(js_to_number_value(ctx, ARG(1)), a->elem_count) : 0;
     uint32_t end = argc > 2 && !js_is_undefined(ARG(2))
@@ -1103,7 +1122,7 @@ static bool am_reduce(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
 /* stable binary insertion sort; comparator optional */
 static bool am_sort(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsObject *a;
-    if (!array_this(ctx, tv, &a, r))
+    if (!array_this_mut(ctx, tv, &a, r, false))
         return false;
     JsValue cmp = ARG(0);
     bool has_cmp = js_is_function(cmp);
@@ -2123,11 +2142,51 @@ static bool obj_assign(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     return true;
 }
 
+/*
+ * Per spec these are no-ops on a primitive rather than an error, and both
+ * return their argument so `const o = Object.freeze({...})` reads naturally.
+ * Idempotent: freezing a frozen object, or a sealed one, just re-asserts it.
+ */
+static bool obj_set_integrity(JsContext *ctx, const JsValue *args, int argc,
+                              JsValue *r, uint8_t flags) {
+    (void)ctx;
+    (void)argc;
+    JsValue v = ARG(0);
+    if (js_is_object(v))
+        js_value_object(v)->obj_flags |= flags;
+    *r = v;
+    return true;
+}
+
 static bool obj_freeze(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    return obj_set_integrity(ctx, args, argc, r, JS_OBJ_SEALED | JS_OBJ_FROZEN);
+}
+
+static bool obj_seal(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    return obj_set_integrity(ctx, args, argc, r, JS_OBJ_SEALED);
+}
+
+/* A non-object has no properties to write, so it is vacuously frozen/sealed —
+ * again matching the spec, and the reason these take the object test first. */
+static bool obj_isFrozen(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)ctx;
     (void)tv;
     (void)argc;
-    *r = ARG(0); /* freeze semantics not enforced (documented) */
+    JsValue v = ARG(0);
+    *r = js_bool(!js_is_object(v) ||
+                 (js_value_object(v)->obj_flags & JS_OBJ_FROZEN) != 0);
+    return true;
+}
+
+static bool obj_isSealed(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)ctx;
+    (void)tv;
+    (void)argc;
+    JsValue v = ARG(0);
+    *r = js_bool(!js_is_object(v) ||
+                 (js_value_object(v)->obj_flags & JS_OBJ_SEALED) != 0);
     return true;
 }
 
@@ -2868,7 +2927,9 @@ bool js_builtins_init(JsContext *ctx) {
         return false;
     if (!def_fn(ctx, object, "keys", obj_keys) || !def_fn(ctx, object, "values", obj_values) ||
         !def_fn(ctx, object, "entries", obj_entries) || !def_fn(ctx, object, "assign", obj_assign) ||
-        !def_fn(ctx, object, "freeze", obj_freeze) || !def_fn(ctx, object, "fromEntries", obj_fromEntries) ||
+        !def_fn(ctx, object, "freeze", obj_freeze) || !def_fn(ctx, object, "isFrozen", obj_isFrozen) ||
+        !def_fn(ctx, object, "seal", obj_seal) || !def_fn(ctx, object, "isSealed", obj_isSealed) ||
+        !def_fn(ctx, object, "fromEntries", obj_fromEntries) ||
         !def_fn(ctx, object, "hasOwn", obj_hasOwn) ||
         !def_fn(ctx, object, "getPrototypeOf", obj_getPrototypeOf) ||
         !def_fn(ctx, object, "setPrototypeOf", obj_setPrototypeOf))

@@ -508,6 +508,40 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
     return JS_PROP_OK;
 }
 
+/*
+ * Own-property presence, for seal/freeze. A sealed object still accepts writes
+ * to properties it already has, so refusing a write means first deciding
+ * whether the key is new — and for an array that question is about the element
+ * range, not the property map.
+ */
+static bool own_prop_present(JsContext *ctx, JsObject *o, JsValue key) {
+    uint32_t idx;
+    if (o->obj_kind == JS_OBJ_ARRAY && key_to_index(key, &idx))
+        return idx < o->elem_count;
+    JsString *k = to_prop_key(ctx, key);
+    if (!k)
+        return false;
+    bool found = false;
+    js_map_get(&o->props, k, &found);
+    return found;
+}
+
+/*
+ * The single gate every guest property write passes through, so freeze cannot
+ * be enforced in one path and forgotten in another. Array index writes and
+ * `length` assignment reach here too. The in-place array mutators in
+ * js_builtins.c write a->elems directly and are gated separately.
+ */
+static const char *write_blocked(JsContext *ctx, JsObject *o, JsValue key) {
+    if (!o->obj_flags)
+        return NULL; /* the overwhelmingly common case: one predictable branch */
+    if (o->obj_flags & JS_OBJ_FROZEN)
+        return "TypeError: cannot assign to a property of a frozen object";
+    if (!own_prop_present(ctx, o, key))
+        return "TypeError: cannot add a property to a sealed object";
+    return NULL;
+}
+
 static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
                                  JsValue val, const char **errmsg) {
     JsVm *vm = ctx->vm;
@@ -537,6 +571,11 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
         return JS_PROP_TYPE_ERROR;
     }
     JsObject *o = js_value_object(base);
+    const char *blocked = write_blocked(ctx, o, key);
+    if (blocked) {
+        *errmsg = blocked;
+        return JS_PROP_TYPE_ERROR;
+    }
 #ifdef LAMASSU_HAS_REGEX
     if (o->obj_kind == JS_OBJ_REGEXP) {
         bool handled = false;
@@ -1627,6 +1666,11 @@ run:; /* (re)load the top frame */
                 JsValue key = PEEK(0), b = PEEK(1);
                 if (js_is_object(b)) {
                     JsObject *o = js_value_object(b);
+                    /* Sealing exists precisely to stop the shape changing, so
+                     * delete is refused on both sealed and frozen objects. */
+                    if (o->obj_flags)
+                        RT_THROW("TypeError: cannot delete a property of a "
+                                 "sealed or frozen object");
                     uint32_t idx;
                     if (o->obj_kind == JS_OBJ_ARRAY && value_to_index(key, &idx)) {
                         if (idx < o->elem_count)

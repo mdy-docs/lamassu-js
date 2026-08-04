@@ -73,6 +73,7 @@ static bool alloc_setobj(JsContext *ctx, JsValue *out) {
         return false;
     JsSetObj *s = (JsSetObj *)c;
     s->obj.obj_kind = JS_OBJ_SET;
+    s->obj.obj_flags = 0;
     js_map_init(&s->obj.props);
     s->obj.elems = NULL;
     s->obj.elem_count = s->obj.elem_cap = 0;

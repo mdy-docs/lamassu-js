@@ -180,6 +180,7 @@ JsValue js_regexp_new(JsContext *ctx, const uint16_t *pat, uint32_t pat_len,
     }
     JsRegExp *re = (JsRegExp *)c;
     re->obj.obj_kind = JS_OBJ_REGEXP;
+    re->obj.obj_flags = 0;
     js_map_init(&re->obj.props);
     re->obj.elems = NULL;
     re->obj.elem_count = re->obj.elem_cap = 0;

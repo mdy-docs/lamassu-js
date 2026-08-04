@@ -109,11 +109,15 @@ runtime's epoch interruption (see the LIMITS note in `src/reactor.c`).
 
 **Use a fresh context per tenant.** `Array.prototype`, `Object.prototype` and
 the other object-kind prototypes are real, script-reachable, mutable objects, as
-they are in any JS engine — and `Object.freeze` is currently a no-op, so it is
-not a defence. A context reused across mutually distrusting guests carries one
-guest's prototype mutations into the next. Create a context per untrusted
-execution; for the wasm reactor, prefer a fresh instance (`src/reactor.c`
-explains why that is cheap enough to be the default).
+they are in any JS engine, so a context reused across mutually distrusting
+guests carries one guest's prototype mutations into the next. Create a context
+per untrusted execution; for the wasm reactor, prefer a fresh instance
+(`src/reactor.c` explains why that is cheap enough to be the default).
+
+`Object.freeze` is now enforced, so hardening the prototypes of a context you
+do intend to reuse is a real defence rather than a no-op that reads like one.
+Prefer a fresh context anyway: freezing covers the prototypes you remember to
+freeze, while a new context covers everything.
 
 **Prefer precompiled bytecode for fleet processes.** Link the runtime alone and
 "this process cannot compile attacker-supplied source" stops being a policy
@@ -121,28 +125,37 @@ someone has to remember and becomes a property of the binary.
 
 ## Known gaps
 
-One remains, and it is unmitigated inside the engine:
+None of the gaps this document originally listed remain open inside the engine.
+The obligations in the previous section are still obligations — they are host
+configuration, not engine defects — and two limits remain approximate by
+construction rather than by omission:
 
-- **`Object.freeze` is a no-op.** It returns its argument and enforces nothing,
-  so neither guest nor host code can rely on it — which is worse than not
-  having it, because the call succeeds. Combined with prototypes being
-  ordinary mutable objects, this is why "one context per tenant" above is a
-  requirement and not a suggestion.
+- **Interrupt latency is bounded by the dispatch loop, not by wall-clock.** A
+  builtin already running finishes its current step before the stop is seen.
+  Every such step is individually bounded, so this is a latency question, not
+  an unbounded one, but a hard deadline still wants an outer kill.
+- **`heap_limit` can be overshot by a single in-flight allocation**, since it is
+  checked before the allocation rather than reserved. The overshoot is one
+  allocation's worth, and per-operation ceilings (`JS_MAX_STRING_UNITS`,
+  `JS_MAX_ARRAY_GAP`) bound how large that can be.
 
-Recently closed, listed here because embeddings written against the old
-behaviour may still be compensating for them:
+Closed recently, listed because embeddings written against the old behaviour may
+still be compensating for them:
 
-- Regex memory is now allocated through the VM, so it is counted in
-  `js_vm_allocated_bytes` and capped by `heap_limit` like anything else. It
-  used to come from libc directly and was invisible to both.
+- Regex memory is allocated through the VM, so it is counted in
+  `js_vm_allocated_bytes` and capped by `heap_limit`. It used to come from libc
+  directly and was invisible to both.
 - `js_vm_interrupt` gives a host an asynchronous stop; there was previously no
   way to halt a running script from outside the engine.
 - `js_gc_protect` can no longer fail, so the ~141 call sites that never checked
   its result are correct by construction rather than by luck.
 - Out-of-memory always carries a reason, and a settled promise always notifies
-  its reactions. Both used to degrade silently under memory pressure — the
-  first to a bare `undefined` rejection, the second to an `await` that stayed
-  pending forever.
+  its reactions. Both used to degrade silently under memory pressure — the first
+  to a bare `undefined` rejection, the second to an `await` that stayed pending
+  forever.
+- `Object.freeze` and `Object.seal` are enforced, on every path that can write:
+  property assignment, array indexed writes, `length`, `delete`, the in-place
+  array mutators that bypass the property path, and the host's `js_object_set`.
 
 ## Testing
 
