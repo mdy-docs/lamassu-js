@@ -8,7 +8,7 @@
 #ifndef JS_BYTECODE_H
 #define JS_BYTECODE_H
 
-#include "js_syntax.h"
+#include "lamassu_internal.h"
 
 typedef enum JsOp {
     JS_OP_NOP = 0,
@@ -96,7 +96,7 @@ typedef enum JsOp {
 
 /*
  * Per-opcode metadata, the single source of truth the bytecode verifier
- * (js_serialize.c) uses to walk and validate code. It MUST stay in lockstep
+ * (js_bytecode_read.c) uses to walk and validate code. It MUST stay in lockstep
  * with the interpreter's operand reads and sp arithmetic (js_interp.c) and
  * the compiler's emitted stack deltas (js_compiler.c) — a test
  * (test_bytecode.c) recomputes every function's max stack from this table and
@@ -148,21 +148,11 @@ typedef struct JsOpInfo {
     bool valid; /* false = not a real opcode (gap / unused) */
 } JsOpInfo;
 
-/* Defined in js_serialize.c; NULL entry (valid=false) for any unknown byte. */
+/* Defined in js_bytecode_read.c; NULL entry (valid=false) for any unknown byte. */
 extern const JsOpInfo js_op_info[JS_OP__COUNT];
 
 /* TDZ sentinel: internal special value, never exposed to scripts. */
 #define JS_SPECIAL_TDZ (JS_TAG_SPECIAL | 4)
-
-typedef struct JsCompileError {
-    const char *msg; /* static ASCII */
-    uint32_t pos;    /* source offset */
-} JsCompileError;
-
-/* AST -> function cell; NULL on error. The result must be rooted by caller.
- * repl=true makes top-level declarations persistent globals (REPL sessions). */
-JsFunctionCell *js_compile_ast(JsContext *ctx, const JsAstNode *module, bool repl,
-                               JsCompileError *err);
 
 /* Runs fn on a fresh fiber. False -> *result is the error value. */
 bool js_interp_run(JsContext *ctx, JsFunctionCell *fn, JsValue *result);
@@ -223,11 +213,11 @@ void js_module_free_cell(JsVm *vm, JsModule *m);
 void js_modules_free_registry(JsContext *ctx);
 void js_gc_mark_module_registry(JsContext *ctx);
 
-/* Compiles a parsed module AST into a body function bound to `mod`. */
-JsFunctionCell *js_compile_module_body(JsContext *ctx, const JsAstNode *module,
-                                       JsModule *mod, JsCompileError *err);
+/* Fresh unregistered module cell (no resolution/linking/evaluation). Shared so
+ * the frontend's js_bytecode_compile_module can compile one module alone. */
+JsModule *js_module_alloc_placeholder(JsContext *ctx, JsString *specifier);
 
-/* ---- module bytecode (js_serialize.c <-> js_module.c seam) ---- */
+/* ---- module bytecode (js_bytecode_read/write.c <-> js_module.c seam) ---- */
 
 /* Buffer-kind tags in a .jsbc header. */
 typedef enum JsBcKind {
@@ -237,13 +227,6 @@ typedef enum JsBcKind {
 
 /* Peeks a bytecode buffer's kind; -1 if the header is bad/too short. */
 int js_bytecode_peek_kind(const uint8_t *buf, size_t len);
-
-/*
- * Serializes one compiled (unlinked) module — its specifier, import/star/dep
- * metadata, and body function tree — to a VM-owned buffer. Runtime state
- * (resolved deps, live exports, status) is not written. false on OOM.
- */
-bool js_bc_serialize_module(JsContext *ctx, JsModule *m, uint8_t **out, size_t *out_len);
 
 /*
  * Loads + fully validates a module bytecode buffer into the caller-provided

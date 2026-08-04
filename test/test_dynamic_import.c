@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "lamassu.h"
+#include "lamassu_compile.h"
 
 static int checks_run, checks_failed;
 
@@ -165,6 +166,7 @@ static char *eval_main_export(const char *exp, bool *ok, long *leak) {
     JsContext *ctx = js_context_new(vm);
     g_pending.count = 0;
     js_set_module_loader(ctx, loader, NULL, vm);
+    js_enable_source_modules(ctx);
     static const uint16_t spec[] = {'m', 'a', 'i', 'n'};
     JsValue p = js_eval_module(ctx, spec, 4);
     js_gc_protect(vm, &p);
@@ -280,6 +282,7 @@ static void test_plain_script_cross_turn(void) {
     JsContext *ctx = js_context_new(vm);
     g_pending.count = 0;
     js_set_module_loader(ctx, loader, NULL, vm);
+    js_enable_source_modules(ctx);
 
     /* predefine OUT so strict-mode assignment works */
     static const uint16_t k_out[] = {'O', 'U', 'T'};
@@ -332,6 +335,7 @@ static void test_module_cross_turn(void) {
     JsContext *ctx = js_context_new(vm);
     g_pending.count = 0;
     js_set_module_loader(ctx, loader, NULL, vm);
+    js_enable_source_modules(ctx);
     static const uint16_t spec[] = {'m', 'a', 'i', 'n'};
     JsValue p = js_eval_module(ctx, spec, 4);
     js_gc_protect(vm, &p);

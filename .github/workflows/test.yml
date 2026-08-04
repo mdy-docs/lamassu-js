@@ -1,9 +1,25 @@
 name: Test
 
-# Builds and runs the native test suite — every suite twice, plain and
-# ASan/UBSan — on each push and pull request. Needs nothing but a C
-# compiler, so this is the fast always-on gate; the wasm artifact is
-# exercised separately by the npm-publish workflow's smoke test.
+# Two jobs.
+#
+#   native — every suite twice, plain and ASan/UBSan, plus the frontend/runtime
+#            link guard. Needs nothing but a C compiler, so it is the fast
+#            always-on gate and reports a C-level break long before the wasm
+#            job has finished installing a toolchain. It is also the only job
+#            that can catch a memory error at all: the wasm suites drive the
+#            same C, but a use-after-free there is invisible.
+#
+#   wasm   — the same sources on wasm32-wasip2 under wasmtime, plus the fleet
+#            reactor on wasip1. Not redundant with `native`: wasm32 has 32-bit
+#            pointers and a linear-memory stack where the native job has 64-bit
+#            pointers and the system's, so this is the only job whose memory
+#            model resembles what a fleet actually ships.
+#
+# Both toolchains are pinned in tools/toolchain.sh and installed by the same
+# scripts a developer runs, so a runner and a laptop cannot end up on different
+# ones — a codegen change should arrive as a commit, not as a Tuesday.
+#
+# The npm/emscripten artifact is exercised separately by npm-publish's smoke test.
 
 on:
   push:
@@ -14,7 +30,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  native:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (with submodules)
@@ -25,5 +41,89 @@ jobs:
       - name: Build and run tests (plain + ASan/UBSan)
         run: make test
 
+      # The frontend/runtime split is only real if it is checked. This links
+      # liblamassu_runtime.a alone against a bytecode-only main, so a new call
+      # from a runtime source into the parser or compiler fails here with an
+      # undefined symbol rather than silently re-coupling the two halves.
+      - name: Check the runtime links with no frontend
+        run: make check-runtime-only
+
       - name: Build the CLI and run benchmarks
         run: make bench
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # /opt/... rather than the scripts' default (beside the checkout) because
+      # both are on the Makefile's search path, so every step below needs no
+      # environment at all — they are exactly what a developer types.
+      - name: Install wasi-sdk (pinned)
+        run: ./tools/get-wasi-sdk.sh --dir /opt/wasi-sdk
+
+      - name: Install wasmtime (pinned)
+        run: ./tools/get-wasmtime.sh --dir /opt/wasmtime
+
+      - name: Build the CLI as a wasip2 component
+        run: make wasi
+
+      - name: Run the unit suites under wasmtime
+        run: make test-wasi
+
+      - name: Benchmarks under wasmtime
+        run: make bench-wasi
+
+      # The fleet artifact: src/reactor.c against the runtime archive alone.
+      # reactor-check greps the linked binary for parser/compiler symbols, so
+      # this fails if the frontend ever reaches the reactor — a stronger claim
+      # than check-runtime-only, made against the real deployed object.
+      - name: Build the fleet reactor
+        run: make reactor
+
+      - name: Check no parser reached the reactor
+        run: make reactor-check
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # The server, on all three targets it can be built for. Building all three
+      # is most of the value: one main() over one engine, and a target that
+      # stops compiling is a boundary that has moved.
+      - name: Server (native, wasip1, wasip2)
+        run: |
+          make server-native
+          make server-wasip1
+          make server
+
+      - name: Check no parser reached the server
+        run: make server-check
+
+      # End-to-end through the reactor's ABI: compile a template to bytecode
+      # with the CLI, then load it once and render it twice under a WASI host
+      # with no preopened directories at all. A reactor that stops being
+      # drivable is a broken deployment target reporting green.
+      - name: Reactor end-to-end (bytecode in, render out)
+        run: |
+          make cli
+          printf 'const n = __input() || "world";\n`hello ${n}`;\n' > /tmp/page.js
+          ./build/lamassu --emit-bytecode /tmp/page.js /tmp/page.jsbc
+          node tools/reactor-host.mjs build/lamassu-reactor.wasm /tmp/page.jsbc alice bob
+
+      # The server over its two transports, on the deployment target. --stdio
+      # runs everywhere and needs no network; the socket path is the one that
+      # actually ships, so it is driven over a real TCP connection by curl.
+      - name: Server end-to-end (stdio + sockets under wasmtime)
+        run: |
+          mkdir -p /tmp/bc && cp /tmp/page.jsbc /tmp/bc/page.jsbc
+          printf 'POST /page HTTP/1.1\r\nContent-Length: 5\r\n\r\nalice' \
+            | wasmtime run --dir /tmp/bc::. build/lamassu-server-wasip2.wasm --stdio
+          wasmtime run -S inherit-network --dir /tmp/bc::. \
+            build/lamassu-server-wasip2.wasm --port 8080 &
+          sleep 3
+          curl -sf --retry 5 --retry-connrefused -d alice localhost:8080/page
+          echo

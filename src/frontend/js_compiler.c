@@ -1,4 +1,5 @@
-#include "js_bytecode.h"
+#include "js_compile.h"
+#include "lamassu_compile.h"
 #ifdef LAMASSU_HAS_REGEX
 #include "js_regexp.h"
 #endif

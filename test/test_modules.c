@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "lamassu.h"
+#include "lamassu_compile.h"
 
 static int checks_run, checks_failed;
 
@@ -267,6 +268,7 @@ static void tv_open(TestVm *tv, JsModuleCanonicalizer canon) {
     tv->ctx = js_context_new(tv->vm);
     g_pending.count = 0;
     js_set_module_loader(tv->ctx, loader, canon, tv->vm);
+    js_enable_source_modules(tv->ctx);
 }
 
 static void tv_close(TestVm *tv, const char *label) {
@@ -788,6 +790,50 @@ static void test_tla_dep_cross_turn(void) {
     mods_reset();
 }
 
+
+/*
+ * The frontend/runtime split, observed from the embedder's side.
+ *
+ * A context that has NOT been granted source compilation must refuse a loader
+ * that fulfills with source, while a loader fulfilling with bytecode keeps
+ * working. This is the one behaviour that distinguishes a fleet runtime from a
+ * build-time process, and the only way to test it in a binary that links both
+ * halves is to simply not call js_enable_source_modules — which is exactly the
+ * state a runtime-only link is permanently in, since the symbol isn't there.
+ */
+static void test_source_modules_gated(void) {
+    mods_reset();
+    mod_add("main", "export const x = 1;");
+
+    TestVm tv;
+    tv.ca.net_bytes = 0;
+    tv.ca.live_allocs = 0;
+    JsVmConfig cfg = {.realloc_fn = count_realloc, .alloc_ud = &tv.ca};
+    tv.vm = js_vm_new(&cfg);
+    tv.ctx = js_context_new(tv.vm);
+    g_pending.count = 0;
+    js_set_module_loader(tv.ctx, loader, NULL, tv.vm);
+    /* deliberately NO js_enable_source_modules(tv.ctx) */
+
+    size_t slen;
+    uint16_t *su = to_u16("main", &slen);
+    JsValue p = js_eval_module(tv.ctx, su, slen);
+    free(su);
+    js_gc_protect(tv.vm, &p);
+    settle_all_loads(tv.ctx);
+    int st = js_promise_state(p);
+    char *out = value_to_cstr(tv.ctx, js_promise_result(p));
+    checks_run++;
+    if (st != 2 || !strstr(out, "source modules unavailable")) {
+        checks_failed++;
+        fprintf(stderr, "FAIL expected source-module rejection, got state=%d: %s\n", st, out);
+    }
+    free(out);
+    js_gc_unprotect(tv.vm, &p);
+    tv_close(&tv, "source modules gated");
+    mods_reset();
+}
+
 int main(void) {
     test_basic_exports();
     test_imports();
@@ -809,6 +855,7 @@ int main(void) {
     test_reject_propagation();
     test_canonicalization();
     test_tla_dep_cross_turn();
+    test_source_modules_gated();
     mods_reset();
     if (checks_failed) {
         fprintf(stderr, "%d/%d module checks FAILED\n", checks_failed, checks_run);

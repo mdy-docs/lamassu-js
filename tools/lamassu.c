@@ -11,6 +11,7 @@
 
 #include "js_syntax.h" /* js_source_line_col */
 #include "lamassu.h"
+#include "lamassu_compile.h"
 
 static uint8_t *read_file(const char *path, size_t *len_out) {
     FILE *f = fopen(path, "rb");
@@ -564,6 +565,7 @@ int main(int argc, char **argv) {
     js_register_native(ctx, print_name, 5, native_print, NULL);
     set_root_dir(argv[1]);
     js_set_module_loader(ctx, file_loader, NULL, vm);
+    js_enable_source_modules(ctx);
 
     int status = 0;
     const char *err_msg;

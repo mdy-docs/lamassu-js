@@ -330,6 +330,28 @@ typedef struct JsAtomTable {
     uint32_t capacity;
 } JsAtomTable;
 
+/* ---- frontend <-> runtime seam: compiling a module from SOURCE ----
+ *
+ * The module pipeline is runtime code, but one branch of it — a loader that
+ * fulfills with a source string — needs a parser. Rather than let that one
+ * branch drag the whole frontend into every build, it goes through a hook the
+ * frontend installs (js_enable_source_modules, in lamassu_compile.h).
+ *
+ * NULL is the normal, supported state for a runtime-only process: source
+ * specifiers fail with a clear error instead of compiling. That makes "this
+ * process cannot turn source into code" a property enforced by what was
+ * LINKED, not by a policy someone has to remember to apply — which is the
+ * point of the split for a fleet running precompiled bytecode.
+ */
+typedef struct JsModError {
+    const char *msg;
+    uint32_t pos;
+    bool oom;
+} JsModError;
+
+typedef bool (*JsModuleCompileFn)(JsContext *ctx, JsModule *m, const uint16_t *source,
+                                  size_t source_len, JsModError *err);
+
 struct JsContext {
     JsVm *vm;
     JsContext *next;
@@ -379,6 +401,10 @@ struct JsContext {
     JsModuleLoader loader;          /* async module loader; may be NULL */
     JsModuleCanonicalizer canon;    /* sync specifier canonicalizer; may be NULL */
     void *loader_ud;                /* shared userdata for loader + canon */
+    /* Source->code for module specifiers the loader answers with a string.
+     * NULL unless the frontend is linked AND js_enable_source_modules was
+     * called; see the seam comment in js_bytecode.h. */
+    JsModuleCompileFn compile_source;
     JsFiber *fiber;     /* current/last fiber; GC root */
     uint64_t fuel;      /* budget for new runs; 0 = unlimited */
     uint32_t error_pos; /* source offset of last runtime error */

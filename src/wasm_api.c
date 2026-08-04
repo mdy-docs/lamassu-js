@@ -25,6 +25,8 @@
 #include <string.h>
 
 #include "lamassu.h"
+#include "utf8.h"
+#include "lamassu_compile.h"
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -60,57 +62,11 @@ static void buf_bytes(const char *b, size_t n) {
 
 static void buf_cstr(const char *s) { buf_bytes(s, strlen(s)); }
 
-/*
- * Shared UTF-16 <-> UTF-8 primitives (used by every conversion below, so the
- * encoding tables live in exactly one place).
- *
- * Decodes the code unit at u[*i] into a scalar value and advances *i: a valid
- * surrogate pair combines and consumes two units; an unpaired surrogate yields
- * U+FFFD (so the emitted UTF-8 is always well-formed, never CESU-8).
- */
-static unsigned utf16_next_cp(const uint16_t *u, size_t n, size_t *i) {
-    unsigned cp = u[*i];
-    if (cp >= 0xD800 && cp <= 0xDBFF) {
-        if (*i + 1 < n && u[*i + 1] >= 0xDC00 && u[*i + 1] <= 0xDFFF) {
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (u[*i + 1] - 0xDC00);
-            *i += 2;
-            return cp;
-        }
-        cp = 0xFFFD; /* unpaired high surrogate */
-    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
-        cp = 0xFFFD; /* unpaired low surrogate */
-    }
-    *i += 1;
-    return cp;
-}
-
-/* Encodes scalar cp into t[0..3]; returns the byte count (1..4). */
-static int utf8_encode_cp(unsigned cp, char t[4]) {
-    if (cp < 0x80) {
-        t[0] = (char)cp;
-        return 1;
-    } else if (cp < 0x800) {
-        t[0] = (char)(0xC0 | (cp >> 6));
-        t[1] = (char)(0x80 | (cp & 0x3F));
-        return 2;
-    } else if (cp < 0x10000) {
-        t[0] = (char)(0xE0 | (cp >> 12));
-        t[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-        t[2] = (char)(0x80 | (cp & 0x3F));
-        return 3;
-    }
-    t[0] = (char)(0xF0 | (cp >> 18));
-    t[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
-    t[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
-    t[3] = (char)(0x80 | (cp & 0x3F));
-    return 4;
-}
-
 /* append UTF-16 code units as UTF-8 */
 static void buf_utf16(const uint16_t *u, size_t n) {
     for (size_t i = 0; i < n;) {
         char t[4];
-        int len = utf8_encode_cp(utf16_next_cp(u, n, &i), t);
+        int len = js_utf8_encode_cp(js_utf16_next_cp(u, n, &i), t);
         buf_bytes(t, (size_t)len);
     }
 }
@@ -144,12 +100,11 @@ static char *utf16_to_utf8_dup(const uint16_t *u, size_t n) {
         return NULL;
     size_t len = 0;
     for (size_t i = 0; i < n;)
-        len += (size_t)utf8_encode_cp(utf16_next_cp(u, n, &i), out + len);
+        len += (size_t)js_utf8_encode_cp(js_utf16_next_cp(u, n, &i), out + len);
     out[len] = 0;
     return out;
 }
 
-static size_t utf8_to_utf16(const char *in, size_t len, uint16_t *out);
 
 /* JsValue (any) -> malloc'd UTF-8 via ToString (caller frees). */
 static char *value_to_utf8_dup(JsContext *ctx, JsValue v) {
@@ -167,7 +122,7 @@ static JsValue string_value_from_utf8(const char *s) {
     uint16_t *u = malloc((blen + 1) * sizeof(uint16_t));
     if (!u)
         return js_undefined();
-    size_t ulen = utf8_to_utf16(s, blen, u);
+    size_t ulen = js_utf8_to_utf16((const uint8_t *)s, blen, u);
     JsValue v = js_string_new(g_vm, u, ulen);
     free(u);
     return v;
@@ -377,7 +332,7 @@ static bool wasm_module_canon(void *ud, const uint16_t *spec, size_t spec_len,
         g_canon_buf = nb;
         g_canon_cap = blen;
     }
-    *out_len = utf8_to_utf16(canon, blen, g_canon_buf);
+    *out_len = js_utf8_to_utf16((const uint8_t *)canon, blen, g_canon_buf);
     *out = g_canon_buf;
     free(canon);
     return true;
@@ -400,55 +355,10 @@ static void ensure_vm(void) {
     js_register_native(g_ctx, defer_name, 13, native_native_defer, NULL);
     memset(g_deferred_live, 0, sizeof g_deferred_live);
     js_set_module_loader(g_ctx, wasm_module_load, wasm_module_canon, NULL);
+    js_enable_source_modules(g_ctx);
 #endif
 }
 
-/*
- * UTF-8 -> UTF-16. Well-formed only: overlong encodings, surrogate codepoints,
- * values above U+10FFFF, truncated sequences, and bad continuation bytes each
- * become one U+FFFD and decoding resyncs at the next byte. Returns unit count.
- */
-static size_t utf8_to_utf16(const char *in, size_t len, uint16_t *out) {
-    size_t n = 0, i = 0;
-    const unsigned char *b = (const unsigned char *)in;
-    while (i < len) {
-        unsigned char c = b[i];
-        unsigned cp;
-        int seqlen;
-        unsigned min; /* smallest value not overlong for this length */
-        if (c < 0x80) {
-            out[n++] = c; /* ASCII */
-            i++;
-            continue;
-        } else if ((c & 0xE0) == 0xC0) {
-            cp = c & 0x1F; seqlen = 2; min = 0x80;
-        } else if ((c & 0xF0) == 0xE0) {
-            cp = c & 0x0F; seqlen = 3; min = 0x800;
-        } else if ((c & 0xF8) == 0xF0) {
-            cp = c & 0x07; seqlen = 4; min = 0x10000;
-        } else {
-            out[n++] = 0xFFFD; i++; continue;
-        }
-        bool ok = i + (size_t)seqlen <= len;
-        for (int k = 1; ok && k < seqlen; k++) {
-            unsigned char cc = b[i + (size_t)k];
-            if ((cc & 0xC0) != 0x80) { ok = false; break; }
-            cp = (cp << 6) | (cc & 0x3F);
-        }
-        if (!ok || cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
-            out[n++] = 0xFFFD; i++; continue;
-        }
-        i += (size_t)seqlen;
-        if (cp > 0xFFFF) {
-            cp -= 0x10000;
-            out[n++] = (uint16_t)(0xD800 + (cp >> 10));
-            out[n++] = (uint16_t)(0xDC00 + (cp & 0x3FF));
-        } else {
-            out[n++] = (uint16_t)cp;
-        }
-    }
-    return n;
-}
 
 EXPORT void lamassu_reset(void) {
     /* Refuse to reset while a __hostcall is suspended in Asyncify: the current
@@ -483,7 +393,7 @@ EXPORT const char *lamassu_eval(const char *src_utf8) {
         buf_cstr("internal: out of memory");
         return g_buf ? g_buf : "";
     }
-    size_t ulen = utf8_to_utf16(src_utf8 ? src_utf8 : "", blen, u);
+    size_t ulen = js_utf8_to_utf16((const uint8_t *)(src_utf8 ? src_utf8 : ""), blen, u);
 
     const char *err_msg;
     uint32_t err_pos;
@@ -535,7 +445,7 @@ EXPORT const char *lamassu_eval_module(const char *spec_utf8) {
         buf_cstr("internal: out of memory");
         return g_buf ? g_buf : "";
     }
-    size_t ulen = utf8_to_utf16(spec_utf8 ? spec_utf8 : "", blen, u);
+    size_t ulen = js_utf8_to_utf16((const uint8_t *)(spec_utf8 ? spec_utf8 : ""), blen, u);
 
     JsValue p = js_eval_module(g_ctx, u, ulen);
     free(u);

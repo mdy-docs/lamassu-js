@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "lamassu.h"
+#include "lamassu_compile.h"
 
 static int checks_run, checks_failed;
 
@@ -179,6 +180,7 @@ static char *eval_with(JsModuleLoader load, const char *name, const char *exp, b
     JsVm *vm = js_vm_new(&cfg);
     JsContext *ctx = js_context_new(vm);
     js_set_module_loader(ctx, load, NULL, vm);
+    js_enable_source_modules(ctx);
     size_t nlen;
     uint16_t *nu = to_u16(name, &nlen);
     JsValue p = js_eval_module(ctx, nu, nlen);

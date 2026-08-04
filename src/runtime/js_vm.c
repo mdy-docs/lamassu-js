@@ -148,6 +148,11 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->modules = NULL;
     ctx->module_count = ctx->module_cap = 0;
     js_map_init(&ctx->module_index);
+    /* NULL until the frontend's js_enable_source_modules grants it; a
+     * runtime-only build has no way to set it at all. Field-by-field init
+     * here means a new field is a deliberate line, not a silent garbage read
+     * — this one is dereferenced through, so it must be set before use. */
+    ctx->compile_source = NULL;
     ctx->loader = NULL;
     ctx->canon = NULL;
     ctx->loader_ud = NULL;

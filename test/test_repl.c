@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "lamassu.h"
+#include "lamassu_compile.h"
 
 static int checks_run, checks_failed;
 

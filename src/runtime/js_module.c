@@ -133,12 +133,6 @@ static bool registry_add(JsContext *ctx, JsModule *m) {
 
 /* ---- small helpers ---- */
 
-typedef struct {
-    const char *msg;
-    uint32_t pos;
-    bool oom;
-} ModError;
-
 /* JsModule cells tag as objects in js_value_from_cell — these make the
  * existing disguise convention explicit for promise captures/fulfillments.
  * Only for js_gc_protect / bound-native plumbing within this file. */
@@ -154,7 +148,7 @@ static JsValue ascii_value(JsContext *ctx, const char *msg) {
     return s ? js_value_from_cell(&s->gc) : js_undefined();
 }
 
-static JsValue mod_error_value(JsContext *ctx, const ModError *err) {
+static JsValue mod_error_value(JsContext *ctx, const JsModError *err) {
     const char *msg = err->oom ? "out of memory" : (err->msg ? err->msg : "module error");
     return ascii_value(ctx, msg);
 }
@@ -214,7 +208,7 @@ static bool then_bound(JsContext *ctx, JsValue promise, JsBoundFn on_f, JsBoundF
 
 /* Bare module cell for `specifier`, status FETCHING, nothing else set.
  * Not registered; NULL on OOM. */
-static JsModule *module_alloc_placeholder(JsContext *ctx, JsString *specifier) {
+JsModule *js_module_alloc_placeholder(JsContext *ctx, JsString *specifier) {
     JsVm *vm = ctx->vm;
     JsValue specv = js_value_from_cell(&specifier->gc);
     js_gc_protect(vm, &specv);
@@ -228,50 +222,6 @@ static JsModule *module_alloc_placeholder(JsContext *ctx, JsString *specifier) {
     m->eval_error = js_undefined();
     m->status = JS_MOD_FETCHING;
     return m;
-}
-
-/* Parses + compiles `source` into m (exports object, body, import/star/dep
- * metadata). m must be rooted by the caller (registry or protected slot). */
-static bool module_compile_source(JsContext *ctx, JsModule *m, const uint16_t *source,
-                                  size_t source_len, ModError *err) {
-    JsVm *vm = ctx->vm;
-    JsValue mv = module_value(m);
-    js_gc_protect(vm, &mv);
-
-    /* exports (namespace) object. Real ESM's Module Namespace Exotic Object
-     * has [[Prototype]] === null (not Object.prototype like an ordinary
-     * object) — js_object_new(ctx) gives every new object Object.prototype
-     * by default, so undo that here to match spec exactly. */
-    JsValue exports = js_object_new(ctx);
-    if (!js_is_object(exports)) {
-        js_gc_unprotect(vm, &mv);
-        err->oom = true;
-        return false;
-    }
-    js_value_object(exports)->proto = js_undefined();
-    value_module(mv)->exports = js_value_object(exports);
-
-    JsArena arena;
-    js_arena_init(&arena, vm);
-    JsParseResult pr;
-    JsFunctionCell *body = NULL;
-    if (!js_parse_module(&arena, source, source_len, &pr)) {
-        err->msg = pr.err_msg;
-        err->pos = pr.err_pos;
-    } else {
-        JsCompileError ce;
-        body = js_compile_module_body(ctx, pr.module, value_module(mv), &ce);
-        if (!body) {
-            err->msg = ce.msg;
-            err->pos = ce.pos;
-        }
-    }
-    js_arena_free(&arena);
-    js_gc_unprotect(vm, &mv);
-    if (!body)
-        return false;
-    m->body = body;
-    return true;
 }
 
 /* ---- canonicalization ---- */
@@ -320,8 +270,17 @@ static bool fetch_on_resolved(JsContext *ctx, JsValue bound, JsValue tv,
 
     if (js_is_string(resolved)) {
         JsString *src = js_value_string(resolved);
-        ModError err = {NULL, 0, false};
-        if (!module_compile_source(ctx, m, src->units, src->length, &err)) {
+        /* Source needs a parser, which a runtime-only build does not link.
+         * Precompiled bytecode (the branch below) is unaffected. */
+        if (!ctx->compile_source) {
+            module_fetch_fail(ctx, m,
+                              ascii_value(ctx, "source modules unavailable in this build "
+                                               "(precompile to bytecode)"),
+                              0);
+            return true;
+        }
+        JsModError err = {NULL, 0, false};
+        if (!ctx->compile_source(ctx, m, src->units, src->length, &err)) {
             module_fetch_fail(ctx, m, mod_error_value(ctx, &err), err.pos);
             return true;
         }
@@ -384,7 +343,7 @@ static JsValue fetch_module_async(JsContext *ctx, JsModule *referrer, JsString *
     if (!ctx->loader)
         return rejected_ascii(ctx, "no module loader set");
 
-    JsModule *m = module_alloc_placeholder(ctx, spec);
+    JsModule *m = js_module_alloc_placeholder(ctx, spec);
     if (!m)
         return js_undefined();
     JsValue mv = module_value(m);
@@ -536,10 +495,10 @@ static JsValue load_graph(JsContext *ctx, JsString *root_spec) {
 
 /* ---- instantiate (resolve dependency graph; sync, post-fetch) ---- */
 
-static JsModule *instantiate(JsContext *ctx, JsModule *m, ModError *err);
+static JsModule *instantiate(JsContext *ctx, JsModule *m, JsModError *err);
 
 static bool resolve_dep(JsContext *ctx, JsModule *referrer, JsString *raw_spec,
-                        JsModule **out, ModError *err) {
+                        JsModule **out, JsModError *err) {
     /* The graph load already fetched and registered every transitive
      * dependency before instantiate runs — this is a pure lookup. The
      * canonicalizer is required to be deterministic, so re-canonicalizing
@@ -567,7 +526,7 @@ static bool resolve_dep(JsContext *ctx, JsModule *referrer, JsString *raw_spec,
     return dep != NULL;
 }
 
-static JsModule *instantiate(JsContext *ctx, JsModule *m, ModError *err) {
+static JsModule *instantiate(JsContext *ctx, JsModule *m, JsModError *err) {
     if (m->status >= JS_MOD_LINKED || m->deps) /* already instantiated */
         return m;
     if (m->dep_spec_count == 0)
@@ -632,7 +591,7 @@ static void resolve_export(JsModule *m, JsString *name, JsModule **out_mod,
     *out_name = name;
 }
 
-static bool link_module(JsContext *ctx, JsModule *m, ModError *err) {
+static bool link_module(JsContext *ctx, JsModule *m, JsModError *err) {
     (void)ctx;
     if (m->status >= JS_MOD_LINKED || m->status == JS_MOD_LINKING)
         return true; /* linked or in-progress (cycle) */
@@ -896,7 +855,7 @@ static bool root_on_fetched(JsContext *ctx, JsValue bound, JsValue tv,
         return true;
     JsModule *root = value_module(args[0]);
 
-    ModError err = {NULL, 0, false};
+    JsModError err = {NULL, 0, false};
     JsModule *inst = instantiate(ctx, root, &err);
     if (inst && !link_module(ctx, inst, &err))
         inst = NULL;
@@ -1000,48 +959,6 @@ JsValue js_module_dynamic_import(JsContext *ctx, JsModule *referrer, JsValue spe
         js_promise_reject(ctx, js_value_promise(donev), ascii_value(ctx, cerr));
     js_gc_unprotect(vm, &donev);
     return donev;
-}
-
-/* ---- bytecode producer (host-side cache tooling) ---- */
-
-bool js_bytecode_compile_module(JsContext *ctx, const uint16_t *specifier,
-                                size_t spec_len, const uint16_t *source,
-                                size_t source_len, uint8_t **out, size_t *out_len,
-                                const char **err_msg, uint32_t *err_pos) {
-    JsVm *vm = ctx->vm;
-    *err_msg = NULL;
-    *err_pos = 0;
-
-    JsValue specv = js_atom(vm, specifier, spec_len);
-    if (!js_is_string(specv)) {
-        *err_msg = "out of memory";
-        return false;
-    }
-    js_gc_protect(vm, &specv);
-
-    /* Compile this module alone — unregistered, no resolution, linking, or
-     * evaluation — so it can be cached independently of its deps. */
-    JsModule *m = module_alloc_placeholder(ctx, js_value_string(specv));
-    if (!m) {
-        js_gc_unprotect(vm, &specv);
-        *err_msg = "out of memory";
-        return false;
-    }
-    JsValue mv = module_value(m);
-    js_gc_protect(vm, &mv);
-    ModError err = {NULL, 0, false};
-    bool ok = module_compile_source(ctx, m, source, source_len, &err);
-    if (!ok) {
-        *err_msg = err.oom ? "out of memory" : (err.msg ? err.msg : "module compile error");
-        *err_pos = err.pos;
-    } else {
-        ok = js_bc_serialize_module(ctx, value_module(mv), out, out_len);
-        if (!ok)
-            *err_msg = "bytecode serialization failed";
-    }
-    js_gc_unprotect(vm, &mv);
-    js_gc_unprotect(vm, &specv);
-    return ok;
 }
 
 JsValue js_module_get_export(JsContext *ctx, JsValue ns, const uint16_t *name,
