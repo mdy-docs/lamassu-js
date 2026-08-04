@@ -38,8 +38,9 @@ language.
 - An npm package (`@mdy-docs/lamassu-js`, `packages/lamassu-js/`) exposing the
   engine as a WebAssembly ES module (`createLamassu() → { eval, reset }`),
   published to npm on CI.
-- A browser playground (`web/`, a Vite app) built on the npm package, with a
-  persistent-VM REPL, deployed to GitHub Pages on CI.
+- A documentation site (`docs-site/`, VitePress) built on the npm package,
+  carrying the guide, the API reference, the security model, and a
+  persistent-VM REPL playground, deployed to GitHub Pages on CI.
 
 ## Non-goals
 

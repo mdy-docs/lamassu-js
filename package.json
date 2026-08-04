@@ -2,16 +2,14 @@
   "name": "lamassu-js-monorepo",
   "version": "0.0.0",
   "private": true,
-  "description": "Workspace root for the lamassu-js engine package, the documentation site (which hosts the REPL playground), and the standalone web demo.",
+  "description": "Workspace root for the lamassu-js engine package and the documentation site, which hosts the REPL playground.",
   "type": "module",
   "workspaces": [
     "packages/*",
-    "web",
     "docs-site"
   ],
   "scripts": {
     "build:wasm": "make pkg",
-    "build:web": "npm run build --workspace @mdy-docs/lamassu-playground",
     "build:docs": "npm run build --workspace @mdy-docs/lamassu-docs",
     "build": "npm run build:wasm && npm run build:docs",
     "dev": "npm run dev --workspace @mdy-docs/lamassu-docs",

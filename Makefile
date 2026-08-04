@@ -2,7 +2,8 @@
 #
 # make test               build and run unit tests (plain + ASan/UBSan)
 # make bench              build the CLI and run bench/*.js, reporting ops/sec
-# make pkg                build the npm package's wasm artifact (needs emcc)
+# make pkg                build the npm package's wasm artifact (needs emcc);
+#                         this is what the docs site and its playground import
 # make wasi               build the CLI as a wasm32-wasip2 component (needs wasi-sdk)
 # make test-wasi          run the unit tests under wasmtime
 # make bench-wasi         run bench/*.js under wasmtime
@@ -424,10 +425,6 @@ $(PKG_DIST)/lamassu.mjs: $(RUNTIME_SRC) $(FRONTEND_SRC) src/wasm_api.c $(HDR) $(
 	  -sASYNCIFY -sASYNCIFY_STACK_SIZE=262144 \
 	  -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=16777216 \
 	  -o $(PKG_DIST)/lamassu.mjs
-
-# Back-compat alias: `make web` now means "build the package artifact".
-.PHONY: web
-web: pkg
 
 .PHONY: clean
 clean:

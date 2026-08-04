@@ -5,21 +5,25 @@
   Browser-side counterpart to packages/lamassu-js/smoke.mjs. The Node test
   covers the engine and the API; this one covers what only a browser can: that
   the .wasm resolves and streams from a real HTTP origin, and that the sandbox
-  limits hold in the environment the playground actually ships to.
+  limits hold in the environment the docs-site playground actually ships to.
+
+  Not part of `make test`: it needs a server and a browser, neither of which
+  the C suite requires. Run it by hand when the package or the wasm build
+  changes.
 
   Needs a server (ES module imports and WebAssembly streaming do not work over
   file://). From the repo root:
 
       make pkg
       python3 -m http.server 8080
-      open http://localhost:8080/web/smoke.html
+      open http://localhost:8080/test/smoke.html
 
   Headless, with the browser Playwright already caches:
 
       "$(ls -d ~/Library/Caches/ms-playwright/chromium_headless_shell-*/ \
         | tail -1)chrome-headless-shell-mac-*/chrome-headless-shell" \
         --headless --disable-gpu --virtual-time-budget=60000 --dump-dom \
-        http://localhost:8080/web/smoke.html
+        http://localhost:8080/test/smoke.html
 -->
 <style>
   body { font: 13px/1.5 ui-monospace, monospace; margin: 2rem; }
