@@ -58,8 +58,14 @@ static RunStatus run_src_opts(const char *src, const RunOpts *opts, char **out) 
     cfg.alloc_ud = &ca;
     JsVm *vm = js_vm_new(&cfg);
     JsContext *ctx = js_context_new(vm);
-    if (!vm || !ctx)
+    if (!vm || !ctx) {
+        /* Set *out and release the VM even here: a heap_limit low enough to
+         * starve context creation used to leave the caller reading an
+         * uninitialized pointer. */
+        *out = strdup("harness: could not create vm/context");
+        js_vm_free(vm);
         return RUN_HARNESS_ERR;
+    }
     if (opts && opts->fuel)
         js_context_set_fuel(ctx, opts->fuel);
     if (opts && opts->set_global_name) {
@@ -795,7 +801,144 @@ static void test_audit_p2_p3(void) {
                   "499500");
 }
 
+/* A native the guest can call to interrupt itself — stands in for the timer
+ * thread or signal handler a host would really use. */
+static bool native_stop_now(JsContext *ctx, JsValue this_val, const JsValue *args,
+                            int argc, JsValue *result) {
+    (void)this_val; (void)args; (void)argc;
+    js_vm_interrupt(js_context_vm(ctx));
+    *result = js_undefined();
+    return true;
+}
+
+/* Runs `src` with a `stopNow()` native available. Returns the promise state and
+ * writes the stringified result. */
+static int run_with_stop(const char *src, char **out, bool clear_after) {
+    JsVm *vm = js_vm_new(NULL);
+    JsContext *ctx = js_context_new(vm);
+    static const uint16_t name[] = {'s','t','o','p','N','o','w'};
+    js_register_native(ctx, name, 7, native_stop_now, NULL);
+    size_t len = strlen(src);
+    uint16_t *u = malloc(len * sizeof(uint16_t));
+    for (size_t i = 0; i < len; i++)
+        u[i] = (uint16_t)(unsigned char)src[i];
+    const char *em; uint32_t ep;
+    JsValue fn = js_compile_module(ctx, u, len, &em, &ep);
+    free(u);
+    if (!js_is_function(fn)) { *out = strdup(em ? em : "compile error"); js_vm_free(vm); return -1; }
+    js_gc_protect(vm, &fn);
+    JsValue p = js_run_module(ctx, fn);
+    js_gc_protect(vm, &p);
+    js_run_jobs(ctx);
+    int st = js_promise_state(p);
+    if (clear_after)
+        js_vm_clear_interrupt(vm);
+    JsValue r = js_promise_result(p);
+    js_gc_protect(vm, &r);
+    JsValue s = js_to_string(ctx, r);
+    size_t sl = 0;
+    const uint16_t *su = js_string_units(s, &sl);
+    char *buf = malloc(sl + 1);
+    for (size_t i = 0; i < sl; i++) buf[i] = su[i] < 128 ? (char)su[i] : '?';
+    buf[sl] = '\0';
+    *out = buf;
+    js_vm_free(vm);
+    return st;
+}
+
+/*
+ * js_vm_interrupt is the only bound on wall-clock: fuel counts instructions,
+ * and a host cannot always map an acceptable running time onto a count. The
+ * stop must also be unswallowable, or a guest defeats it with try/catch the
+ * way it would defeat any ordinary throw.
+ */
+static void test_interrupt(void) {
+    char *out;
+    /* a bare infinite loop stops */
+    int st = run_with_stop("stopNow(); while (true) {} 'never';", &out, false);
+    CHECK(st == 2);
+    CHECK(strstr(out, "interrupted") != NULL);
+    free(out);
+
+    /* ...and stays stopped through a catch, because the flag does not clear */
+    st = run_with_stop("stopNow(); while (true) { try { 1; } catch (e) {} } 'never';",
+                       &out, false);
+    CHECK(st == 2);
+    CHECK(strstr(out, "interrupted") != NULL);
+    free(out);
+
+    /* a finally block cannot outrun it either */
+    st = run_with_stop("stopNow(); try { while (true) {} } finally { while (true) {} } 'never';",
+                       &out, false);
+    CHECK(st == 2);
+    free(out);
+
+    /* The drain stops too. The flag is set from INSIDE a job here, which is the
+     * case that matters: a chain re-queueing itself would otherwise spin in
+     * js_run_jobs forever, allocating a fiber per turn, with the module long
+     * since finished and the host still blocked inside the call. */
+    st = run_with_stop("let n = 0;"
+                       "function f() { n++; if (n === 3) stopNow();"
+                       "               Promise.resolve().then(f); }"
+                       "Promise.resolve().then(f); 'queued';",
+                       &out, false);
+    CHECK(st == 1);
+    CHECK(strcmp(out, "queued") == 0);
+    free(out);
+
+    /* a large sort is the longest a guest can stay inside one native, so it
+     * polls the flag rather than making an interrupt wait for it */
+    st = run_with_stop("let a = []; for (let i = 0; i < 4000; i++) a.push(4000 - i);"
+                       "a.sort(function (x, y) { stopNow(); return x - y; }); 'never';",
+                       &out, false);
+    CHECK(st == 2);
+    CHECK(strstr(out, "interrupted") != NULL);
+    free(out);
+
+    /* uninterrupted code is unaffected */
+    st = run_with_stop("let n = 0; for (let i = 0; i < 1000; i++) n += i; n;", &out, false);
+    CHECK(st == 1);
+    CHECK(strcmp(out, "499500") == 0);
+    free(out);
+}
+
+/*
+ * The one error the engine must never fail to describe is the one saying
+ * allocation failed — building its message allocates too. Under a tight heap
+ * limit the rejection must still carry a reason; it used to come back as bare
+ * `undefined`, which told a host something broke but not what.
+ */
+static void test_oom_is_reported(void) {
+    /* Above the floor a context needs to exist at all — below that the harness
+     * cannot even build a VM, which tests nothing. */
+    static const size_t limits[] = {320 * 1024, 512 * 1024, 1024 * 1024, 4096 * 1024};
+    for (size_t i = 0; i < sizeof limits / sizeof limits[0]; i++) {
+        RunOpts o = {0};
+        o.cfg.heap_limit = limits[i];
+        char *out = NULL;
+        RunStatus st = run_src_opts(
+            "let a = []; for (let i = 0; i < 200000; i++) a.push({ k: 'v' + i }); a.length;",
+            &o, &out);
+        if (st == RUN_HARNESS_ERR) /* limit too small to construct a context */
+            continue;
+        checks_run++;
+        if (st != RUN_RUNTIME_ERR) { /* limit generous enough to finish */
+            free(out);
+            continue;
+        }
+        checks_run++;
+        if (!out || strcmp(out, "undefined") == 0) {
+            checks_failed++;
+            fprintf(stderr, "FAIL: OOM at heap_limit=%zu rejected with no reason\n",
+                    limits[i]);
+        }
+        free(out);
+    }
+}
+
 int main(void) {
+    test_interrupt();
+    test_oom_is_reported();
     test_arithmetic();
     test_strings();
     test_coercions_equality();

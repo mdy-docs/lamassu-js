@@ -15,7 +15,8 @@ static void *js_default_realloc(void *ud, void *ptr, size_t old_size, size_t new
     return realloc(ptr, new_size);
 }
 
-void *js_realloc_raw(JsVm *vm, void *ptr, size_t old_size, size_t new_size) {
+static void *realloc_impl(JsVm *vm, void *ptr, size_t old_size, size_t new_size,
+                          bool limited) {
     if (new_size == 0) {
         if (ptr) {
             vm->realloc_fn(vm->alloc_ud, ptr, old_size, 0);
@@ -29,7 +30,7 @@ void *js_realloc_raw(JsVm *vm, void *ptr, size_t old_size, size_t new_size) {
      * move to a smaller size never does. Skip while the collector is running:
      * its own bookkeeping must not recurse into a collect, and sweep only frees
      * (shrinks) anyway. */
-    if (vm->heap_limit && new_size > old_size && !vm->gc_running) {
+    if (limited && vm->heap_limit && new_size > old_size && !vm->gc_running) {
         size_t grow = new_size - old_size;
         if (vm->bytes_live + grow > vm->heap_limit) {
             js_gc_collect(vm);
@@ -41,6 +42,25 @@ void *js_realloc_raw(JsVm *vm, void *ptr, size_t old_size, size_t new_size) {
     if (p)
         vm->bytes_live = vm->bytes_live - old_size + new_size;
     return p;
+}
+
+void *js_realloc_raw(JsVm *vm, void *ptr, size_t old_size, size_t new_size) {
+    return realloc_impl(vm, ptr, old_size, new_size, true);
+}
+
+/*
+ * For the collector's own bookkeeping — the root array and the mark stack.
+ * Still counted in bytes_live, but NOT refused by heap_limit, because these are
+ * not guest data: they are what makes guest data safe to trace. Refusing them
+ * does not decline an allocation, it leaves a live value unrooted or a live
+ * cell unmarked, which is a use-after-free rather than a clean error. Both are
+ * small and bounded by C-stack depth, which is already capped (JS_MAX_FRAMES,
+ * JS_MAX_REENTRY, JSBC_MAX_FN_DEPTH), so exempting them cannot become an
+ * unbounded hole in the limit — and a guest can no longer pick the moment
+ * rooting fails by driving the heap to its cap.
+ */
+void *js_realloc_internal(JsVm *vm, void *ptr, size_t old_size, size_t new_size) {
+    return realloc_impl(vm, ptr, old_size, new_size, false);
 }
 
 JsVm *js_vm_new(const JsVmConfig *cfg) {
@@ -77,6 +97,41 @@ JsVm *js_vm_new(const JsVmConfig *cfg) {
     } else {
         vm->hash_seed = 0;
     }
+    /* Reserve the root array now, while the allocator is fresh, so ordinary
+     * nesting never grows it mid-operation. Failing here is a clean "no VM"
+     * for the host; failing later would mean suspending the collector. */
+    vm->roots = js_realloc_internal(vm, NULL, 0, JS_ROOTS_INIT_CAP * sizeof *vm->roots);
+    if (!vm->roots) {
+        fn(ud, vm, sizeof *vm, 0);
+        return NULL;
+    }
+    vm->roots_cap = JS_ROOTS_INIT_CAP;
+    /*
+     * Build the out-of-memory error now, while there is memory to build it
+     * with (see js_oom_value). It is deliberately NOT a collectable cell: it is
+     * kept off vm->cells, so sweep never sees it, nothing has to root it, and
+     * it cannot be reclaimed at the one moment it is needed. That also keeps it
+     * out of js_gc_live_cells, which stays a count of guest-visible objects.
+     * Freed in js_vm_free.
+     */
+    static const char oom_msg[] = "out of memory";
+    size_t oom_len = sizeof oom_msg - 1;
+    JsString *oe = js_realloc_internal(vm, NULL, 0,
+                                       sizeof(JsString) + oom_len * sizeof(uint16_t));
+    if (!oe) {
+        js_realloc_internal(vm, vm->roots, vm->roots_cap * sizeof *vm->roots, 0);
+        fn(ud, vm, sizeof *vm, 0);
+        return NULL;
+    }
+    oe->gc.kind = JS_KIND_STRING;
+    oe->gc.mark = 1; /* never swept, but harmless if a mark pass reaches it */
+    oe->gc.next = NULL;
+    oe->length = (uint32_t)oom_len;
+    oe->interned = false;
+    for (size_t i = 0; i < oom_len; i++)
+        oe->units[i] = (uint16_t)(unsigned char)oom_msg[i];
+    oe->hash = js_units_hash(oe->units, oom_len, vm->hash_seed);
+    vm->oom_error = oe;
     return vm;
 }
 
@@ -94,15 +149,40 @@ void js_vm_free(JsVm *vm) {
     }
     vm->cells = NULL;
     js_atoms_free(vm);
-    js_realloc_raw(vm, vm->roots, vm->roots_cap * sizeof *vm->roots, 0);
-    js_realloc_raw(vm, vm->mark_stack, vm->mark_cap * sizeof *vm->mark_stack, 0);
+    /* Not on vm->cells, so the sweep above did not free it. */
+    js_realloc_internal(vm, vm->oom_error,
+                        sizeof(JsString) + (size_t)vm->oom_error->length * sizeof(uint16_t),
+                        0);
+    js_realloc_internal(vm, vm->roots, vm->roots_cap * sizeof *vm->roots, 0);
+    js_realloc_internal(vm, vm->mark_stack, vm->mark_cap * sizeof *vm->mark_stack, 0);
     JsReallocFn fn = vm->realloc_fn;
     void *ud = vm->alloc_ud;
     fn(ud, vm, sizeof *vm, 0);
 }
 
+JsVm *js_context_vm(JsContext *ctx) {
+    return ctx->vm;
+}
+
 size_t js_vm_allocated_bytes(const JsVm *vm) {
     return vm->bytes_live;
+}
+
+bool js_vm_out_of_memory(const JsVm *vm) {
+    return vm->gc_suspended;
+}
+
+/* Async-signal-safe by construction: a single store to a sig_atomic_t. */
+void js_vm_interrupt(JsVm *vm) {
+    vm->interrupt = 1;
+}
+
+void js_vm_clear_interrupt(JsVm *vm) {
+    vm->interrupt = 0;
+}
+
+bool js_vm_interrupted(const JsVm *vm) {
+    return vm->interrupt != 0;
 }
 
 size_t js_gc_live_cells(const JsVm *vm) {

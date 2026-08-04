@@ -125,9 +125,47 @@ JsVm *js_vm_new(const JsVmConfig *cfg); /* cfg may be NULL */
 void  js_vm_free(JsVm *vm);
 size_t js_vm_allocated_bytes(const JsVm *vm);
 
+/*
+ * True once the VM has hit an allocation failure it could not report cleanly —
+ * specifically, one that forced the collector off (see js_gc_protect). The VM
+ * stays memory-safe and keeps refusing work with out-of-memory errors, but it
+ * can no longer reclaim anything, so a host should finish the current call and
+ * discard it rather than keep serving from it.
+ */
+bool js_vm_out_of_memory(const JsVm *vm);
+
+/*
+ * Asks the VM to stop executing as soon as it can. This is the one function
+ * here that may be called while the VM is running, including from another
+ * thread or a signal handler — it only sets a flag, touches nothing else, and
+ * needs no lock.
+ *
+ * It exists because fuel counts instructions, not time, and a host cannot
+ * always predict which budget corresponds to an acceptable wall-clock. Arm a
+ * timer, call this, and the run stops.
+ *
+ * The stop surfaces as a thrown "Error: execution interrupted" that re-arms
+ * itself, so guest code cannot catch it and continue; the run unwinds and the
+ * host gets control back. The flag is NOT cleared automatically — call
+ * js_vm_clear_interrupt before using the VM again, or every subsequent
+ * instruction will keep throwing.
+ *
+ * Latency is bounded by the interpreter's dispatch loop, so a long-running
+ * builtin (a large sort, a big string build, one regex match) finishes its
+ * current step first. Those steps are individually bounded, but if a hard
+ * deadline matters more than a clean unwind, keep an outer kill as well —
+ * under wasm, the runtime's epoch interruption.
+ */
+void js_vm_interrupt(JsVm *vm);
+void js_vm_clear_interrupt(JsVm *vm);
+bool js_vm_interrupted(const JsVm *vm);
+
 JsContext *js_context_new(JsVm *vm);
 void       js_context_free(JsContext *ctx);
 JsValue    js_context_globals(JsContext *ctx);
+/* The VM a context belongs to. A native is handed only the context, but most of
+ * the value and GC API is VM-scoped, so it needs this to use them. */
+JsVm      *js_context_vm(JsContext *ctx);
 
 /* ---- strings ---- */
 
@@ -323,7 +361,15 @@ int js_bytecode_kind(const uint8_t *buf, size_t len);
 /* ---- GC ---- */
 
 void   js_gc_collect(JsVm *vm);
-bool   js_gc_protect(JsVm *vm, JsValue *slot);   /* register *slot as a root */
+/*
+ * Registers *slot as a root. Cannot fail: the root array is exempt from
+ * heap_limit, and if the underlying allocator refuses, collection is suspended
+ * for the VM's lifetime rather than leaving a live value unrooted. That is why
+ * there is no status to check — a caller who checked could not have done
+ * anything safe with a failure anyway, and the 141-of-149 call sites that did
+ * not check were the actual hazard.
+ */
+void   js_gc_protect(JsVm *vm, JsValue *slot);
 void   js_gc_unprotect(JsVm *vm, JsValue *slot);
 size_t js_gc_live_cells(const JsVm *vm);
 

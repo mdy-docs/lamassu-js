@@ -723,9 +723,19 @@ static uint32_t lookup_pos(const JsFunctionCell *fn, uint32_t ip) {
     return pos;
 }
 
+/*
+ * Building the error message allocates, so at the moment it matters most --
+ * reporting that allocation failed -- it can fail too. Fall back to the string
+ * built at VM startup rather than throwing `undefined`, which told a host that
+ * something went wrong but not what.
+ */
+JsValue js_oom_value(JsVm *vm) {
+    return vm->oom_error ? js_value_from_cell(&vm->oom_error->gc) : js_undefined();
+}
+
 static void fiber_throw(JsContext *ctx, JsFiber *fb, const char *ascii_msg) {
     JsString *s = js_ascii_cell(ctx->vm, ascii_msg);
-    fb->error = s ? js_value_from_cell(&s->gc) : js_undefined();
+    fb->error = s ? js_value_from_cell(&s->gc) : js_oom_value(ctx->vm);
     fb->failed = true;
 }
 
@@ -759,7 +769,7 @@ static void fiber_throw_name(JsContext *ctx, JsFiber *fb, const char *prefix,
         buf[n++] = (uint16_t)(unsigned char)suffix[i];
     JsString *s = js_string_cell_new(vm, buf, (uint32_t)total);
     js_realloc_raw(vm, buf, total * sizeof(uint16_t), 0);
-    fb->error = s ? js_value_from_cell(&s->gc) : js_undefined();
+    fb->error = s ? js_value_from_cell(&s->gc) : js_oom_value(vm);
     fb->failed = true;
 }
 
@@ -1031,7 +1041,17 @@ run:; /* (re)load the top frame */
     } while (0)
 
         for (;;) {
-            if (--fb->fuel == 0) {
+            /* Fuel and interrupt are one check because both mean "stop now".
+             * Fuel re-arms to 1 and the interrupt flag stays set, so each is
+             * sticky: the handler a guest jumps to throws again on its own
+             * first instruction, and no try/catch can absorb the stop and keep
+             * running. Neither clears itself — fuel is re-armed by
+             * js_context_set_fuel, the flag by js_vm_clear_interrupt. */
+            if (--fb->fuel == 0 || vm->interrupt) {
+                if (vm->interrupt) {
+                    fb->fuel++; /* not our budget that ran out; leave it intact */
+                    RT_THROW("Error: execution interrupted");
+                }
                 fb->fuel = 1;
                 RT_THROW("RangeError: execution budget exhausted");
             }
@@ -2105,10 +2125,7 @@ static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
      * f(...args) {}` was enough to turn that into a use-after-free.
      */
     JsValue fb_val = js_value_from_cell(fc);
-    if (!js_gc_protect(vm, &fb_val)) {
-        *err = "out of memory";
-        return NULL;
-    }
+    js_gc_protect(vm, &fb_val);
     JsFiber *result = NULL;
     if (!stack_ensure(vm, fb, (uint32_t)(2 + argc) + cl->fn->n_locals +
                                   cl->fn->max_stack + 8)) {

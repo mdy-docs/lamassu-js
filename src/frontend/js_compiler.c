@@ -1601,8 +1601,7 @@ static bool compile_function(JsCompiler *cx, const JsAstNode *fnode) {
     fs.fn_value = js_value_from_cell(cell);
     fs.scratch_slot = -1;
     fs.is_arrow = (fnode->flags & JS_F_ARROW) != 0;
-    if (!js_gc_protect(cx->vm, &fs.fn_value))
-        return cerr(cx, fnode->pos, "out of memory");
+    js_gc_protect(cx->vm, &fs.fn_value);
     /* Intern the name only after fn is rooted (interning may collect). */
     if (fnode->len && !fs.is_arrow) {
         JsValue nm = js_atom(cx->vm, fnode->units, fnode->len);
@@ -2195,11 +2194,7 @@ JsFunctionCell *js_compile_ast(JsContext *ctx, const JsAstNode *module, bool rep
     fs.slot_count = 1; /* slot 0: completion value */
     fs.slot_max = 1;
     cx.cur = &fs;
-    if (!js_gc_protect(vm, &fs.fn_value)) {
-        err->msg = "out of memory";
-        err->pos = 0;
-        return NULL;
-    }
+    js_gc_protect(vm, &fs.fn_value);
 
     bool ok = compile_block_stmts(&cx, module->items, module->count);
     if (ok)
@@ -2463,11 +2458,7 @@ JsFunctionCell *js_compile_module_body(JsContext *ctx, const JsAstNode *module,
     fs.slot_count = 1;
     fs.slot_max = 1;
     cx.cur = &fs;
-    if (!js_gc_protect(vm, &fs.fn_value)) {
-        err->msg = "out of memory";
-        err->pos = 0;
-        return NULL;
-    }
+    js_gc_protect(vm, &fs.fn_value);
 
     bool ok = analyze_module(&cx, module, mod);
     if (ok)

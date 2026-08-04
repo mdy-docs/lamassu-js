@@ -227,7 +227,7 @@ static void test_gc_basic(void) {
     CHECK(js_gc_live_cells(vm) == 0);
 
     JsValue s = js_string_new(vm, U("keep"), 4);
-    CHECK(js_gc_protect(vm, &s));
+    js_gc_protect(vm, &s); /* infallible by design; see include/lamassu.h */
     js_string_new(vm, U("junk"), 4);
     js_gc_collect(vm);
     CHECK(js_gc_live_cells(vm) == 1);

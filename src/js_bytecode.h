@@ -163,6 +163,9 @@ double    js_to_number_value(JsContext *ctx, JsValue v);
 JsString *js_to_string_cell(JsContext *ctx, JsValue v, int depth); /* NULL on OOM */
 bool      js_strict_equals(JsValue a, JsValue b);
 JsString *js_ascii_cell(JsVm *vm, const char *s); /* <=128 chars */
+/* The pre-built out-of-memory error; use when building a message may itself
+ * fail. Returns undefined only if the VM could not be fully initialized. */
+JsValue js_oom_value(JsVm *vm);
 JsString *js_concat_cells(JsVm *vm, const JsString *a, const JsString *b);
 bool      js_spread_into_object(JsContext *ctx, JsObject *dst, JsValue src);
 

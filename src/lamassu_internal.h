@@ -5,6 +5,21 @@
 
 #include <string.h>
 
+/*
+ * Type of the asynchronous stop flag (JsVm.interrupt). sig_atomic_t is the
+ * right choice wherever a signal handler might set it, but wasm has no signals
+ * and its <signal.h> is a hard #error without -D_WASI_EMULATED_SIGNAL — and the
+ * wasm builds are exactly the ones that must stay dependency-free. There the
+ * flag is only ever set by the host between calls, so a plain volatile int
+ * carries the same meaning.
+ */
+#if defined(__wasi__) || defined(__wasm__)
+typedef volatile int JsInterruptFlag;
+#else
+#include <signal.h>
+typedef volatile sig_atomic_t JsInterruptFlag;
+#endif
+
 typedef enum JsGcKind {
     JS_KIND_STRING = 1,
     JS_KIND_OBJECT = 2,
@@ -439,6 +454,12 @@ struct JsVm {
                          * to defeat HashDoS. Fixed for the VM's lifetime (unlike
                          * rng_state, which Math.random mutates). */
     uint32_t regexp_live; /* live compiled patterns (each ~sizeof(Program)) */
+    /* Asynchronous stop request. Written by js_vm_interrupt, which may be
+     * called from another thread or a signal handler while this VM is running,
+     * and only ever read. It is a one-way request flag, not synchronization:
+     * the reader may observe it an instruction or two late, which is all the
+     * precision "stop soon" needs. */
+    JsInterruptFlag interrupt;
 
     /* GC */
     JsGcCell *cells;
@@ -447,6 +468,11 @@ struct JsVm {
     size_t gc_threshold_init;
     bool gc_stress;
     bool gc_running;
+    /* Set when the root array could not grow (true allocator failure, not the
+     * heap limit — roots are exempt from it). A live value is unrooted
+     * somewhere up the C stack, so collecting would free something still in
+     * use; the collector stays off for the VM's lifetime. See js_gc_protect. */
+    bool gc_suspended;
     JsGcCell **mark_stack;
     size_t mark_len, mark_cap;
     bool mark_overflow;
@@ -455,6 +481,12 @@ struct JsVm {
 
     JsAtomTable atoms;
     JsContext *contexts;
+    /* Pre-built "out of memory" error, created while memory was still
+     * available. The one error the engine cannot afford to build on demand is
+     * the one that says allocation failed: fiber_throw's own string allocation
+     * fails too, and the run then rejected with `undefined` — a host could see
+     * that something went wrong but not what. */
+    JsString *oom_error;
 
     /* microtask FIFO queue (raw allocations; a GC root) */
     JsJob *jobs_head, *jobs_tail;
@@ -522,6 +554,13 @@ bool js_array_set_index(JsVm *vm, JsObject *arr, uint32_t idx, JsValue v);
 /* ---- allocator (js_vm.c) ---- */
 
 void *js_realloc_raw(JsVm *vm, void *ptr, size_t old_size, size_t new_size);
+/* Counted but exempt from heap_limit; only for the collector's own root array
+ * and mark stack. See the rationale on the definition in js_vm.c. */
+void *js_realloc_internal(JsVm *vm, void *ptr, size_t old_size, size_t new_size);
+
+/* Root slots reserved up front, while memory is still plentiful, so ordinary
+ * nesting never has to grow the array mid-operation. */
+#define JS_ROOTS_INIT_CAP 64
 
 /* ---- GC (js_gc.c) ---- */
 

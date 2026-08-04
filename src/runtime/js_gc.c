@@ -17,8 +17,8 @@
 static bool js_mark_push(JsVm *vm, JsGcCell *c) {
     if (vm->mark_len == vm->mark_cap) {
         size_t ncap = vm->mark_cap ? vm->mark_cap * 2 : 64;
-        JsGcCell **ns = js_realloc_raw(vm, vm->mark_stack,
-                                       vm->mark_cap * sizeof *ns, ncap * sizeof *ns);
+        JsGcCell **ns = js_realloc_internal(vm, vm->mark_stack,
+                                            vm->mark_cap * sizeof *ns, ncap * sizeof *ns);
         if (!ns) {
             vm->mark_overflow = true;
             return false;
@@ -235,7 +235,10 @@ void js_gc_free_cell(JsVm *vm, JsGcCell *c, bool remove_atoms) {
 }
 
 void js_gc_collect(JsVm *vm) {
-    if (vm->gc_running)
+    /* Suspended after a root-array allocation failure: somewhere up the C stack
+     * a live value is unrooted, so tracing would free something still in use.
+     * See js_gc_protect. */
+    if (vm->gc_running || vm->gc_suspended)
         return;
     vm->gc_running = true;
     vm->mark_overflow = false;
@@ -325,18 +328,40 @@ JsGcCell *js_gc_new_cell(JsVm *vm, JsGcKind kind, size_t size) {
     return c;
 }
 
-bool js_gc_protect(JsVm *vm, JsValue *slot) {
+/*
+ * Rooting cannot fail, and that is a deliberate design choice rather than an
+ * optimistic one.
+ *
+ * It used to return false when the root array could not grow, and of its ~149
+ * call sites 8 checked. The other 141 carried on with a value they believed was
+ * rooted — and since the array grew through the heap-limited allocator, a guest
+ * could choose the moment that happened by driving the heap to its cap. That
+ * made "unrooted value, then collect, then use" a condition an attacker could
+ * schedule, which is the worst shape a use-after-free can have.
+ *
+ * Two changes remove the failure mode instead of asking 149 sites to handle it.
+ * The array is allocated through js_realloc_internal, so the heap limit cannot
+ * refuse it (see the rationale there). And if the real allocator refuses — the
+ * process is out of memory, nothing to do with the guest — collection is
+ * suspended for the VM's lifetime. An unrooted slot is only dangerous because
+ * something can collect it; with the collector off, the value survives, the
+ * operation unwinds through the ordinary out-of-memory path, and the heap limit
+ * still refuses further growth, so the VM fails closed rather than corrupting.
+ * js_vm_out_of_memory reports that state so a host can discard the VM.
+ */
+void js_gc_protect(JsVm *vm, JsValue *slot) {
     if (vm->roots_len == vm->roots_cap) {
-        size_t ncap = vm->roots_cap ? vm->roots_cap * 2 : 16;
-        JsValue **nr = js_realloc_raw(vm, vm->roots,
-                                      vm->roots_cap * sizeof *nr, ncap * sizeof *nr);
-        if (!nr)
-            return false;
+        size_t ncap = vm->roots_cap ? vm->roots_cap * 2 : JS_ROOTS_INIT_CAP;
+        JsValue **nr = js_realloc_internal(vm, vm->roots,
+                                           vm->roots_cap * sizeof *nr, ncap * sizeof *nr);
+        if (!nr) {
+            vm->gc_suspended = true;
+            return;
+        }
         vm->roots = nr;
         vm->roots_cap = ncap;
     }
     vm->roots[vm->roots_len++] = slot;
-    return true;
 }
 
 void js_gc_unprotect(JsVm *vm, JsValue *slot) {

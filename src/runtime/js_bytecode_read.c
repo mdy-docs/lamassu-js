@@ -262,10 +262,7 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
 
     /* Root the half-built cell across every subsequent allocation. */
     JsValue hold = js_value_from_cell(c);
-    if (!js_gc_protect(vm, &hold)) {
-        *err = "out of memory";
-        return NULL;
-    }
+    js_gc_protect(vm, &hold);
 
     JsFunctionCell *result = NULL;
 
@@ -973,10 +970,7 @@ JsValue js_bytecode_load(JsContext *ctx, const uint8_t *buf, size_t len,
 
     /* Root the loaded fn across verification (which allocates scratch). */
     JsValue fv = js_value_from_cell(&fn->gc);
-    if (!js_gc_protect(ctx->vm, &fv)) {
-        *err_msg = "out of memory";
-        return js_undefined();
-    }
+    js_gc_protect(ctx->vm, &fv);
     bool ok = verify_fn(ctx, fn, /*is_module=*/false, /*import_count=*/0, err_msg);
     js_gc_unprotect(ctx->vm, &fv);
     if (!ok) {
@@ -1046,10 +1040,7 @@ bool js_bc_load_module(JsContext *ctx, JsModule *m, const uint8_t *buf, size_t l
      * GC stays consistent. On failure the partial fill is left on the cell —
      * the caller marks it ERRORED and the sweep reclaims the arrays. */
     JsValue mv = js_value_from_cell(&m->gc);
-    if (!js_gc_protect(vm, &mv)) {
-        *err = "out of memory";
-        return false;
-    }
+    js_gc_protect(vm, &mv);
     bool result = false;
 
     /* the record's own embedded specifier (kept only if needed; identity uses

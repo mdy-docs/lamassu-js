@@ -170,7 +170,10 @@ static JsValue sb_finish(StrBuf *sb) {
 
 static bool native_throw(JsContext *ctx, JsValue *result, const char *msg) {
     JsString *s = js_ascii_cell(ctx->vm, msg);
-    *result = s ? js_value_from_cell(&s->gc) : js_undefined();
+    /* Falling back to undefined would report a failure with no reason attached,
+     * and the case it happens in -- no memory for the message -- is exactly the
+     * one a host most needs told apart. */
+    *result = s ? js_value_from_cell(&s->gc) : js_oom_value(ctx->vm);
     return false;
 }
 
@@ -1113,7 +1116,16 @@ static bool am_sort(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     js_gc_protect(ctx->vm, &midstr);
     bool failed = false;
 
+    /* Insertion sort is quadratic in element moves and the interpreter charges
+     * one fuel unit for the whole call, so a large sort is the longest a guest
+     * can keep the engine inside a single native. Poll the stop flag per pass
+     * so an interrupt is not left waiting for it. */
     for (uint32_t i = 1; i < a->elem_count && !failed; i++) {
+        if (ctx->vm->interrupt) {
+            failed = true;
+            native_throw(ctx, r, "Error: execution interrupted");
+            break; /* not `return`: the roots below still have to come off */
+        }
         key = a->elems[i];
         uint32_t lo = 0, hi = i;
         while (lo < hi) {

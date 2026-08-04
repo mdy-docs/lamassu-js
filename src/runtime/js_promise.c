@@ -114,7 +114,7 @@ static void schedule_reaction(JsContext *ctx, JsReaction *rx, bool fulfilled,
                               JsValue value) {
     JsJob *job = job_alloc(ctx->vm);
     if (!job)
-        return; /* OOM: drop the reaction (degradation, not a crash) */
+        return; /* unreachable: reaction_alloc reserved this node (job_reserve) */
     job->kind = rx->kind;
     job->fulfilled = fulfilled;
     job->value = value;
@@ -177,7 +177,27 @@ static void add_reaction(JsContext *ctx, JsPromise *p, JsReaction *rx) {
     js_realloc_raw(ctx->vm, rx, sizeof *rx, 0);
 }
 
+/*
+ * Puts one spare job node on the free list. Every reaction reserves the node it
+ * will need when the promise settles, because settlement is a point with no way
+ * to report failure: a dropped job leaves an `await` pending forever and a
+ * `.then` that never runs, which a host cannot tell apart from work that is
+ * legitimately still outstanding. Registration CAN fail visibly, so the
+ * allocation belongs there. job_alloc has this one consumer, and job_recycle
+ * returns nodes here, so the reserve is never raided by anything else.
+ */
+static bool job_reserve(JsVm *vm) {
+    JsJob *job = js_realloc_raw(vm, NULL, 0, sizeof(JsJob));
+    if (!job)
+        return false;
+    job->next = vm->jobs_free;
+    vm->jobs_free = job;
+    return true;
+}
+
 static JsReaction *reaction_alloc(JsContext *ctx) {
+    if (!job_reserve(ctx->vm))
+        return NULL;
     JsReaction *rx = js_realloc_raw(ctx->vm, NULL, 0, sizeof(JsReaction));
     if (!rx)
         return NULL;
@@ -285,7 +305,11 @@ static void run_then_job(JsContext *ctx, JsJob *job) {
 
 void js_run_jobs(JsContext *ctx) {
     JsVm *vm = ctx->vm;
-    while (vm->jobs_head) {
+    /* Stop dequeuing once interrupted. Each job would only enter the
+     * interpreter and throw on its first instruction, but a chain that
+     * re-queues itself would still spin here allocating a fiber per turn.
+     * Anything left queued stays queued, and js_has_pending_jobs reports it. */
+    while (vm->jobs_head && !vm->interrupt) {
         JsJob *job = vm->jobs_head;
         vm->jobs_head = job->next;
         if (!vm->jobs_head)
