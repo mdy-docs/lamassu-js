@@ -72,7 +72,11 @@ running — each subsequent instruction throws again until the fiber unwinds.
 
 **Heap bound.** `heap_limit` is enforced in `js_realloc_raw`, so it covers bulk
 allocations (property maps, array element buffers, fiber stacks, the job queue)
-and not merely GC cell headers. Individual operations have their own ceilings:
+and not merely GC cell headers — and it is a cap, not a target: the check runs
+before the allocation, so the accounted total never exceeds it. The collector's
+mark stack is charged too, sized from the cell count before marking begins
+rather than grown in the middle of it, where a refusal could not have been
+reported. Individual operations have their own ceilings:
 `JS_MAX_STRING_UNITS` for anything that builds a string, `JS_MAX_ARRAY_GAP` for
 array growth per operation.
 
@@ -134,10 +138,12 @@ construction rather than by omission:
   builtin already running finishes its current step before the stop is seen.
   Every such step is individually bounded, so this is a latency question, not
   an unbounded one, but a hard deadline still wants an outer kill.
-- **`heap_limit` can be overshot by a single in-flight allocation**, since it is
-  checked before the allocation rather than reserved. The overshoot is one
-  allocation's worth, and per-operation ceilings (`JS_MAX_STRING_UNITS`,
-  `JS_MAX_ARRAY_GAP`) bound how large that can be.
+- **`heap_limit` bounds accounted bytes, not process RSS.** `bytes_live` counts
+  what the engine *requested*, so the allocator's own metadata and size-class
+  rounding are invisible to it, and a growing `realloc` may briefly hold the old
+  block and the new one at once. A host that needs a true RSS ceiling should
+  enforce it in the `JsReallocFn` it supplies, which is the only place with the
+  real numbers.
 
 Closed recently, listed because embeddings written against the old behaviour may
 still be compensating for them:
@@ -156,6 +162,10 @@ still be compensating for them:
 - `Object.freeze` and `Object.seal` are enforced, on every path that can write:
   property assignment, array indexed writes, `length`, `delete`, the in-place
   array mutators that bypass the property path, and the host's `js_object_set`.
+- Nothing pushes the accounted total past `heap_limit` any more, including the
+  collector's own mark stack. That stack is now sized before marking rather than
+  grown during it, so the one allocation the limit could not cover is gone; it
+  used to overshoot by up to 20% of the cap on a heap of small cells.
 
 ## Testing
 

@@ -12,19 +12,48 @@
  * recursion); if the stack cannot grow, the cycle is abandoned — every
  * cell is treated as live and the threshold backs off, so an OOM during
  * GC is never fatal and never frees a reachable cell.
+ *
+ * The mark stack is sized AHEAD of marking rather than grown during it, which
+ * is what lets heap_limit be a real cap. Growing it mid-cycle meant allocating
+ * at the one moment the limit cannot be enforced — a collector that stopped to
+ * collect, or that failed, would be reentering or abandoning itself — so that
+ * allocation was exempt, and a guest holding many small cells could push the
+ * total past the limit by the size of the stack needed to trace them (measured
+ * at 12.5% of the cap, with a worst case of 20%: eight bytes per traceable
+ * cell against a 40-byte JsPromise).
+ *
+ * js_gc_new_cell instead keeps `mark_cap >= cell_count` as an invariant, paid
+ * for where an allocation failure is an ordinary reportable OOM. That bound is
+ * exact: js_gc_mark_cell sets the mark bit BEFORE pushing, so each cell is
+ * pushed at most once per cycle and the stack can never hold more entries than
+ * there are cells. Marking therefore never needs to grow it, and the tracing
+ * cost is charged to the same budget as everything else.
  */
 
+/* Grows to hold `need` entries. Charged, so it is refused like any other
+ * allocation once the limit is reached. Off the hot path: js_gc_new_cell tests
+ * the capacity itself and only calls this on the rare growth, because it runs
+ * once per cell allocated and the common answer is "already big enough". */
+static bool mark_grow(JsVm *vm, size_t need) {
+    size_t ncap = vm->mark_cap ? vm->mark_cap : 64;
+    while (ncap < need)
+        ncap *= 2;
+    JsGcCell **ns = js_realloc_raw(vm, vm->mark_stack, vm->mark_cap * sizeof *ns,
+                                   ncap * sizeof *ns);
+    if (!ns)
+        return false;
+    vm->mark_stack = ns;
+    vm->mark_cap = ncap;
+    return true;
+}
+
 static bool js_mark_push(JsVm *vm, JsGcCell *c) {
+    /* Unreachable while the invariant above holds; kept because the cost of it
+     * being wrong is freeing a reachable cell, and the fallback is already the
+     * sound one (abandon the cycle, free nothing). */
     if (vm->mark_len == vm->mark_cap) {
-        size_t ncap = vm->mark_cap ? vm->mark_cap * 2 : 64;
-        JsGcCell **ns = js_realloc_internal(vm, vm->mark_stack,
-                                            vm->mark_cap * sizeof *ns, ncap * sizeof *ns);
-        if (!ns) {
-            vm->mark_overflow = true;
-            return false;
-        }
-        vm->mark_stack = ns;
-        vm->mark_cap = ncap;
+        vm->mark_overflow = true;
+        return false;
     }
     vm->mark_stack[vm->mark_len++] = c;
     return true;
@@ -319,6 +348,14 @@ JsGcCell *js_gc_new_cell(JsVm *vm, JsGcKind kind, size_t size) {
         c = js_realloc_raw(vm, NULL, 0, size);
         if (!c)
             return NULL;
+    }
+    /* Room to trace the cell we are about to add, reserved before it exists.
+     * Failing here is an ordinary out-of-memory for the allocation the caller
+     * asked for, which is the whole point of doing it at this moment: the
+     * alternative is discovering it mid-mark, where nothing can report it. */
+    if (vm->cell_count + 1 > vm->mark_cap && !mark_grow(vm, vm->cell_count + 1)) {
+        js_realloc_raw(vm, c, size, 0);
+        return NULL;
     }
     c->kind = (uint8_t)kind;
     c->mark = 0;

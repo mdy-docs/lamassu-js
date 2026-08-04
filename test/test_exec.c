@@ -969,7 +969,92 @@ static void test_regex_memory_is_capped(void) {
     free(out);
 }
 
+/*
+ * heap_limit is a cap on what the VM may hold, so nothing should ever push the
+ * accounted total past it -- not even transiently, and not even the collector's
+ * own bookkeeping. The mark stack used to: it grew during marking, at the one
+ * moment the limit could not be enforced, so a guest holding many small cells
+ * pushed the total over by the size of the stack needed to trace them (12.5% of
+ * the cap when measured, 20% worst case). It is now sized before marking, from
+ * the cell count, where a refusal is an ordinary out-of-memory.
+ *
+ * This allocator watches every call rather than sampling at the end, because
+ * the overshoot was transient -- a peak during a collection, gone by the time
+ * anything on the outside could look.
+ */
+typedef struct {
+    size_t live;
+    size_t limit;
+    size_t worst;   /* highest live seen */
+} CapWatch;
+
+static void *cap_watch_realloc(void *ud, void *ptr, size_t old_size, size_t new_size) {
+    CapWatch *w = ud;
+    if (new_size == 0) {
+        if (ptr) { w->live -= old_size; free(ptr); }
+        return NULL;
+    }
+    void *p = realloc(ptr, new_size);
+    if (!p)
+        return NULL;
+    w->live = w->live - old_size + new_size;
+    if (w->live > w->worst)
+        w->worst = w->live;
+    return p;
+}
+
+static void expect_within_heap_limit(const char *label, const char *src, size_t limit) {
+    CapWatch w = {0, limit, 0};
+    JsVmConfig cfg = {0};
+    cfg.realloc_fn = cap_watch_realloc;
+    cfg.alloc_ud = &w;
+    cfg.heap_limit = limit;
+    JsVm *vm = js_vm_new(&cfg);
+    JsContext *ctx = js_context_new(vm);
+    if (!vm || !ctx) { js_vm_free(vm); return; }
+    size_t len = strlen(src);
+    uint16_t *u = malloc(len * sizeof(uint16_t));
+    for (size_t i = 0; i < len; i++)
+        u[i] = (uint16_t)(unsigned char)src[i];
+    const char *em; uint32_t ep;
+    JsValue fn = js_compile_module(ctx, u, len, &em, &ep);
+    free(u);
+    if (js_is_function(fn)) {
+        js_gc_protect(vm, &fn);
+        JsValue p = js_run_module(ctx, fn);
+        js_gc_protect(vm, &p);
+        js_run_jobs(ctx);
+    }
+    js_vm_free(vm);
+    checks_run++;
+    if (w.worst > limit) {
+        checks_failed++;
+        fprintf(stderr, "FAIL heap_limit exceeded (%s): peak %zu > limit %zu (+%zu)\n",
+                label, w.worst, limit, w.worst - limit);
+    }
+}
+
+static void test_heap_limit_is_a_hard_cap(void) {
+    const size_t L = 2u * 1024 * 1024;
+    /* Cell-heavy workloads are the ones that grow the mark stack. */
+    expect_within_heap_limit("many objects",
+        "let a = []; for (let i = 0; i < 1000000; i++) a.push({ v: i }); a.length;", L);
+    expect_within_heap_limit("closures",
+        "let f = []; for (let i = 0; i < 300000; i++) f.push(function () { return i; }); f.length;", L);
+    expect_within_heap_limit("property churn",
+        "let o = {}; for (let i = 0; i < 500000; i++) o['k' + i] = i; 1;", L);
+    expect_within_heap_limit("array growth",
+        "let a = []; for (let i = 0; i < 1000000; i++) a.push(i); a.length;", L);
+    expect_within_heap_limit("string growth",
+        "let s = 'x'; for (let i = 0; i < 40; i++) { s = s + s; } s.length;", L);
+    /* A tight limit exercises the same paths with the collector under pressure. */
+    expect_within_heap_limit("many objects (tight)",
+        "let a = []; for (let i = 0; i < 1000000; i++) a.push({ v: i }); a.length;",
+        512u * 1024);
+}
+
 int main(void) {
+    test_heap_limit_is_a_hard_cap();
     test_regex_memory_is_capped();
     test_interrupt();
     test_oom_is_reported();

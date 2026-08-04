@@ -27,13 +27,20 @@ static void *realloc_impl(JsVm *vm, void *ptr, size_t old_size, size_t new_size,
     /* Enforce the heap limit at the single byte-accounting choke point so that
      * bulk allocations (array/string buffers, hash tables) are capped too, not
      * just cell headers. Only net growth can breach the limit; a shrink or a
-     * move to a smaller size never does. Skip while the collector is running:
-     * its own bookkeeping must not recurse into a collect, and sweep only frees
-     * (shrinks) anyway. */
-    if (limited && vm->heap_limit && new_size > old_size && !vm->gc_running) {
+     * move to a smaller size never does.
+     *
+     * The check applies while the collector is running as well. It used to be
+     * skipped there, which is how the accounted total could exceed the limit:
+     * the mark stack grew during marking and so was never charged. Nothing
+     * allocates during a collection any more (the mark stack is sized ahead of
+     * it, and sweep only frees), so the exemption bought nothing but a hole.
+     * Only the collect ATTEMPT is conditional — a collector cannot stop to
+     * collect, and js_gc_collect would refuse the reentry anyway. */
+    if (limited && vm->heap_limit && new_size > old_size) {
         size_t grow = new_size - old_size;
         if (vm->bytes_live + grow > vm->heap_limit) {
-            js_gc_collect(vm);
+            if (!vm->gc_running)
+                js_gc_collect(vm);
             if (vm->bytes_live + grow > vm->heap_limit)
                 return NULL;
         }
