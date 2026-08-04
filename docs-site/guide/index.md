@@ -10,10 +10,11 @@ It ships as:
 
 - **[`@mdy-docs/lamassu-js`](/api/npm-package)** — an npm package exposing the
   engine as a WebAssembly ES module, for use in Node or the browser.
-- A native C library (`liblamassu`) and a command-line tool (`lamassu`), for
-  embedders working directly in C — see the
-  **[C embedding API](/api/c-embedding)**.
-- A [browser playground](https://mdy-docs.github.io/lamassu-js/) with a
+- A native C library — a runtime archive and a frontend archive, so a process
+  that only runs precompiled bytecode need not contain a compiler at all — and
+  a command-line tool (`lamassu`), for embedders working directly in C. See
+  the **[C embedding API](/api/c-embedding)**.
+- A [browser playground](/playground) with a
   persistent-VM REPL, so you can try the language without installing
   anything.
 
@@ -56,4 +57,7 @@ sees an ordinary call.
 - **[Deviations from real JS](/guide/deviations)** — places the subset's
   behavior differs from Node's, tracked so differential testing has a
   baseline.
+- **[Running untrusted code](/security)** — the threat model, the limits you
+  have to set (they're off by default), and what the engine can't bound for
+  you.
 - **[API Reference](/api/)** — embedding the engine, from JavaScript or C.

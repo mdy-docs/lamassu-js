@@ -13,12 +13,17 @@ hero:
       text: API Reference
       link: /api/
     - theme: alt
+      text: Running untrusted code
+      link: /security
+    - theme: alt
       text: Try it live
-      link: https://mdy-docs.github.io/lamassu-js/
+      link: /playground
 
 features:
-  - title: Sandboxed by construction
-    details: WebAssembly linear memory is the trust boundary. Bounded CPU (fuel metering), bounded memory, and bounded stack depth make it safe to run scripts you didn't write.
+  - title: Built for untrusted input
+    details: A per-instruction CPU budget, a hard heap cap, an interrupt safe to call from a signal handler, bounded stack depth, and a bytecode loader that treats its input as hostile. The limits are opt-in — set them, and a guest that never stops is a caught error rather than a hung process.
+    link: /security
+    linkText: How to set the limits
   - title: Compile once, run repeatedly
     details: Source compiles to a versioned, validated bytecode format. Cache it, ship it, run it — the validating loader treats bytecode as hostile input, never as trusted state.
   - title: Real async, two ways

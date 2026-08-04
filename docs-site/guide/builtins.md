@@ -22,10 +22,18 @@ as-is — real JS would box it into a wrapper object, but this engine has no
 boxed-primitive type at all (see `String`/`Number` below), so there's
 nothing to box it into.
 
-**Statics**: `keys`, `values`, `entries`, `assign`, `freeze` (returns the
-object but does not enforce immutability — see
-[Deviations](/guide/deviations)), `fromEntries`, `hasOwn`,
-`getPrototypeOf`, `setPrototypeOf`.
+**Statics**: `keys`, `values`, `entries`, `assign`, `freeze`, `isFrozen`,
+`seal`, `isSealed`, `fromEntries`, `hasOwn`, `getPrototypeOf`,
+`setPrototypeOf`.
+
+`freeze` and `seal` are enforced, not advisory: writing to a frozen object,
+or adding to or deleting from a sealed one, throws a `TypeError`. Sealing
+fixes the shape while leaving existing properties writable, so
+`reverse`/`fill`/`sort` still work on a sealed array while
+`push`/`pop`/`shift`/`unshift` don't. Both return their argument, and both
+are no-ops on a primitive (which `isFrozen`/`isSealed` therefore report as
+frozen and sealed). Integrity is whole-object — there are no per-property
+attributes; see [Deviations](/guide/deviations).
 
 **`Object.prototype`**: `hasOwnProperty`, `toString` (`"[object Object]"`),
 `valueOf` (returns the object itself). This is the root of *every*

@@ -1,12 +1,14 @@
 name: Deploy playground + docs to GitHub Pages
 
-# Builds the engine to WebAssembly (Emscripten), builds the Vite playground
-# against the workspace package, builds the VitePress docs site, and
-# publishes both to GitHub Pages as one deploy: the playground at the site
-# root (https://mdy-docs.github.io/lamassu-js/, unchanged) and the docs
-# nested under /docs/ (docs-site/.vitepress/config.mts sets `base` to match).
-# Enable Pages in repo Settings → Pages with "Source: GitHub Actions" for
-# this to deploy.
+# Builds the engine to WebAssembly (Emscripten) and then the VitePress site,
+# which is the whole deployment: guide, API reference, security notes, and the
+# REPL playground as a page of it. The playground used to be a separate Vite
+# app served at the root with the docs nested under /docs/; it is one build
+# now, so the guides and the thing they describe can link to each other.
+#
+# docs-site/.vitepress/config.mts sets `base` to /lamassu-js/ to match the
+# project-site path. Enable Pages in repo Settings → Pages with
+# "Source: GitHub Actions" for this to deploy.
 
 on:
   push:
@@ -53,26 +55,25 @@ jobs:
       - name: Install workspace dependencies
         run: npm ci
 
-      - name: Build the Vite playground (web/dist)
-        run: npm run build:web
-
-      - name: Build the VitePress docs site (docs-site/dist)
+      - name: Build the site (docs + playground)
         run: npm run build:docs
-
-      - name: Merge the docs build into the playground build (web/dist/docs)
-        run: |
-          mkdir -p web/dist/docs
-          cp -r docs-site/dist/. web/dist/docs/
 
       - name: Sanity-check the artifacts exist
         run: |
-          test -f web/dist/index.html && ls web/dist/assets/*.wasm
-          test -f web/dist/docs/index.html
+          # The playground page and the engine it loads are the two things most
+          # likely to go missing without failing the build: the .wasm is pulled
+          # in through a `?url` import, so a resolution change would silently
+          # produce a page that loads nothing.
+          test -f docs-site/dist/index.html
+          test -f docs-site/dist/playground.html
+          test -f docs-site/dist/guide/index.html
+          test -f docs-site/dist/api/index.html
+          ls docs-site/dist/assets/*.wasm
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: web/dist
+          path: docs-site/dist
 
   deploy:
     needs: build

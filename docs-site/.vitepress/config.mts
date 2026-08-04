@@ -1,10 +1,12 @@
 import { defineConfig } from "vitepress";
 
-// Deploys alongside the playground under https://mdy-docs.github.io/lamassu-js/
-// (see .github/workflows/pages.yml, which builds this into web/dist/docs/ next
-// to the playground build) — so assets must be served under that sub-path.
+// This site IS the deployment: docs, API reference, and the playground, served
+// from https://mdy-docs.github.io/lamassu-js/ (see .github/workflows/pages.yml).
+// The playground used to be a separate Vite app at the root with the docs
+// nested under /docs/ — one build now, so a guide page can link straight to
+// the REPL and back.
 // Override for a local root preview: VITEPRESS_BASE=/ npm run docs:dev
-const base = process.env.VITEPRESS_BASE ?? "/lamassu-js/docs/";
+const base = process.env.VITEPRESS_BASE ?? "/lamassu-js/";
 
 export default defineConfig({
   title: "lamassu-js",
@@ -26,7 +28,8 @@ export default defineConfig({
     nav: [
       { text: "Guide", link: "/guide/" },
       { text: "API Reference", link: "/api/" },
-      { text: "Playground", link: "https://mdy-docs.github.io/lamassu-js/" },
+      { text: "Security", link: "/security" },
+      { text: "Playground", link: "/playground" },
     ],
 
     sidebar: {
@@ -44,6 +47,14 @@ export default defineConfig({
             { text: "Deviations from real JS", link: "/guide/deviations" },
           ],
         },
+        {
+          text: "Running untrusted code",
+          items: [{ text: "Security model", link: "/security" }],
+        },
+        {
+          text: "Try it",
+          items: [{ text: "Playground", link: "/playground" }],
+        },
       ],
       "/api/": [
         {
@@ -53,6 +64,10 @@ export default defineConfig({
             { text: "npm package", link: "/api/npm-package" },
             { text: "C embedding API", link: "/api/c-embedding" },
           ],
+        },
+        {
+          text: "Running untrusted code",
+          items: [{ text: "Security model", link: "/security" }],
         },
       ],
     },

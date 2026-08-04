@@ -24,8 +24,17 @@ that's known to differ, so you're not surprised by one in production.
   engine's property storage moves to hidden-class "shapes," which store
   properties in insertion order — see the roadmap in the project's
   `docs/plan.md`.)
-- **`Object.freeze` returns the object but does not enforce immutability.**
-  Property writes on a "frozen" object still succeed.
+- **Integrity is whole-object, not per-property.** `Object.freeze` and
+  `Object.seal` are enforced — on property assignment, indexed array writes,
+  `length`, `delete`, the in-place array mutators (`push`/`pop`/`shift`/
+  `unshift`/`reverse`/`fill`/`sort`), and the host's `js_object_set` — and
+  because the engine is strict-mode throughout, a refused write throws a
+  `TypeError` rather than failing quietly. `Object.isFrozen` and
+  `Object.isSealed` report the state. What's missing is anything *finer*:
+  there are no per-property attributes here, so there is no
+  `writable`/`configurable` distinction and no `Object.defineProperty` to set
+  one. That covers everything guest code can observe of an ordinary frozen
+  object; it only differs if you were reaching for a partially frozen one.
 
 ## Arrays
 

@@ -1,9 +1,30 @@
 # C embedding API
 
-The full public surface is `include/lamassu.h` — this page is a guided tour of
-it, not a replacement. Everything hangs off an explicit `JsVm` or
-`JsContext` handle (C's version of `this`); there is no static mutable
-state anywhere in the core, so multiple engines can coexist in one process.
+The public surface is two headers — this page is a guided tour of them, not a
+replacement. Everything hangs off an explicit `JsVm` or `JsContext` handle
+(C's version of `this`); there is no static mutable state anywhere in the
+core, so multiple engines can coexist in one process.
+
+## Two headers, two archives
+
+`include/lamassu.h` is the **runtime**: values, objects, strings, promises,
+modules, the GC, and loading precompiled bytecode. `include/lamassu_compile.h`
+is the **frontend**: everything that turns source text into code — the two
+`js_compile_module` entry points, bytecode production, and
+`js_enable_source_modules`.
+
+They ship as separate archives (`liblamassu_runtime.a`,
+`liblamassu_frontend.a`), and the split is the point rather than a side
+effect. A process that links only the runtime *cannot* compile
+attacker-supplied source, because the code that would do it is not in the
+binary — a property of the link rather than a policy someone has to remember.
+`make check-runtime-only` links `tools/run_bc.c` against the runtime alone to
+prove the split holds; that file is also the skeleton of what such a process
+looks like. See [Running untrusted code](/security) for when this is worth
+doing.
+
+Link order is always frontend-then-runtime: the frontend calls into the
+runtime, never the reverse.
 
 ## GC contract
 
@@ -42,7 +63,12 @@ size_t js_vm_allocated_bytes(const JsVm *vm);
 JsContext *js_context_new(JsVm *vm);
 void       js_context_free(JsContext *ctx);
 JsValue    js_context_globals(JsContext *ctx);
+JsVm      *js_context_vm(JsContext *ctx);
 ```
+
+A `JsNativeFn` is handed only the context, but most of the value and GC API is
+VM-scoped — `js_context_vm` is how a native gets from one to the other without
+threading a `JsVm *` through its own userdata.
 
 ```c
 typedef struct JsVmConfig {
@@ -55,13 +81,60 @@ typedef struct JsVmConfig {
 } JsVmConfig;
 ```
 
-`heap_limit` and `js_context_set_fuel` (below) are the two knobs for
-running genuinely untrusted scripts — see the security notes in the
-project's `docs/plan.md` for how they combine with a WASM sandbox and a
-regex step budget.
+`heap_limit` and `js_context_set_fuel` (below) are the two knobs for running
+genuinely untrusted scripts. Both default to off, so an embedding that leaves
+them alone has no bound on anything — see [Running untrusted
+code](/security) for how to set them and what they don't cover.
+
+`heap_limit` is checked before each allocation, so the accounted total never
+exceeds it, and it covers bulk allocations (property maps, array element
+buffers, fiber stacks, the job queue) rather than only GC cell headers. It
+bounds *accounted* bytes, though, not process RSS: allocator metadata and
+size-class rounding are invisible to it. A host that needs a true RSS ceiling
+should enforce it in the `JsReallocFn` it supplies, which is the only place
+with the real numbers.
 
 One `JsVm` can host multiple `JsContext`s (independent realms sharing one
 heap/GC/atom table); a single context is enough for most embedders.
+
+### Stopping a run from outside
+
+```c
+void js_vm_interrupt(JsVm *vm);
+void js_vm_clear_interrupt(JsVm *vm);
+bool js_vm_interrupted(const JsVm *vm);
+```
+
+`js_vm_interrupt` is the one function here that may be called **while the VM
+is running**, including from another thread or a signal handler: it sets a
+flag, touches nothing else, and needs no lock. It exists because fuel counts
+instructions and a host usually wants to bound *time* — arm a timer, call
+this, and the run stops.
+
+The stop surfaces as a thrown `Error: execution interrupted` that re-arms
+itself, so guest code cannot catch it and carry on; the run unwinds and the
+host gets control back. The flag is **not** cleared automatically — call
+`js_vm_clear_interrupt` before using the VM again, or every subsequent
+instruction keeps throwing.
+
+::: warning Latency is bounded by the dispatch loop, not by wall-clock
+The flag is read between instructions, so a builtin already running (a large
+sort, a big string build, one regex match) finishes its current step first.
+Each of those steps is individually bounded, so this is a latency question
+rather than an unbounded one — but if the deadline is hard rather than
+best-effort, keep an outer kill as well. Under wasm that is the runtime's
+epoch interruption.
+:::
+
+```c
+bool js_vm_out_of_memory(const JsVm *vm);
+```
+
+True once the VM has hit an allocation failure it could not report cleanly —
+specifically one that forced the collector off (see [GC](#gc) below). The VM
+stays memory-safe and keeps refusing work with out-of-memory errors, but it
+can no longer reclaim anything, so a host should finish the current call and
+discard it rather than keep serving from it.
 
 ## Values
 
@@ -128,6 +201,8 @@ properties (no `[[Prototype]]` walk), so they need no realm context.
 
 ## Compiling & running
 
+Compilation lives in `lamassu_compile.h`; running lives in `lamassu.h`.
+
 ```c
 JsValue js_compile_module(JsContext *ctx, const uint16_t *src, size_t len,
                           const char **err_msg, uint32_t *err_pos);
@@ -136,6 +211,10 @@ JsValue js_compile_module(JsContext *ctx, const uint16_t *src, size_t len,
 Compiles UTF-16 source as a strict-mode module body. Returns a function
 value (root it per the GC contract), or `undefined` on error with
 `*err_msg` (a static ASCII string) and `*err_pos` (a source offset) set.
+Source that uses top-level `import`/`export` has to go through the module
+pipeline instead, and says so by failing with `*err_msg` equal to
+`JS_ERR_NEEDS_MODULE_LOADER` — compare against that constant rather than
+searching the message for a substring.
 
 ```c
 JsValue js_compile_module_repl(JsContext *ctx, const uint16_t *src, size_t len,
@@ -148,13 +227,16 @@ context share state, i.e. a REPL session. This is what the npm package's
 `eval` uses.
 
 ```c
-bool js_run_module(JsContext *ctx, JsValue fn, JsValue *result);
+JsValue js_run_module(JsContext *ctx, JsValue fn);
 ```
 
-Runs a compiled module function. Returns `true` with `*result` = the
-completion value (the value of the last expression statement), or `false`
-with `*result` = the thrown error value (`js_context_error_pos()` gives its
-source offset).
+Runs a compiled module function and returns its **completion promise**:
+fulfilled with the completion value (the value of the last expression
+statement), rejected with the thrown error (`js_context_error_pos()` gives its
+source offset), or still pending if top-level `await` suspended on a promise
+the host hasn't settled yet. In that last case, protect the returned promise,
+settle the host promises it is waiting on, call `js_run_jobs()`, and observe
+the outcome with `js_promise_state` / `js_promise_result`.
 
 ```c
 bool js_call(JsContext *ctx, JsValue fn, JsValue this_val, const JsValue *args,
@@ -162,7 +244,8 @@ bool js_call(JsContext *ctx, JsValue fn, JsValue this_val, const JsValue *args,
 ```
 
 Calls a function value (a script closure or a native) on a fresh fiber.
-Same result contract as `js_run_module`.
+Returns `true` with `*result` = the return value, or `false` with `*result` =
+the error value.
 
 ```c
 bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
@@ -185,9 +268,34 @@ uint32_t js_context_error_pos(const JsContext *ctx);
 void     js_context_set_fuel(JsContext *ctx, uint64_t fuel); // 0 = unlimited
 ```
 
-`fuel` is checked on interpreter loop back-edges and calls — the CPU-bound
-half of running untrusted scripts (`heap_limit` in `JsVmConfig` is the
-memory half).
+`js_context_set_fuel` arms an execution budget, charged **one unit per
+dispatched bytecode instruction** — the CPU-bound half of running untrusted
+scripts (`heap_limit` in `JsVmConfig` is the memory half). Three properties of
+it matter more than the count:
+
+- **It covers a turn, not a call.** One top-level run (`js_run_module`,
+  `js_call`, `js_eval_module`) *plus* the microtask drain it feeds, including
+  every job `js_run_jobs` runs.
+- **It is shared, not per-fiber and not per-job.** Nested calls inherit the
+  remainder, and so does every queued microtask, so no amount of re-queueing
+  mints a fresh budget.
+- **Exhaustion is not catchable.** It throws a `RangeError` that re-arms
+  itself: a `try`/`catch` around the loop swallows one throw and the next
+  instruction throws again, until the fiber unwinds.
+
+Because it arms *one* turn, it has to be re-armed per turn. A server that
+calls it once at startup has given the whole process a single budget, not one
+per request.
+
+::: warning Fuel counts instructions, not time
+A single instruction can enter a builtin that runs a while — `sort` is O(n²)
+in element moves and charges nothing for them, string concatenation can copy
+and rehash a large string, and the regex step budget is per call, so a loop of
+cheap-looking `re.test(s)` calls multiplies it. All of those are individually
+bounded and none are memory-unsafe, but the aggregate is not bounded in *time*
+by fuel alone. To bound wall-clock, arm a timer and call
+[`js_vm_interrupt`](#stopping-a-run-from-outside).
+:::
 
 ## Promises / async
 
@@ -214,49 +322,89 @@ this differs from the npm package's Asyncify-based `__hostcall`.
 ## Modules
 
 ```c
-typedef bool (*JsModuleResolver)(void *ud, const uint16_t *specifier, size_t spec_len,
-                                 const uint16_t *referrer, size_t ref_len,
-                                 const uint16_t **out_specifier, size_t *out_spec_len,
-                                 const uint16_t **out_source, size_t *out_len);
+typedef JsValue (*JsModuleLoader)(void *ud, JsContext *ctx,
+                                  const uint16_t *specifier, size_t spec_len,
+                                  const uint16_t *referrer, size_t ref_len);
 
-void js_set_module_resolver(JsContext *ctx, JsModuleResolver fn, void *ud);
+typedef bool (*JsModuleCanonicalizer)(void *ud, const uint16_t *specifier, size_t spec_len,
+                                      const uint16_t *referrer, size_t ref_len,
+                                      const uint16_t **out_specifier, size_t *out_spec_len);
+
+void js_set_module_loader(JsContext *ctx, JsModuleLoader load,
+                          JsModuleCanonicalizer canon, void *ud);
 ```
 
-Given an import `specifier` and the importing module's `referrer` (empty
-for the root), resolve and return the module's source. Write a canonical
-specifier to `*out_specifier` (used as the cache/identity key — specifiers
-are compared by content) and the source to `*out_source`/`*out_len`. The
-returned buffers only need to stay valid until the call returns; the
-engine copies what it needs.
+The loader is **promise-returning**, which is what lets module loading do real
+I/O. Given a canonical `specifier` and the importing module's `referrer`
+(empty for the root, or for a dynamic `import()` from a plain script), return a
+promise — already settled, or pending and settled later with
+`js_resolve`/`js_reject` followed by `js_run_jobs()`. Fulfil it with:
+
+- a **JS string** — ES module source, compiled here (its own imports are
+  loaded through this same loader);
+- a **bytecode value** from `js_bytecode_value` — precompiled module bytecode;
+- **any other object** — adopted directly as the module's exports, i.e. a
+  synthetic leaf module with no parse and no dependencies. This is how you
+  expose a host-provided module.
+
+Rejecting fails the load, and the reason propagates to every dependent.
+
+Canonicalization is separate and synchronous: it runs *before* dedupe and
+fetch, and maps a raw specifier plus referrer to the identity the module is
+cached under (a relative path to an absolute URL, say). It must be
+deterministic for a given pair. A `NULL` canonicalizer means the raw specifier
+is the identity.
+
+::: tip Source modules are a frontend capability
+Compiling a loader's string result needs the frontend. A context has to be
+granted it explicitly with `js_enable_source_modules(ctx)` from
+`lamassu_compile.h` — and there is no way to call that in a runtime-only
+build, because the symbol isn't in the archive. Without it a string specifier
+fails with "source modules unavailable in this build (precompile to
+bytecode)", while loaders fulfilling with `js_bytecode_value` keep working.
+It's per-context, so a host embedding both trusted tooling and untrusted
+execution can hand out contexts that differ in exactly this capability.
+:::
 
 ```c
-JsValue js_eval_module(JsContext *ctx, const uint16_t *specifier, size_t spec_len,
-                       const uint16_t *source, size_t source_len, bool *ok,
-                       const char **err_msg, uint32_t *err_pos);
+JsValue js_eval_module(JsContext *ctx, const uint16_t *specifier, size_t spec_len);
 
 JsValue js_module_get_export(JsContext *ctx, JsValue ns, const uint16_t *name,
                              size_t name_len);
 ```
 
-`js_eval_module` compiles, links, and evaluates a root module (pulling
-dependencies through the resolver), returning its namespace (exports)
-object on success. `js_module_get_export` is a host convenience for
-reading a named export back out.
+`js_eval_module` loads, links, and evaluates the module graph rooted at
+`specifier` — everything, the root included, arrives through the loader. It
+always returns a live promise: protect it, drive outstanding loads with
+`js_resolve`/`js_reject` plus `js_run_jobs()`, then read the outcome with
+`js_promise_state` / `js_promise_result`. It fulfils with the module's
+namespace (exports) object and rejects with the load/compile/link/evaluate
+error. `js_module_get_export` is a host convenience for reading a named export
+back out.
 
 ## Bytecode caching
 
 Compile once, cache the bytecode, skip re-parsing on every subsequent run.
 The loader treats its input as **hostile by default** — a tampered or
-corrupted buffer is rejected structurally (bounds-checked constant/local/
-upvalue indices, jump targets on instruction boundaries, a required
-terminator, and an abstract stack-depth pass that recomputes `max_stack`
-from scratch rather than trusting the stored value), so it never becomes
-undefined behavior in the interpreter, only a clean load failure.
+corrupted buffer is rejected structurally (opcode validity, bounds-checked
+constant/local/upvalue indices, constant *kinds* as well as indices, jump
+targets on instruction boundaries, a required terminator, and a worklist
+fixpoint over every control-flow edge that proves the operand-stack and
+try-handler depths at each reachable instruction, recomputing `max_stack`
+rather than trusting the stored value), so it never becomes undefined
+behavior in the interpreter, only a clean load failure. [Running untrusted
+code](/security#untrusted-bytecode) has the detail, including why this is a
+stronger attacker than untrusted source.
+
+Production is in `lamassu_compile.h`, loading in `lamassu.h` — the whole
+point of the split:
 
 ```c
+// frontend
 bool js_bytecode_serialize(JsContext *ctx, JsValue fn, uint8_t **out, size_t *out_len);
 void js_bytecode_free(JsContext *ctx, uint8_t *buf, size_t len);
 
+// runtime
 JsValue js_bytecode_load(JsContext *ctx, const uint8_t *buf, size_t len,
                          const char **err_msg);
 ```
@@ -274,39 +422,42 @@ Modules have their own bytecode path, since a module's link metadata
 script:
 
 ```c
+// frontend
 bool js_bytecode_compile_module(JsContext *ctx, const uint16_t *specifier,
                                 size_t spec_len, const uint16_t *source,
                                 size_t source_len, uint8_t **out, size_t *out_len,
                                 const char **err_msg, uint32_t *err_pos);
 
-typedef bool (*JsBytecodeResolver)(void *ud, const uint16_t *specifier, size_t spec_len,
-                                   const uint16_t *referrer, size_t ref_len,
-                                   const uint16_t **out_specifier, size_t *out_spec_len,
-                                   const uint8_t **out_bytecode, size_t *out_len);
-
-void js_set_bytecode_resolver(JsContext *ctx, JsBytecodeResolver fn, void *ud);
-int  js_bytecode_kind(const uint8_t *buf, size_t len); // 0 = script, 1 = module, <0 = invalid
-
-JsValue js_eval_module_bytecode(JsContext *ctx, const uint16_t *specifier,
-                                size_t spec_len, const uint8_t *bytecode, size_t len,
-                                bool *ok, const char **err_msg, uint32_t *err_pos);
+// runtime
+JsValue js_bytecode_value(JsContext *ctx, const uint8_t *buf, size_t len);
+int     js_bytecode_kind(const uint8_t *buf, size_t len); // 0 = script, 1 = module, <0 = invalid
 ```
 
 `js_bytecode_compile_module` compiles one module to bytecode *without*
 resolving, linking, or evaluating it, so each module can be compiled and
-cached independently. `js_eval_module_bytecode` loads, validates, links,
-and evaluates a root module from bytecode, pulling dependencies through the
-bytecode resolver — same result contract as `js_eval_module`. A script
-buffer and a module buffer can't be confused: `js_bytecode_load` rejects a
-module buffer and `js_eval_module_bytecode` rejects a script buffer.
-`js_bytecode_kind` lets a host tell which one a `.jsbc` file is before
-picking a path.
+cached independently. The buffer carries the module body plus its link
+metadata (import descriptors, star re-exports, dependency specifiers);
+resolved dependencies and live exports are runtime state, rebuilt at load.
+`specifier` becomes the module's identity.
+
+There is no separate bytecode resolver: running a precompiled graph uses the
+ordinary [module loader](#modules), with each fulfilment wrapped in
+`js_bytecode_value` instead of being a source string. The bytes are copied
+into a GC-managed value, and every loaded module buffer is fully validated —
+including the import-index bounds the interpreter would otherwise trust — so a
+tampered cache cannot become undefined behavior. `js_eval_module` then drives
+the graph exactly as it does for source.
+
+A script buffer and a module buffer can't be confused: `js_bytecode_load`
+rejects a module buffer and the module loader rejects a script buffer.
+`js_bytecode_kind` lets a host tell which one a `.jsbc` file is before picking
+a path, without loading it.
 
 ## GC
 
 ```c
 void   js_gc_collect(JsVm *vm);
-bool   js_gc_protect(JsVm *vm, JsValue *slot);   // register *slot as a GC root
+void   js_gc_protect(JsVm *vm, JsValue *slot);   // register *slot as a GC root
 void   js_gc_unprotect(JsVm *vm, JsValue *slot);
 size_t js_gc_live_cells(const JsVm *vm);
 ```
@@ -314,6 +465,31 @@ size_t js_gc_live_cells(const JsVm *vm);
 Mark-and-sweep, precise, stop-the-world. `js_gc_protect`/`js_gc_unprotect`
 are how you satisfy the [GC contract](#gc-contract) above for any `JsValue`
 your native code holds across a safe point.
+
+### Why rooting cannot fail
+
+`js_gc_protect` returns `void`, and that is a design decision rather than an
+optimistic one. It used to return `false` when the root array could not grow.
+Of its ~149 call sites, 8 checked. The other 141 carried on with a value they
+believed was rooted — and because the array grew through the heap-limited
+allocator, **a guest could choose the moment that happened** by driving the
+heap to its cap. "Unrooted value, then collect, then use" became a condition
+an attacker could schedule, which is the worst shape a use-after-free can
+have.
+
+Rather than ask 149 sites to handle a failure correctly, the failure mode was
+removed. The root array is allocated outside the heap limit, so a guest cannot
+make rooting fail. If the *real* allocator refuses — the process is genuinely
+out of memory, nothing to do with the guest — collection is suspended for the
+VM's lifetime instead. An unrooted slot is only dangerous because something
+can collect it; with the collector off, the value survives, the operation
+unwinds through the ordinary out-of-memory path, and `heap_limit` still
+refuses further growth, so the VM fails closed rather than corrupting.
+[`js_vm_out_of_memory`](#stopping-a-run-from-outside) reports that state, and
+a host that sees it should finish the current call and discard the VM.
+
+There is therefore no status to check, and a caller who checked one could not
+have done anything safe with it anyway.
 
 ## Native constructors and `new`
 
@@ -331,9 +507,13 @@ script-visible `.prototype`.
 
 ```c
 #include "lamassu.h"
+#include "lamassu_compile.h"
 
-JsVm *vm = js_vm_new(NULL);
+JsVmConfig cfg = {0};
+cfg.heap_limit = 16 * 1024 * 1024;   // set both limits for untrusted input
+JsVm *vm = js_vm_new(&cfg);
 JsContext *ctx = js_context_new(vm);
+js_context_set_fuel(ctx, 20000000); // and re-arm this per turn
 
 const uint16_t src[] = {'1', '+', '2'}; // "1+2"
 const char *err_msg; uint32_t err_pos;
@@ -341,14 +521,15 @@ JsValue fn = js_compile_module(ctx, src, 3, &err_msg, &err_pos);
 if (!js_is_function(fn)) { /* handle compile error */ }
 
 js_gc_protect(vm, &fn);
-JsValue result;
-bool ok = js_run_module(ctx, fn, &result);
-// ok == true, result == js_number(3)
+JsValue done = js_run_module(ctx, fn);
+// js_promise_state(done) == 1 (fulfilled), js_promise_result(done) == js_number(3)
 js_gc_unprotect(vm, &fn);
 
 js_vm_free(vm); // frees ctx too
 ```
 
-For a fuller worked example — argument parsing, a module resolver, a
-`print` native, bytecode caching — see `tools/lamassu.c`, the native
-command-line tool this same library backs.
+For a fuller worked example — argument parsing, a module loader, a `print`
+native, bytecode caching, `--fuel`/`--heap-limit` — see `tools/lamassu.c`, the
+native command-line tool this same library backs. For the other shape, a
+process that runs only precompiled bytecode and links the runtime alone, see
+`tools/run_bc.c`.
