@@ -1,6 +1,6 @@
 {
   "name": "@mdy-docs/lamassu-js",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "A strict, safe JavaScript-subset engine written in C, compiled to WebAssembly \u2014 sandboxed evaluation for untrusted templates.",
   "type": "module",
   "main": "./index.js",

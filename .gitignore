@@ -18,3 +18,6 @@ web/jsvm.wasm
 
 # npm pack output
 *.tgz
+
+# Claude Code local settings
+.claude/
