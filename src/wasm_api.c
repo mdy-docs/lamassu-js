@@ -339,10 +339,26 @@ static bool wasm_module_canon(void *ud, const uint16_t *spec, size_t spec_len,
 }
 #endif
 
+/*
+ * Sandbox limits. Both are 0 (unlimited) until the host sets them, because the
+ * engine cannot guess an acceptable budget — but a host embedding this to run
+ * UNTRUSTED code must set them: wasm isolates the host's memory from the guest,
+ * it does not stop the guest looping forever or growing linear memory until the
+ * tab or the process dies. See docs/security.md.
+ *
+ * Carried as double because that is what crosses the JS boundary losslessly for
+ * integers up to 2^53, and both budgets are far below that.
+ */
+static double g_fuel;
+static double g_heap_limit;
+
 static void ensure_vm(void) {
     if (g_vm)
         return;
-    g_vm = js_vm_new(NULL); /* libc realloc via emscripten */
+    JsVmConfig cfg = {0};
+    /* libc realloc via emscripten; only the cap is ours to set */
+    cfg.heap_limit = g_heap_limit > 0 ? (size_t)g_heap_limit : 0;
+    g_vm = js_vm_new(&cfg);
     g_ctx = js_context_new(g_vm);
     static const uint16_t print_name[] = {'p', 'r', 'i', 'n', 't'};
     js_register_native(g_ctx, print_name, 5, native_print, NULL);
@@ -359,6 +375,36 @@ static void ensure_vm(void) {
 #endif
 }
 
+
+/*
+ * Sets the per-call instruction budget and the heap cap, in bytes. 0 disables
+ * either one. The heap cap belongs to the VM, so changing it takes effect on
+ * the next fresh VM: this rebuilds one immediately unless a host call is
+ * suspended on the stack, in which case it applies at the next lamassu_reset.
+ */
+EXPORT void lamassu_set_limits(double fuel, double heap_limit_bytes) {
+    g_fuel = fuel > 0 ? fuel : 0;
+    double want = heap_limit_bytes > 0 ? heap_limit_bytes : 0;
+    if (want != g_heap_limit) {
+        g_heap_limit = want;
+        if (g_vm && !g_hostcall_active) {
+            js_vm_free(g_vm);
+            g_vm = NULL;
+            g_ctx = NULL;
+            ensure_vm();
+        }
+    }
+}
+
+/*
+ * Arms the budget for one turn. js_context_set_fuel covers a top-level run plus
+ * the microtask drain it feeds, so it has to be re-armed per entry point rather
+ * than once at startup — otherwise the whole session shares one budget and the
+ * second script inherits whatever the first left.
+ */
+static void arm_fuel(void) {
+    js_context_set_fuel(g_ctx, g_fuel > 0 ? (uint64_t)g_fuel : 0);
+}
 
 EXPORT void lamassu_reset(void) {
     /* Refuse to reset while a __hostcall is suspended in Asyncify: the current
@@ -383,6 +429,7 @@ EXPORT void lamassu_reset(void) {
  */
 EXPORT const char *lamassu_eval(const char *src_utf8) {
     ensure_vm();
+    arm_fuel();
     buf_reset();
     if (!g_buf)
         buf_bytes("", 0); /* allocate at least the NUL */
@@ -435,6 +482,7 @@ EXPORT const char *lamassu_eval(const char *src_utf8) {
  */
 EXPORT const char *lamassu_eval_module(const char *spec_utf8) {
     ensure_vm();
+    arm_fuel();
     buf_reset();
     if (!g_buf)
         buf_bytes("", 0); /* allocate at least the NUL */

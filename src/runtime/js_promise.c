@@ -61,6 +61,33 @@ static void job_enqueue(JsVm *vm, JsJob *job) {
     vm->jobs_tail = job;
 }
 
+/*
+ * Recycled job nodes kept for reuse. The free list used to be unbounded, which
+ * was invisible until heap_limit started being enforced against it: a guest
+ * that queues a microtask per turn (`function f(){ Promise.resolve().then(f) }`)
+ * runs its budget out, every job is abandoned, and the nodes it churned through
+ * stay parked for the VM's lifetime — the guest's heap ends up full of memory
+ * the collector cannot see and nothing will ever reuse. Trimming after a drain
+ * keeps the fast path (a warm pool for the common case of a few pending
+ * reactions) without letting one burst pin the heap.
+ */
+#define JS_JOBS_FREE_MAX 64
+
+static void jobs_free_trim(JsVm *vm) {
+    size_t kept = 0;
+    JsJob **link = &vm->jobs_free;
+    while (*link) {
+        if (kept < JS_JOBS_FREE_MAX) {
+            kept++;
+            link = &(*link)->next;
+            continue;
+        }
+        JsJob *dead = *link;
+        *link = dead->next;
+        js_realloc_raw(vm, dead, sizeof *dead, 0);
+    }
+}
+
 static void job_recycle(JsVm *vm, JsJob *job) {
     job->value = js_undefined();
     job->on_fulfilled = js_undefined();
@@ -327,6 +354,10 @@ void js_run_jobs(JsContext *ctx) {
         vm->running_job = job->next;
         job_recycle(vm, job);
     }
+    /* Only at quiescence: trimming mid-drain would free nodes the very next
+     * reaction wants back. */
+    if (!vm->running_job)
+        jobs_free_trim(vm);
 }
 
 bool js_has_pending_jobs(const JsContext *ctx) {

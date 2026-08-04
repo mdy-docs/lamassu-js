@@ -12,6 +12,9 @@ import createLamassuModule from "./dist/lamassu.mjs";
  * Instantiate the engine. Resolves to a Lamassu instance.
  *
  * @param {object} [options]
+ * @param {number} [options.fuel]  Instruction budget per eval (0 = unlimited).
+ *   Set this when running untrusted code; see setLimits.
+ * @param {number} [options.heapLimit]  Guest heap cap in bytes (0 = unlimited).
  * @param {string} [options.wasmUrl]  Explicit URL for lamassu.wasm. Required
  *   when a bundler (Vite/webpack/…) relocates the module — import it with
  *   `import wasmUrl from "@mdy-docs/lamassu-js/lamassu.wasm?url"`. Omit for
@@ -92,6 +95,17 @@ export async function createLamassu(options = {}) {
   const evalRaw = M.cwrap("lamassu_eval", "string", ["string"], { async: true });
   const evalModuleRaw = M.cwrap("lamassu_eval_module", "string", ["string"], { async: true });
   const resetRaw = M.cwrap("lamassu_reset", null, []);
+  const setLimitsRaw = M.cwrap("lamassu_set_limits", null, ["number", "number"]);
+
+  /*
+   * Apply limits before the first eval. Both default to unlimited because the
+   * engine cannot guess a budget that suits every embedding — but running
+   * untrusted code without them is not sandboxed in any useful sense: wasm
+   * keeps the guest out of the host's memory, it does not stop the guest
+   * spinning forever or growing linear memory until the tab dies.
+   */
+  let limits = { fuel: options.fuel ?? 0, heapLimit: options.heapLimit ?? 0 };
+  setLimitsRaw(limits.fuel, limits.heapLimit);
 
   return {
     /**
@@ -124,6 +138,30 @@ export async function createLamassu(options = {}) {
     },
 
     /** Replace the natives table (e.g. per embedder task). */
+    /**
+     * Set the sandbox limits.
+     *
+     * @param {object} next
+     * @param {number} [next.fuel]  Bytecode instructions one eval/evalModule
+     *   may execute, counting the microtask drain it feeds. Exceeding it
+     *   throws inside the guest and cannot be caught by it. 0 = unlimited.
+     * @param {number} [next.heapLimit]  Bytes the guest heap may hold.
+     *   0 = unlimited. Changing it rebuilds the VM, which discards REPL state.
+     */
+    setLimits(next = {}) {
+      limits = {
+        fuel: next.fuel ?? limits.fuel,
+        heapLimit: next.heapLimit ?? limits.heapLimit,
+      };
+      setLimitsRaw(limits.fuel, limits.heapLimit);
+      return { ...limits };
+    },
+
+    /** The limits currently in force. */
+    getLimits() {
+      return { ...limits };
+    },
+
     setNatives(next) {
       natives = { ...(next ?? {}) };
     },

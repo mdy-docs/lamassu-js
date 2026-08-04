@@ -1,0 +1,66 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>lamassu browser smoke</title>
+<!--
+  Browser-side counterpart to packages/lamassu-js/smoke.mjs. The Node test
+  covers the engine and the API; this one covers what only a browser can: that
+  the .wasm resolves and streams from a real HTTP origin, and that the sandbox
+  limits hold in the environment the playground actually ships to.
+
+  Needs a server (ES module imports and WebAssembly streaming do not work over
+  file://). From the repo root:
+
+      make pkg
+      python3 -m http.server 8080
+      open http://localhost:8080/web/smoke.html
+
+  Headless, with the browser Playwright already caches:
+
+      "$(ls -d ~/Library/Caches/ms-playwright/chromium_headless_shell-*/ \
+        | tail -1)chrome-headless-shell-mac-*/chrome-headless-shell" \
+        --headless --disable-gpu --virtual-time-budget=60000 --dump-dom \
+        http://localhost:8080/web/smoke.html
+-->
+<style>
+  body { font: 13px/1.5 ui-monospace, monospace; margin: 2rem; }
+  .ok { color: #0a7; } .fail { color: #c00; font-weight: 700; }
+  pre { white-space: pre-wrap; }
+</style>
+<h1>lamassu browser smoke</h1>
+<pre id="out">running…</pre>
+<script type="module">
+import { createLamassu } from "/packages/lamassu-js/index.js";
+
+const lines = [];
+let failures = 0;
+const check = (label, actual, needle) => {
+  const ok = String(actual).includes(needle);
+  if (!ok) failures++;
+  lines.push(`${ok ? "ok  " : "FAIL"} ${label.padEnd(24)} ${String(actual).slice(0, 60)}`);
+};
+
+try {
+  const lam = await createLamassu({ fuel: 20_000_000, heapLimit: 16 * 1024 * 1024 });
+  check("limits applied", JSON.stringify(lam.getLimits()), '"fuel":20000000');
+  check("eval", await lam.eval("[3,1,2].sort((a,b)=>a-b).join(',');"), "1,2,3");
+  check("repl state persists", await lam.eval("const k = 7; k * 6;"), "42");
+  check("...across calls", await lam.eval("k + 1;"), "8");
+  check("regex", await lam.eval("/(\\d+)-(\\d+)/.exec('10-20')[2];"), "20");
+  check("print()", await lam.eval("print('out'); 1;"), "out");
+  /* Without limits each of these would lock the tab up rather than return. */
+  check("infinite loop", await lam.eval("while (true) {}"), "budget exhausted");
+  check("memory bomb", await lam.eval("let z=[]; for(;;) z.push({x:1});"), "out of memory");
+  lam.reset();
+  check("recovers after reset", await lam.eval("2 + 2;"), "4");
+} catch (e) {
+  failures++;
+  lines.push("FAIL fatal: " + (e && e.message ? e.message : e));
+}
+
+lines.push("");
+lines.push(failures ? `${failures} check(s) FAILED` : "all smoke checks passed");
+document.title = failures ? "FAIL" : "OK";
+const out = document.getElementById("out");
+out.textContent = lines.join("\n");
+out.className = failures ? "fail" : "ok";
+</script>

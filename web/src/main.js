@@ -248,7 +248,18 @@ promptEl.addEventListener("keydown", (e) => {
   }
 });
 
-createLamassu({ wasmUrl })
+/*
+ * This is a REPL open to whatever a visitor types, so it runs with the sandbox
+ * limits on. Without them `while (true) {}` — the first thing people try —
+ * locks up the tab: wasm keeps the guest out of the page's memory, it does not
+ * stop it spinning. The budget is generous enough for the samples and any
+ * ordinary experiment, and is re-armed for every evaluation.
+ */
+createLamassu({
+  wasmUrl,
+  fuel: 200_000_000,          /* ~0.7s of guest CPU per evaluation */
+  heapLimit: 128 * 1024 * 1024,
+})
   .then((e) => {
     engine = e;
     ready = true;

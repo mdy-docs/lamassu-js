@@ -433,7 +433,61 @@ static void test_fuel_covers_microtasks(void) {
     js_vm_free(vm);
 }
 
+/*
+ * The recycled-job free list must not grow without bound. It used to keep
+ * every node it ever allocated, which was invisible until heap_limit started
+ * being enforced against it: a guest that queues a microtask per turn churns
+ * through millions, and the nodes stayed parked for the VM's lifetime — memory
+ * the collector cannot see and nothing will reuse. In the wasm playground that
+ * showed up as a script REPORTING SUCCESS and leaving the heap too full to
+ * compile anything afterwards.
+ */
+static void test_job_pool_is_bounded(void) {
+    CountAlloc ca = {0, 0};
+    JsVmConfig cfg = {.realloc_fn = count_realloc, .alloc_ud = &ca};
+    JsVm *vm = js_vm_new(&cfg);
+    JsContext *ctx = js_context_new(vm);
+
+    const char *src = "let n = 0;"
+                      "function f() { n++; if (n < 50000) Promise.resolve().then(f); }"
+                      "Promise.resolve().then(f); 1;";
+    size_t len = strlen(src);
+    uint16_t *u = malloc(len * sizeof(uint16_t));
+    for (size_t i = 0; i < len; i++)
+        u[i] = (uint16_t)(unsigned char)src[i];
+    const char *em; uint32_t ep;
+    JsValue fn = js_compile_module(ctx, u, len, &em, &ep);
+    free(u);
+    checks_run++;
+    if (!js_is_function(fn)) {
+        checks_failed++;
+        fprintf(stderr, "FAIL: job-pool source did not compile: %s\n", em);
+        js_vm_free(vm);
+        return;
+    }
+    js_gc_protect(vm, &fn);
+    js_gc_collect(vm);
+    size_t before = js_vm_allocated_bytes(vm);
+
+    JsValue p = js_run_module(ctx, fn);
+    js_gc_protect(vm, &p);
+    js_run_jobs(ctx);
+    js_gc_collect(vm);
+    size_t after = js_vm_allocated_bytes(vm);
+
+    /* 50k nodes would be megabytes; the pool is capped at a few dozen. The
+     * bound is loose on purpose — it is testing "bounded", not an exact size. */
+    checks_run++;
+    if (after > before + 256u * 1024) {
+        checks_failed++;
+        fprintf(stderr, "FAIL: job pool retained %zu bytes after 50k microtasks\n",
+                after - before);
+    }
+    js_vm_free(vm);
+}
+
 int main(void) {
+    test_job_pool_is_bounded();
     test_fuel_covers_microtasks();
     test_then();
     test_async_await();
