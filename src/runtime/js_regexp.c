@@ -47,6 +47,55 @@ static bool key_is(JsValue key, const char *name) {
     return i == k->length;
 }
 
+/* ---- engine allocator ----
+ *
+ * Everything the regex engine allocates — compiled bytecode, parser AST
+ * nodes, class range/string buffers, the per-match context and its thread
+ * arenas — is routed here, so it lands in bytes_live and is refused by
+ * heap_limit like every other allocation. Before this existed the engine
+ * called libc directly and a guest could hold regex memory outside its
+ * configured budget entirely.
+ *
+ * The handle is installed per-Program (and inherited by every VMContext
+ * created for it), never process-wide: two JsVms have two heaps, and each
+ * pattern must be charged to the one that owns it.
+ *
+ * js_realloc_raw needs the OLD size on every call to keep bytes_live by
+ * delta, and the engine's hook is malloc-shaped — it does not track one.
+ * Each block therefore carries its own charged size in a header written and
+ * read in this one function, so the size at free time is by construction
+ * the size charged at allocation time and the accounting cannot drift. The
+ * header is a max_align_t union so the payload keeps malloc-grade
+ * alignment.
+ *
+ * A NULL return needs no special handling here: the engine already reports
+ * allocation failure as a compile error (Program.error) or an abandoned
+ * match (vm_context_budget_exhausted), both of which reach the guest as a
+ * catchable error.
+ */
+typedef union {
+    size_t charged; /* header + payload: exactly what the VM was told */
+    max_align_t align;
+} ReBlock;
+
+static void *re_vm_realloc(void *ud, void *ptr, size_t size) {
+    JsVm *vm = ud;
+    ReBlock *h = ptr ? (ReBlock *)ptr - 1 : NULL;
+    size_t old = h ? h->charged : 0;
+    if (size == 0) {
+        js_realloc_raw(vm, h, old, 0);
+        return NULL;
+    }
+    if (size > SIZE_MAX - sizeof(ReBlock))
+        return NULL;
+    size_t charged = size + sizeof(ReBlock);
+    ReBlock *nh = js_realloc_raw(vm, h, old, charged);
+    if (!nh)
+        return NULL; /* the old block, and its header, are untouched */
+    nh->charged = charged;
+    return nh + 1;
+}
+
 /* ---- flags ---- */
 
 static int flags_mask(const uint16_t *flags, uint32_t n) {
@@ -84,6 +133,7 @@ const char *js_regexp_validate(JsVm *vm, const uint16_t *pat, uint32_t pat_len,
     if (!prog)
         return "out of memory";
     memset(prog, 0, sizeof *prog);
+    program_set_allocator(prog, re_vm_realloc, vm);
     uint16_t *pbuf = js_realloc_raw(vm, NULL, 0, ((size_t)pat_len + 1) * sizeof(uint16_t));
     if (!pbuf) {
         js_realloc_raw(vm, prog, sizeof *prog, 0);
@@ -139,6 +189,7 @@ JsValue js_regexp_new(JsContext *ctx, const uint16_t *pat, uint32_t pat_len,
     re->last_index = 0;
     re->global = (mask & REGEX_FLAG_GLOBAL) != 0;
     memset(&re->prog, 0, sizeof re->prog); /* compile_into requires zero init */
+    program_set_allocator(&re->prog, re_vm_realloc, vm);
     vm->regexp_live++; /* balanced by js_regexp_release at sweep */
 
     JsValue rev = js_value_from_cell(c);
@@ -600,8 +651,14 @@ static bool rexp_test(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     JsString *s = js_to_string_cell(ctx, ARG(0), 0);
     if (!s)
         return re_oom(ctx, r);
+    /* Rooted across the match like every other subject here: matching now
+     * allocates through the VM, so it is a GC safe point, and a coerced
+     * subject (test(123)) is a fresh cell nothing else references. */
+    JsValue sv = js_value_from_cell(&s->gc);
+    js_gc_protect(ctx->vm, &sv);
     int32_t caps[CAPS_MAX];
     int rc = exec_protocol(re, s, caps);
+    js_gc_unprotect(ctx->vm, &sv);
     if (rc == RE_RUN_BUDGET)
         return re_throw(ctx, r, re_budget_msg);
     *r = js_bool(rc == RE_RUN_MATCH);

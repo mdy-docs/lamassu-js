@@ -94,15 +94,18 @@ fiber stack of `JS_MAX_FRAMES × n_locals` slots.
 top-level run plus the microtask drain it feeds. A server that sets it once at
 startup gives the whole process one budget, not one per request.
 
-**Bound wall-clock from outside.** Fuel counts instructions, not time, and a
-single instruction can enter a builtin that runs long. `sort` is O(n²) in
+**Bound wall-clock.** Fuel counts instructions, not time, and a single
+instruction can enter a builtin that runs long. `sort` is O(n²) in
 element moves and charges nothing for them; string concatenation can copy and
 rehash up to `JS_MAX_STRING_UNITS` per instruction; the regex step budget is per
 call, so a loop of cheap-looking `re.test(s)` calls multiplies it. None of these
 are memory-unsafe, and all are bounded per operation — but the aggregate is not
-bounded in *time* by fuel alone. Under wasm, use the runtime's epoch
-interruption (see the LIMITS note in `src/reactor.c`); natively, run guest work
-where you can kill it.
+bounded in *time* by fuel alone. Arm a timer and call `js_vm_interrupt`, which
+is safe from another thread or a signal handler and stops the run at the next
+dispatch. Keep an outer kill as well if the deadline is hard rather than
+best-effort: the interrupt is read between instructions, so a builtin already
+running finishes its current step first. Under wasm that outer bound is the
+runtime's epoch interruption (see the LIMITS note in `src/reactor.c`).
 
 **Use a fresh context per tenant.** `Array.prototype`, `Object.prototype` and
 the other object-kind prototypes are real, script-reachable, mutable objects, as
@@ -118,22 +121,28 @@ someone has to remember and becomes a property of the binary.
 
 ## Known gaps
 
-These are real and currently unmitigated inside the engine:
+One remains, and it is unmitigated inside the engine:
 
-- **The regex engine allocates with libc `malloc`, outside `bytes_live`.** Its
-  compiled programs and per-match structures are not charged against
-  `heap_limit`. The live-pattern and program-size caps bound it, but not to the
-  guest's configured budget.
-- **No asynchronous interrupt.** There is no way for a host to stop a running
-  script from outside the engine; see "bound wall-clock" above.
-- **`js_gc_protect`'s failure result is ignored at most call sites.** It can
-  fail only when the heap limit blocks the root array from growing — a
-  condition a guest chooses the timing of — and an unrooted value there becomes
-  a use-after-free rather than a clean error.
-- **Allocation failure mid-operation is reported inconsistently.** Some paths
-  produce `"out of memory"`, others reject with `undefined`, and a promise
-  reaction dropped on OOM leaves an `await` pending forever with no way for the
-  host to tell it apart from legitimate pending work.
+- **`Object.freeze` is a no-op.** It returns its argument and enforces nothing,
+  so neither guest nor host code can rely on it — which is worse than not
+  having it, because the call succeeds. Combined with prototypes being
+  ordinary mutable objects, this is why "one context per tenant" above is a
+  requirement and not a suggestion.
+
+Recently closed, listed here because embeddings written against the old
+behaviour may still be compensating for them:
+
+- Regex memory is now allocated through the VM, so it is counted in
+  `js_vm_allocated_bytes` and capped by `heap_limit` like anything else. It
+  used to come from libc directly and was invisible to both.
+- `js_vm_interrupt` gives a host an asynchronous stop; there was previously no
+  way to halt a running script from outside the engine.
+- `js_gc_protect` can no longer fail, so the ~141 call sites that never checked
+  its result are correct by construction rather than by luck.
+- Out-of-memory always carries a reason, and a settled promise always notifies
+  its reactions. Both used to degrade silently under memory pressure — the
+  first to a bare `undefined` rejection, the second to an `await` that stayed
+  pending forever.
 
 ## Testing
 

@@ -936,7 +936,41 @@ static void test_oom_is_reported(void) {
     }
 }
 
+/*
+ * The regex engine used to call libc directly, so none of its memory -- the
+ * compiled program, the parser's AST, class buffers, the per-match context --
+ * was counted in bytes_live or refused by heap_limit. A guest could hold regex
+ * memory entirely outside its configured budget. It now allocates through the
+ * VM, so the cap applies to it like anything else.
+ */
+static void test_regex_memory_is_capped(void) {
+    RunOpts o = {0};
+    o.cfg.heap_limit = 700 * 1024;
+    char *out = NULL;
+    RunStatus st = run_src_opts(
+        "let rs = [];"
+        "for (let i = 0; i < 64; i++) rs.push(new RegExp('(a|b|c){1,200}'.repeat(20)));"
+        "rs.length;",
+        &o, &out);
+    CHECK(st == RUN_RUNTIME_ERR);
+    CHECK(out && strstr(out, "memory") != NULL);
+    free(out);
+
+    /* The cap must not break ordinary patterns, and the ReDoS step budget --
+     * the other thing standing between a guest and an unbounded match -- has
+     * to survive being routed through a different allocator. */
+    o.cfg.heap_limit = 4 * 1024 * 1024;
+    st = run_src_opts("let caught = 0;"
+                      "try { /(a+)+$/.test('a'.repeat(200) + 'X'); } catch (e) { caught = 1; }"
+                      "caught + ':' + 'xabbc'.replace(/ab+c/g, function (m) { return m.length; });",
+                      &o, &out);
+    CHECK(st == RUN_OK);
+    CHECK(out && strcmp(out, "1:x4") == 0);
+    free(out);
+}
+
 int main(void) {
+    test_regex_memory_is_capped();
     test_interrupt();
     test_oom_is_reported();
     test_arithmetic();
