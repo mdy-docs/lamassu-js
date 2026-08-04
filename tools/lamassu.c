@@ -217,8 +217,34 @@ static void set_root_dir(const char *file) {
 
 /* Interactive REPL over one persistent context (top-level let/const/function
  * carry across lines through the lexical scope). */
+/*
+ * Sandbox limits, off unless asked for. A developer running their own script
+ * wants neither, but the moment this is pointed at a file someone else wrote
+ * they are the difference between a failed run and a wedged terminal.
+ */
+static uint64_t g_fuel;
+static size_t g_heap_limit;
+
+static JsVmConfig limit_config(void) {
+    JsVmConfig cfg = {0};
+    cfg.heap_limit = g_heap_limit;
+    return cfg;
+}
+
+/*
+ * Arms the instruction budget for one turn -- a top-level run plus the
+ * microtask drain it feeds. Must be called before each evaluation, not once
+ * per context, or a REPL session shares a single budget across every line and
+ * the second line inherits whatever the first left of it.
+ */
+static void arm_fuel(JsContext *ctx) {
+    if (g_fuel)
+        js_context_set_fuel(ctx, g_fuel);
+}
+
 static int run_repl(void) {
-    JsVm *vm = js_vm_new(NULL);
+    JsVmConfig cfg = limit_config();
+    JsVm *vm = js_vm_new(&cfg);
     JsContext *ctx = js_context_new(vm);
     if (!vm || !ctx) {
         fprintf(stderr, "lamassu: out of memory\n");
@@ -243,6 +269,7 @@ static int run_repl(void) {
             continue;
         const char *err_msg;
         uint32_t err_pos;
+        arm_fuel(ctx); /* re-armed per line: the budget covers one turn */
         JsValue fn = js_compile_module_repl(ctx, src, len, &err_msg, &err_pos);
         if (!js_is_function(fn)) {
             fprintf(stderr, "SyntaxError: %s\n", err_msg ? err_msg : "compile error");
@@ -365,7 +392,8 @@ static int emit_bytecode(const char *src_path, const char *out_path) {
         fprintf(stderr, "lamassu: out of memory\n");
         return 2;
     }
-    JsVm *vm = js_vm_new(NULL);
+    JsVmConfig cfg = limit_config();
+    JsVm *vm = js_vm_new(&cfg);
     JsContext *ctx = js_context_new(vm);
     if (!vm || !ctx) {
         fprintf(stderr, "lamassu: out of memory\n");
@@ -434,7 +462,8 @@ static int run_bytecode(const char *path) {
         fprintf(stderr, "lamassu: cannot read %s\n", path);
         return 2;
     }
-    JsVm *vm = js_vm_new(NULL);
+    JsVmConfig cfg = limit_config();
+    JsVm *vm = js_vm_new(&cfg);
     JsContext *ctx = js_context_new(vm);
     if (!vm || !ctx) {
         fprintf(stderr, "lamassu: out of memory\n");
@@ -502,6 +531,7 @@ static int run_bytecode(const char *path) {
         status = 1;
     } else {
         js_gc_protect(vm, &fn);
+        arm_fuel(ctx);
         JsValue p = js_run_module(ctx, fn);
         int st = js_promise_state(p);
         bool ok = st == 0 || st == 1;
@@ -526,20 +556,95 @@ static int run_bytecode(const char *path) {
     return status;
 }
 
+static void usage(FILE *out) {
+    fprintf(out,
+        "usage: lamassu [options] [file.js]             run a source file, or the REPL\n"
+        "       lamassu [options] --run-bytecode FILE   run a bytecode cache\n"
+        "       lamassu --emit-bytecode SRC OUT        compile SRC to a bytecode cache\n"
+        "\n"
+        "options:\n"
+        "  --fuel N          bytecode-instruction budget per evaluation (0 = unlimited).\n"
+        "                    Roughly 3e8 per second. Exceeding it throws an error the\n"
+        "                    script cannot catch, and the run unwinds.\n"
+        "  --heap-limit N    cap on the guest heap. Accepts a K/M/G suffix (e.g. 64M).\n"
+        "  -h, --help        this message\n"
+        "\n"
+        "Both limits are off by default, which is what you want for your own code and\n"
+        "not what you want for anyone else's. Neither bounds wall-clock on its own: a\n"
+        "single instruction can enter a builtin that runs a while, so if the input is\n"
+        "untrusted, also run this where you can kill it. See docs/security.md.\n");
+}
+
+/* Parses a byte count with an optional K/M/G suffix. False on anything else,
+ * including a bare negative, which strtoull would otherwise wrap into a
+ * near-unlimited cap. */
+static bool parse_size(const char *text, unsigned long long *out) {
+    if (!text || !*text || *text == '-')
+        return false;
+    char *end;
+    unsigned long long v = strtoull(text, &end, 10);
+    if (end == text)
+        return false;
+    unsigned long long scale = 1;
+    if (*end == 'k' || *end == 'K') scale = 1024ULL, end++;
+    else if (*end == 'm' || *end == 'M') scale = 1024ULL * 1024, end++;
+    else if (*end == 'g' || *end == 'G') scale = 1024ULL * 1024 * 1024, end++;
+    if (*end)
+        return false;
+    if (v > (unsigned long long)-1 / scale)
+        return false;
+    *out = v * scale;
+    return true;
+}
+
 int main(int argc, char **argv) {
-    if (argc == 1)
+    /* Options first, then the subcommand or file. Kept hand-rolled rather than
+     * getopt so the wasip2 build has nothing extra to link. */
+    int i = 1;
+    for (; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
+            usage(stdout);
+            return 0;
+        }
+        if (strcmp(a, "--fuel") == 0 || strcmp(a, "--heap-limit") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "lamassu: %s needs a value\n", a);
+                return 2;
+            }
+            unsigned long long v;
+            if (!parse_size(argv[i + 1], &v)) {
+                fprintf(stderr, "lamassu: bad value for %s: %s\n", a, argv[i + 1]);
+                return 2;
+            }
+            if (strcmp(a, "--fuel") == 0)
+                g_fuel = (uint64_t)v;
+            else
+                g_heap_limit = (size_t)v;
+            i++;
+            continue;
+        }
+        if (strcmp(a, "--") == 0) { /* everything after is a path */
+            i++;
+            break;
+        }
+        break; /* not an option: the subcommand or the file */
+    }
+
+    int rest = argc - i;
+    if (rest == 0)
         return run_repl(); /* no file: interactive REPL */
-    if (argc == 4 && strcmp(argv[1], "--emit-bytecode") == 0)
-        return emit_bytecode(argv[2], argv[3]);
-    if (argc == 3 && strcmp(argv[1], "--run-bytecode") == 0)
-        return run_bytecode(argv[2]);
-    if (argc != 2) {
-        fprintf(stderr,
-                "usage: lamassu [file.js]                 run a source file (or REPL if omitted)\n"
-                "       lamassu --emit-bytecode SRC OUT   compile SRC to a bytecode cache OUT\n"
-                "       lamassu --run-bytecode FILE       run a bytecode cache\n");
+    if (rest == 3 && strcmp(argv[i], "--emit-bytecode") == 0)
+        return emit_bytecode(argv[i + 1], argv[i + 2]);
+    if (rest == 2 && strcmp(argv[i], "--run-bytecode") == 0)
+        return run_bytecode(argv[i + 1]);
+    if (rest != 1 || argv[i][0] == '-') {
+        if (rest >= 1 && argv[i][0] == '-')
+            fprintf(stderr, "lamassu: unknown option %s\n", argv[i]);
+        usage(stderr);
         return 2;
     }
+    argv += i - 1; /* argv[1] is the script path from here on */
     size_t byte_len;
     uint8_t *bytes = read_file(argv[1], &byte_len);
     if (!bytes) {
@@ -554,7 +659,8 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    JsVm *vm = js_vm_new(NULL);
+    JsVmConfig cfg = limit_config();
+    JsVm *vm = js_vm_new(&cfg);
     JsContext *ctx = js_context_new(vm);
     if (!vm || !ctx) {
         fprintf(stderr, "lamassu: out of memory\n");
@@ -580,6 +686,7 @@ int main(int argc, char **argv) {
         g_root_src = src;
         g_root_src_len = len;
         static const uint16_t root_spec[] = {'<', 'r', 'o', 'o', 't', '>'};
+        arm_fuel(ctx);
         JsValue p = js_eval_module(ctx, root_spec, 6);
         js_gc_protect(vm, &p);
         if (js_promise_state(p) == 2) {
@@ -601,6 +708,7 @@ int main(int argc, char **argv) {
         status = 1;
     } else {
         js_gc_protect(vm, &fn);
+        arm_fuel(ctx);
         JsValue p = js_run_module(ctx, fn);
         int st = js_promise_state(p);
         bool ok = st == 0 || st == 1;

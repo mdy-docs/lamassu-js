@@ -94,6 +94,15 @@ embedding that leaves them at the default has no bound on anything. `heap_limit`
 in particular is what stops a single deeply recursive call from demanding a
 fiber stack of `JS_MAX_FRAMES × n_locals` slots.
 
+The bundled embeddings expose them, and also default to off, so pointing one at
+someone else's code means passing them:
+
+| embedding | how |
+| --- | --- |
+| CLI (`build/lamassu`, and the wasip2 build) | `--fuel N`, `--heap-limit N` (`K`/`M`/`G` suffixes accepted) |
+| npm package (`@mdy-docs/lamassu-js`) | `createLamassu({ fuel, heapLimit })`, or `setLimits()` later |
+| C API | `js_context_set_fuel`, `JsVmConfig.heap_limit` |
+
 **Re-arm the fuel budget per turn.** `js_context_set_fuel` arms one turn — a
 top-level run plus the microtask drain it feeds. A server that sets it once at
 startup gives the whole process one budget, not one per request.
