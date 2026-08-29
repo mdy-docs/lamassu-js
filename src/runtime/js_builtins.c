@@ -18,6 +18,7 @@
  * only; sort is a stable O(n^2) binary insertion sort.
  */
 #include "js_bytecode.h"
+#include "js_error.h"
 #include "lamassu_internal.h"
 #include "js_date.h"
 #include "js_mapobj.h"
@@ -169,11 +170,7 @@ static JsValue sb_finish(StrBuf *sb) {
 /* ---- throwing from a native ---- */
 
 static bool native_throw(JsContext *ctx, JsValue *result, const char *msg) {
-    JsString *s = js_ascii_cell(ctx->vm, msg);
-    /* Falling back to undefined would report a failure with no reason attached,
-     * and the case it happens in -- no memory for the message -- is exactly the
-     * one a host most needs told apart. */
-    *result = s ? js_value_from_cell(&s->gc) : js_oom_value(ctx->vm);
+    *result = js_error_from_ascii(ctx, msg); /* Error object; string on OOM */
     return false;
 }
 
@@ -2988,6 +2985,10 @@ bool js_builtins_init(JsContext *ctx) {
 
     /* Boolean: callable conversion */
     if (!def_ctor(ctx, "Boolean", g_Boolean))
+        return false;
+
+    /* Error + TypeError/RangeError/ReferenceError/SyntaxError (js_error.c) */
+    if (!js_error_builtins_init(ctx))
         return false;
 
     /* promises (js_promise.c) */

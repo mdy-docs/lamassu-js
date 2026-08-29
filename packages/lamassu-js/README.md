@@ -8,7 +8,8 @@ typed ESM wrapper.
 
 > Strict-mode-only, ES-module-aware subset: `let`/`const` (no `var`),
 > arrow/async functions, template literals, destructuring, classes-free objects,
-> `try/catch`, promises, `import`/`export`, and ECMAScript `RegExp`. See the
+> `try/catch` with real `Error`/`TypeError`/`RangeError`/… objects, promises,
+> `import`/`export`, and ECMAScript `RegExp`. See the
 > [project README](https://github.com/mdy-docs/lamassu-js) for the full language
 > scope and the safety model.
 

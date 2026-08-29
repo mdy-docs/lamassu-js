@@ -124,6 +124,25 @@ not the full parser for arbitrary date strings).
   `toJSON`, `toString`, `toDateString`, `toTimeString`, `toUTCString` /
   `toGMTString`.
 
+## `Error`
+
+`new Error(message?, { cause }?)` (callable without `new` too), plus
+`TypeError`, `RangeError`, `ReferenceError`, and `SyntaxError` with the same
+signature and `Error.prototype` in their chain.
+
+- **Instances**: own `message` (ToString of the argument; absent when the
+  argument is `undefined`, inheriting `""`), own `cause` when the options
+  object has one.
+- **`Error.prototype`**: `name` (`"Error"`; each subclass prototype
+  overrides it), `message` (`""`), `toString` → `"name: message"`, dropping
+  either half when it is empty.
+- String conversion (`String(e)`, `'' + e`, template literals) uses the
+  same `"name: message"` form, so an error renders identically whether it
+  came from `throw new TypeError('x')` or from the engine.
+- **Engine-raised errors** (`null.x`, an undefined variable, a bad `Map`
+  iterable, the regex step budget, the execution budget, …) are instances of
+  the matching subclass, not strings.
+
 ## `Map` / `Set`
 
 Both accept an iterable (array) to seed from — `new Map([["a", 1]])`,

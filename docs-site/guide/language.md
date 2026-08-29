@@ -75,6 +75,25 @@ strings) are supported. Strings are UTF-16 internally, matching JS
 `finally` blocks that run on every exit path (return, break, continue,
 rethrow).
 
+`Error` and the standard subclasses `TypeError`, `RangeError`,
+`ReferenceError`, and `SyntaxError` are real constructors, and every error
+the engine itself raises is an instance of the matching one — so a single
+`catch` handles script and engine errors the same way:
+
+```js
+try {
+  null.x;
+} catch (e) {
+  e.name;     // "TypeError"
+  e.message;  // "cannot read properties of undefined or null (reading 'x')"
+  String(e);  // "TypeError: cannot read properties of ..."
+}
+throw new RangeError('out of bounds', { cause: previous });
+```
+
+There is no `instanceof` (see [Deviations](./deviations.md)); discriminate
+on `e.name` or `Object.getPrototypeOf(e) === RangeError.prototype`.
+
 ## Async
 
 `async`/`await`, including top-level await in a module. See

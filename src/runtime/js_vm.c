@@ -230,6 +230,8 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->date_proto = NULL;
     ctx->map_proto = NULL;
     ctx->set_proto = NULL;
+    for (int k = 0; k < JS_ERROR_KIND_COUNT; k++)
+        ctx->error_protos[k] = NULL;
     ctx->repl_scope = NULL;
     ctx->repl_const = NULL;
     ctx->modules = NULL;

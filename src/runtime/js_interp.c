@@ -1,4 +1,5 @@
 #include "js_bytecode.h"
+#include "js_error.h"
 #include "js_date.h"
 #include "js_mapobj.h"
 #include "js_setobj.h"
@@ -91,6 +92,8 @@ JsString *js_to_string_cell(JsContext *ctx, JsValue v, int depth) {
             return js_ascii_cell(vm, "[object Map]");
         if (o->obj_kind == JS_OBJ_SET)
             return js_ascii_cell(vm, "[object Set]");
+        if (o->obj_kind == JS_OBJ_ERROR)
+            return js_error_repr(ctx, o, depth);
         if (o->obj_kind != JS_OBJ_ARRAY)
             return js_ascii_cell(vm, "[object Object]");
         if (depth >= JS_TOSTRING_MAX_DEPTH)
@@ -772,9 +775,10 @@ JsValue js_oom_value(JsVm *vm) {
     return vm->oom_error ? js_value_from_cell(&vm->oom_error->gc) : js_undefined();
 }
 
+/* Engine-raised errors are Error objects (js_error.h); the "Name: " prefix of
+ * the message selects the subclass. Falls back to the bare string on OOM. */
 static void fiber_throw(JsContext *ctx, JsFiber *fb, const char *ascii_msg) {
-    JsString *s = js_ascii_cell(ctx->vm, ascii_msg);
-    fb->error = s ? js_value_from_cell(&s->gc) : js_oom_value(ctx->vm);
+    fb->error = js_error_from_ascii(ctx, ascii_msg);
     fb->failed = true;
 }
 
@@ -808,7 +812,7 @@ static void fiber_throw_name(JsContext *ctx, JsFiber *fb, const char *prefix,
         buf[n++] = (uint16_t)(unsigned char)suffix[i];
     JsString *s = js_string_cell_new(vm, buf, (uint32_t)total);
     js_realloc_raw(vm, buf, total * sizeof(uint16_t), 0);
-    fb->error = s ? js_value_from_cell(&s->gc) : js_oom_value(vm);
+    fb->error = s ? js_error_from_cell(ctx, s) : js_oom_value(vm);
     fb->failed = true;
 }
 

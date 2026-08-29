@@ -289,7 +289,7 @@ static void test_step_budget(void) {
         "RangeError: regular expression step budget exhausted");
     /* the error is catchable and the VM stays usable afterwards */
     eq("let msg = ''; try { /(a+)+$/.test('a'.repeat(200) + 'b'); }"
-       "catch (e) { msg = e.slice(0, 10); } msg + '|' + /a/.test('a');",
+       "catch (e) { msg = e.name; } msg + '|' + /a/.test('a');",
        "RangeError|true");
     /* legitimate work stays comfortably inside the budget */
     eq("/(a+)+$/.test('a'.repeat(200));", "true"); /* same pattern, matching input */

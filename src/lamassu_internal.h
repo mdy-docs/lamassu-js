@@ -74,6 +74,7 @@ typedef enum JsObjKind {
     JS_OBJ_DATE = 3,   /* JsDateObject (js_date.h) */
     JS_OBJ_MAP = 4,    /* JsMapObj (js_mapobj.h) */
     JS_OBJ_SET = 5,    /* JsSetObj (js_setobj.h) */
+    JS_OBJ_ERROR = 6,  /* plain JsObject shape; see js_error.h */
 } JsObjKind;
 
 /* JsObject.obj_flags. Extensibility only — this engine has no per-property
@@ -82,6 +83,17 @@ typedef enum JsObjKind {
  * observably do to an ordinary object, which is all guest code can test. */
 #define JS_OBJ_SEALED 1u /* no adding, no deleting; existing props writable */
 #define JS_OBJ_FROZEN 2u /* sealed, and no writes either */
+
+/* Error / TypeError / RangeError / ReferenceError / SyntaxError — the index
+ * into JsContext.error_protos (js_error.c). */
+typedef enum JsErrorKind {
+    JS_ERROR_PLAIN = 0,
+    JS_ERROR_TYPE,
+    JS_ERROR_RANGE,
+    JS_ERROR_REFERENCE,
+    JS_ERROR_SYNTAX,
+    JS_ERROR_KIND_COUNT
+} JsErrorKind;
 
 typedef struct JsObject {
     JsGcCell gc;
@@ -417,6 +429,7 @@ struct JsContext {
     JsObject *date_proto;
     JsObject *map_proto;
     JsObject *set_proto;
+    JsObject *error_protos[JS_ERROR_KIND_COUNT]; /* Error.prototype and subclasses */
     /* persistent REPL lexical scope: top-level let/const/function bindings
      * that survive across evaluations. repl_scope holds values (TDZ sentinel
      * for uninitialized); repl_const marks the const names. Both lazily

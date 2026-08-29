@@ -70,6 +70,22 @@ Unicode case folding.
 iterator (`for...of` over the result behaves the same either way).
 `String.prototype.split` ignores its `limit` argument.
 
+## Errors
+
+- **No `instanceof`**, so `e instanceof TypeError` is a syntax error;
+  test `e.name` or compare `Object.getPrototypeOf(e)` against the
+  constructor's `.prototype`.
+- **No `stack`**, and no `EvalError`/`URIError`/`AggregateError`.
+- **`message` and `cause` are ordinary enumerable own properties** (the
+  engine has no property attributes), so `JSON.stringify(new Error('x'))`
+  is `{"message":"x"}` rather than `{}`, and `Object.keys` lists them.
+- **`Object.prototype.toString` reports `[object Object]`** for errors.
+- **Subclassing is not possible** (no classes); set `name` on an instance
+  for a custom discriminator.
+- **Out-of-memory errors may still be bare strings**: when the engine
+  cannot allocate an Error object, it throws the message text instead so
+  the failure is never lost.
+
 ## Promises & async
 
 - **`Promise(executor)` is callable without `new`** — a deliberate

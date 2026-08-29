@@ -51,7 +51,8 @@ RUNTIME_SRC := src/runtime/js_vm.c src/runtime/js_gc.c src/runtime/js_string.c \
                src/runtime/js_builtins.c src/runtime/js_promise.c \
                src/runtime/js_module.c src/runtime/js_regexp.c \
                src/runtime/js_bytecode_read.c src/runtime/js_date.c \
-               src/runtime/js_mapobj.c src/runtime/js_setobj.c
+               src/runtime/js_mapobj.c src/runtime/js_setobj.c \
+               src/runtime/js_error.c
 
 # js_arena.c is here and not in the runtime because the arena's only users are
 # the parser and the two compile entry points — the runtime never allocates one.
@@ -63,7 +64,7 @@ FRONTEND_SRC := src/frontend/js_lexer.c src/frontend/js_parser.c \
 HDR := include/lamassu.h include/lamassu_compile.h src/lamassu_internal.h \
        src/js_bytecode.h src/js_bcformat.h src/js_valindex.h \
        src/frontend/js_syntax.h src/runtime/js_regexp.h src/runtime/js_date.h \
-       src/runtime/js_mapobj.h src/runtime/js_setobj.h
+       src/runtime/js_mapobj.h src/runtime/js_setobj.h src/runtime/js_error.h
 INC := -Iinclude -Isrc -Isrc/runtime -Isrc/frontend
 
 ASAN := -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer

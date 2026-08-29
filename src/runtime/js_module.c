@@ -31,6 +31,7 @@
  * re-exports are snapshot-copied once the source has evaluated.
  */
 #include "js_bytecode.h"
+#include "js_error.h"
 #include "lamassu_internal.h"
 
 /* ---- GC helpers ---- */
@@ -144,8 +145,7 @@ static JsModule *value_module(JsValue v) {
 }
 
 static JsValue ascii_value(JsContext *ctx, const char *msg) {
-    JsString *s = js_ascii_cell(ctx->vm, msg);
-    return s ? js_value_from_cell(&s->gc) : js_undefined();
+    return js_error_from_ascii(ctx, msg); /* Error object; string on OOM */
 }
 
 static JsValue mod_error_value(JsContext *ctx, const JsModError *err) {

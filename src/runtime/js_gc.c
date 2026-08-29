@@ -294,6 +294,10 @@ void js_gc_collect(JsVm *vm) {
             js_gc_mark_cell(vm, &ctx->map_proto->gc);
         if (ctx->set_proto)
             js_gc_mark_cell(vm, &ctx->set_proto->gc);
+        for (int k = 0; k < JS_ERROR_KIND_COUNT; k++) {
+            if (ctx->error_protos[k])
+                js_gc_mark_cell(vm, &ctx->error_protos[k]->gc);
+        }
         if (ctx->repl_scope)
             js_gc_mark_cell(vm, &ctx->repl_scope->gc);
         if (ctx->repl_const)

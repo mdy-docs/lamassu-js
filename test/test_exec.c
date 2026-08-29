@@ -496,8 +496,10 @@ static void test_exceptions(void) {
     /* exception propagates across a call */
     expect_result("function boom() { throw 'deep'; } let r;"
                   " try { boom(); } catch (e) { r = e; } r;", "deep");
-    /* runtime TypeError is catchable */
-    expect_result("let r; try { null.x; } catch (e) { r = typeof e === 'string'; } r;", "true");
+    /* runtime TypeError is catchable, and is a real TypeError object */
+    expect_result("let r; try { null.x; } catch (e) { r = typeof e === 'object' && e.name === 'TypeError'"
+                  " && e.message === \"cannot read properties of undefined or null (reading 'x')\"; } r;",
+                  "true");
     /* finally runs even when catch rethrows */
     expect_result("let log = ''; try { try { throw 1; } catch { log += 'c'; throw 2; }"
                   " finally { log += 'f'; } } catch (e) { log += 'o' + e; } log;", "cfo2");

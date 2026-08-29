@@ -527,6 +527,71 @@ static void test_set(void) {
 
 /* GC-sensitive cases: allocation-heavy methods and callbacks that call back
  * into user code (js_call) while building results — exercises rooting. */
+static void test_error(void) {
+    /* construction, with and without new; message/name/toString */
+    eq("const e = new Error('boom'); e.message + '|' + e.name;", "boom|Error");
+    eq("const e = Error('boom'); e.message + '|' + e.name;", "boom|Error");
+    eq("String(new Error('boom'));", "Error: boom");
+    eq("`${new TypeError('bad')}`;", "TypeError: bad");
+    eq("new RangeError('r').toString();", "RangeError: r");
+    eq("new Error().message === '' && new Error().toString() === 'Error';", "true");
+    eq("new Error('x') + '';", "Error: x");
+    eq("typeof new Error('x');", "object");
+    eq("new Error(42).message;", "42");
+    eq("new Error(undefined).message;", "");
+    /* the standard subclasses share Error.prototype */
+    eq("['TypeError','RangeError','ReferenceError','SyntaxError']"
+       ".map(n => Object.getPrototypeOf(new TypeError('x')) === TypeError.prototype).join();",
+       "true,true,true,true");
+    eq("Object.getPrototypeOf(TypeError.prototype) === Error.prototype;", "true");
+    eq("Object.getPrototypeOf(new Error('x')) === Error.prototype;", "true");
+    eq("Error.prototype.name + '|' + TypeError.prototype.name + '|' + SyntaxError.prototype.name;",
+       "Error|TypeError|SyntaxError");
+    eq("new TypeError('x').constructor === TypeError;", "true");
+    eq("TypeError.prototype.toString === Error.prototype.toString;", "true");
+    /* own message shadows the prototype's; name is inherited but overridable */
+    eq("const e = new Error('m'); e.hasOwnProperty('message') + '|' + e.hasOwnProperty('name');",
+       "true|false");
+    eq("const e = new Error('m'); e.name = 'Custom'; String(e);", "Custom: m");
+    eq("const e = new Error('m'); e.message = ''; String(e);", "Error");
+    /* toString: either half may be empty */
+    eq("const o = { name: '', message: 'only', toString: Error.prototype.toString }; o.toString();",
+       "only");
+    eq("const o = { toString: Error.prototype.toString }; o.toString();", "Error");
+    /* options.cause */
+    eq("const c = new Error('inner'); const e = new Error('outer', { cause: c });"
+       " e.cause === c;", "true");
+    eq("new Error('x', {}).hasOwnProperty('cause');", "false");
+    eq("new Error('x', { cause: undefined }).hasOwnProperty('cause');", "true");
+    /* throw / catch round-trips the object identity */
+    eq("const e = new Error('id'); let got; try { throw e; } catch (x) { got = x; } got === e;",
+       "true");
+    eq("try { throw new TypeError('t'); } catch (e) { e.name + ': ' + e.message; }", "TypeError: t");
+    /* engine-raised errors are Error objects of the matching subclass */
+    eq("try { null.x; } catch (e) { e.name; }", "TypeError");
+    eq("try { undefinedVariable; } catch (e) { e.name + '|' + e.message; }",
+       "ReferenceError|undefinedVariable is not defined");
+    eq("try { [].length = -1; } catch (e) { Object.getPrototypeOf(e) === RangeError.prototype; }",
+       "true");
+    eq("try { new Map([1]); } catch (e) { e.name + '|' + (e.message.length > 0); }", "TypeError|true");
+    eq("try { null.x; } catch (e) { typeof e + '|' + (e.message === String(e).slice(11)); }",
+       "object|true");
+    /* engine errors render exactly as the old bare strings did */
+    eq("try { null.x; } catch (e) { '' + e; }",
+       "TypeError: cannot read properties of undefined or null (reading 'x')");
+    /* rejections from builtins are Error objects too */
+    eq("await Promise.resolve().then(() => { null.x; }).catch(e => e.name);", "TypeError");
+    eq("await Promise.reject(new SyntaxError('s')).catch(e => e.name + '|' + e.message);",
+       "SyntaxError|s");
+    eq_s("let s = ''; for (let i = 0; i < 200; i++) { try { null.x; } catch (e) { s = e.name; } } s;",
+         "TypeError");
+    /* JSON: message is an ordinary own property (see deviations) */
+    eq("JSON.stringify(new Error('j'));", "{\"message\":\"j\"}");
+    /* uncaught: the completion is the Error object; the host sees its text */
+    err("throw new RangeError('top');", "RangeError: top");
+    err("throw new Error('top');", "Error: top");
+}
+
 static void test_stress(void) {
     eq_s("'a-b-c-d'.split('-').map(s => s.toUpperCase()).join('');", "ABCD");
     eq_s("'ab'.repeat(20).length;", "40");
@@ -648,6 +713,7 @@ int main(void) {
     test_date();
     test_map();
     test_set();
+    test_error();
     test_stress();
     test_integration();
     if (checks_failed) {

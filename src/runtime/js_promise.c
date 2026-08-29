@@ -12,6 +12,7 @@
  * reachable by one of those, or protected explicitly.
  */
 #include "js_bytecode.h"
+#include "js_error.h"
 #include "lamassu_internal.h"
 
 #define RX_THEN 0
@@ -405,8 +406,7 @@ JsValue js_promise_result(JsValue v) {
 #define ARG(i) ((i) < argc ? args[i] : js_undefined())
 
 static bool nthrow(JsContext *ctx, JsValue *r, const char *msg) {
-    JsString *s = js_ascii_cell(ctx->vm, msg);
-    *r = s ? js_value_from_cell(&s->gc) : js_undefined();
+    *r = js_error_from_ascii(ctx, msg); /* Error object; string on OOM */
     return false;
 }
 

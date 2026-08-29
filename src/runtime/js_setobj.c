@@ -4,14 +4,14 @@
  * SetIterator).
  */
 #include "js_bytecode.h"
+#include "js_error.h"
 #include "js_setobj.h"
 #include "js_valindex.h"
 
 #define ARG(i) ((i) < argc ? args[i] : js_undefined())
 
 static bool nthrow(JsContext *ctx, JsValue *r, const char *msg) {
-    JsString *s = js_ascii_cell(ctx->vm, msg);
-    *r = s ? js_value_from_cell(&s->gc) : js_undefined();
+    *r = js_error_from_ascii(ctx, msg); /* Error object; string on OOM */
     return false;
 }
 

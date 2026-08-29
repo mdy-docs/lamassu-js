@@ -18,6 +18,7 @@
 #ifdef LAMASSU_HAS_REGEX
 
 #include "js_bytecode.h"
+#include "js_error.h"
 #include "js_regexp.h"
 
 #define ARG(i) ((i) < argc ? args[i] : js_undefined())
@@ -26,8 +27,7 @@
 #define CAPS_MAX ((MAX_GROUPS + 1) * 2)
 
 static bool re_throw(JsContext *ctx, JsValue *r, const char *msg) {
-    JsString *s = js_ascii_cell(ctx->vm, msg);
-    *r = s ? js_value_from_cell(&s->gc) : js_undefined();
+    *r = js_error_from_ascii(ctx, msg); /* Error object; string on OOM */
     return false;
 }
 
