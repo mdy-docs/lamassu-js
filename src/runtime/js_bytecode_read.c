@@ -190,11 +190,12 @@ static JsValue load_string_const(JsContext *ctx, InBuf *b, const char **err) {
         *err = "SyntaxError: truncated bytecode string";
         return js_undefined();
     }
-    /* read code units LE without assuming input alignment. A flag, not a
-     * pointer comparison, decides whether to free: comparing against the
-     * array's address makes gcc's -O3 flow analysis report the (never read
-     * when n == 0) array as maybe-uninitialized under -Werror. */
-    uint16_t stackbuf[128];
+    /* read code units LE without assuming input alignment. The array is
+     * zero-initialized and a flag (not a pointer comparison) decides the
+     * free: either way gcc's -O3 flow analysis otherwise reports the (never
+     * read when n == 0) array as maybe-uninitialized under -Werror. The
+     * memset is 256 bytes per string constant, paid once per load. */
+    uint16_t stackbuf[128] = {0};
     bool heap = n > 128;
     uint16_t *u = stackbuf;
     if (heap) {
