@@ -190,10 +190,14 @@ static JsValue load_string_const(JsContext *ctx, InBuf *b, const char **err) {
         *err = "SyntaxError: truncated bytecode string";
         return js_undefined();
     }
-    /* read code units LE without assuming input alignment */
+    /* read code units LE without assuming input alignment. A flag, not a
+     * pointer comparison, decides whether to free: comparing against the
+     * array's address makes gcc's -O3 flow analysis report the (never read
+     * when n == 0) array as maybe-uninitialized under -Werror. */
     uint16_t stackbuf[128];
+    bool heap = n > 128;
     uint16_t *u = stackbuf;
-    if (n > 128) {
+    if (heap) {
         u = js_realloc_raw(ctx->vm, NULL, 0, (size_t)n * sizeof(uint16_t));
         if (!u) {
             *err = "out of memory";
@@ -204,7 +208,7 @@ static JsValue load_string_const(JsContext *ctx, InBuf *b, const char **err) {
         u[i] = (uint16_t)(b->p[i * 2] | ((uint16_t)b->p[i * 2 + 1] << 8));
     b->p += (size_t)n * 2;
     JsValue a = js_atom(ctx->vm, u, n);
-    if (u != stackbuf)
+    if (heap)
         js_realloc_raw(ctx->vm, u, (size_t)n * sizeof(uint16_t), 0);
     if (!js_is_string(a))
         *err = "out of memory";
