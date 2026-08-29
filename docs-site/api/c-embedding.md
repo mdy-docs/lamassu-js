@@ -242,6 +242,23 @@ Engine-raised errors are `Error` objects — read `name` / `message` with
 failure degrades the value to a bare string.
 
 ```c
+typedef enum JsErrorCause {
+    JS_CAUSE_GUEST = 0,     // a guest throw, or an ordinary engine TypeError etc.
+    JS_CAUSE_BUDGET = 1,    // the js_context_set_fuel budget ran out
+    JS_CAUSE_INTERRUPT = 2, // js_vm_interrupt stopped the run
+    JS_CAUSE_OOM = 3        // heap_limit or the allocator refused
+} JsErrorCause;
+JsErrorCause js_error_cause(JsContext *ctx, JsValue error);
+```
+
+The three stops the engine imposes carry a structured cause, so a host can
+route them (retry, 503, discard the VM) without parsing message text. It
+works on whatever a failed `js_call`, a rejected promise, or a `catch`
+handler holds — including the bare `"out of memory"` string the engine
+falls back to when it cannot allocate an `Error`. A guest-built error that
+merely says the same words is `JS_CAUSE_GUEST`.
+
+```c
 bool js_call(JsContext *ctx, JsValue fn, JsValue this_val, const JsValue *args,
              int argc, JsValue *result);
 ```

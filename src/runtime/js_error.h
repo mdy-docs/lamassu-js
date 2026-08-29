@@ -21,6 +21,16 @@
 
 #include "lamassu_internal.h"
 
+/*
+ * The messages of the three engine-imposed stops. Raise sites use these
+ * macros, and js_error_from_cell recognizes exactly these texts to stamp the
+ * structured cause (js_error_cause) on the Error object — one definition,
+ * so the two can never drift apart.
+ */
+#define JS_MSG_BUDGET "RangeError: execution budget exhausted"
+#define JS_MSG_INTERRUPT "Error: execution interrupted"
+#define JS_MSG_OOM "out of memory"
+
 /* New error object of `kind`; `message` may be NULL (inherits ""). Roots
  * `message` itself. undefined on OOM. */
 JsValue js_error_new(JsContext *ctx, JsErrorKind kind, JsString *message);

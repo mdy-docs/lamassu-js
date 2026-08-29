@@ -1139,7 +1139,7 @@ static bool am_sort(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     for (uint32_t i = 1; i < a->elem_count && !failed; i++) {
         if (ctx->vm->interrupt) {
             failed = true;
-            native_throw(ctx, r, "Error: execution interrupted");
+            native_throw(ctx, r, JS_MSG_INTERRUPT);
             break; /* not `return`: the roots below still have to come off */
         }
         key = a->elems[i];

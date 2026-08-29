@@ -849,6 +849,89 @@ static int run_with_stop(const char *src, char **out, bool clear_after) {
 }
 
 /*
+ * A host maps the engine's three stops to different outcomes (503 for fuel,
+ * 504 for a deadline, discard-the-VM for memory), so it must be able to tell
+ * them apart without parsing message text. js_error_cause is that answer; a
+ * guest-built error that merely says the same words is still JS_CAUSE_GUEST.
+ */
+static JsErrorCause cause_of(const char *src, uint64_t fuel, size_t heap_limit, bool stop,
+                             char **text) {
+    JsVmConfig cfg = {.heap_limit = heap_limit};
+    JsVm *vm = js_vm_new(&cfg);
+    JsContext *ctx = js_context_new(vm);
+    static const uint16_t name[] = {'s','t','o','p','N','o','w'};
+    js_register_native(ctx, name, 7, native_stop_now, NULL);
+    size_t len = strlen(src);
+    uint16_t *u = malloc(len * sizeof(uint16_t));
+    for (size_t i = 0; i < len; i++)
+        u[i] = (uint16_t)(unsigned char)src[i];
+    const char *em; uint32_t ep;
+    JsValue fn = js_compile_module(ctx, u, len, &em, &ep);
+    free(u);
+    js_gc_protect(vm, &fn);
+    js_context_set_fuel(ctx, fuel);
+    JsValue p = js_run_module(ctx, fn);
+    js_gc_protect(vm, &p);
+    js_run_jobs(ctx);
+    if (stop)
+        js_vm_clear_interrupt(vm);
+    JsValue r = js_promise_result(p);
+    js_gc_protect(vm, &r);
+    JsErrorCause cause = js_promise_state(p) == 2 ? js_error_cause(ctx, r) : JS_CAUSE_GUEST;
+    JsValue s = js_to_string(ctx, r);
+    size_t sl = 0;
+    const uint16_t *su = js_string_units(s, &sl);
+    char *buf = malloc(sl + 1);
+    for (size_t i = 0; i < sl; i++) buf[i] = su[i] < 128 ? (char)su[i] : '?';
+    buf[sl] = '\0';
+    *text = buf;
+    js_vm_free(vm);
+    return cause;
+}
+
+static void test_error_cause(void) {
+    char *t;
+    CHECK(cause_of("for (;;) {}", 500, 0, false, &t) == JS_CAUSE_BUDGET);
+    CHECK(strcmp(t, "RangeError: execution budget exhausted") == 0);
+    free(t);
+    /* the guest's catch does not launder it */
+    CHECK(cause_of("try { for (;;) {} } catch (e) { 'caught'; }", 500, 0, false, &t) == JS_CAUSE_BUDGET);
+    free(t);
+    CHECK(cause_of("stopNow(); while (true) {} 'never';", 0, 0, true, &t) == JS_CAUSE_INTERRUPT);
+    CHECK(strcmp(t, "Error: execution interrupted") == 0);
+    free(t);
+    CHECK(cause_of("const a = []; for (;;) a.push({ k: 'v' + a.length, xs: [1, 2, 3] });",
+                   0, 256 * 1024, false, &t) == JS_CAUSE_OOM);
+    free(t);
+    /* guest-raised, even with the same words */
+    CHECK(cause_of("throw new RangeError('execution budget exhausted');", 0, 0, false, &t) == JS_CAUSE_GUEST);
+    free(t);
+    CHECK(cause_of("throw new Error('execution interrupted');", 0, 0, false, &t) == JS_CAUSE_GUEST);
+    free(t);
+    CHECK(cause_of("throw 'out of memory';", 0, 0, false, &t) == JS_CAUSE_GUEST);
+    free(t);
+    CHECK(cause_of("throw new Error('mine');", 0, 0, false, &t) == JS_CAUSE_GUEST);
+    free(t);
+    /* an ordinary engine error is a guest-visible mistake, not a stop */
+    CHECK(cause_of("null.x;", 0, 0, false, &t) == JS_CAUSE_GUEST);
+    free(t);
+    /* a fulfilled run has no cause to speak of */
+    CHECK(cause_of("1 + 1;", 0, 0, false, &t) == JS_CAUSE_GUEST);
+    free(t);
+    /* a host-built string with the same text is not the engine's prebuilt
+     * OOM value: strings are classified by identity, never by text */
+    JsVm *vm = js_vm_new(NULL);
+    JsContext *ctx = js_context_new(vm);
+    static const uint16_t oom[] = {'o','u','t',' ','o','f',' ','m','e','m','o','r','y'};
+    JsValue s = js_string_new(vm, oom, 13);
+    js_gc_protect(vm, &s);
+    CHECK(js_error_cause(ctx, s) == JS_CAUSE_GUEST);
+    CHECK(js_error_cause(ctx, js_number(1)) == JS_CAUSE_GUEST);
+    CHECK(js_error_cause(ctx, js_undefined()) == JS_CAUSE_GUEST);
+    js_vm_free(vm);
+}
+
+/*
  * js_vm_interrupt is the only bound on wall-clock: fuel counts instructions,
  * and a host cannot always map an acceptable running time onto a count. The
  * stop must also be unswallowable, or a guest defeats it with try/catch the
@@ -1059,6 +1142,7 @@ int main(void) {
     test_heap_limit_is_a_hard_cap();
     test_regex_memory_is_capped();
     test_interrupt();
+    test_error_cause();
     test_oom_is_reported();
     test_arithmetic();
     test_strings();

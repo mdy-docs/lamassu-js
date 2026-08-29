@@ -46,6 +46,7 @@ JsValue js_error_new(JsContext *ctx, JsErrorKind kind, JsString *message) {
     if (ok) {
         JsObject *e = js_value_object(ev);
         e->obj_kind = JS_OBJ_ERROR;
+        e->error_cause = JS_CAUSE_GUEST;
         JsObject *proto = ctx->error_protos[kind];
         if (proto)
             e->proto = js_value_from_cell(&proto->gc);
@@ -77,16 +78,83 @@ static JsErrorKind split_prefix(const JsString *s, uint32_t *msg_off) {
     return JS_ERROR_PLAIN;
 }
 
+static bool units_equal_ascii(const JsString *s, const char *ascii) {
+    uint32_t n = 0;
+    while (ascii[n]) {
+        if (n >= s->length || s->units[n] != (uint16_t)(unsigned char)ascii[n])
+            return false;
+        n++;
+    }
+    return n == s->length;
+}
+
+/* "out of memory", or a site-specific variant ("internal: out of memory",
+ * "module load failed (out of memory)"): every one is the allocator saying no. */
+static bool is_oom_text(const JsString *s) {
+    static const char tail[] = JS_MSG_OOM;
+    uint32_t tl = sizeof tail - 1;
+    if (s->length < tl)
+        return false;
+    uint32_t off = s->length - tl;
+    for (uint32_t i = 0; i < tl; i++) {
+        if (s->units[off + i] != (uint16_t)(unsigned char)tail[i])
+            return false;
+    }
+    if (off == 0)
+        return true;
+    uint16_t before = s->units[off - 1];
+    if (before == ' ' || before == '(')
+        return true;
+    /* "...(out of memory)" */
+    return off >= 1 && s->units[off - 1] == '(' ;
+}
+
+/* The engine-imposed stops are recognized by their exact texts (the
+ * JS_MSG_* constants the raise sites use); a guest cannot reach this path. */
+static JsErrorCause cause_of_text(const JsString *s) {
+    if (units_equal_ascii(s, JS_MSG_BUDGET))
+        return JS_CAUSE_BUDGET;
+    if (units_equal_ascii(s, JS_MSG_INTERRUPT))
+        return JS_CAUSE_INTERRUPT;
+    if (is_oom_text(s))
+        return JS_CAUSE_OOM;
+    return JS_CAUSE_GUEST;
+}
+
 JsValue js_error_from_cell(JsContext *ctx, JsString *full) {
     JsVm *vm = ctx->vm;
     JsValue fallback = js_value_from_cell(&full->gc);
     js_gc_protect(vm, &fallback);
     uint32_t off;
     JsErrorKind kind = split_prefix(full, &off);
+    JsErrorCause cause = cause_of_text(full);
     JsString *msg = off ? js_string_cell_new(vm, full->units + off, full->length - off) : full;
     JsValue ev = msg ? js_error_new(ctx, kind, msg) : js_undefined();
     js_gc_unprotect(vm, &fallback);
-    return js_is_object(ev) ? ev : fallback;
+    if (!js_is_object(ev)) {
+        /* The only way to get here is an allocation failing, so the honest
+         * value is the prebuilt OOM string — which js_error_cause recognizes
+         * by identity, so no guest-built string can impersonate it. If even
+         * that is missing (a VM that never finished construction), keep the
+         * text rather than lose it. */
+        JsValue oom = js_oom_value(vm);
+        return js_is_undefined(oom) ? fallback : oom;
+    }
+    js_value_object(ev)->error_cause = (uint8_t)cause;
+    return ev;
+}
+
+JsErrorCause js_error_cause(JsContext *ctx, JsValue error) {
+    if (js_is_object(error)) {
+        JsObject *o = js_value_object(error);
+        return o->obj_kind == JS_OBJ_ERROR ? (JsErrorCause)o->error_cause : JS_CAUSE_GUEST;
+    }
+    /* The bare-string fallback is exactly one cell, the VM's prebuilt OOM
+     * value — identity, not text, so `throw 'out of memory'` from a guest is
+     * still JS_CAUSE_GUEST. */
+    if (js_is_string(error) && js_value_string(error) == ctx->vm->oom_error)
+        return JS_CAUSE_OOM;
+    return JS_CAUSE_GUEST;
 }
 
 JsValue js_error_from_ascii(JsContext *ctx, const char *msg) {

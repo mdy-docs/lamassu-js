@@ -1093,10 +1093,10 @@ run:; /* (re)load the top frame */
             if (--fb->fuel == 0 || vm->interrupt) {
                 if (vm->interrupt) {
                     fb->fuel++; /* not our budget that ran out; leave it intact */
-                    RT_THROW("Error: execution interrupted");
+                    RT_THROW(JS_MSG_INTERRUPT);
                 }
                 fb->fuel = 1;
-                RT_THROW("RangeError: execution budget exhausted");
+                RT_THROW(JS_MSG_BUDGET);
             }
             op_ip = ip;
             JsOp op = (JsOp)code[ip++];

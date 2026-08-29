@@ -99,6 +99,7 @@ typedef struct JsObject {
     JsGcCell gc;
     uint8_t obj_kind;
     uint8_t obj_flags; /* fits in the padding before props; costs nothing */
+    uint8_t error_cause; /* JS_OBJ_ERROR only: a JsErrorCause (js_error.c) */
     JsMap props;
     /* JS_OBJ_ARRAY: dense elements; sparse writes fall back to props. */
     JsValue *elems;

@@ -219,6 +219,29 @@ bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
                         JsNativeFn fn, void *userdata);
 
 uint32_t js_context_error_pos(const JsContext *ctx);
+
+/*
+ * Why an error was raised. The three stops the engine imposes on a guest —
+ * the fuel budget running out, js_vm_interrupt, and an allocation the heap
+ * limit or the allocator refused — carry a structured cause, so a host can
+ * map them to its own outcomes (retry, 503, discard the VM, ...) without
+ * parsing message text. Everything else, a guest `throw` and the engine's
+ * ordinary TypeErrors alike, is JS_CAUSE_GUEST.
+ *
+ * Works on whatever a failed js_call, a rejected promise, or a catch handler
+ * holds: the Error object the engine raised, or the VM's prebuilt
+ * "out of memory" string it falls back to when it cannot allocate even that
+ * (recognized by identity, not text). A value the guest built itself —
+ * `throw new RangeError('execution budget exhausted')`, `throw 'out of
+ * memory'` — is JS_CAUSE_GUEST no matter what it says.
+ */
+typedef enum JsErrorCause {
+    JS_CAUSE_GUEST = 0,
+    JS_CAUSE_BUDGET = 1,    /* js_context_set_fuel budget spent */
+    JS_CAUSE_INTERRUPT = 2, /* js_vm_interrupt */
+    JS_CAUSE_OOM = 3        /* heap_limit or the allocator refused */
+} JsErrorCause;
+JsErrorCause js_error_cause(JsContext *ctx, JsValue error);
 /*
  * Arms an execution budget, in bytecode instructions, for the next TURN — a
  * top-level run (js_run_module / js_call / js_eval_module) together with the
