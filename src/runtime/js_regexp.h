@@ -45,6 +45,19 @@ typedef struct JsRegExp {
     JsString *flags;  /* normalized flags, spec order "dgimsuvy" */
     double last_index;
     bool global;      /* /g lives here; the engine VM never needs it */
+    /*
+     * The engine's match-time scratch, kept between calls instead of built
+     * and torn down for each one. It is what baru-re calls a reusable
+     * context: an embedded depth[MAX_AST_DEPTH] table plus the buffers each
+     * level lazily allocates, so making one per match meant zeroing tens of
+     * kilobytes and freeing a few hundred slots to match five characters.
+     * vm_context_set_step_budget re-arms it per call, which is the reuse the
+     * engine documents. NULL until the first match, and dropped again if a
+     * match ever reports exhaustion — that flag also covers a match-time OOM,
+     * after which baru-re says the context must never enter the VM again.
+     * Bounded by JS_REGEXP_MAX_LIVE, and small beside the Program above.
+     */
+    VMContext *vctx;
     Program prog;     /* embedded compiled pattern (large; see regexp.h) */
 } JsRegExp;
 

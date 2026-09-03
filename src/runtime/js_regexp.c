@@ -160,8 +160,22 @@ JsValue js_regexp_new(JsContext *ctx, const uint16_t *pat, uint32_t pat_len,
         return js_undefined();
     }
     if (vm->regexp_live >= JS_REGEXP_MAX_LIVE) {
-        *err = "RangeError: too many live regular expressions";
-        return js_undefined();
+        /*
+         * The count falls at sweep, so a script that evaluates regex literals
+         * in a loop — every evaluation is a fresh object, per the spec — can
+         * be holding the whole cap in garbage. Refusing on that would fail
+         * code that is not, in fact, keeping 64 patterns alive: collect first
+         * and only refuse if they really are all reachable. Same shape as
+         * js_gc_new_cell's collect-and-retry for an allocation that did not
+         * fit, and safe for the same reason — this function is about to
+         * allocate anyway, so every caller already tolerates a collection
+         * here.
+         */
+        js_gc_collect(vm);
+        if (vm->regexp_live >= JS_REGEXP_MAX_LIVE) {
+            *err = "RangeError: too many live regular expressions";
+            return js_undefined();
+        }
     }
     uint16_t *pbuf = js_realloc_raw(vm, NULL, 0, ((size_t)pat_len + 1) * sizeof(uint16_t));
     if (!pbuf) {
@@ -189,6 +203,7 @@ JsValue js_regexp_new(JsContext *ctx, const uint16_t *pat, uint32_t pat_len,
     re->flags = NULL;
     re->last_index = 0;
     re->global = (mask & REGEX_FLAG_GLOBAL) != 0;
+    re->vctx = NULL; /* built on first match, reused after — see js_regexp.h */
     memset(&re->prog, 0, sizeof re->prog); /* compile_into requires zero init */
     program_set_allocator(&re->prog, re_vm_realloc, vm);
     vm->regexp_live++; /* balanced by js_regexp_release at sweep */
@@ -248,6 +263,7 @@ void js_regexp_mark(JsVm *vm, JsObject *o) {
 
 size_t js_regexp_release(JsVm *vm, JsObject *o) {
     JsRegExp *re = (JsRegExp *)o;
+    vm_context_free(re->vctx);
     program_release(&re->prog);
     vm->regexp_live--;
     return sizeof *re;
@@ -359,10 +375,14 @@ static int re_run(JsRegExp *re, const JsString *s, uint32_t start, bool anchored
     const uint16_t *captures[CAPS_MAX] = {0};
     bool matched = false;
 
-    VMContext *vctx = vm_context_new(prog);
-    if (!vctx)
-        return RE_RUN_BUDGET; /* OOM: the match was never evaluated, so it
-                               * must throw, not report a bogus non-match */
+    VMContext *vctx = re->vctx;
+    if (!vctx) {
+        vctx = vm_context_new(prog);
+        if (!vctx)
+            return RE_RUN_BUDGET; /* OOM: the match was never evaluated, so it
+                                   * must throw, not report a bogus non-match */
+        re->vctx = vctx;
+    }
     vm_context_set_step_budget(vctx, JS_REGEXP_STEP_BASE +
                                          (uint64_t)s->length * JS_REGEXP_STEPS_PER_UNIT);
     if (anchored || prog->sticky) {
@@ -377,7 +397,14 @@ static int re_run(JsRegExp *re, const JsString *s, uint32_t start, bool anchored
         }
     }
     bool exhausted = vm_context_budget_exhausted(vctx);
-    vm_context_free(vctx);
+    if (exhausted) {
+        /* Exhaustion also reports a match-time OOM, which can leave a depth
+         * level half-initialised; baru-re's contract is that such a context
+         * must never enter the VM again. Cheaper to drop it than to tell the
+         * two apart, and both are rare. */
+        vm_context_free(vctx);
+        re->vctx = NULL;
+    }
     if (!matched)
         return exhausted ? RE_RUN_BUDGET : RE_RUN_NOMATCH;
     for (int g = 0; g <= prog->group_count; g++) {

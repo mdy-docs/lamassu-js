@@ -297,9 +297,57 @@ static void test_step_budget(void) {
     eq("('x'.repeat(5000) + 'needle').search(/needle/);", "5000");
 }
 
+/*
+ * A regexp keeps the engine's match-time scratch between calls (JsRegExp.vctx)
+ * rather than building one per match. Reuse must be invisible: no state may
+ * leak from one match into the next, and a match that exhausts its budget —
+ * which also covers a match-time OOM, after which baru-re says the context
+ * must never re-enter the VM — must leave the regexp usable.
+ */
+static void test_context_reuse(void) {
+    /* the same regexp, matched repeatedly, keeps answering independently */
+    eq("const re = /^[0-9]+$/;"
+       "re.test('12345') + '|' + re.test('abc') + '|' + re.test('7');",
+       "true|false|true");
+    /* captures do not bleed between calls */
+    eq("const re = /(\\w)(\\d)?/;"
+       "const a = re.exec('x1'); const b = re.exec('y');"
+       "a[1] + (a[2] === undefined ? '-' : a[2]) + '|' +"
+       "b[1] + (b[2] === undefined ? '-' : b[2]);",
+       "x1|y-");
+    /* a global regexp's lastIndex walk is unaffected by reuse */
+    eq("const re = /a/g; let n = 0; const s = 'aaaa';"
+       "while (re.exec(s)) n++; n;",
+       "4");
+    /* alternating subjects and lengths through one regexp */
+    eq("const re = /b+/;"
+       "re.test('b') + '|' + re.test('c'.repeat(500)) + '|' + re.test('c'.repeat(500) + 'b');",
+       "true|false|true");
+    /* budget exhaustion drops the context; the SAME regexp still works after */
+    eq("const re = /(a+)+$/; let msg = '';"
+       "try { re.test('a'.repeat(200) + 'b'); } catch (e) { msg = e.name; }"
+       "msg + '|' + re.test('aaa');",
+       "RangeError|true");
+    /* and it can be exhausted again afterwards, not just once */
+    eq("const re = /(a+)+$/; let n = 0;"
+       "for (let i = 0; i < 3; i++) { try { re.test('a'.repeat(200) + 'b'); } catch (e) { n++; } }"
+       "n + '|' + re.test('aaa');",
+       "3|true");
+}
+
 static void test_lifecycle(void) {
     /* transient patterns are collected: far more than the live cap in total */
     eq("for (let i = 0; i < 100; i++) RegExp('x' + i); 'ok';", "ok");
+    /* Distinct literals, evaluated once each and dropped: every evaluation is
+     * a fresh object, so this makes far more patterns than the cap while
+     * keeping none. It must not be refused — the cap counts live patterns,
+     * and these are garbage by the time the next one is built. */
+    eq("let n = 0;"
+       "for (let i = 0; i < 200; i++) {"
+       "  if (/a/.test('a')) n++; if (/b/.test('b')) n++; if (/c/.test('c')) n++;"
+       "}"
+       "n;",
+       "600");
     /* the live-pattern cap trips when they are all kept reachable */
     err("const a = []; for (let i = 0; i < 70; i++) a.push(RegExp('x' + i)); 1;",
         "RangeError: too many live regular expressions");
@@ -322,6 +370,7 @@ int main(void) {
     test_split();
     test_flags_semantics();
     test_step_budget();
+    test_context_reuse();
     test_lifecycle();
     if (checks_failed) {
         fprintf(stderr, "%d/%d regex checks FAILED\n", checks_failed, checks_run);
