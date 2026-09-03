@@ -604,6 +604,7 @@ void    js_map_free(JsVm *vm, JsMap *m);
 /* ---- strings / atoms (js_string.c) ---- */
 
 uint32_t  js_units_hash(const uint16_t *units, size_t len, uint32_t seed);
+uint32_t  js_units_hash_from(uint32_t h, const uint16_t *units, size_t len);
 JsString *js_string_cell_new(JsVm *vm, const uint16_t *units, size_t len);
 JsString *js_atoms_find(JsVm *vm, const uint16_t *units, size_t len, uint32_t hash);
 JsString *js_intern_cell(JsVm *vm, JsString *s); /* canonical string, or NULL on OOM */

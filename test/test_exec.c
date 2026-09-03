@@ -580,6 +580,38 @@ static void test_completion_value(void) {
     expect_result("if (true) { 'taken'; }", "taken");
 }
 
+/*
+ * Concatenation continues the left operand's FNV fold instead of rehashing the
+ * whole result (js_units_hash_from). That is only sound if a built string
+ * hashes identically to the same text written as a literal — otherwise it
+ * would fail to intern, and property lookup, Map and Set would all quietly
+ * miss. These check the hash through its consumers rather than directly.
+ */
+static void test_concat_hash_interning(void) {
+    expect_result("('ab' + 'c') === 'abc'", "true");
+    expect_result("('a' + 'b' + 'c') === ('ab' + 'c')", "true");
+    expect_result("('' + 'z') === 'z'", "true");
+    expect_result("('z' + '') === 'z'", "true");
+    /* property keys */
+    expect_result("const o = { abc: 42 }; o['ab' + 'c']", "42");
+    expect_result("const o = {}; o['x' + 'y'] = 7; o.xy", "7");
+    /* Map and Set hash strings the same way */
+    expect_result("const m = new Map(); m.set('hello', 1); m.get('hel' + 'lo')", "1");
+    expect_result("const s = new Set(['one']); s.has('o' + 'ne')", "true");
+    /* a long string built by repeated append, against the same text built
+     * in different-sized pieces */
+    expect_result("let a = ''; for (let i = 0; i < 500; i++) a += 'ab';"
+                  "let b = ''; for (let i = 0; i < 250; i++) b += 'abab';"
+                  "a === b",
+                  "true");
+    expect_result("let a = ''; for (let i = 0; i < 500; i++) a += 'ab';"
+                  "let b = ''; for (let i = 0; i < 250; i++) b += 'abab';"
+                  "const o = {}; o[a] = 'yes'; o[b]",
+                  "yes");
+    /* non-ASCII code units fold the same */
+    expect_result("const o = {}; o['\u00e9' + '\u00fc'] = 1; o['\u00e9\u00fc']", "1");
+}
+
 /* Builds prefix + n copies of unit + suffix into a malloc'd string. */
 static char *repeat_src(const char *prefix, const char *unit, int n, const char *suffix) {
     size_t pl = strlen(prefix), ul = strlen(unit), sl = strlen(suffix);
@@ -1165,6 +1197,7 @@ int main(void) {
     test_gc_stress_run();
     test_host_globals();
     test_completion_value();
+    test_concat_hash_interning();
     test_audit_regressions();
     test_audit_p2_p3();
 

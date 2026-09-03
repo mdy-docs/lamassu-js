@@ -749,7 +749,10 @@ JsString *js_concat_cells(JsVm *vm, const JsString *a, const JsString *b) {
         memcpy(s->units, a->units, (size_t)a->length * sizeof(uint16_t));
     if (b->length)
         memcpy(s->units + a->length, b->units, (size_t)b->length * sizeof(uint16_t));
-    s->hash = js_units_hash(s->units, len, vm->hash_seed);
+    /* Continue the left operand's fold over b rather than rehashing a ++ b:
+     * the result is bit-identical (see js_units_hash_from), and building a
+     * string by repeated append stops paying for its whole length each time. */
+    s->hash = js_units_hash_from(a->hash, b->units, b->length);
     return s;
 }
 

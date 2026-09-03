@@ -1,16 +1,26 @@
 #include "lamassu_internal.h"
 
-uint32_t js_units_hash(const uint16_t *units, size_t len, uint32_t seed) {
-    /* Seeded FNV-1a over code units. seed == 0 (the default) reproduces the
-     * plain FNV hash exactly; a non-zero per-VM seed (set when the embedder
-     * provides rng_seed) perturbs the basis so an attacker cannot precompute a
-     * colliding key set — HashDoS hardening. */
-    uint32_t h = 2166136261u ^ seed; /* FNV-1a over code units */
+/*
+ * FNV-1a is a plain left-to-right fold with no length mixing and no
+ * finalisation, so the hash of a ++ b is the fold of b's units continued from
+ * the hash of a. js_concat_cells relies on that: it starts from the left
+ * operand's existing hash instead of rehashing the whole result, which is what
+ * made building a string a code unit at a time quadratic in its own length.
+ */
+uint32_t js_units_hash_from(uint32_t h, const uint16_t *units, size_t len) {
     for (size_t i = 0; i < len; i++) {
         h ^= units[i];
         h *= 16777619u;
     }
     return h;
+}
+
+uint32_t js_units_hash(const uint16_t *units, size_t len, uint32_t seed) {
+    /* Seeded FNV-1a over code units. seed == 0 (the default) reproduces the
+     * plain FNV hash exactly; a non-zero per-VM seed (set when the embedder
+     * provides rng_seed) perturbs the basis so an attacker cannot precompute a
+     * colliding key set — HashDoS hardening. */
+    return js_units_hash_from(2166136261u ^ seed, units, len);
 }
 
 JsString *js_string_cell_new(JsVm *vm, const uint16_t *units, size_t len) {
