@@ -271,6 +271,15 @@ double js_k_atan2(double y, double x);
 double js_k_asin(double x);
 double js_k_acos(double x);
 
+/* js_case.c — Unicode case conversion, over baru-re's UCD tables. `out` holds
+ * three code points; the return is how many were written. `final_sigma` is
+ * consulted only for U+03A3 when lowercasing, and the CALLER decides it,
+ * because it is a fact about what surrounds the character rather than about
+ * the character. */
+int  js_case_map(uint32_t cp, bool to_upper, bool final_sigma, uint32_t *out);
+bool js_case_is_cased(uint32_t cp);
+bool js_case_is_ignorable(uint32_t cp);
+
 /* js_number.c */
 double  js_make_double(uint64_t mant, int exp10);
 double  js_units_to_number(const uint16_t *units, size_t len);

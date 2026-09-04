@@ -400,37 +400,112 @@ static bool sm_substring(JsContext *ctx, JsValue tv, const JsValue *args, int ar
     return make_substr(ctx, s, a, b, r);
 }
 
-static bool sm_toUpperCase(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    (void)args;
-    (void)argc;
+/*
+ * Case conversion is Unicode's, not ASCII's.
+ *
+ * These both used to add or subtract 32 over A-Z, which is wrong for every
+ * language that is not English and wrong quietly: `'Ä'.toLowerCase()` came
+ * back unchanged, so anything lowercasing a string before comparing it stopped
+ * matching. The mapping tables live in js_case.c; what these do is walk the
+ * string as CHARACTERS rather than as code units, which is the other half of
+ * being right.
+ */
+
+/** One code point at `i`, and how many units it took — a surrogate pair is one
+ * character, and mapping its halves separately maps neither. */
+static uint32_t str_codepoint_at(const JsString *s, uint32_t i, uint32_t *width) {
+    uint16_t hi = s->units[i];
+    if (hi >= 0xD800 && hi <= 0xDBFF && i + 1 < s->length) {
+        uint16_t lo = s->units[i + 1];
+        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+            *width = 2;
+            return 0x10000u + (((uint32_t)(hi - 0xD800)) << 10) + (uint32_t)(lo - 0xDC00);
+        }
+    }
+    *width = 1;
+    return hi;
+}
+
+static void sb_codepoint(StrBuf *sb, uint32_t cp) {
+    if (cp > 0xFFFF) {
+        cp -= 0x10000;
+        sb_unit(sb, (uint16_t)(0xD800 + (cp >> 10)));
+        sb_unit(sb, (uint16_t)(0xDC00 + (cp & 0x3FF)));
+    } else {
+        sb_unit(sb, (uint16_t)cp);
+    }
+}
+
+/*
+ * Final_Sigma, the one context-dependent rule in the language-independent
+ * path: a capital sigma lowercases to `ς` when it ends a word and `σ` when it
+ * does not, so `'ΟΔΟΣ ΣΤΟ'` is `'οδος στο'`.
+ *
+ * "Ends a word" means preceded by a cased character and not followed by one,
+ * skipping case-ignorable characters (accents, apostrophes) on both sides.
+ */
+static bool final_sigma_at(const JsString *s, uint32_t index, uint32_t width) {
+    bool before = false;
+    for (uint32_t i = index; i > 0;) {
+        uint32_t w = 1;
+        /* Step back one character; a low surrogate means the pair started one
+         * unit earlier. */
+        uint16_t unit = s->units[i - 1];
+        uint32_t start = i - 1;
+        if (unit >= 0xDC00 && unit <= 0xDFFF && i >= 2 &&
+            s->units[i - 2] >= 0xD800 && s->units[i - 2] <= 0xDBFF) {
+            start = i - 2;
+        }
+        uint32_t cp = str_codepoint_at(s, start, &w);
+        i = start;
+        if (js_case_is_ignorable(cp)) continue;
+        before = js_case_is_cased(cp);
+        break;
+    }
+    if (!before) return false;
+
+    for (uint32_t i = index + width; i < s->length;) {
+        uint32_t w = 1;
+        uint32_t cp = str_codepoint_at(s, i, &w);
+        i += w;
+        if (js_case_is_ignorable(cp)) continue;
+        return !js_case_is_cased(cp);
+    }
+    return true;   /* nothing after it at all — still final */
+}
+
+static bool str_case_convert(JsContext *ctx, JsValue tv, JsValue *r, bool to_upper) {
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
     StrBuf sb;
     sb_init(&sb, ctx->vm);
-    for (uint32_t i = 0; i < s->length; i++) {
-        uint16_t c = s->units[i];
-        sb_unit(&sb, c >= 'a' && c <= 'z' ? c - 32 : c);
+    for (uint32_t i = 0; i < s->length;) {
+        uint32_t width = 1;
+        uint32_t cp = str_codepoint_at(s, i, &width);
+        bool final_sigma = !to_upper && cp == 0x03A3 && final_sigma_at(s, i, width);
+
+        uint32_t mapped[3];
+        int n = js_case_map(cp, to_upper, final_sigma, mapped);
+        for (int k = 0; k < n; k++) sb_codepoint(&sb, mapped[k]);
+        i += width;
     }
     *r = sb_finish(&sb);
     return !js_is_undefined(*r) || s->length == 0 ? true : oom(ctx, r);
 }
 
+static bool sm_toUpperCase(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args;
+    (void)argc;
+    return str_case_convert(ctx, tv, r, true);
+}
+
 static bool sm_toLowerCase(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)args;
     (void)argc;
-    JsString *s;
-    if (!str_this(ctx, tv, &s, r))
-        return false;
-    StrBuf sb;
-    sb_init(&sb, ctx->vm);
-    for (uint32_t i = 0; i < s->length; i++) {
-        uint16_t c = s->units[i];
-        sb_unit(&sb, c >= 'A' && c <= 'Z' ? c + 32 : c);
-    }
-    *r = sb_finish(&sb);
-    return !js_is_undefined(*r) || s->length == 0 ? true : oom(ctx, r);
+    return str_case_convert(ctx, tv, r, false);
 }
+
 
 static bool is_ws(uint16_t c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0x0B ||

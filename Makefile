@@ -49,6 +49,7 @@ RUNTIME_SRC := src/runtime/js_vm.c src/runtime/js_gc.c src/runtime/js_string.c \
                src/runtime/js_map.c src/runtime/js_object.c src/runtime/js_number.c \
                src/runtime/js_interp.c src/runtime/js_mathkernel.c \
                src/runtime/js_builtins.c src/runtime/js_promise.c \
+               src/runtime/js_case.c \
                src/runtime/js_module.c src/runtime/js_regexp.c \
                src/runtime/js_bytecode_read.c src/runtime/js_date.c \
                src/runtime/js_mapobj.c src/runtime/js_setobj.c \

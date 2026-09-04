@@ -35,18 +35,80 @@ static void *count_realloc(void *ud, void *ptr, size_t old_size, size_t new_size
 }
 
 /* Runs src, returns malloc'd ASCII of ToString(result); ok=false on error. */
+/*
+ * UTF-8 <-> UTF-16, because this harness used to do neither.
+ *
+ * Source went in a byte per code unit — so `'Ä'` reached the engine as two
+ * characters, U+00C3 and U+0084 — and results came back with every non-ASCII
+ * unit replaced by `?`. Between them, a test COULD NOT EXPRESS a non-ASCII
+ * expectation, which is how toLowerCase stayed ASCII-only without a failing
+ * test to say so. Fixing the harness is what let the bug be written down.
+ */
+static uint16_t *utf8_to_utf16(const char *s, size_t len, size_t *out_units) {
+    uint16_t *u = malloc((len + 1) * sizeof(uint16_t));
+    size_t n = 0;
+    for (size_t i = 0; i < len;) {
+        unsigned char a = (unsigned char)s[i];
+        uint32_t cp;
+        size_t width;
+        if (a < 0x80) { cp = a; width = 1; }
+        else if ((a & 0xE0) == 0xC0) { cp = a & 0x1F; width = 2; }
+        else if ((a & 0xF0) == 0xE0) { cp = a & 0x0F; width = 3; }
+        else if ((a & 0xF8) == 0xF0) { cp = a & 0x07; width = 4; }
+        else { cp = 0xFFFD; width = 1; }
+        if (i + width > len) { cp = 0xFFFD; width = 1; }
+        for (size_t k = 1; k < width; k++) cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3F);
+        i += width;
+        if (cp > 0xFFFF) {
+            cp -= 0x10000;
+            u[n++] = (uint16_t)(0xD800 + (cp >> 10));
+            u[n++] = (uint16_t)(0xDC00 + (cp & 0x3FF));
+        } else {
+            u[n++] = (uint16_t)cp;
+        }
+    }
+    *out_units = n;
+    return u;
+}
+
+static char *utf16_to_utf8(const uint16_t *u, size_t len) {
+    char *out = malloc(len * 4 + 1);
+    size_t o = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint32_t cp = u[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < len &&
+            u[i + 1] >= 0xDC00 && u[i + 1] <= 0xDFFF) {
+            cp = 0x10000u + ((cp - 0xD800) << 10) + (u[++i] - 0xDC00);
+        }
+        if (cp < 0x80) out[o++] = (char)cp;
+        else if (cp < 0x800) {
+            out[o++] = (char)(0xC0 | (cp >> 6));
+            out[o++] = (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out[o++] = (char)(0xE0 | (cp >> 12));
+            out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            out[o++] = (char)(0xF0 | (cp >> 18));
+            out[o++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    out[o] = 0;
+    return out;
+}
+
 static char *run(const char *src, bool stress, bool *ok) {
     CountAlloc ca = {0, 0};
     JsVmConfig cfg = {.realloc_fn = count_realloc, .alloc_ud = &ca, .gc_stress = stress};
     JsVm *vm = js_vm_new(&cfg);
     JsContext *ctx = js_context_new(vm);
-    size_t len = strlen(src);
-    uint16_t *u = malloc(len * sizeof(uint16_t));
-    for (size_t i = 0; i < len; i++)
-        u[i] = (uint16_t)(unsigned char)src[i];
+    size_t units = 0;
+    uint16_t *u = utf8_to_utf16(src, strlen(src), &units);
     const char *em;
     uint32_t ep;
-    JsValue fn = js_compile_module(ctx, u, len, &em, &ep);
+    JsValue fn = js_compile_module(ctx, u, units, &em, &ep);
     char *out;
     if (!js_is_function(fn)) {
         out = strdup(em ? em : "compile error");
@@ -61,10 +123,7 @@ static char *run(const char *src, bool stress, bool *ok) {
         JsValue s = js_to_string(ctx, res);
         size_t sl;
         const uint16_t *su = js_string_units(s, &sl);
-        out = malloc(sl + 1);
-        for (size_t i = 0; i < sl; i++)
-            out[i] = su && su[i] < 128 ? (char)su[i] : '?';
-        out[sl] = 0;
+        out = su ? utf16_to_utf8(su, sl) : strdup("");
     }
     free(u);
     js_vm_free(vm);
@@ -127,6 +186,38 @@ static void test_string(void) {
     eq("'hello'.substring(1, 3);", "el");
     eq("'Hello'.toUpperCase();", "HELLO");
     eq("'Hello'.toLowerCase();", "hello");
+
+    /*
+     * Case conversion is Unicode's, not ASCII's — these both used to add or
+     * subtract 32 over A-Z, which left every one of the following unchanged.
+     * Each answer here is what node prints for the same expression.
+     */
+    eq("'\xc3\x84\xc3\x96\xc3\x9c'.toLowerCase();", "\xc3\xa4\xc3\xb6\xc3\xbc");   /* ÄÖÜ -> äöü */
+    eq("'\xc3\xa4\xc3\xb6\xc3\xbc'.toUpperCase();", "\xc3\x84\xc3\x96\xc3\x9c");   /* äöü -> ÄÖÜ */
+    eq("'\xc5\x83'.toLowerCase();", "\xc5\x84");                    /* Ń  -> ń, Latin Extended-A */
+    eq("'\xe1\xb8\xaa'.toLowerCase();", "\xe1\xb8\xab");              /* Ḫ  -> ḫ, Latin Ext Additional */
+    eq("'\xd0\x94'.toLowerCase();", "\xd0\xb4");                    /* Д  -> д, Cyrillic */
+
+    /* Mappings that CHANGE LENGTH: one character becoming two. Unit-by-unit
+     * arithmetic cannot express these at all. */
+    eq("'\xc3\x9f'.toUpperCase();", "SS");                        /* ß -> SS */
+    eq("'stra\xc3\x9f" "e'.toUpperCase();", "STRASSE");
+    eq("'\xc4\xb0'.toLowerCase();", "i\xcc\x87");                    /* İ -> i + combining dot */
+
+    /* Final_Sigma: a capital sigma lowercases differently at the end of a word
+     * than inside one, which is the only context-dependent rule in the
+     * language-independent path. */
+    eq("'\xce\x91\xce\xa3'.toLowerCase();", "\xce\xb1\xcf\x82");            /* ΑΣ -> ας */
+    eq("'\xce\xa3\xce\x9f\xce\xa6\xce\x9f\xce\xa3'.toLowerCase();", "\xcf\x83\xce\xbf\xcf\x86\xce\xbf\xcf\x82");  /* ΣΟΦΟΣ -> σοφος */
+    eq("'\xce\x9f\xce\x94\xce\x9f\xce\xa3 \xce\xa3\xce\xa4\xce\x9f'.toLowerCase();",
+       "\xce\xbf\xce\xb4\xce\xbf\xcf\x82 \xcf\x83\xcf\x84\xce\xbf");                  /* ΟΔΟΣ ΣΤΟ -> οδος στο */
+
+    /* An astral character is TWO code units and one character. Mapping the
+     * units separately would map a surrogate; these have no case, so they must
+     * come back exactly as they went in. */
+    eq("'\xf0\x9d\x90\x80'.toLowerCase();", "\xf0\x9d\x90\x80");            /* 𝐀 */
+    eq("'\xf0\x92\x80\x80'.toUpperCase();", "\xf0\x92\x80\x80");            /* cuneiform */
+    eq("'a\xf0\x92\x80\x80" "B'.toLowerCase();", "a\xf0\x92\x80\x80" "b");
     eq("'  hi  '.trim();", "hi");
     eq("'  hi  '.trimStart() + '|';", "hi  |");
     eq("'ab'.repeat(3);", "ababab");
@@ -153,9 +244,10 @@ static void test_string(void) {
      * conversion function just calls it and returns the primitive. */
     eq("new String(42);", "42");
     eq("typeof new String('x');", "string");
-    /* the test harness maps input bytes to code units (no UTF-8 decode), so
-     * the two UTF-8 bytes of 'é' count as two units here. */
-    eq("'caf\xc3\xa9'.length;", "5");
+    /* A `.length` is UTF-16 code units, and `é` is one of them — the same
+     * answer node gives. This asserted 5 for years, because the harness fed
+     * source in a byte per unit, so `é` arrived as two characters. */
+    eq("'caf\xc3\xa9'.length;", "4");
     /* chaining */
     eq("'  Hello World  '.trim().toLowerCase().split(' ').join('-');", "hello-world");
 }
