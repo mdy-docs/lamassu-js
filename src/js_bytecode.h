@@ -273,7 +273,6 @@ double js_k_acos(double x);
 
 /* js_number.c */
 double  js_make_double(uint64_t mant, int exp10);
-size_t  js_dtoa(double d, char *buf /* >= 32 bytes */);
 double  js_units_to_number(const uint16_t *units, size_t len);
 int32_t js_to_int32(double d);
 uint32_t js_to_uint32(double d);

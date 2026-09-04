@@ -287,7 +287,18 @@ static size_t format_digits(char *buf, size_t n, uint64_t D, int ndigits, int e1
     return n;
 }
 
-size_t js_dtoa(double d, char *buf) {
+/*
+ * STATIC, and it matters beyond hygiene. An embedder that links lamassu beside
+ * another JavaScript engine hits a duplicate-symbol error otherwise: QuickJS
+ * exports a js_dtoa of its own, and ours was external for no reason — it is
+ * used here and nowhere else. Comparing the two archives' symbol tables, this
+ * was the ONLY name they had in common, so hiding it makes the two link
+ * cleanly with no pre-link step at all.
+ *
+ * The workaround it replaces was `ld -r -unexported_symbol`, which is ld64
+ * only. That made macOS the one platform an embedder could do this on.
+ */
+static size_t js_dtoa(double d, char *buf) {
     size_t n = 0;
     if (d != d)
         return put_ascii(buf, 0, "NaN");
