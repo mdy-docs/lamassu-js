@@ -940,6 +940,14 @@ bool js_object_set_ascii(JsContext *ctx, JsObject *obj, const char *key, JsValue
     return js_map_set(vm, &obj->props, ik, v);
 }
 
+void js_context_set_userdata(JsContext *ctx, void *ud) {
+    if (ctx) ctx->host_ud = ud;
+}
+
+void *js_context_userdata(JsContext *ctx) {
+    return ctx ? ctx->host_ud : NULL;
+}
+
 bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
                         JsNativeFn fn, void *userdata) {
     JsVm *vm = ctx->vm;

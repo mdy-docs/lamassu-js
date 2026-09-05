@@ -221,6 +221,8 @@ JsContext *js_context_new(JsVm *vm) {
     if (!ctx)
         return NULL;
     ctx->vm = vm;
+    /* The host's, and nobody sets it but the host. */
+    ctx->host_ud = NULL;
     ctx->string_methods = NULL;
     ctx->number_methods = NULL;
     ctx->promise_methods = NULL;

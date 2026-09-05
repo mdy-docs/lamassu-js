@@ -399,6 +399,9 @@ typedef bool (*JsModuleCompileFn)(JsContext *ctx, JsModule *m, const uint16_t *s
                                   size_t source_len, JsModError *err);
 
 struct JsContext {
+    /* The host's own pointer — see js_context_set_userdata. Never read,
+     * freed or copied by the engine. */
+    void *host_ud;
     JsVm *vm;
     JsContext *next;
     JsContext **prev_link;

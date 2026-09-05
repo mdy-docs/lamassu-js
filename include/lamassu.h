@@ -163,6 +163,19 @@ bool js_vm_interrupted(const JsVm *vm);
 JsContext *js_context_new(JsVm *vm);
 void       js_context_free(JsContext *ctx);
 JsValue    js_context_globals(JsContext *ctx);
+
+/*
+ * A pointer the host keeps on the context, and gets back inside a native.
+ *
+ * A native is called with the context and nothing else of the host's, so
+ * without this an embedding with more than one engine in a process has to
+ * reach for a static. `js_register_native` takes a `userdata` that is stored
+ * and never delivered; this is the thing that was wanted.
+ *
+ * The engine never reads it, never frees it, and never copies it.
+ */
+void   js_context_set_userdata(JsContext *ctx, void *ud);
+void  *js_context_userdata(JsContext *ctx);
 /* The VM a context belongs to. A native is handed only the context, but most of
  * the value and GC API is VM-scoped, so it needs this to use them. */
 JsVm      *js_context_vm(JsContext *ctx);
@@ -191,6 +204,22 @@ JsValue js_object_get(JsVm *vm, JsValue obj, JsValue key);          /* undefined
 bool    js_object_set(JsVm *vm, JsValue obj, JsValue key, JsValue value); /* false on OOM/bad args */
 bool    js_object_delete(JsVm *vm, JsValue obj, JsValue key);       /* true if a property was removed */
 size_t  js_object_size(JsValue obj);
+
+/*
+ * The nth own property NAME of an object, or undefined past the end.
+ *
+ * The order is the one guest code sees from Object.keys — so a host walking
+ * an object and a script walking the same object agree, which is what matters
+ * when both are looking at the same data.
+ *
+ * NOTE that order is the engine's hash order, not insertion order, and the
+ * language specifies insertion order for string keys. That is a conformance
+ * gap in this engine rather than a property of this function, and closing it
+ * means giving plain objects the ordered-entries-plus-index shape Map and Set
+ * already have (js_valindex.h). Until then, a host that needs a particular
+ * order has to impose it.
+ */
+JsValue js_object_key_at(JsValue obj, size_t index);
 
 /* ---- arrays ----
  *

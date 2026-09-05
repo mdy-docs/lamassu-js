@@ -146,6 +146,27 @@ size_t js_object_size(JsValue obj) {
     return js_is_object(obj) ? js_value_object(obj)->props.count : 0;
 }
 
+/*
+ * The nth own property name — the same walk the interpreter does for
+ * Object.keys, so a host and a script enumerating the same object see the
+ * same order. Live slots only: an empty one and a tombstone are skipped.
+ */
+JsValue js_object_key_at(JsValue obj, size_t index) {
+    if (!js_is_object(obj))
+        return js_undefined();
+    const JsMap *m = &js_value_object(obj)->props;
+    size_t seen = 0;
+    for (uint32_t i = 0; i < m->capacity; i++) {
+        JsString *k = m->entries[i].key;
+        if (!k || k == JS_MAP_TOMBSTONE)
+            continue;
+        if (seen == index)
+            return js_value_from_cell(&k->gc);
+        seen++;
+    }
+    return js_undefined();
+}
+
 /* ---- the host's view of an array ----
  *
  * An array's elements and its length live in `elems`/`elem_count`, not in the

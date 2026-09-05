@@ -239,8 +239,97 @@ static void test_gc(void) {
     js_vm_free(vm);
 }
 
+/* ---- enumerating an object's keys ------------------------------------------ */
+
+static void test_keys(void) {
+    JsVmConfig cfg = {0};
+    JsVm *vm = js_vm_new(&cfg);
+    JsContext *ctx = js_context_new(vm);
+
+    JsValue obj = eval(ctx, vm, "({ type: 'checkbox', checked: true, disabled: true })");
+    js_gc_protect(vm, &obj);
+    ok("an object reports its size", js_object_size(obj) == 3);
+
+    /*
+     * A host walking the object and a script walking it must agree — that is
+     * the guarantee, not any particular order. `Object.keys` is asked for the
+     * same thing and the two are compared.
+     */
+    JsValue globals = js_context_globals(ctx);
+    js_object_set(vm, globals, key(vm, "subject"), obj);
+    JsValue joined = eval(ctx, vm, "(Object.keys(subject).join(','))");
+    size_t ulen = 0;
+    const uint16_t *units = js_string_units(joined, &ulen);
+    char from_script[128] = {0};
+    for (size_t i = 0; i < ulen && i < sizeof from_script - 1; i++) from_script[i] = (char)units[i];
+
+    char from_host[128] = {0};
+    size_t n = 0;
+    for (size_t i = 0; i < js_object_size(obj); i++) {
+        JsValue k = js_object_key_at(obj, i);
+        size_t klen = 0;
+        const uint16_t *ku = js_string_units(k, &klen);
+        if (!ku) continue;
+        if (n) from_host[n++] = ',';
+        for (size_t j = 0; j < klen && n < sizeof from_host - 1; j++) from_host[n++] = (char)ku[j];
+    }
+    ok("the host and a script agree on the order", strcmp(from_host, from_script) == 0);
+    if (strcmp(from_host, from_script) != 0)
+        fprintf(stderr, "  host: %s\n  script: %s\n", from_host, from_script);
+
+    ok("every key is a string", js_is_string(js_object_key_at(obj, 0)));
+    ok("past the end is undefined", js_is_undefined(js_object_key_at(obj, 3)));
+    ok("a non-object has no keys", js_is_undefined(js_object_key_at(js_number(1), 0)));
+
+    /* Deleting leaves a tombstone the walk must skip. */
+    js_object_delete(vm, obj, key(vm, "checked"));
+    ok("a deleted key is gone from the walk", js_object_size(obj) == 2 &&
+       js_is_string(js_object_key_at(obj, 0)) && js_is_string(js_object_key_at(obj, 1)) &&
+       js_is_undefined(js_object_key_at(obj, 2)));
+
+    js_gc_unprotect(vm, &obj);
+    js_context_free(ctx);
+    js_vm_free(vm);
+}
+
+/* ---- the host's own pointer ------------------------------------------------ */
+
+static int marker = 41;
+
+static bool sees_userdata(JsContext *ctx, JsValue this_val, const JsValue *args,
+                          int argc, JsValue *result) {
+    (void)this_val; (void)args; (void)argc;
+    int *seen = js_context_userdata(ctx);
+    *result = js_number(seen ? *seen + 1 : -1);
+    return true;
+}
+
+static void test_userdata(void) {
+    JsVmConfig cfg = {0};
+    JsVm *vm = js_vm_new(&cfg);
+    JsContext *ctx = js_context_new(vm);
+
+    ok("a context starts with no host pointer", js_context_userdata(ctx) == NULL);
+    js_context_set_userdata(ctx, &marker);
+    ok("…and gives back what was put on it", js_context_userdata(ctx) == &marker);
+
+    size_t n = 0;
+    uint16_t *name = widen("__probe", &n);
+    js_register_native(ctx, name, n, sees_userdata, NULL);
+    free(name);
+
+    JsValue v = eval(ctx, vm, "(__probe())");
+    ok("a native reaches it through the context",
+       js_is_number(v) && js_get_number(v) == 42);
+
+    js_context_free(ctx);
+    js_vm_free(vm);
+}
+
 int main(void) {
     test_reading();
+    test_keys();
+    test_userdata();
     test_building();
     test_limits();
     test_gc();
