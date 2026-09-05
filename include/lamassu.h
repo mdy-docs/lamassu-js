@@ -192,6 +192,32 @@ bool    js_object_set(JsVm *vm, JsValue obj, JsValue key, JsValue value); /* fal
 bool    js_object_delete(JsVm *vm, JsValue obj, JsValue key);       /* true if a property was removed */
 size_t  js_object_size(JsValue obj);
 
+/* ---- arrays ----
+ *
+ * An array is an object to `js_is_object`, but its ELEMENTS are not properties
+ * and its `length` is not one either — both live outside the property map. So
+ * js_object_get and js_object_size cannot see them, and a host reaching for
+ * `length` on an array gets `undefined` rather than an error. These are how a
+ * host reads and builds one.
+ *
+ * They matter because structured data crossing the boundary is full of arrays:
+ * a template hands back its lines as an array of pairs, and a request carries
+ * lists of whatever the host is answering with. Without these a host can only
+ * exchange arrays by serialising them, which is what they exist to avoid.
+ *
+ * Like the object functions, these touch only the array's own storage — no
+ * [[Prototype]] walk, no `length` setter, no holes. Arrays here are dense.
+ */
+bool     js_is_array(JsValue v);
+JsValue  js_array_new(JsContext *ctx, uint32_t reserve);            /* undefined on OOM */
+uint32_t js_array_length(JsValue arr);                              /* 0 if not an array */
+JsValue  js_array_get(JsValue arr, uint32_t index);                 /* undefined past the end */
+/* Setting past the end fills the gap with undefined, as assigning to an index
+ * does in the interpreter; a gap wider than the engine's limit is refused
+ * rather than allowed to allocate without bound. */
+bool     js_array_set(JsVm *vm, JsValue arr, uint32_t index, JsValue value);
+bool     js_array_push(JsVm *vm, JsValue arr, JsValue value);
+
 /* ---- run ---- */
 
 /*

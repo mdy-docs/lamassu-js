@@ -145,3 +145,63 @@ bool js_object_delete(JsVm *vm, JsValue obj, JsValue key) {
 size_t js_object_size(JsValue obj) {
     return js_is_object(obj) ? js_value_object(obj)->props.count : 0;
 }
+
+/* ---- the host's view of an array ----
+ *
+ * An array's elements and its length live in `elems`/`elem_count`, not in the
+ * property map, so js_object_get and js_object_size are blind to both. These
+ * are the same storage the interpreter uses, reached the same way — no
+ * [[Prototype]] walk, no `length` setter, no holes.
+ */
+
+bool js_is_array(JsValue v) {
+    return js_is_object(v) && js_value_object(v)->obj_kind == JS_OBJ_ARRAY;
+}
+
+JsValue js_array_new(JsContext *ctx, uint32_t reserve) {
+    JsObject *o = js_array_new_cell(ctx, reserve);
+    return o ? js_value_from_cell(&o->gc) : js_undefined();
+}
+
+uint32_t js_array_length(JsValue arr) {
+    return js_is_array(arr) ? js_value_object(arr)->elem_count : 0;
+}
+
+JsValue js_array_get(JsValue arr, uint32_t index) {
+    if (!js_is_array(arr))
+        return js_undefined();
+    JsObject *o = js_value_object(arr);
+    return index < o->elem_count ? o->elems[index] : js_undefined();
+}
+
+bool js_array_set(JsVm *vm, JsValue arr, uint32_t index, JsValue value) {
+    if (!js_is_array(arr))
+        return false;
+    JsObject *o = js_value_object(arr);
+    /* Frozen and sealed mean the same here as they do for a property: a host
+     * that locked an array to keep guest code out must not be able to defeat
+     * its own guarantee by reaching past the property path. Sealed still
+     * allows writing an element that already exists. */
+    if (o->obj_flags & JS_OBJ_FROZEN)
+        return false;
+    if ((o->obj_flags & JS_OBJ_SEALED) && index >= o->elem_count)
+        return false;
+    /* The same ceiling the interpreter puts on an index-assignment gap: every
+     * slot up to `index` is materialized, so an unbounded index would be an
+     * unbounded allocation. */
+    if (index >= o->elem_count && index - o->elem_count >= JS_MAX_ARRAY_GAP)
+        return false;
+    js_gc_protect(vm, &value);      /* growth can collect */
+    bool ok = js_array_set_index(vm, o, index, value);
+    js_gc_unprotect(vm, &value);
+    return ok;
+}
+
+bool js_array_push(JsVm *vm, JsValue arr, JsValue value) {
+    if (!js_is_array(arr))
+        return false;
+    JsObject *o = js_value_object(arr);
+    if (o->obj_flags & (JS_OBJ_FROZEN | JS_OBJ_SEALED))
+        return false;
+    return js_array_append(vm, o, value);
+}
