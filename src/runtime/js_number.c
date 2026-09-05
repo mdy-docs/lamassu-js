@@ -6,6 +6,9 @@
  * are exact. Extreme magnitudes may be ~1 ulp off (TODO exact big-num
  * path); differential tests against Node will quantify this.
  */
+#include <stdio.h>
+#include <stdlib.h>
+
 #include "js_bytecode.h"
 
 /* 10^0..10^22 are exactly representable doubles. */
@@ -17,27 +20,37 @@ static const double js_pow10[] = {
 double js_make_double(uint64_t mant, int exp10) {
     if (mant == 0)
         return 0.0;
+
+    /*
+     * One rounding, so exactly right: a mantissa the format can hold and a
+     * power of ten that is itself exact.
+     */
     if (mant <= ((uint64_t)1 << 53)) {
         if (exp10 >= 0 && exp10 <= 22)
             return (double)mant * js_pow10[exp10];
         if (exp10 < 0 && exp10 >= -22)
             return (double)mant / js_pow10[-exp10];
     }
-    double d = (double)mant;
-    int e = exp10;
-    while (e > 22) {
-        d *= 1e22;
-        e -= 22;
-        if (d > 1.7e308)
-            return __builtin_inf();
-    }
-    while (e < -22) {
-        d /= 1e22;
-        e += 22;
-        if (d == 0.0)
-            return 0.0;
-    }
-    return e >= 0 ? d * js_pow10[e] : d / js_pow10[-e];
+
+    /*
+     * Otherwise the platform's decimal conversion, which is correctly rounded.
+     *
+     * Scaling by powers of ten rounds at EVERY step, and for a 17-digit
+     * mantissa — the exact shape of a coordinate written out in full, or of
+     * anything that has been through `%.17g` — the accumulated error reaches a
+     * whole ulp. The value is then a different double from the one every other
+     * engine produces for the same literal, and it prints differently: a page
+     * of computed positions disagreed with Node in the last digit, which is
+     * how this was found.
+     *
+     * Written as `<digits>e<exp>` with NO decimal point, so the locale's
+     * decimal separator cannot come into it.
+     */
+    char buf[32];
+    int n = snprintf(buf, sizeof buf, "%llue%d", (unsigned long long)mant, exp10);
+    if (n <= 0 || (size_t)n >= sizeof buf)
+        return __builtin_inf();     /* unreachable: 20 digits + "e" + 5 */
+    return strtod(buf, NULL);
 }
 
 int32_t js_to_int32(double d) {
@@ -203,43 +216,40 @@ static size_t put_u64(char *buf, size_t n, uint64_t v) {
  * digits (as u64 in [1e16, 1e17)) and the exponent e10 such that
  * d ~= digits * 10^(e10-16).
  */
+/*
+ * The 17 significant digits of `d`, correctly rounded, and its decimal
+ * exponent — `d == digits * 10^(e10 - 16)`.
+ *
+ * Taken from the platform's own conversion rather than computed by scaling.
+ * Multiplying a double by a power of ten rounds at every step, and for a
+ * value that needs all 17 digits the last one comes out wrong: the shortest
+ * search above then settles on a 17-digit string that round-trips but is not
+ * the one every other engine prints. A page of computed coordinates
+ * disagreeing with Node in the final digit is how this was found.
+ *
+ * `%.16e` is one digit before the point and sixteen after, so seventeen in
+ * all. The separator between them is whatever the locale uses, so the digits
+ * are picked out by being digits rather than by position.
+ */
 static void extract_digits(double d, uint64_t *digits, int *e10_out) {
-    /*
-     * Estimate the decimal exponent from the binary one, then scale with a
-     * single exact-power multiply/divide when |k| <= 22 (one rounding).
-     * The adjust loops fix estimate error (at most one step).
-     */
-    union { double dd; uint64_t u; } p;
-    p.dd = d;
-    int e2 = (int)((p.u >> 52) & 0x7FF) - 1023;
-    int e10 = (int)((double)e2 * 0.30102999566398119);
-    int k = 16 - e10;
-    double scaled = d;
-    while (k > 22) {
-        scaled *= 1e22;
-        k -= 22;
+    char tmp[48];
+    int n = snprintf(tmp, sizeof tmp, "%.16e", d);
+    if (n <= 0 || (size_t)n >= sizeof tmp) { *digits = 0; *e10_out = 0; return; }
+
+    uint64_t D = 0;
+    int seen = 0;
+    const char *p = tmp;
+    while (*p && *p != 'e' && *p != 'E') {
+        if (*p >= '0' && *p <= '9' && seen < 17) {
+            D = D * 10 + (uint64_t)(*p - '0');
+            seen++;
+        }
+        p++;
     }
-    while (k < -22) {
-        scaled /= 1e22;
-        k += 22;
-    }
-    if (k >= 0)
-        scaled *= js_pow10[k];
-    else
-        scaled /= js_pow10[-k];
-    while (scaled >= 1e17) {
-        scaled /= 10;
-        e10 += 1;
-    }
-    while (scaled < 1e16) {
-        scaled *= 10;
-        e10 -= 1;
-    }
-    uint64_t D = (uint64_t)(scaled + 0.5);
-    if (D >= UINT64_C(100000000000000000)) { /* rounded up to 1e17 */
-        D /= 10;
-        e10 += 1;
-    }
+    int e10 = (*p) ? (int)strtol(p + 1, NULL, 10) : 0;
+    /* Defensive: a libc that gave fewer digits than asked. */
+    while (seen < 17) { D *= 10; seen++; }
+
     *digits = D;
     *e10_out = e10;
 }
