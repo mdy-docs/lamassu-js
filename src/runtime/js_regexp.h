@@ -20,12 +20,19 @@
 #include "regexp.h"
 
 /*
- * Cap on live compiled patterns per VM. A Program is a large fixed-size
- * struct (~1.8 MB — see regexp.h), allocated through the VM allocator so
- * heap_limit accounting sees it; this cap is defense-in-depth on top for
- * hosts that run with an unlimited heap.
+ * Cap on live compiled patterns per VM. A Program is a 21 KB struct — the
+ * class table and group names are fixed arrays, the instructions are
+ * allocated to size (see regexp.h) — through the VM allocator, so heap_limit
+ * accounting sees all of it; this cap is defense-in-depth on top for hosts
+ * that run with an unlimited heap.
+ *
+ * It was 64, sized when a Program embedded its instruction array and ran to
+ * ~1.8 MB. That made 64 patterns 115 MB; it makes 4096 of today's 86 MB at
+ * the very worst, and a guest that holds that many is a grammar, not an
+ * attack — highlight.js keeps several hundred alive across its 37 languages,
+ * which is what raised it.
  */
-#define JS_REGEXP_MAX_LIVE 64
+#define JS_REGEXP_MAX_LIVE 4096
 
 /*
  * Per-match-call step budget handed to the engine
