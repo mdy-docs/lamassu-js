@@ -348,8 +348,11 @@ static void test_lifecycle(void) {
        "}"
        "n;",
        "600");
-    /* the live-pattern cap trips when they are all kept reachable */
-    err("const a = []; for (let i = 0; i < 70; i++) a.push(RegExp('x' + i)); 1;",
+    /* the live-pattern cap trips when they are all kept reachable — and it
+     * is a cap for a grammar's worth of patterns, not a handful: a few
+     * hundred live is what highlight.js keeps, and is fine */
+    eq("const a = []; for (let i = 0; i < 500; i++) a.push(RegExp('x' + i)); a.length;", "500");
+    err("const a = []; for (let i = 0; i < 4100; i++) a.push(RegExp('x' + i)); 1;",
         "RangeError: too many live regular expressions");
     /* a literal creates a fresh object per evaluation */
     eq("let last = null, diff = false;"

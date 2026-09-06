@@ -442,22 +442,37 @@ static bool graph_enqueue(JsContext *ctx, JsValue statev, JsModule *referrer,
         graph_fail(ctx, state, ascii_value(ctx, cerr));
         return true; /* op failed; not an OOM to propagate */
     }
+    /*
+     * The canonical specifier is a fresh cell held nowhere but here until
+     * the seen-set has it, and reading the seen-set allocates (its key is a
+     * cell too). A collection there swept it, and the loader was then handed
+     * a freed string's units — a use-after-free that surfaced as
+     * "unexpected character" from the lexer, on a build with enough live
+     * cells for the collector to run at that moment.
+     */
+    JsValue specv = js_value_from_cell(&spec->gc);
+    js_gc_protect(ctx->vm, &specv);
+    bool ok = true;
     JsValue seenv = mstate_get(ctx, state, "seen");
-    if (!js_is_object(seenv))
-        return false;
-    JsObject *seen = js_value_object(seenv);
-    bool found;
-    js_map_get(&seen->props, spec, &found);
-    if (found)
-        return true;
-    if (!js_map_set(ctx->vm, &seen->props, spec, js_number(1)))
-        return false;
-    double rem = js_to_number_value(ctx, mstate_get(ctx, state, "remaining"));
-    mstate_set(ctx, state, "remaining", js_number(rem + 1));
-    JsValue fp = fetch_module_async(ctx, referrer, spec);
-    if (!js_is_promise(fp))
-        return false;
-    return then_bound(ctx, fp, graph_on_fetched, graph_on_failed, statev);
+    if (!js_is_object(seenv)) {
+        ok = false;
+    } else {
+        JsObject *seen = js_value_object(seenv);
+        bool found;
+        js_map_get(&seen->props, spec, &found);
+        if (!found) {
+            if (!js_map_set(ctx->vm, &seen->props, spec, js_number(1))) {
+                ok = false;
+            } else {
+                double rem = js_to_number_value(ctx, mstate_get(ctx, state, "remaining"));
+                mstate_set(ctx, state, "remaining", js_number(rem + 1));
+                JsValue fp = fetch_module_async(ctx, referrer, spec);
+                ok = js_is_promise(fp) && then_bound(ctx, fp, graph_on_fetched, graph_on_failed, statev);
+            }
+        }
+    }
+    js_gc_unprotect(ctx->vm, &specv);
+    return ok;
 }
 
 /*
