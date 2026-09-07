@@ -331,10 +331,11 @@ roadmap:
 
 Tracked so differential testing against Node has a baseline.
 
-- **Object key order follows hash order, not insertion order.** Affects
-  `Object.keys/values/entries`, `for` over object props, and
-  `JSON.stringify` of objects. Resolved when shapes land (they store
-  properties in insertion order) — see "Property storage".
+- ~~**Object key order follows hash order, not insertion order.**~~ Resolved:
+  `JsMap` keeps a dense, insertion-ordered entry array with a hash index
+  beside it (js_map.c), so `Object.keys/values/entries`, `for` over object
+  props and `JSON.stringify` see string keys in the order they were added.
+  Shapes, when they land, will keep that order for free.
 - **Case mapping is ASCII only** (`toUpperCase`/`toLowerCase`); full Unicode
   case folding would need the UCD tables the regex engine ships.
 - **`Array.prototype.sort` is a stable O(n²) binary insertion sort** — fine

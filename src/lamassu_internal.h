@@ -52,18 +52,30 @@ typedef struct JsString {
 /*
  * Open-addressed map, interned-string keys (pointer identity), linear
  * probing with tombstones. used counts live + tombstoned slots.
+ * (See JsMap below for how the order of keys is kept.)
  */
 typedef struct JsMapEntry {
     JsString *key; /* NULL empty, JS_MAP_TOMBSTONE deleted */
     JsValue value;
 } JsMapEntry;
 
+/*
+ * Insertion-ordered: `entries` is a DENSE array in the order keys were first
+ * set, which is the order JavaScript enumerates string keys in and what
+ * every walk over `entries[0..capacity)` therefore sees; `index` is the hash
+ * table beside it, holding positions into `entries`. A deleted key leaves a
+ * tombstone in place, so positions stay valid until the next rebuild.
+ */
 typedef struct JsMap {
-    JsMapEntry *entries;
-    uint32_t count;
-    uint32_t used;
-    uint32_t capacity; /* power of two, or 0 */
+    JsMapEntry *entries; /* [0, used) written, in insertion order; NULL keys past that */
+    uint32_t *index;     /* hash slot -> entry position, or JS_MAP_EMPTY */
+    uint32_t count;      /* live entries */
+    uint32_t used;       /* entries written, tombstones included */
+    uint32_t capacity;   /* length of `entries`, or 0 */
+    uint32_t index_cap;  /* length of `index`: power of two, or 0 */
 } JsMap;
+
+#define JS_MAP_EMPTY UINT32_MAX
 
 #define JS_MAP_TOMBSTONE ((JsString *)(uintptr_t)1)
 

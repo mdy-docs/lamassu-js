@@ -159,8 +159,8 @@ static void run_session(bool stress) {
     /* builtins still resolve through the global fallback */
     expect(r, "Math.max(4, 9, 2);", "9");
     expect(r, "[1, 2, 3].map(sq).join(',');", "1,4,9");
-    /* object key order is hash order (documented deviation) */
-    expect(r, "JSON.stringify({ a: base, k: K });", "{\"k\":3,\"a\":200}");
+    /* object key order is insertion order, as the language specifies */
+    expect(r, "JSON.stringify({ a: base, k: K });", "{\"a\":200,\"k\":3}");
 
     /* destructuring declarations persist */
     expect(r, "const [p, q] = [1, 2]; const { m } = { m: 3 };", "undefined");
