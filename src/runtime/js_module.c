@@ -183,8 +183,9 @@ static JsValue mstate_get(JsContext *ctx, JsObject *st, const char *k) {
     return js_map_get(&st->props, ik, &found);
 }
 
-static void mstate_set(JsContext *ctx, JsObject *st, const char *k, JsValue v) {
-    js_object_set_ascii(ctx, st, k, v);
+/* False on OOM: the state object is then missing a field its reader needs. */
+static bool mstate_set(JsContext *ctx, JsObject *st, const char *k, JsValue v) {
+    return js_object_set_ascii(ctx, st, k, v);
 }
 
 /* Attaches C continuations to a promise; false on OOM (nothing attached). */
@@ -494,11 +495,11 @@ static JsValue load_graph(JsContext *ctx, JsString *root_spec) {
     bool ok = js_is_object(statev) && js_is_object(seenv) && op != NULL;
     if (ok) {
         JsObject *state = js_value_object(statev);
-        mstate_set(ctx, state, "remaining", js_number(0));
-        mstate_set(ctx, state, "promise", opv);
-        mstate_set(ctx, state, "root", rootv);
-        mstate_set(ctx, state, "seen", seenv);
-        if (!graph_enqueue(ctx, statev, NULL, root_spec))
+        bool set = mstate_set(ctx, state, "remaining", js_number(0)) &&
+                   mstate_set(ctx, state, "promise", opv) &&
+                   mstate_set(ctx, state, "root", rootv) &&
+                   mstate_set(ctx, state, "seen", seenv);
+        if (!set || !graph_enqueue(ctx, statev, NULL, root_spec))
             js_promise_reject(ctx, op, ascii_value(ctx, "out of memory"));
     }
     js_gc_unprotect(vm, &opv);
@@ -743,6 +744,8 @@ static bool eval_on_body_done(JsContext *ctx, JsValue bound, JsValue tv,
 static bool eval_step(JsContext *ctx, JsValue statev) {
     JsObject *state = js_value_object(statev);
     JsModule *m = value_module(mstate_get(ctx, state, "module"));
+    if (!m)
+        return false; /* a state whose module could not be recorded: OOM */
     uint32_t i = (uint32_t)js_to_number_value(ctx, mstate_get(ctx, state, "index"));
     for (; i < m->dep_count; i++) {
         JsModule *dep = m->deps[i];
@@ -827,10 +830,11 @@ static JsValue evaluate(JsContext *ctx, JsModule *m) {
     bool ok = js_is_object(statev) && ep != NULL;
     if (ok) {
         JsObject *state = js_value_object(statev);
-        mstate_set(ctx, state, "module", mv);
-        mstate_set(ctx, state, "index", js_number(0));
-        mstate_set(ctx, state, "promise", epv);
-        eval_step(ctx, statev);
+        ok = mstate_set(ctx, state, "module", mv) &&
+             mstate_set(ctx, state, "index", js_number(0)) &&
+             mstate_set(ctx, state, "promise", epv);
+        if (ok)
+            eval_step(ctx, statev);
     }
     js_gc_unprotect(vm, &epv);
     js_gc_unprotect(vm, &statev);
