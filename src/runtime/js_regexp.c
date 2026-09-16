@@ -78,6 +78,18 @@ typedef union {
     max_align_t align;
 } ReBlock;
 
+/*
+ * baru-re reports an allocation it could not make the same way it reports
+ * an exhausted step budget — through vm_context_budget_exhausted — and the
+ * two must not throw alike: a budget is the pattern's fault and a guest may
+ * catch it; no memory is the host's, and a guest that caught it as a
+ * pattern's would carry on with a wrong answer. The allocator below is
+ * ours, so it remembers that it refused, and re_run turns that into the
+ * message the throw sites use. Single-threaded, like the VM.
+ */
+static bool re_alloc_failed;
+static bool re_budget_was_oom;
+
 static void *re_vm_realloc(void *ud, void *ptr, size_t size) {
     JsVm *vm = ud;
     ReBlock *h = ptr ? (ReBlock *)ptr - 1 : NULL;
@@ -86,12 +98,16 @@ static void *re_vm_realloc(void *ud, void *ptr, size_t size) {
         js_realloc_raw(vm, h, old, 0);
         return NULL;
     }
-    if (size > SIZE_MAX - sizeof(ReBlock))
+    if (size > SIZE_MAX - sizeof(ReBlock)) {
+        re_alloc_failed = true;
         return NULL;
+    }
     size_t charged = size + sizeof(ReBlock);
     ReBlock *nh = js_realloc_raw(vm, h, old, charged);
-    if (!nh)
+    if (!nh) {
+        re_alloc_failed = true;
         return NULL; /* the old block, and its header, are untouched */
+    }
     nh->charged = charged;
     return nh + 1;
 }
@@ -358,6 +374,13 @@ static uint32_t advance_index(const JsString *s, uint32_t i, bool uni) {
 static const char *const re_budget_msg =
     "RangeError: regular expression step budget exhausted";
 
+/* What a RE_RUN_BUDGET throws: the budget, or the out-of-memory it stood for. */
+static bool re_budget_throw(JsContext *ctx, JsValue *r) {
+    bool oom = re_budget_was_oom;
+    re_budget_was_oom = false;
+    return oom ? re_oom(ctx, r) : re_throw(ctx, r, re_budget_msg);
+}
+
 /*
  * Runs the compiled pattern against s. anchored=true tries only at `start`
  * (split's forced-sticky semantics); otherwise sticky patterns anchor
@@ -378,9 +401,12 @@ static int re_run(JsRegExp *re, const JsString *s, uint32_t start, bool anchored
     VMContext *vctx = re->vctx;
     if (!vctx) {
         vctx = vm_context_new(prog);
-        if (!vctx)
+        if (!vctx) {
+            re_alloc_failed = false;
+            re_budget_was_oom = true;
             return RE_RUN_BUDGET; /* OOM: the match was never evaluated, so it
                                    * must throw, not report a bogus non-match */
+        }
         re->vctx = vctx;
     }
     vm_context_set_step_budget(vctx, JS_REGEXP_STEP_BASE +
@@ -397,6 +423,9 @@ static int re_run(JsRegExp *re, const JsString *s, uint32_t start, bool anchored
         }
     }
     bool exhausted = vm_context_budget_exhausted(vctx);
+    if (exhausted)
+        re_budget_was_oom = re_alloc_failed;
+    re_alloc_failed = false;
     if (exhausted) {
         /* Exhaustion also reports a match-time OOM, which can leave a depth
          * level half-initialised; baru-re's contract is that such a context
@@ -661,7 +690,7 @@ static bool rexp_exec(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     int rc = exec_protocol(re, s, caps);
     if (rc == RE_RUN_BUDGET) {
         js_gc_unprotect(ctx->vm, &sv);
-        return re_throw(ctx, r, re_budget_msg);
+        return re_budget_throw(ctx, r);
     }
     if (rc == RE_RUN_NOMATCH)
         *r = js_null();
@@ -688,7 +717,7 @@ static bool rexp_test(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     int rc = exec_protocol(re, s, caps);
     js_gc_unprotect(ctx->vm, &sv);
     if (rc == RE_RUN_BUDGET)
-        return re_throw(ctx, r, re_budget_msg);
+        return re_budget_throw(ctx, r);
     *r = js_bool(rc == RE_RUN_MATCH);
     return true;
 }
@@ -858,7 +887,7 @@ bool js_re_str_match(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     js_gc_unprotect(vm, &rev);
     js_gc_unprotect(vm, &sv);
     if (budget)
-        return re_throw(ctx, r, re_budget_msg);
+        return re_budget_throw(ctx, r);
     return ok ? true : re_oom(ctx, r);
 }
 
@@ -905,7 +934,7 @@ bool js_re_str_matchAll(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     js_gc_unprotect(vm, &rev);
     js_gc_unprotect(vm, &sv);
     if (budget)
-        return re_throw(ctx, r, re_budget_msg);
+        return re_budget_throw(ctx, r);
     return ok ? true : re_oom(ctx, r);
 }
 
@@ -930,7 +959,7 @@ bool js_re_str_search(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     js_gc_unprotect(vm, &rev);
     js_gc_unprotect(vm, &sv);
     if (rc == RE_RUN_BUDGET)
-        return re_throw(ctx, r, re_budget_msg);
+        return re_budget_throw(ctx, r);
     *r = js_number(rc == RE_RUN_MATCH ? (double)caps[0] : -1.0);
     return true;
 }
@@ -1196,7 +1225,7 @@ bool js_re_str_replace(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     if (thrown)
         return false;
     if (budget)
-        return re_throw(ctx, r, re_budget_msg);
+        return re_budget_throw(ctx, r);
     return ok ? true : re_oom(ctx, r);
 }
 
@@ -1264,7 +1293,7 @@ bool js_re_str_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     js_gc_unprotect(vm, &arrv);
     js_gc_unprotect(vm, &sv);
     if (budget)
-        return re_throw(ctx, r, re_budget_msg);
+        return re_budget_throw(ctx, r);
     if (!ok)
         return re_oom(ctx, r);
     *r = arrv;
