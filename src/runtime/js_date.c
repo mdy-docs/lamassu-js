@@ -28,11 +28,26 @@ static bool is_finite_num(double d) {
 
 /* ---- wall clock ---- */
 
-#include <sys/time.h>
+/*
+ * timespec_get is C11, not POSIX, and that is the point: gettimeofday needs
+ * <sys/time.h>, which Windows does not have. This was the engine's LAST
+ * POSIX-only dependency -- everything else here is plain C -- so replacing it
+ * is what lets the runtime compile for a Windows target at all. It is also
+ * what every other target already wanted: glibc, macOS, wasi-sdk and
+ * emscripten all implement it.
+ *
+ * TIME_UTC is the only base C11 requires, and a conforming implementation can
+ * still fail: the return is checked rather than assumed, because a clock that
+ * did not answer should read as the epoch rather than as whatever was on the
+ * stack. gettimeofday's return was never checked here, so this is also a
+ * uninitialized-read fixed in passing.
+ */
+#include <time.h>
 static double host_now_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+    struct timespec ts;
+    if (timespec_get(&ts, TIME_UTC) != TIME_UTC)
+        return 0.0;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
 }
 
 /* ---- integer floor div/mod (well-defined for negative operands) ---- */

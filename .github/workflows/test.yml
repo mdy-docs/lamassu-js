@@ -30,8 +30,15 @@ permissions:
   contents: read
 
 jobs:
+  # Linux and macOS: the same commands a developer types, on both system
+  # compilers (gcc on ubuntu, apple clang on macos). Both can link a sanitizer,
+  # so both run the full `test` -- plain AND ASan/UBSan.
   native:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout (with submodules)
         uses: actions/checkout@v4
@@ -51,6 +58,94 @@ jobs:
       - name: Build the CLI and run benchmarks
         run: make bench
 
+  # Windows, via mingw-w64 under MSYS2.
+  #
+  # MSVC IS NOT AN OPTION and this is not a preference: the engine uses
+  # __builtin_inf/nan/floor/trunc/sqrt in ~96 places, and cl.exe has none of
+  # them. mingw's gcc is the same compiler family the other targets already
+  # build with, so Windows costs a toolchain here rather than a second dialect
+  # of the source.
+  #
+  # It runs `test-plain`, not `test`: mingw ships no libasan, so the sanitized
+  # half cannot be linked at all. Windows therefore proves the suites RUN, and
+  # Linux/macOS remain the targets that prove they run clean.
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSYS2 + mingw-w64 (UCRT)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          # UCRT rather than the old msvcrt: it is the runtime that implements
+          # C99 printf, so %zu in the sources means what it says.
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+
+      # STD=-std=gnu11: see the comment on STD in the Makefile. mingw hides
+      # strdup -- which the test harnesses use -- behind __STRICT_ANSI__.
+      - name: Build and run the test suites
+        run: make STD=-std=gnu11 test-plain
+
+      - name: Check the runtime links with no frontend
+        run: make STD=-std=gnu11 check-runtime-only
+
+      - name: Build the CLI and run benchmarks
+        run: make STD=-std=gnu11 bench
+
+  # The OTHER wasm: emscripten, which is the build the npm package ships and
+  # the playground on the Pages site loads. `wasm` above proves the engine runs
+  # on wasm32-wasip2 under wasmtime; it says nothing about this artifact, which
+  # is a different toolchain, a different libc and a different embedding
+  # (src/wasm_api.c and its Asyncify __hostcall).
+  #
+  # It was previously built only by pages.yml on a push to main and by
+  # npm-publish on a release -- so the first thing to discover a broken web
+  # build was a deploy or a publish. Building and RUNNING it here moves that to
+  # the pull request.
+  wasm-web:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+          actions-cache-folder: emsdk-cache
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build the package artifact (packages/lamassu-js/dist)
+        run: make pkg
+
+      # Instantiates the module and evaluates, including a host call that
+      # suspends -- a .wasm that builds but cannot be driven is the failure
+      # this catches.
+      - name: The artifact loads and evaluates
+        run: node .github/scripts/smoke.mjs
+
+      # The stronger one: the sandbox limits. Each hostile case here hangs
+      # forever if fuel and the heap cap are not actually applied, which is the
+      # property the playground page depends on being true.
+      - name: The sandbox limits hold
+        working-directory: packages/lamassu-js
+        run: node smoke.mjs
+
   wasm:
     runs-on: ubuntu-latest
     steps:
@@ -66,7 +161,17 @@ jobs:
         run: ./tools/get-wasi-sdk.sh --dir /opt/wasi-sdk
 
       - name: Install wasmtime (pinned)
-        run: ./tools/get-wasmtime.sh --dir /opt/wasmtime
+        run: |
+          ./tools/get-wasmtime.sh --dir /opt/wasmtime
+          # The Makefile finds /opt/wasmtime/wasmtime by itself (see WASMTIME),
+          # which is why every `make ...-wasi` step here works. The end-to-end
+          # steps at the bottom of this job do NOT go through make -- they run
+          # `wasmtime` from the shell, where nothing put it on PATH. That is
+          # why the server e2e has been exiting 127, "command not found",
+          # rather than running, on every push since it was added. Putting the
+          # directory on PATH makes the bare name work for the whole job, which
+          # is what those steps already assumed.
+          echo /opt/wasmtime >> "$GITHUB_PATH"
 
       - name: Build the CLI as a wasip2 component
         run: make wasi
