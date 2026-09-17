@@ -29,24 +29,37 @@ static bool is_finite_num(double d) {
 /* ---- wall clock ---- */
 
 /*
- * timespec_get is C11, not POSIX, and that is the point: gettimeofday needs
- * <sys/time.h>, which Windows does not have. This was the engine's LAST
- * POSIX-only dependency -- everything else here is plain C -- so replacing it
- * is what lets the runtime compile for a Windows target at all. It is also
- * what every other target already wanted: glibc, macOS, wasi-sdk and
- * emscripten all implement it.
+ * The wall clock, and the engine's ONLY call into an operating system.
  *
- * TIME_UTC is the only base C11 requires, and a conforming implementation can
- * still fail: the return is checked rather than assumed, because a clock that
- * did not answer should read as the epoch rather than as whatever was on the
- * stack. gettimeofday's return was never checked here, so this is also a
- * uninitialized-read fixed in passing.
+ * This is the one #if in the runtime, and it is here because no single spelling
+ * of "what time is it" is available everywhere the engine builds:
+ *
+ *   - gettimeofday needs <sys/time.h>, which Windows does not have.
+ *   - timespec_get is C11 and Windows has it -- but Apple only introduced it in
+ *     macOS 10.15, so it is a hard error under -Werror for any embedder that
+ *     targets older. That is not hypothetical: lamassu-web compiles the engine
+ *     with -mmacosx-version-min set from rustc's deployment target, which is
+ *     10.12, and an engine that cannot be embedded is not portable.
+ *   - clock_gettime is POSIX 2008 and goes back to macOS 10.12; wasi-libc and
+ *     emscripten both implement it. It is missing on exactly one target.
+ *
+ * So: clock_gettime everywhere, timespec_get on Windows. Both fill the same
+ * struct timespec, so the arithmetic below is shared.
+ *
+ * The return is checked in both branches, which gettimeofday's never was: a
+ * clock that did not answer reads as the epoch rather than as whatever was on
+ * the stack. An uninitialized read fixed in passing.
  */
 #include <time.h>
 static double host_now_ms(void) {
     struct timespec ts;
+#if defined(_WIN32)
     if (timespec_get(&ts, TIME_UTC) != TIME_UTC)
         return 0.0;
+#else
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+        return 0.0;
+#endif
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
 }
 
