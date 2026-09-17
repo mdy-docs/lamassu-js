@@ -37,9 +37,10 @@ CC ?= cc
 AR ?= ar
 
 # -D_POSIX_C_SOURCE: -std=c11 makes glibc hide POSIX declarations (strdup in
-# the test harnesses); macOS exposes them regardless. js_date.c used to need it
-# too, for gettimeofday -- it is C11 timespec_get now, which is why there is a
-# Windows target at all.
+# the test harnesses, clock_gettime in js_date.c); macOS exposes them
+# regardless. js_date.c used to call gettimeofday, which needs <sys/time.h> and
+# so had no Windows build at all; it is clock_gettime now, with timespec_get on
+# Windows alone. See the comment on host_now_ms for why it is not one call.
 #
 # STD is a variable for exactly one target: mingw hides strdup behind
 # __STRICT_ANSI__, which -std=c11 defines and _POSIX_C_SOURCE does not undo, so
@@ -210,7 +211,7 @@ bench: build/lamassu
 
 # ---- WASI: the same C, built for wasm32-wasip2, run under wasmtime --------
 #
-# Not a port. The core's entire OS surface is timespec_get (js_date.c), which
+# Not a port. The core's entire OS surface is clock_gettime (js_date.c), which
 # wasi-libc maps to clock_time_get; everything else is stdio and malloc from
 # tools/lamassu.c. No #ifdef, no shim, no source shared with wasm_api.c — that
 # file is the *emscripten* embedding, and its Asyncify __hostcall has no place
