@@ -36,9 +36,17 @@
 CC ?= cc
 AR ?= ar
 
-# -D_POSIX_C_SOURCE: -std=c11 makes glibc hide POSIX declarations (strdup
-# in the tests, gettimeofday in js_date.c); macOS exposes them regardless.
-WARNINGS = -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Wshadow -Wvla
+# -D_POSIX_C_SOURCE: -std=c11 makes glibc hide POSIX declarations (strdup in
+# the test harnesses); macOS exposes them regardless. js_date.c used to need it
+# too, for gettimeofday -- it is C11 timespec_get now, which is why there is a
+# Windows target at all.
+#
+# STD is a variable for exactly one target: mingw hides strdup behind
+# __STRICT_ANSI__, which -std=c11 defines and _POSIX_C_SOURCE does not undo, so
+# the Windows job passes STD=-std=gnu11. That widens what the TEST files may
+# call; the engine sources are strict C11 everywhere and no target changes them.
+STD ?= -std=c11
+WARNINGS = $(STD) -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Wshadow -Wvla
 CFLAGS  ?= -O2 -g
 # The math kernel is freestanding, but a few builtins (fmod, sqrt/hypot)
 # use compiler-native ops that gcc lowers to libm calls on Linux; macOS
@@ -75,7 +83,7 @@ ASAN := -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
 # engine's own build permits — the engine keeps every other strict flag,
 # lamassu code keeps -Wvla.
 RE_INC  := -Ithird_party/baru-re/include
-RE_WARN := -std=c11 -Wall -Wextra -Werror -Wshadow
+RE_WARN := $(STD) -Wall -Wextra -Werror -Wshadow
 RE_SRC  := third_party/baru-re/src/re_lexer.c third_party/baru-re/src/re_parser.c \
            third_party/baru-re/src/re_compiler.c third_party/baru-re/src/re_vm.c
 RE_HDR  := third_party/baru-re/include/regexp.h third_party/baru-re/include/ucd.h
@@ -159,6 +167,15 @@ build/%_asan: test/%.c $(FRONTEND_LIB_A) $(RUNTIME_LIB_A)
 test: $(TESTS) $(TESTS_ASAN)
 	@for t in $(TESTS) $(TESTS_ASAN); do echo "-- $$t"; ./$$t || exit 1; done
 
+# The same suites without the sanitized pair, for a toolchain that has no
+# sanitizer to link: mingw ships no libasan, so the Windows job runs this.
+# It is strictly weaker -- it proves the suites RUN on that target, not that
+# they run clean -- so nothing that can build `test` should use it. Linux and
+# macOS both can, and do.
+.PHONY: test-plain
+test-plain: $(TESTS)
+	@for t in $(TESTS); do echo "-- $$t"; ./$$t || exit 1; done
+
 # ---- the lamassu CLI: compile + run a .js file ---------------------------
 .PHONY: cli
 cli: build/lamassu
@@ -193,7 +210,7 @@ bench: build/lamassu
 
 # ---- WASI: the same C, built for wasm32-wasip2, run under wasmtime --------
 #
-# Not a port. The core's entire OS surface is gettimeofday (js_date.c), which
+# Not a port. The core's entire OS surface is timespec_get (js_date.c), which
 # wasi-libc maps to clock_time_get; everything else is stdio and malloc from
 # tools/lamassu.c. No #ifdef, no shim, no source shared with wasm_api.c — that
 # file is the *emscripten* embedding, and its Asyncify __hostcall has no place

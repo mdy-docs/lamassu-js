@@ -52,6 +52,15 @@ jobs:
       - name: Build the WebAssembly package (packages/lamassu-js/dist)
         run: make pkg
 
+      # Before building a site around it: the artifact instantiates, evaluates,
+      # and enforces its sandbox limits. The playground page is a REPL open to
+      # whatever a visitor types, so shipping an engine whose fuel cap does not
+      # actually bite is the failure that matters here.
+      - name: The engine the site will ship actually runs
+        run: |
+          node .github/scripts/smoke.mjs
+          node packages/lamassu-js/smoke.mjs
+
       - name: Install workspace dependencies
         run: npm ci
 
@@ -69,6 +78,23 @@ jobs:
           test -f docs-site/dist/guide/index.html
           test -f docs-site/dist/api/index.html
           ls docs-site/dist/assets/*.wasm
+
+      # THAT THE FILE EXISTS IS NOT THE CLAIM. Vite emits the .wasm because
+      # something imported it, but an emitted asset nothing links to still
+      # ships a playground that loads nothing -- the `ls` above passes in
+      # exactly the case its own comment is worried about. So: find the hashed
+      # asset, then prove some built script actually references that name.
+      - name: The published page really loads the wasm engine
+        run: |
+          set -euo pipefail
+          wasm=$(basename docs-site/dist/assets/*.wasm)
+          echo "emitted engine: $wasm"
+          # Size guard: a stub or a truncated copy is not the engine.
+          bytes=$(wc -c < "docs-site/dist/assets/$wasm")
+          test "$bytes" -gt 500000 || { echo "engine is only $bytes bytes"; exit 1; }
+          refs=$(grep -rl --include='*.js' -F "$wasm" docs-site/dist || true)
+          test -n "$refs" || { echo "nothing in the site references $wasm"; exit 1; }
+          echo "referenced by:"; echo "$refs"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
