@@ -161,7 +161,17 @@ jobs:
         run: ./tools/get-wasi-sdk.sh --dir /opt/wasi-sdk
 
       - name: Install wasmtime (pinned)
-        run: ./tools/get-wasmtime.sh --dir /opt/wasmtime
+        run: |
+          ./tools/get-wasmtime.sh --dir /opt/wasmtime
+          # The Makefile finds /opt/wasmtime/wasmtime by itself (see WASMTIME),
+          # which is why every `make ...-wasi` step here works. The end-to-end
+          # steps at the bottom of this job do NOT go through make -- they run
+          # `wasmtime` from the shell, where nothing put it on PATH. That is
+          # why the server e2e has been exiting 127, "command not found",
+          # rather than running, on every push since it was added. Putting the
+          # directory on PATH makes the bare name work for the whole job, which
+          # is what those steps already assumed.
+          echo /opt/wasmtime >> "$GITHUB_PATH"
 
       - name: Build the CLI as a wasip2 component
         run: make wasi
