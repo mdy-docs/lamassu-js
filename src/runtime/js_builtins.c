@@ -1473,17 +1473,6 @@ static bool nm_toString(JsContext *ctx, JsValue tv, const JsValue *args, int arg
 
 static double m_abs(double x) { return x < 0 ? -x : x; }
 static double m_sign(double x) { return x != x ? x : (x > 0 ? 1 : (x < 0 ? -1 : x)); }
-static double m_cbrt(double x) {
-    if (x == 0.0 || x != x || x == __builtin_inf() || x == -__builtin_inf())
-        return x;
-    double a = x < 0 ? -x : x;
-    double y = js_k_pow(a, 1.0 / 3);
-    /* two Newton steps nail perfect cubes to full precision */
-    y = y - (y * y * y - a) / (3.0 * y * y);
-    y = y - (y * y * y - a) / (3.0 * y * y);
-    return x < 0 ? -y : y;
-}
-
 static bool math_min(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     double best = __builtin_inf();
@@ -2793,7 +2782,7 @@ MATH1(math_ceil, __builtin_ceil)
 MATH1(math_trunc, __builtin_trunc)
 MATH1(math_sign, m_sign)
 MATH1(math_sqrt, __builtin_sqrt)
-MATH1(math_cbrt, m_cbrt)
+MATH1(math_cbrt, js_k_cbrt)
 MATH1(math_exp, js_k_exp)
 MATH1(math_log, js_k_log)
 MATH1(math_sin, js_k_sin)
@@ -2802,6 +2791,8 @@ MATH1(math_tan, js_k_tan)
 MATH1(math_asin, js_k_asin)
 MATH1(math_acos, js_k_acos)
 MATH1(math_atan, js_k_atan)
+MATH1(math_log2, js_k_log2)
+MATH1(math_log10, js_k_log10)
 #undef MATH1
 
 static bool math_round(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
@@ -2825,17 +2816,6 @@ static bool math_round(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     return true;
 }
 
-static bool math_log2(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    (void)tv; (void)argc;
-    *r = js_number(js_k_log(js_to_number_value(ctx, ARG(0))) / 0.69314718055994530942);
-    return true;
-}
-
-static bool math_log10(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    (void)tv; (void)argc;
-    *r = js_number(js_k_log(js_to_number_value(ctx, ARG(0))) / 2.30258509299404568402);
-    return true;
-}
 
 static bool def_num(JsContext *ctx, JsObject *o, const char *k, double v) {
     return js_object_set_ascii(ctx, o, k, js_number(v));

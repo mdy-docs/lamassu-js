@@ -270,6 +270,9 @@ double js_k_atan(double x);
 double js_k_atan2(double y, double x);
 double js_k_asin(double x);
 double js_k_acos(double x);
+double js_k_cbrt(double x);
+double js_k_log2(double x);
+double js_k_log10(double x);
 
 /* js_case.c — Unicode case conversion, over baru-re's UCD tables. `out` holds
  * three code points; the return is how many were written. `final_sigma` is

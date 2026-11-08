@@ -87,9 +87,9 @@ boxed `String` object — this engine has no boxed-primitive type at all).
 - **`Number.prototype`**: `toFixed`, `toString`, `valueOf`.
 
 `toString()`/number-to-string formatting is exact for safe integers and for
-magnitudes within ~1e±22; transcendental `Math` functions are ~1e-12
-accurate rather than correctly rounded (a custom freestanding kernel, no
-libm) — `sqrt`/`floor`/`ceil`/`trunc`/`round` are exact native ops.
+magnitudes within ~1e±22; transcendental `Math` functions are fdlibm-accurate
+(< 1 ulp, musl's fdlibm-derived kernel in `src/runtime/fdlibm/`, no libm) rather
+than correctly rounded — `sqrt`/`floor`/`ceil`/`trunc`/`round` are exact native ops.
 
 ## `Boolean`
 

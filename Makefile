@@ -48,6 +48,10 @@ AR ?= ar
 # call; the engine sources are strict C11 everywhere and no target changes them.
 STD ?= -std=c11
 WARNINGS = $(STD) -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Wshadow -Wvla
+# No fused multiply-add: clang contracts a*b+c into one rounding by default on
+# arm64, which moves the fdlibm results by an ulp against V8, musl and wasm
+# (which has no FMA). Same bits on every host is the point of that kernel.
+WARNINGS += -ffp-contract=off
 CFLAGS  ?= -O2 -g
 # The math kernel is freestanding, but a few builtins (fmod, sqrt/hypot)
 # use compiler-native ops that gcc lowers to libm calls on Linux; macOS
@@ -56,13 +60,17 @@ LIBS = -lm
 
 RUNTIME_SRC := src/runtime/js_vm.c src/runtime/js_gc.c src/runtime/js_string.c \
                src/runtime/js_map.c src/runtime/js_object.c src/runtime/js_number.c \
-               src/runtime/js_interp.c src/runtime/js_mathkernel.c \
+               src/runtime/js_interp.c \
                src/runtime/js_builtins.c src/runtime/js_promise.c \
                src/runtime/js_case.c \
                src/runtime/js_module.c src/runtime/js_regexp.c \
                src/runtime/js_bytecode_read.c src/runtime/js_date.c \
                src/runtime/js_mapobj.c src/runtime/js_setobj.c \
-               src/runtime/js_error.c
+               src/runtime/js_error.c \
+               src/runtime/fdlibm/scalbn.c src/runtime/fdlibm/rem_pio2_large.c src/runtime/fdlibm/rem_pio2.c \
+               src/runtime/fdlibm/k_sin.c src/runtime/fdlibm/k_cos.c src/runtime/fdlibm/k_tan.c src/runtime/fdlibm/sin.c src/runtime/fdlibm/cos.c src/runtime/fdlibm/tan.c src/runtime/fdlibm/atan.c \
+               src/runtime/fdlibm/atan2.c src/runtime/fdlibm/asin.c src/runtime/fdlibm/acos.c src/runtime/fdlibm/exp.c src/runtime/fdlibm/log.c src/runtime/fdlibm/pow.c \
+               src/runtime/fdlibm/log2.c src/runtime/fdlibm/log10.c src/runtime/fdlibm/cbrt.c
 
 # js_arena.c is here and not in the runtime because the arena's only users are
 # the parser and the two compile entry points — the runtime never allocates one.
@@ -74,7 +82,8 @@ FRONTEND_SRC := src/frontend/js_lexer.c src/frontend/js_parser.c \
 HDR := include/lamassu.h include/lamassu_compile.h src/lamassu_internal.h \
        src/js_bytecode.h src/js_bcformat.h src/js_valindex.h \
        src/frontend/js_syntax.h src/runtime/js_regexp.h src/runtime/js_date.h \
-       src/runtime/js_mapobj.h src/runtime/js_setobj.h src/runtime/js_error.h
+       src/runtime/js_mapobj.h src/runtime/js_setobj.h src/runtime/js_error.h \
+       src/runtime/fdlibm/libm.h
 INC := -Iinclude -Isrc -Isrc/runtime -Isrc/frontend
 
 ASAN := -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer

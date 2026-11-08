@@ -51,8 +51,11 @@ that's known to differ, so you're not surprised by one in production.
 
 ## Numbers
 
-- **Transcendental `Math` functions are ~1e-12 accurate**, not correctly
-  rounded — a custom freestanding kernel, no libm.
+- **Transcendental `Math` functions are fdlibm-accurate (< 1 ulp), not
+  correctly rounded.** The kernel is musl's fdlibm-derived code (`src/runtime/
+  fdlibm/`), built without fused multiply-add so native and wasm give the same
+  bits. V8 now uses LLVM libc's correctly-rounded functions, so about 2% of
+  results differ from Node by one ulp; the rest are identical.
   `sqrt`/`floor`/`ceil`/`trunc`/`round` are exact (native ops).
 - **Number-to-string formatting is exact for safe integers and for
   magnitudes within ~1e±22**; extreme magnitudes may differ from Node in
