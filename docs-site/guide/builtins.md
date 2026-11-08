@@ -102,7 +102,7 @@ numbers).
 Constants: `PI`, `E`, `LN2`, `LN10`, `LOG2E`, `LOG10E`, `SQRT2`,
 `SQRT1_2`. Functions: `abs`, `floor`, `ceil`, `trunc`, `sign`, `sqrt`,
 `cbrt`, `exp`, `log`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`,
-`pow`, `min`, `max`, `hypot`, `random`.
+`pow`, `min`, `max`, `hypot`, `fround`, `random`.
 
 ## `JSON`
 

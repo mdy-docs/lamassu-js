@@ -1472,6 +1472,9 @@ static bool nm_toString(JsContext *ctx, JsValue tv, const JsValue *args, int arg
  * ===================================================================== */
 
 static double m_abs(double x) { return x < 0 ? -x : x; }
+/* Math.fround: the nearest float32, as a double. Code that mirrors Float32Array arithmetic needs it. */
+static double m_fround(double x) { return (double)(float)x; }
+
 static double m_sign(double x) { return x != x ? x : (x > 0 ? 1 : (x < 0 ? -1 : x)); }
 static bool math_min(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
@@ -2782,6 +2785,7 @@ MATH1(math_ceil, __builtin_ceil)
 MATH1(math_trunc, __builtin_trunc)
 MATH1(math_sign, m_sign)
 MATH1(math_sqrt, __builtin_sqrt)
+MATH1(math_fround, m_fround)
 MATH1(math_cbrt, js_k_cbrt)
 MATH1(math_exp, js_k_exp)
 MATH1(math_log, js_k_log)
@@ -2928,7 +2932,7 @@ bool js_builtins_init(JsContext *ctx) {
     if (!def_fn(ctx, math, "abs", math_abs) || !def_fn(ctx, math, "floor", math_floor) ||
         !def_fn(ctx, math, "ceil", math_ceil) || !def_fn(ctx, math, "round", math_round) ||
         !def_fn(ctx, math, "trunc", math_trunc) || !def_fn(ctx, math, "sign", math_sign) ||
-        !def_fn(ctx, math, "sqrt", math_sqrt) || !def_fn(ctx, math, "cbrt", math_cbrt) ||
+        !def_fn(ctx, math, "sqrt", math_sqrt) || !def_fn(ctx, math, "fround", math_fround) || !def_fn(ctx, math, "cbrt", math_cbrt) ||
         !def_fn(ctx, math, "exp", math_exp) || !def_fn(ctx, math, "log", math_log) ||
         !def_fn(ctx, math, "log2", math_log2) || !def_fn(ctx, math, "log10", math_log10) ||
         !def_fn(ctx, math, "sin", math_sin) || !def_fn(ctx, math, "cos", math_cos) ||
