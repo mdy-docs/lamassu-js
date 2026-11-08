@@ -273,6 +273,39 @@ bool js_call(JsContext *ctx, JsValue fn, JsValue this_val, const JsValue *args,
 bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
                         JsNativeFn fn, void *userdata);
 
+/*
+ * A native as a VALUE, to store wherever a function may go: a property of an
+ * object (a namespace or a prototype), an array element, a callback. `name`
+ * is ASCII (the function's .name, may be NULL). Returns undefined on OOM.
+ * js_register_native is this plus a js_object_set on the globals.
+ */
+JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *userdata);
+
+/*
+ * The userdata of the native currently executing — what js_native_new or
+ * js_register_native was given — so one C function can serve many natives.
+ * Valid inside a JsNativeFn (nested calls see their own); NULL outside one.
+ */
+void *js_native_userdata(JsContext *ctx);
+
+/*
+ * The error classes a host can raise from a native: the value for `*result`
+ * when it returns false. Instances carry `name` and `message` like a guest
+ * `new TypeError(msg)`, and js_error_cause reports them as JS_CAUSE_GUEST.
+ */
+typedef enum JsErrorKind {
+    JS_ERROR_PLAIN = 0,     /* Error */
+    JS_ERROR_TYPE,          /* TypeError */
+    JS_ERROR_RANGE,         /* RangeError */
+    JS_ERROR_REFERENCE,     /* ReferenceError */
+    JS_ERROR_SYNTAX,        /* SyntaxError */
+    JS_ERROR_KIND_COUNT
+} JsErrorKind;
+
+/* An error of that kind with a message (any length); undefined on OOM. */
+JsValue js_error_new_ascii(JsContext *ctx, JsErrorKind kind, const char *message);
+JsValue js_error_new_utf16(JsContext *ctx, JsErrorKind kind, const uint16_t *message, size_t len);
+
 uint32_t js_context_error_pos(const JsContext *ctx);
 
 /*

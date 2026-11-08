@@ -96,16 +96,7 @@ typedef enum JsObjKind {
 #define JS_OBJ_SEALED 1u /* no adding, no deleting; existing props writable */
 #define JS_OBJ_FROZEN 2u /* sealed, and no writes either */
 
-/* Error / TypeError / RangeError / ReferenceError / SyntaxError — the index
- * into JsContext.error_protos (js_error.c). */
-typedef enum JsErrorKind {
-    JS_ERROR_PLAIN = 0,
-    JS_ERROR_TYPE,
-    JS_ERROR_RANGE,
-    JS_ERROR_REFERENCE,
-    JS_ERROR_SYNTAX,
-    JS_ERROR_KIND_COUNT
-} JsErrorKind;
+/* JsErrorKind (lamassu.h) indexes JsContext.error_protos (js_error.c). */
 
 typedef struct JsObject {
     JsGcCell gc;
@@ -482,6 +473,7 @@ struct JsContext {
      * cannot mint a fresh budget per job. Re-armed by js_context_set_fuel. */
     uint64_t fuel_left;
     uint32_t error_pos; /* source offset of last runtime error */
+    JsNative *running_native; /* the native executing right now (js_native_userdata); NULL outside one */
     JsStackFrame error_trace[JS_TRACE_MAX]; /* its frames, innermost first */
     uint32_t error_trace_count;
     JsValue error_trace_value; /* the error those frames belong to: a rethrow of the same value

@@ -251,6 +251,7 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->fuel = 0;
     ctx->fuel_left = 0;
     ctx->error_pos = 0;
+    ctx->running_native = NULL;
     ctx->error_trace_count = 0;
     ctx->error_trace_value = js_undefined();
     ctx->reentry_depth = 0;

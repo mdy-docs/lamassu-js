@@ -288,6 +288,27 @@ uint32_t js_context_error_pos(const JsContext *ctx);
 void     js_context_set_fuel(JsContext *ctx, uint64_t fuel); // 0 = unlimited
 ```
 
+### Native function values and errors
+
+```c
+JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *userdata);
+void   *js_native_userdata(JsContext *ctx);
+
+typedef enum JsErrorKind { JS_ERROR_PLAIN, JS_ERROR_TYPE, JS_ERROR_RANGE, JS_ERROR_REFERENCE, JS_ERROR_SYNTAX } JsErrorKind;
+JsValue js_error_new_ascii(JsContext *ctx, JsErrorKind kind, const char *message);
+JsValue js_error_new_utf16(JsContext *ctx, JsErrorKind kind, const uint16_t *message, size_t len);
+```
+
+`js_register_native` defines a global. `js_native_new` gives the native as a *value*, to put
+wherever a function may go: a property of a namespace object, a method on a prototype, an array
+element, a callback. Inside the native, `js_native_userdata` returns the `userdata` that was passed
+when it was created (nested calls through `js_call` see their own and the outer value is restored),
+so one C function can serve many natives.
+
+A native that fails returns `false` with `*result` set to the value to throw. The constructors make
+a real `TypeError`, `RangeError`, … with `name` and `message` set, catchable by guest code and
+reported by `js_error_cause` as `JS_CAUSE_GUEST`. Messages may be any length.
+
 ### Stack traces
 
 ```c

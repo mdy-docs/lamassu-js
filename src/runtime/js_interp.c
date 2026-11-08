@@ -924,6 +924,8 @@ static void upvalues_close_from(JsFiber *fb, uint32_t floor) {
     }
 }
 
+void *js_native_userdata(JsContext *ctx) { return ctx->running_native ? ctx->running_native->ud : NULL; }
+
 JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *ud) {
     JsVm *vm = ctx->vm;
     JsString *nm = name ? js_ascii_cell(vm, name) : NULL;
@@ -1889,9 +1891,12 @@ run:; /* (re)load the top frame */
                         JsNative *nf = (JsNative *)cc;
                         fr->ip = ip;
                         JsValue res;
+                        JsNative *outer_native = ctx->running_native;
+                        ctx->running_native = nf;
                         bool ok = nf->is_bound
                             ? nf->bound_fn(ctx, nf->bound, S[nb - 1], &S[nb], (int)argc, &res)
                             : nf->fn(ctx, S[nb - 1], &S[nb], (int)argc, &res);
+                        ctx->running_native = outer_native;
                         fb->sp = nb - 2;
                         if (!ok) {
                             fb->error = res;
@@ -1958,9 +1963,12 @@ run:; /* (re)load the top frame */
                     JsNative *nf = (JsNative *)cc;
                     fr->ip = ip;
                     JsValue res;
+                    JsNative *outer_native = ctx->running_native;
+                    ctx->running_native = nf;
                     bool ok = nf->is_bound
                         ? nf->bound_fn(ctx, nf->bound, S[nb - 1], &S[nb], (int)argc, &res)
                         : nf->fn(ctx, S[nb - 1], &S[nb], (int)argc, &res);
+                    ctx->running_native = outer_native;
                     fb->sp = nb - 2;
                     if (!ok) {
                         fb->error = res;
@@ -2398,9 +2406,13 @@ bool js_call(JsContext *ctx, JsValue fn, JsValue this_val, const JsValue *args,
     JsGcCell *c = js_value_cell(fn);
     if (c->kind == JS_KIND_NATIVE) {
         JsNative *nf = (JsNative *)c;
-        return nf->is_bound
+        JsNative *outer_native = ctx->running_native;
+        ctx->running_native = nf;
+        bool ok_ = nf->is_bound
             ? nf->bound_fn(ctx, nf->bound, this_val, args, argc, result)
             : nf->fn(ctx, this_val, args, argc, result);
+        ctx->running_native = outer_native;
+        return ok_;
     }
     JsClosure *cl;
     if (c->kind == JS_KIND_CLOSURE) {

@@ -253,7 +253,7 @@ bool js_bc_load_module(JsContext *ctx, JsModule *m, const uint8_t *buf, size_t l
 JsValue js_module_dynamic_import(JsContext *ctx, JsModule *referrer, JsValue spec);
 
 /* Creates a native function cell (not registered anywhere); undefined on OOM. */
-JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *ud);
+/* js_native_new: public, lamassu.h */
 /* Bound native carrying a captured value (js_interp.c). */
 JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound);
 /* Defines an own property by ASCII key; false on OOM. */

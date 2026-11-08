@@ -25,8 +25,12 @@ typedef double double_t;
 #define isinf(x) __builtin_isinf(x)
 #define isfinite(x) __builtin_isfinite(x)
 #define signbit(x) __builtin_signbit(x)
+#ifndef INFINITY
 #define INFINITY __builtin_inf()
+#endif
+#ifndef NAN
 #define NAN __builtin_nan("")
+#endif
 
 #define predict_true(x) __builtin_expect(!!(x), 1)
 #define predict_false(x) __builtin_expect(x, 0)

@@ -1,3 +1,5 @@
+#include <stdlib.h>
+#include <string.h>
 #include "js_error.h"
 #include "js_bytecode.h"
 
@@ -155,6 +157,26 @@ JsErrorCause js_error_cause(JsContext *ctx, JsValue error) {
     if (js_is_string(error) && js_value_string(error) == ctx->vm->oom_error)
         return JS_CAUSE_OOM;
     return JS_CAUSE_GUEST;
+}
+
+/* Public constructors (lamassu.h): a message of any length, no "Name: " prefix parsing. */
+JsValue js_error_new_utf16(JsContext *ctx, JsErrorKind kind, const uint16_t *message, size_t len) {
+    if ((unsigned)kind >= JS_ERROR_KIND_COUNT)
+        kind = JS_ERROR_PLAIN;
+    JsString *s = js_string_cell_new(ctx->vm, message, (uint32_t)len);
+    return s ? js_error_new(ctx, kind, s) : js_undefined();
+}
+
+JsValue js_error_new_ascii(JsContext *ctx, JsErrorKind kind, const char *message) {
+    size_t n = strlen(message);
+    uint16_t *u = malloc((n ? n : 1) * sizeof *u);
+    if (!u)
+        return js_undefined();
+    for (size_t i = 0; i < n; i++)
+        u[i] = (uint16_t)(unsigned char)message[i];
+    JsValue v = js_error_new_utf16(ctx, kind, u, n);
+    free(u);
+    return v;
 }
 
 JsValue js_error_from_ascii(JsContext *ctx, const char *msg) {
