@@ -125,6 +125,10 @@ static void js_gc_trace(JsVm *vm) {
             if (fb->result_promise)
                 js_gc_mark_cell(vm, &fb->result_promise->gc);
             js_gc_mark_value(vm, fb->error);
+            for (uint32_t i = 0; i < fb->trace_count; i++) {
+                js_gc_mark_value(vm, fb->trace[i].specifier);
+                js_gc_mark_value(vm, fb->trace[i].function);
+            }
             break;
         }
         case JS_KIND_PROMISE: {
@@ -305,6 +309,11 @@ void js_gc_collect(JsVm *vm) {
         js_gc_mark_module_registry(ctx);
         if (ctx->fiber)
             js_gc_mark_cell(vm, &ctx->fiber->gc);
+        for (uint32_t i = 0; i < ctx->error_trace_count; i++) {
+            js_gc_mark_value(vm, ctx->error_trace[i].specifier);
+            js_gc_mark_value(vm, ctx->error_trace[i].function);
+        }
+        js_gc_mark_value(vm, ctx->error_trace_value);
     }
     js_gc_mark_jobs(vm);
     js_gc_trace(vm);

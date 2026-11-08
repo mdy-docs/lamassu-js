@@ -436,6 +436,50 @@ JsValue js_bytecode_value(JsContext *ctx, const uint8_t *buf, size_t len);
  */
 int js_bytecode_kind(const uint8_t *buf, size_t len);
 
+/* ---- stack traces ---- */
+
+/*
+ * One frame of a trace, innermost first: the module the function came from
+ * (its canonical specifier as a string; undefined for a function compiled
+ * outside the module pipeline), the function's name (a string; undefined for
+ * anonymous functions and module bodies), and the source offset of the
+ * instruction executing in that frame. Both strings are engine values that
+ * stay valid while the module and function live; copy them to keep them.
+ *
+ * Why a host needs this and not just js_context_error_pos: an offset alone
+ * does not say which module it belongs to, and a throw inside library code
+ * (an assert helper, an argument check) points at the library, not at the
+ * script line that called it. With the frames a host can walk outward to the
+ * first frame in the user's own file and report that.
+ */
+typedef struct JsStackFrame {
+    JsValue specifier;
+    JsValue function;
+    uint32_t pos;
+} JsStackFrame;
+
+/* Frames kept per trace; deeper stacks are truncated at the outermost end. */
+#define JS_TRACE_MAX 32
+
+/*
+ * The current fiber's frames, innermost first, including the fibers a
+ * re-entering native was called from. Usable inside a native to learn its
+ * call site (frame 0 is the caller). Returns the number written, at most max.
+ */
+size_t js_context_stack(JsContext *ctx, JsStackFrame *out, size_t max);
+
+/*
+ * The frames at the point the last error was raised — the trace behind
+ * js_context_error_pos, captured when the exception started unwinding and
+ * before any frame was popped. A compile error has one frame: the module and
+ * the offset of the syntax error. Returns the number written, at most max.
+ */
+size_t js_context_error_stack(const JsContext *ctx, JsStackFrame *out, size_t max);
+
+/* 1-based line and column of a source offset (CR, LF, CRLF, U+2028 and U+2029 end lines). */
+void js_source_line_col(const uint16_t *src, size_t len, uint32_t pos,
+                        uint32_t *line, uint32_t *col);
+
 /* ---- GC ---- */
 
 void   js_gc_collect(JsVm *vm);

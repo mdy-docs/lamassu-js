@@ -381,6 +381,9 @@ struct JsFiber {
     bool failed;
     bool is_async;   /* body may suspend at await */
     uint32_t err_pos;
+    /* frames at the last raise, innermost first (js_context_error_stack) */
+    JsStackFrame trace[JS_TRACE_MAX];
+    uint32_t trace_count;
     uint64_t fuel; /* 0 = unlimited */
 };
 
@@ -479,6 +482,10 @@ struct JsContext {
      * cannot mint a fresh budget per job. Re-armed by js_context_set_fuel. */
     uint64_t fuel_left;
     uint32_t error_pos; /* source offset of last runtime error */
+    JsStackFrame error_trace[JS_TRACE_MAX]; /* its frames, innermost first */
+    uint32_t error_trace_count;
+    JsValue error_trace_value; /* the error those frames belong to: a rethrow of the same value
+                                * (an await resuming with a rejection) appends its frames */
     uint32_t reentry_depth; /* nested interpreter entries (native re-entry);
                              * bounds C-stack recursion the per-fiber frame
                              * limit can't see */

@@ -251,6 +251,8 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->fuel = 0;
     ctx->fuel_left = 0;
     ctx->error_pos = 0;
+    ctx->error_trace_count = 0;
+    ctx->error_trace_value = js_undefined();
     ctx->reentry_depth = 0;
 
     JsValue globals = js_object_new(ctx); /* safe point; ctx->object_proto is
@@ -316,4 +318,24 @@ uint32_t js_context_error_pos(const JsContext *ctx) {
 void js_context_set_fuel(JsContext *ctx, uint64_t fuel) {
     ctx->fuel = fuel;
     ctx->fuel_left = fuel; /* arms a fresh turn */
+}
+
+/* Public: 1-based line/column of a source offset. Shared with the frontend's error reporting. */
+void js_source_line_col(const uint16_t *src, size_t len, uint32_t pos,
+                        uint32_t *line, uint32_t *col) {
+    uint32_t ln = 1, c = 1;
+    if (pos > len)
+        pos = (uint32_t)len;
+    for (uint32_t i = 0; i < pos; i++) {
+        if ((src[i] == '\n' || src[i] == '\r' || src[i] == 0x2028 || src[i] == 0x2029)) {
+            if (src[i] == '\r' && i + 1 < pos && src[i + 1] == '\n')
+                i++;
+            ln++;
+            c = 1;
+        } else {
+            c++;
+        }
+    }
+    *line = ln;
+    *col = c;
 }

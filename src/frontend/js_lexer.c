@@ -64,24 +64,7 @@ void js_lexer_init(JsLexer *lx, JsArena *arena, const uint16_t *src, size_t len)
     lx->tok.newline_before = false;
 }
 
-void js_source_line_col(const uint16_t *src, size_t len, uint32_t pos,
-                        uint32_t *line, uint32_t *col) {
-    uint32_t ln = 1, c = 1;
-    if (pos > len)
-        pos = (uint32_t)len;
-    for (uint32_t i = 0; i < pos; i++) {
-        if (is_line_term(src[i])) {
-            if (src[i] == '\r' && i + 1 < pos && src[i + 1] == '\n')
-                i++;
-            ln++;
-            c = 1;
-        } else {
-            c++;
-        }
-    }
-    *line = ln;
-    *col = c;
-}
+/* js_source_line_col lives in the runtime now (public API, lamassu.h). */
 
 /* Skips whitespace and comments; reports whether a line terminator passed. */
 static bool skip_space(JsLexer *lx, bool *newline) {

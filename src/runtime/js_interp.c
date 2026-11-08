@@ -768,6 +768,45 @@ static uint32_t lookup_pos(const JsFunctionCell *fn, uint32_t ip) {
     return pos;
 }
 
+static void frame_record(JsStackFrame *out, const JsFrame *fr, uint32_t ip) {
+    const JsFunctionCell *fn = fr->closure->fn;
+    out->specifier = fn->module && fn->module->specifier
+                         ? js_value_from_cell(&fn->module->specifier->gc)
+                         : js_undefined();
+    out->function = fn->name ? js_value_from_cell(&fn->name->gc) : js_undefined();
+    out->pos = lookup_pos(fn, ip);
+}
+
+/*
+ * Frames of fb and of the fibers it was re-entered from, innermost first.
+ * Every frame's saved ip points just past the instruction in flight — the
+ * raise macros store op_ip + 1 for the top frame so it reads the same way as
+ * a caller's ip saved at CALL — hence ip - 1 lands inside that instruction
+ * and lookup_pos finds its position.
+ */
+static uint32_t capture_trace(const JsFiber *fb, JsStackFrame *out, uint32_t max) {
+    uint32_t n = 0;
+    for (const JsFiber *f = fb; f && n < max; f = f->caller)
+        for (uint32_t i = f->frame_count; i > 0 && n < max; i--) {
+            const JsFrame *fr = &f->frames[i - 1];
+            frame_record(&out[n++], fr, fr->ip > 0 ? fr->ip - 1 : 0);
+        }
+    return n;
+}
+
+size_t js_context_stack(JsContext *ctx, JsStackFrame *out, size_t max) {
+    if (!ctx->fiber || !out)
+        return 0;
+    return capture_trace(ctx->fiber, out, max > JS_TRACE_MAX ? JS_TRACE_MAX : (uint32_t)max);
+}
+
+size_t js_context_error_stack(const JsContext *ctx, JsStackFrame *out, size_t max) {
+    size_t n = ctx->error_trace_count < max ? ctx->error_trace_count : max;
+    if (out)
+        memcpy(out, ctx->error_trace, n * sizeof *out);
+    return n;
+}
+
 /*
  * Building the error message allocates, so at the moment it matters most --
  * reporting that allocation failed -- it can fail too. Fall back to the string
@@ -1108,11 +1147,13 @@ run:; /* (re)load the top frame */
     do {                                                                        \
         fiber_throw(ctx, fb, (msg));                                            \
         fb->err_pos = lookup_pos(fn, op_ip);                                    \
+        fb->frames[fb->frame_count - 1].ip = op_ip + 1;                         \
         goto on_error;                                                          \
     } while (0)
 #define RT_RAISE()                                                              \
     do {                                                                        \
         fb->err_pos = lookup_pos(fn, op_ip);                                    \
+        fb->frames[fb->frame_count - 1].ip = op_ip + 1;                         \
         goto on_error;                                                          \
     } while (0)
 
@@ -2119,6 +2160,10 @@ run:; /* (re)load the top frame */
     }
 
 on_error:
+    /* Before any frame is popped: where the exception was raised, for
+     * js_context_error_stack. A resume-with-rejection arrives here with the
+     * top frame's ip just past its AWAIT, which reads the same way. */
+    fb->trace_count = capture_trace(fb, fb->trace, JS_TRACE_MAX);
     while (fb->try_count > 0) {
         JsTryEntry t = fb->trys[fb->try_count - 1];
         while (fb->frame_count > t.frame_count) {
@@ -2143,6 +2188,20 @@ on_error:
     }
     *result = fb->error;
     ctx->error_pos = fb->err_pos;
+    /* The same error value leaving a second fiber — an awaiting fiber resumed
+     * with the rejection — extends the trace outward instead of replacing it,
+     * so the frames read: where it was thrown, then who was waiting. */
+    if (ctx->error_trace_count > 0 && js_same_value(ctx->error_trace_value, fb->error) &&
+        !js_is_undefined(fb->error)) {
+        uint32_t room = JS_TRACE_MAX - ctx->error_trace_count;
+        uint32_t add = fb->trace_count < room ? fb->trace_count : room;
+        memcpy(ctx->error_trace + ctx->error_trace_count, fb->trace, add * sizeof fb->trace[0]);
+        ctx->error_trace_count += add;
+    } else {
+        ctx->error_trace_count = fb->trace_count;
+        memcpy(ctx->error_trace, fb->trace, fb->trace_count * sizeof fb->trace[0]);
+    }
+    ctx->error_trace_value = fb->error;
     return JS_RUN_ERROR;
 
 #undef S

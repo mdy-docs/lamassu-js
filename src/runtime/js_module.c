@@ -259,7 +259,18 @@ static void module_fetch_fail(JsContext *ctx, JsModule *m, JsValue reason, uint3
     m->status = JS_MOD_ERRORED;
     m->eval_error = reason;
     ctx->error_pos = pos;
+    ctx->error_trace_count = 0; /* a load failure has no frames; see module_compile_fail */
     js_promise_reject(ctx, m->fetch_promise, reason);
+}
+
+/* A syntax error has a place: one trace frame naming the module and the offset,
+ * so a host can report file and line without a running stack. */
+static void module_compile_fail(JsContext *ctx, JsModule *m, JsValue reason, uint32_t pos) {
+    module_fetch_fail(ctx, m, reason, pos);
+    ctx->error_trace[0].specifier = m->specifier ? js_value_from_cell(&m->specifier->gc) : js_undefined();
+    ctx->error_trace[0].function = js_undefined();
+    ctx->error_trace[0].pos = pos;
+    ctx->error_trace_count = 1;
 }
 
 static bool fetch_on_resolved(JsContext *ctx, JsValue bound, JsValue tv,
@@ -282,7 +293,7 @@ static bool fetch_on_resolved(JsContext *ctx, JsValue bound, JsValue tv,
         }
         JsModError err = {NULL, 0, false};
         if (!ctx->compile_source(ctx, m, src->units, src->length, &err)) {
-            module_fetch_fail(ctx, m, mod_error_value(ctx, &err), err.pos);
+            module_compile_fail(ctx, m, mod_error_value(ctx, &err), err.pos);
             return true;
         }
     } else if (js_value_is_cell(resolved) &&

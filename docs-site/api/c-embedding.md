@@ -288,6 +288,46 @@ uint32_t js_context_error_pos(const JsContext *ctx);
 void     js_context_set_fuel(JsContext *ctx, uint64_t fuel); // 0 = unlimited
 ```
 
+### Stack traces
+
+```c
+typedef struct JsStackFrame {
+    JsValue  specifier;   // the module's canonical specifier, or undefined outside the module pipeline
+    JsValue  function;    // the function's name, or undefined (anonymous, module body)
+    uint32_t pos;         // source offset of the instruction in flight in that frame
+} JsStackFrame;
+#define JS_TRACE_MAX 32
+
+size_t js_context_stack(JsContext *ctx, JsStackFrame *out, size_t max);
+size_t js_context_error_stack(const JsContext *ctx, JsStackFrame *out, size_t max);
+void   js_source_line_col(const uint16_t *src, size_t len, uint32_t pos, uint32_t *line, uint32_t *col);
+```
+
+`js_context_error_pos` is an offset with no module attached, and a throw inside
+library code points at the library. The trace fixes both. It is captured the
+moment an exception starts unwinding, before any frame is popped, and includes
+the fibers a re-entering native was called from, so a host can walk outward to
+the first frame in the user's own file:
+
+```c
+JsStackFrame fr[JS_TRACE_MAX];
+size_t n = js_context_error_stack(ctx, fr, JS_TRACE_MAX);
+for (size_t i = 0; i < n; i++) {
+    if (!is_user_file(fr[i].specifier)) continue;   // skip the prelude / library frames
+    uint32_t line, col;
+    js_source_line_col(source_of(fr[i].specifier), source_len, fr[i].pos, &line, &col);
+    report(fr[i].specifier, line, col);
+    break;
+}
+```
+
+`js_context_stack` reads the frames of the fiber currently running, so a
+native can learn its call site (frame 0 is the caller) — the way to give a
+`log()` or `warn()` the script line it was called from. A compile error in a
+module graph produces a one-frame trace naming the module and the offset; a
+loader rejection has no frames. The strings in a frame are engine values and
+stay valid while the module and function live; copy them to keep them.
+
 `js_context_set_fuel` arms an execution budget, charged **one unit per
 dispatched bytecode instruction** — the CPU-bound half of running untrusted
 scripts (`heap_limit` in `JsVmConfig` is the memory half). Three properties of
