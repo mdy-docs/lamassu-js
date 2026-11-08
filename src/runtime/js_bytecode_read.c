@@ -237,10 +237,17 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
      * `fixed = n_params - 1` underflows to 4 billion on a forged
      * HAS_REST-with-zero-params header and its "fill missing params with
      * undefined" loop runs off the end of the fiber stack.
+     *
+     * USES_ARGUMENTS stores the arguments array into local slot n_params, so
+     * that slot must exist (n_locals > n_params); and an arrow never has its
+     * own `arguments`, so the pair is contradictory.
      */
-    if ((fn_flags & ~(uint8_t)(JS_FN_ARROW | JS_FN_HAS_REST | JS_FN_ASYNC)) ||
+    if ((fn_flags & ~(uint8_t)(JS_FN_ARROW | JS_FN_HAS_REST | JS_FN_ASYNC |
+                               JS_FN_USES_ARGUMENTS)) ||
         n_locals > JSBC_MAX_LOCALS || n_params > n_locals ||
-        ((fn_flags & JS_FN_HAS_REST) && n_params == 0)) {
+        ((fn_flags & JS_FN_HAS_REST) && n_params == 0) ||
+        ((fn_flags & JS_FN_USES_ARGUMENTS) &&
+         ((fn_flags & JS_FN_ARROW) || n_locals <= n_params))) {
         *err = "SyntaxError: invalid bytecode function header";
         return NULL;
     }

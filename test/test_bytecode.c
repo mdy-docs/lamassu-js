@@ -277,7 +277,8 @@ static uint8_t *make_valid_bc_src(const char *src, size_t *out_len) {
 static uint8_t *make_valid_bc(size_t *out_len) {
     return make_valid_bc_src(
         "function fact(n){ return n<=1 ? 1 : n*fact(n-1); }"
-        "let s=0; for (const x of [1,2,3,4]) s += fact(x); s;",
+        "function cnt(a){ return arguments.length; }"
+        "let s=cnt(1,2); for (const x of [1,2,3,4]) s += fact(x); s;",
         out_len);
 }
 

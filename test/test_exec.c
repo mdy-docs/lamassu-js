@@ -357,6 +357,32 @@ static void test_functions(void) {
                   " sum(1, 2, 3, 4);", "10");
     expect_result("function h(a, ...rest) { return a + '/' + rest.length; } h(1, 2, 3);",
                   "1/2");
+    /* `arguments`: a plain array of the actual args (subset choice) */
+    expect_result("function f(a) { return arguments.length; } f(1, 2, 3);", "3");
+    expect_result("function f() { return arguments.length; } f();", "0");
+    expect_result("function f(a) { return [...arguments].join(','); } f(1, 2, 3);", "1,2,3");
+    expect_result("function f(a, b) { let s = 0; for (const x of arguments) s += x; return s; }"
+                  " f(1, 2, 3, 4);", "10");
+    expect_result("function f(a) { return Array.isArray(arguments); } f(1);", "true");
+    expect_result("function f(a) { a = 9; return arguments[0]; } f(1);", "1"); /* unmapped */
+    expect_result("function f(a, b = arguments.length) { return b; } f(1);", "1");
+    expect_result("function f(a, ...r) { return arguments.length + '/' + r.length; } f(1, 2, 3);",
+                  "3/2");
+    expect_result("function f(a) { return (() => arguments.length)(); } f(1, 2);", "2");
+    expect_result("function f(a) { return (() => (() => arguments[1])())(); } f(1, 'x');", "x");
+    expect_result("function o() { function i() { return arguments.length; } return i(1); }"
+                  " o(1, 2, 3);", "1");
+    expect_result("function o() { const g = function() { return arguments.length; };"
+                  " return g(); } o(1, 2, 3);", "0");
+    expect_result("function f() { const a = arguments; return () => a.length; } f(1, 2, 3)();",
+                  "3");
+    expect_result("function C() { this.n = arguments.length; } new C(1, 2).n;", "2");
+    expect_result("async function f(a) { return arguments.length; } await f(1, 2, 3);", "3");
+    expect_result("function f() {} typeof f.arguments;", "undefined");
+    expect_error("arguments;", RUN_RUNTIME_ERR, "arguments is not defined");
+    expect_error("(() => arguments.length)();", RUN_RUNTIME_ERR, "arguments is not defined");
+    expect_error("function f(arguments) {}", RUN_COMPILE_ERR, "cannot bind");
+    expect_error("function f() { arguments = 1; }", RUN_COMPILE_ERR, "cannot assign");
     /* destructuring params */
     expect_result("function p({x, y}) { return x + y; } p({x: 3, y: 4});", "7");
     expect_result("function q([a, b]) { return a * b; } q([5, 6]);", "30");

@@ -33,7 +33,14 @@ supported. `for...in` is **not** (a targeted parse error points you at
   stack for JS calls, so recursion depth is bounded and checked, not a
   segfault risk.
 - `this` in a plain function is `undefined` (strict-mode semantics, not the
-  global object). `arguments.callee`/`arguments.caller` are not supported.
+  global object).
+- `arguments` is available in regular functions (arrow functions see the
+  enclosing function's, as in standard JS). It is a **plain array** of the
+  actual arguments, so `arguments.length`, `[...arguments]`,
+  `for (const x of arguments)` and array methods all work directly. This is
+  the one deliberate divergence: `Array.isArray(arguments)` is `true`. As in
+  strict mode, it is not aliased to the parameters, and
+  `arguments.callee`/`arguments.caller` do not exist.
 - Duplicate parameter names are a compile error.
 
 ## Objects, arrays, and constructors

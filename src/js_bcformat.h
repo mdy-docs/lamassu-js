@@ -17,7 +17,7 @@
 #ifndef JS_BCFORMAT_H
 #define JS_BCFORMAT_H
 
-#define JSBC_VERSION 2u
+#define JSBC_VERSION 3u /* 3: JS_FN_USES_ARGUMENTS function flag */
 #define JSBC_FLAG_HAS_REGEX 1u /* producer had regex enabled (informational) */
 
 /* Sanity caps: reject absurd sizes early (before allocating) rather than

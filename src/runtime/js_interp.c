@@ -1018,12 +1018,32 @@ static int frame_setup(JsContext *ctx, JsFiber *fb, JsClosure *cl, uint32_t base
     if (!stack_ensure(vm, fb, base + fn->n_locals + fn->max_stack + 8))
         return -1;
     bool has_rest = (fn->fn_flags & JS_FN_HAS_REST) != 0;
+    bool uses_args = (fn->fn_flags & JS_FN_USES_ARGUMENTS) != 0;
     uint32_t fixed = has_rest ? (uint32_t)fn->n_params - 1 : fn->n_params;
 
+    /* `arguments`: a plain array of every actual arg (this subset's deliberate
+     * choice — the iterator opcode only knows arrays, so for-of and spread
+     * work without an Arguments exotic). Built first, while the args are
+     * still intact on the stack, and rooted across the rest-array allocation
+     * below since nothing else holds it yet. */
+    JsValue args_val = js_undefined();
+    if (uses_args) {
+        JsObject *args = js_array_new_cell(ctx, argc);
+        if (!args)
+            return -1;
+        for (uint32_t i = 0; i < argc; i++)
+            args->elems[i] = fb->stack[base + i];
+        args->elem_count = argc;
+        args_val = js_value_from_cell(&args->gc);
+    }
     JsObject *rest = NULL;
     if (has_rest) {
+        if (uses_args)
+            js_gc_protect(vm, &args_val);
         uint32_t rn = argc > fixed ? argc - fixed : 0;
         rest = js_array_new_cell(ctx, rn);
+        if (uses_args)
+            js_gc_unprotect(vm, &args_val);
         if (!rest)
             return -1;
         for (uint32_t i = 0; i < rn; i++)
@@ -1035,9 +1055,11 @@ static int frame_setup(JsContext *ctx, JsFiber *fb, JsClosure *cl, uint32_t base
         fb->stack[base + i] = js_undefined();
     if (has_rest)
         fb->stack[base + fixed] = js_value_from_cell(&rest->gc);
-    /* clear declared (non-param) locals */
+    /* clear declared (non-param) locals (this also wipes surplus args) */
     for (uint32_t i = fn->n_params; i < fn->n_locals; i++)
         fb->stack[base + i] = js_undefined();
+    if (uses_args)
+        fb->stack[base + fn->n_params] = args_val;
 
     if (!frames_ensure(vm, fb, fb->frame_count + 1))
         return -1;

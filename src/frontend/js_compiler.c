@@ -69,6 +69,11 @@ typedef struct JsFuncState {
     JsValue fn_value;          /* GC root while building */
     bool is_module;
     bool is_arrow;
+    /* Hidden local named `arguments` (non-arrow functions only): index into
+     * locals, or -1. uses_arguments flips when any lookup resolves to it,
+     * including an inner arrow capturing it as an upvalue. */
+    int arguments_local;
+    bool uses_arguments;
     JsLocalVar *locals;
     uint32_t local_count, local_cap;
     uint16_t slot_count, slot_max;
@@ -321,8 +326,11 @@ static bool is_repl_top(JsCompiler *cx) {
 
 static int resolve_local_in(JsFuncState *fs, const uint16_t *name, uint32_t len) {
     for (uint32_t i = fs->local_count; i-- > 0;) {
-        if (units_equal(fs->locals[i].name, fs->locals[i].len, name, len))
+        if (units_equal(fs->locals[i].name, fs->locals[i].len, name, len)) {
+            if ((int)i == fs->arguments_local)
+                fs->uses_arguments = true;
             return (int)i;
+        }
     }
     return -1;
 }
@@ -1534,6 +1542,21 @@ static bool bind_params(JsCompiler *cx, const JsAstNode *fnode, uint16_t *n_para
     }
     *n_params = np;
 
+    /* `arguments`: one hidden local directly after the params (slot == np),
+     * declared before pattern names so default-value expressions can read
+     * it. Arrows have none — their `arguments` resolves outward. The parser
+     * already rejects `arguments` as a binding name, so no clash is possible.
+     * frame_setup fills the slot only when JS_FN_USES_ARGUMENTS ends up set. */
+    if (!fs->is_arrow) {
+        static const uint16_t args_name[] = {'a','r','g','u','m','e','n','t','s'};
+        uint16_t slot;
+        if (!declare_local(cx, args_name, 9, false, fnode->pos, 0, &slot))
+            return false;
+        if (slot != np)
+            return cerr(cx, fnode->pos, "internal error: arguments slot misplaced");
+        fs->arguments_local = (int)fs->local_count - 1;
+    }
+
     /* Pass 2: pre-declare names introduced by patterns (slots after params). */
     for (uint32_t i = 0; i < count; i++) {
         const JsAstNode *p = fnode->items[i];
@@ -1600,6 +1623,7 @@ static bool compile_function(JsCompiler *cx, const JsAstNode *fnode) {
     fs.fn = fn;
     fs.fn_value = js_value_from_cell(cell);
     fs.scratch_slot = -1;
+    fs.arguments_local = -1;
     fs.is_arrow = (fnode->flags & JS_F_ARROW) != 0;
     js_gc_protect(cx->vm, &fs.fn_value);
     /* Intern the name only after fn is rooted (interning may collect). */
@@ -1627,7 +1651,8 @@ static bool compile_function(JsCompiler *cx, const JsAstNode *fnode) {
     fn->n_params = n_params;
     fn->fn_flags = (uint8_t)((fs.is_arrow ? JS_FN_ARROW : 0) |
                              (has_rest ? JS_FN_HAS_REST : 0) |
-                             ((fnode->flags & JS_F_ASYNC) ? JS_FN_ASYNC : 0));
+                             ((fnode->flags & JS_F_ASYNC) ? JS_FN_ASYNC : 0) |
+                             (fs.uses_arguments ? JS_FN_USES_ARGUMENTS : 0));
     fn->n_locals = fs.slot_max;
     fn->max_stack = (uint32_t)(fs.max_depth < 0 ? 0 : fs.max_depth) + 8;
 

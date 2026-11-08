@@ -137,6 +137,10 @@ typedef struct JsUpvalDesc {
 #define JS_FN_ARROW 0x01
 #define JS_FN_HAS_REST 0x02
 #define JS_FN_ASYNC 0x04
+/* The body (or a nested arrow) reads `arguments`: frame_setup materialises a
+ * plain array of the actual args into local slot n_params. Never set on an
+ * arrow (arrows see the enclosing function's `arguments` as an upvalue). */
+#define JS_FN_USES_ARGUMENTS 0x08
 
 typedef struct JsModule JsModule;
 
