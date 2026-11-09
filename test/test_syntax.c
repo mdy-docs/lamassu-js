@@ -510,7 +510,7 @@ static void check_dump(const char *src, const char *expected) {
     JsArena arena;
     js_arena_init(&arena, vm);
     JsParseResult res;
-    bool ok = js_parse_module(&arena, u, len, &res);
+    bool ok = js_parse_module(&arena, u, len, false, &res);
     CHECK(ok);
     if (!ok) {
         fprintf(stderr, "  source: %s\n  error: %s (at %u)\n", src,
@@ -539,7 +539,7 @@ static void check_parses(const char *src) {
     JsArena arena;
     js_arena_init(&arena, vm);
     JsParseResult res;
-    bool ok = js_parse_module(&arena, u, len, &res);
+    bool ok = js_parse_module(&arena, u, len, false, &res);
     CHECK(ok);
     if (!ok)
         fprintf(stderr, "  source: %s\n  error: %s (at %u)\n", src, res.err_msg,
@@ -556,7 +556,7 @@ static void check_err(const char *src, const char *substr, long pos) {
     JsArena arena;
     js_arena_init(&arena, vm);
     JsParseResult res;
-    bool ok = js_parse_module(&arena, u, len, &res);
+    bool ok = js_parse_module(&arena, u, len, false, &res);
     checks_run++;
     if (ok) {
         checks_failed++;
@@ -817,7 +817,7 @@ static void test_garbage_resilience(void) {
         JsArena arena;
         js_arena_init(&arena, vm);
         JsParseResult res;
-        bool ok = js_parse_module(&arena, u, len, &res);
+        bool ok = js_parse_module(&arena, u, len, false, &res);
         CHECK(!ok);
         CHECK(res.err_msg != NULL);
         js_arena_free(&arena);

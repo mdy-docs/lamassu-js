@@ -496,6 +496,7 @@ execution can hand out contexts that differ in exactly this capability.
 
 ```c
 JsValue js_eval_module(JsContext *ctx, const uint16_t *specifier, size_t spec_len);
+JsValue js_eval_entry(JsContext *ctx, const uint16_t *specifier, size_t spec_len);
 
 JsValue js_module_get_export(JsContext *ctx, JsValue ns, const uint16_t *name,
                              size_t name_len);
@@ -509,6 +510,26 @@ always returns a live promise: protect it, drive outstanding loads with
 namespace (exports) object and rejects with the load/compile/link/evaluate
 error. `js_module_get_export` is a host convenience for reading a named export
 back out.
+
+`js_eval_entry` is the same for a program's entry point, where the host wants a
+result rather than exports. The root module — only the root — may `return` at
+its top level, anywhere a function body could (inside a block, a loop or a
+`try` with its `finally`); the return ends its evaluation, and the promise
+fulfils with the returned value, or `undefined` if the body runs off its end.
+Its imports load and run first as usual, and a top-level `return` in any of them
+is still a `SyntaxError`, as it is under `js_eval_module`. The exports are still
+there: a following `js_eval_module` of the same specifier hands back the
+namespace from the cached graph. A script host that used to wrap the entry in a
+function to get a return value (and pay a line offset in every error location)
+can hand over the source as written.
+
+```c
+static const uint16_t main_js[] = {'m', 'a', 'i', 'n', '.', 'j', 's'};
+JsValue p = js_eval_entry(ctx, main_js, 7);   /* main.js: `...; return { body, lid };` */
+js_gc_protect(vm, &p);
+/* settle loads, js_run_jobs, then: */
+if (js_promise_state(p) == 1) use(js_promise_result(p));
+```
 
 ## Bytecode caching
 

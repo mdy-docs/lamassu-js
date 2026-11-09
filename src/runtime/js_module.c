@@ -46,6 +46,7 @@ void js_gc_mark_module(JsVm *vm, JsModule *m) {
     if (m->fetch_promise)
         js_gc_mark_cell(vm, &m->fetch_promise->gc);
     js_gc_mark_value(vm, m->eval_error);
+    js_gc_mark_value(vm, m->returned);
     for (uint32_t i = 0; i < m->import_count; i++) {
         if (m->imports[i].specifier)
             js_gc_mark_cell(vm, &m->imports[i].specifier->gc);
@@ -278,6 +279,7 @@ JsModule *js_module_alloc_placeholder(JsContext *ctx, JsString *specifier) {
     memset((char *)m + sizeof(JsGcCell), 0, sizeof *m - sizeof(JsGcCell));
     m->specifier = specifier;
     m->eval_error = js_undefined();
+    m->returned = js_undefined();
     m->status = JS_MOD_FETCHING;
     return m;
 }
@@ -415,6 +417,7 @@ static JsValue fetch_module_async(JsContext *ctx, JsModule *referrer, JsString *
     JsModule *m = js_module_alloc_placeholder(ctx, spec);
     if (!m)
         return js_undefined();
+    m->entry = !referrer && spec == ctx->entry_spec;
     JsValue mv = module_value(m);
     js_gc_protect(vm, &mv);
     JsPromise *fp = js_promise_alloc(ctx);
@@ -790,12 +793,12 @@ static bool eval_on_fail(JsContext *ctx, JsValue bound, JsValue tv,
 static bool eval_on_body_done(JsContext *ctx, JsValue bound, JsValue tv,
                               const JsValue *args, int argc, JsValue *r) {
     (void)tv;
-    (void)args;
-    (void)argc;
     *r = js_undefined();
     JsObject *state = js_value_object(bound);
     JsModule *m = value_module(mstate_get(ctx, state, "module"));
     m->status = JS_MOD_EVALUATED;
+    if (m->entry && argc > 0)
+        m->returned = args[0];
     JsValue pv = mstate_get(ctx, state, "promise");
     if (js_is_promise(pv))
         js_promise_fulfill(ctx, js_value_promise(pv), module_value(m));
@@ -852,6 +855,8 @@ static bool eval_step(JsContext *ctx, JsValue statev) {
     int st = js_promise_state(bp);
     if (st == 1) {
         m->status = JS_MOD_EVALUATED;
+        if (m->entry)
+            m->returned = js_promise_result(bp);
         JsValue pv = mstate_get(ctx, state, "promise");
         if (js_is_promise(pv))
             js_promise_fulfill(ctx, js_value_promise(pv), module_value(m));
@@ -913,15 +918,26 @@ static JsValue evaluate(JsContext *ctx, JsModule *m) {
 
 /* ---- public entry ---- */
 
+/* What the root's promise fulfills with: the namespace, or for js_eval_entry what the body returned. */
+static void root_fulfill(JsContext *ctx, JsPromise *done, JsModule *root, bool entry) {
+    js_promise_fulfill(ctx, done, entry ? root->returned : js_value_from_cell(&root->exports->gc));
+}
+
 static bool root_on_eval_done(JsContext *ctx, JsValue bound, JsValue tv,
                               const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     *r = js_undefined();
-    JsPromise *done = js_value_promise(bound);
-    if (argc > 0) {
-        JsModule *m = value_module(args[0]);
-        js_promise_fulfill(ctx, done, js_value_from_cell(&m->exports->gc));
-    }
+    if (argc > 0)
+        root_fulfill(ctx, js_value_promise(bound), value_module(args[0]), false);
+    return true;
+}
+
+static bool entry_on_eval_done(JsContext *ctx, JsValue bound, JsValue tv,
+                               const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    *r = js_undefined();
+    if (argc > 0)
+        root_fulfill(ctx, js_value_promise(bound), value_module(args[0]), true);
     return true;
 }
 
@@ -934,13 +950,10 @@ static bool root_on_eval_fail(JsContext *ctx, JsValue bound, JsValue tv,
 }
 
 /* graph fetched: run the synchronous instantiate/link, then evaluation */
-static bool root_on_fetched(JsContext *ctx, JsValue bound, JsValue tv,
-                            const JsValue *args, int argc, JsValue *r) {
-    (void)tv;
-    *r = js_undefined();
+static void root_fetched(JsContext *ctx, JsValue bound, const JsValue *args, int argc, bool entry) {
     JsPromise *done = js_value_promise(bound);
     if (argc < 1)
-        return true;
+        return;
     JsModule *root = value_module(args[0]);
 
     JsModError err = {NULL, 0, false};
@@ -949,23 +962,39 @@ static bool root_on_fetched(JsContext *ctx, JsValue bound, JsValue tv,
         inst = NULL;
     if (!inst) {
         js_promise_reject(ctx, done, mod_error_value(ctx, &err));
-        return true;
+        return;
     }
 
     JsValue ep = evaluate(ctx, root);
     int st = js_promise_state(ep);
     if (st == 1) {
-        js_promise_fulfill(ctx, done, js_value_from_cell(&root->exports->gc));
+        root_fulfill(ctx, done, root, entry);
     } else if (st == 2) {
         js_promise_reject(ctx, done, js_promise_result(ep));
     } else if (st < 0 ||
-               !then_bound(ctx, ep, root_on_eval_done, root_on_eval_fail, bound)) {
+               !then_bound(ctx, ep, entry ? entry_on_eval_done : root_on_eval_done,
+                           root_on_eval_fail, bound)) {
         js_promise_reject(ctx, done, ascii_value(ctx, "out of memory"));
     }
+}
+
+static bool root_on_fetched(JsContext *ctx, JsValue bound, JsValue tv,
+                            const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    *r = js_undefined();
+    root_fetched(ctx, bound, args, argc, false);
     return true;
 }
 
-JsValue js_eval_module(JsContext *ctx, const uint16_t *specifier, size_t spec_len) {
+static bool entry_on_fetched(JsContext *ctx, JsValue bound, JsValue tv,
+                             const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    *r = js_undefined();
+    root_fetched(ctx, bound, args, argc, true);
+    return true;
+}
+
+static JsValue eval_root(JsContext *ctx, const uint16_t *specifier, size_t spec_len, bool entry) {
     JsVm *vm = ctx->vm;
     JsPromise *done = js_promise_alloc(ctx);
     if (!done)
@@ -987,9 +1016,13 @@ JsValue js_eval_module(JsContext *ctx, const uint16_t *specifier, size_t spec_le
     if (canon) {
         JsValue canonv = js_value_from_cell(&canon->gc);
         js_gc_protect(vm, &canonv);
+        /* the root's record is made inside load_graph, synchronously: mark it there */
+        if (entry)
+            ctx->entry_spec = js_value_string(canonv);
         JsValue gp = load_graph(ctx, js_value_string(canonv));
+        ctx->entry_spec = NULL;
         wired = js_is_promise(gp) &&
-                then_bound(ctx, gp, root_on_fetched, root_on_eval_fail, donev);
+                then_bound(ctx, gp, entry ? entry_on_fetched : root_on_fetched, root_on_eval_fail, donev);
         js_gc_unprotect(vm, &canonv);
         cerr = "out of memory";
     }
@@ -1002,6 +1035,14 @@ JsValue js_eval_module(JsContext *ctx, const uint16_t *specifier, size_t spec_le
     js_run_jobs(ctx);
     js_gc_unprotect(vm, &donev);
     return donev;
+}
+
+JsValue js_eval_module(JsContext *ctx, const uint16_t *specifier, size_t spec_len) {
+    return eval_root(ctx, specifier, spec_len, false);
+}
+
+JsValue js_eval_entry(JsContext *ctx, const uint16_t *specifier, size_t spec_len) {
+    return eval_root(ctx, specifier, spec_len, true);
 }
 
 JsValue js_module_dynamic_import(JsContext *ctx, JsModule *referrer, JsValue specv) {

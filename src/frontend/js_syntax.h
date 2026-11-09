@@ -175,7 +175,8 @@ typedef struct JsParseResult {
     uint32_t err_pos;    /* offset in source units */
 } JsParseResult;
 
-bool js_parse_module(JsArena *arena, const uint16_t *src, size_t len,
+/* allow_return: the entry module (js_eval_entry), where `return` at top level is allowed. */
+bool js_parse_module(JsArena *arena, const uint16_t *src, size_t len, bool allow_return,
                      JsParseResult *out);
 
 #endif /* JS_SYNTAX_H */

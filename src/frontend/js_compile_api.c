@@ -19,7 +19,7 @@ static JsValue compile_module_impl(JsContext *ctx, const uint16_t *src, size_t l
     JsArena arena;
     js_arena_init(&arena, ctx->vm);
     JsParseResult pr;
-    if (!js_parse_module(&arena, src, len, &pr)) {
+    if (!js_parse_module(&arena, src, len, false, &pr)) {
         *err_msg = pr.err_msg;
         *err_pos = pr.err_pos;
         js_arena_free(&arena);

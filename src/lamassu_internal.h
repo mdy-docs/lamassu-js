@@ -359,7 +359,9 @@ struct JsModule {
     uint32_t dep_count;
     uint8_t status;
     bool synthetic;           /* exports adopted from a loader-resolved object */
+    bool entry;               /* the root of js_eval_entry: may `return` at top level */
     JsValue eval_error;
+    JsValue returned;         /* entry only: what the body returned (undefined off the end) */
     /* Settles once this module's source/bytecode/synthetic exports have
      * arrived and been compiled/adopted (dep_specs known; deps NOT yet
      * fetched) — a shallow per-module signal the graph loader composes.
@@ -500,6 +502,9 @@ struct JsContext {
      * NULL unless the frontend is linked AND js_enable_source_modules was
      * called; see the seam comment in js_bytecode.h. */
     JsModuleCompileFn compile_source;
+    /* While js_eval_entry starts its graph: the canonical root specifier, so the root's record is
+     * made as an entry (JsModule.entry). NULL otherwise. */
+    JsString *entry_spec;
     JsFiber *fiber;     /* current/last fiber; GC root */
     uint64_t fuel;      /* budget armed by js_context_set_fuel; 0 = unlimited */
     /* What remains of `fuel` for the current turn — the top-level run PLUS the

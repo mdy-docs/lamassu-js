@@ -463,6 +463,18 @@ void js_set_module_loader(JsContext *ctx, JsModuleLoader load,
 JsValue js_eval_module(JsContext *ctx, const uint16_t *specifier, size_t spec_len);
 
 /*
+ * js_eval_module for a program's entry point. The root module, and only it, may use `return` at
+ * its top level (anywhere a function body could: in a block, a loop, a try), which ends its
+ * evaluation the way it ends a function. The promise fulfills with the value returned — undefined
+ * if the body runs off its end — instead of the namespace; a later js_eval_module of the same
+ * specifier hands back the namespace from the cached graph. A top-level `return` in any other
+ * module is still a SyntaxError. A root already in the registry (loaded earlier
+ * through js_eval_module or as an import) keeps the rules it was compiled under and returns
+ * undefined.
+ */
+JsValue js_eval_entry(JsContext *ctx, const uint16_t *specifier, size_t spec_len);
+
+/*
  * The module registry: every module the context has loaded, by canonical
  * specifier, in load order. A host that re-runs an entry module with changed
  * sources evicts it first; otherwise js_eval_module hands back the cached

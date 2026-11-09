@@ -45,7 +45,7 @@ static bool module_compile_source(JsContext *ctx, JsModule *m, const uint16_t *s
     js_arena_init(&arena, vm);
     JsParseResult pr;
     JsFunctionCell *body = NULL;
-    if (!js_parse_module(&arena, source, source_len, &pr)) {
+    if (!js_parse_module(&arena, source, source_len, m->entry, &pr)) {
         err->msg = pr.err_msg;
         err->pos = pr.err_pos;
     } else {

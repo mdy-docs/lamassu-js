@@ -2257,7 +2257,7 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
         return patch_list_add(cx, &l->continues, patch);
     }
     case JS_AST_RETURN:
-        if (cx->cur->is_module)
+        if (cx->cur->is_module && !(cx->module && cx->module->entry))
             return cerr(cx, n->pos, "'return' outside function");
         note_pos(cx, n->pos);
         if (n->a) {
@@ -2607,8 +2607,10 @@ JsFunctionCell *js_compile_module_body(JsContext *ctx, const JsAstNode *module,
     bool ok = analyze_module(&cx, module, mod);
     if (ok)
         ok = compile_block_stmts(&cx, module->items, module->count);
+    /* an entry that runs off its end returned undefined, not its last expression */
     if (ok)
-        ok = emit_op_u16(&cx, JS_OP_GET_LOCAL, JS_COMPLETION_SLOT, +1) &&
+        ok = (mod->entry ? emit_op(&cx, JS_OP_UNDEFINED, +1)
+                         : emit_op_u16(&cx, JS_OP_GET_LOCAL, JS_COMPLETION_SLOT, +1)) &&
              emit_op(&cx, JS_OP_RETURN, -1);
 
     fn->n_locals = fs.slot_max;

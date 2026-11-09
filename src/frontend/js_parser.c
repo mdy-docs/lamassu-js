@@ -25,6 +25,7 @@ typedef struct JsParser {
     int cover_init_open;
     uint32_t cover_init_pos;
     bool module_tla;
+    bool allow_return; /* the entry module: `return` at top level ends it (js_eval_entry) */
 } JsParser;
 
 typedef struct JsNodeVec {
@@ -1967,7 +1968,7 @@ static JsAstNode *parse_statement(JsParser *p) {
         break;
     }
     case JS_T_RETURN: {
-        if (!p->in_function) {
+        if (!p->in_function && !p->allow_return) {
             result = perr(p, pos, "'return' outside function");
             break;
         }
@@ -2326,11 +2327,12 @@ static JsAstNode *parse_export(JsParser *p) {
 
 /* ---- entry point ---- */
 
-bool js_parse_module(JsArena *arena, const uint16_t *src, size_t len,
+bool js_parse_module(JsArena *arena, const uint16_t *src, size_t len, bool allow_return,
                      JsParseResult *out) {
     JsParser p;
     memset(&p, 0, sizeof p);
     p.arena = arena;
+    p.allow_return = allow_return;
     p.fn_async = true; /* module top level: await allowed (TLA) */
     js_lexer_init(&p.lx, arena, src, len);
 

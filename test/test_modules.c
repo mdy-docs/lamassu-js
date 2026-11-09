@@ -834,6 +834,102 @@ static void test_source_modules_gated(void) {
     mods_reset();
 }
 
+/* ---- js_eval_entry: top-level return in the root ---- */
+
+/* Evaluates `main` with js_eval_entry; the fulfilled value's (or the rejection's) ToString. */
+static char *eval_entry_str(bool *ok) {
+    TestVm tv;
+    tv_open(&tv, NULL);
+    static const uint16_t spec[] = {'m', 'a', 'i', 'n'};
+    JsValue p = js_eval_entry(tv.ctx, spec, 4);
+    js_gc_protect(tv.vm, &p);
+    settle_all_loads(tv.ctx);
+    int st = js_promise_state(p);
+    *ok = st == 1;
+    char *out = value_to_cstr(tv.ctx, js_promise_result(p));
+    js_gc_unprotect(tv.vm, &p);
+    tv_close(&tv, "main");
+    return out;
+}
+
+static void eq_entry(const char *root_src, bool want_ok, const char *expected) {
+    mod_add("main", root_src);
+    bool ok;
+    char *out = eval_entry_str(&ok);
+    checks_run++;
+    if (ok != want_ok || !strstr(out, expected) || (want_ok && strcmp(out, expected) != 0)) {
+        checks_failed++;
+        fprintf(stderr, "FAIL entry\n  root: %s\n  expected: %s%s\n  actual: %s%s\n", root_src,
+                expected, want_ok ? "" : " (error)", out, ok ? "" : " (error)");
+    }
+    free(out);
+    mods_reset();
+}
+
+static void test_entry_return(void) {
+    eq_entry("return 42;", true, "42");
+    eq_entry("const a = 6; return a * 7;", true, "42");
+    eq_entry("1 + 1;", true, "undefined");                          /* off the end: undefined, not the last expression */
+    eq_entry("let n = 0; for (;;) { if (++n > 3) return n; } ", true, "4");
+    eq_entry("if (true) { return 'early'; } throw 'not reached';", true, "early");
+    eq_entry("let log = ''; try { return 'r'; } finally { log = 'f'; }", true, "r");
+    eq_entry("function f() { return 1; } return f() + (() => { return 2; })();", true, "3");
+    eq_entry("return await Promise.resolve('tla');", true, "tla");  /* top-level await too */
+    eq_entry("return;", true, "undefined");
+    eq_entry("throw new Error('boom');", false, "boom");
+    /* imports still load first, and their own top-level return is a SyntaxError */
+    mod_add("dep", "export const v = 5;");
+    eq_entry("import { v } from 'dep'; return v * 2;", true, "10");
+    mod_add("dep", "return 1; export const v = 5;");
+    eq_entry("import { v } from 'dep'; return v;", false, "'return' outside function");
+    /* a deferred (async) loader: the root's record is still marked while it waits */
+    mod_add_mode("main", "return 'later';", MODE_DEFERRED);
+    {
+        bool ok;
+        char *out = eval_entry_str(&ok);
+        check(ok && strcmp(out, "later") == 0, "entry: return from a root loaded on a later turn");
+        free(out);
+        mods_reset();
+    }
+    /* js_eval_module keeps refusing it */
+    mod_add("main", "return 1;");
+    {
+        bool ok;
+        char *out = eval_export_spec("main", "x", &ok);
+        check(!ok && strstr(out, "'return' outside function"), "js_eval_module: top-level return is a SyntaxError");
+        free(out);
+        mods_reset();
+    }
+    /* exports declared after the return exist; the cached graph hands back the namespace and the value */
+    mod_add("main", "export const before = 1; return 'v'; export function after() { return 2; }");
+    {
+        TestVm tv;
+        tv_open(&tv, NULL);
+        static const uint16_t spec[] = {'m', 'a', 'i', 'n'};
+        JsValue p = js_eval_entry(tv.ctx, spec, 4);
+        js_gc_protect(tv.vm, &p);
+        settle_all_loads(tv.ctx);
+        char *v = value_to_cstr(tv.ctx, js_promise_result(p));
+        JsValue ns = js_eval_module(tv.ctx, spec, 4);
+        js_gc_protect(tv.vm, &ns);
+        settle_all_loads(tv.ctx);
+        char *b = export_to_cstr(tv.ctx, tv.vm, js_promise_result(ns), "before");
+        char *t = export_to_cstr(tv.ctx, tv.vm, js_promise_result(ns), "after");
+        JsValue again = js_eval_entry(tv.ctx, spec, 4);
+        js_gc_protect(tv.vm, &again);
+        settle_all_loads(tv.ctx);
+        char *v2 = value_to_cstr(tv.ctx, js_promise_result(again));
+        check(strcmp(v, "v") == 0 && strcmp(b, "1") == 0 && strstr(t, "function") && strcmp(v2, "v") == 0,
+              "entry: exports past the return, namespace and value from the cached graph");
+        free(v); free(b); free(t); free(v2);
+        js_gc_unprotect(tv.vm, &again);
+        js_gc_unprotect(tv.vm, &ns);
+        js_gc_unprotect(tv.vm, &p);
+        tv_close(&tv, "main");
+        mods_reset();
+    }
+}
+
 int main(void) {
     test_basic_exports();
     test_imports();
@@ -856,6 +952,7 @@ int main(void) {
     test_canonicalization();
     test_tla_dep_cross_turn();
     test_source_modules_gated();
+    test_entry_return();
     mods_reset();
     if (checks_failed) {
         fprintf(stderr, "%d/%d module checks FAILED\n", checks_failed, checks_run);
