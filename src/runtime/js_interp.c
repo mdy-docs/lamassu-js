@@ -1979,6 +1979,27 @@ run:; /* (re)load the top frame */
                 }
                 uint32_t nb = fb->sp - argc; /* callee=nb-2, this(placeholder)=nb-1 */
                 JsValue callee = S[nb - 2];
+                /* `new` on a function from bind() constructs its target with the preset arguments
+                 * first; the bound this is ignored, as the language specifies. Bound twice: unwrap
+                 * again (each layer's presets go in front of the next one's). */
+                while (js_is_function(callee) && js_value_cell(callee)->kind == JS_KIND_NATIVE &&
+                       ((JsNative *)js_value_cell(callee))->is_bound &&
+                       ((JsNative *)js_value_cell(callee))->bound_fn == js_bind_call) {
+                    JsObject *b = js_value_object(((JsNative *)js_value_cell(callee))->bound);
+                    uint32_t extra = b->elem_count - 2;
+                    if (argc + extra > JS_MAX_CALL_ARGS)
+                        RT_THROW("RangeError: too many function arguments");
+                    if (!stack_ensure(vm, fb, fb->sp + extra + 8))
+                        RT_THROW("out of memory");
+                    for (uint32_t i = argc; i-- > 0;)
+                        S[nb + extra + i] = S[nb + i];
+                    for (uint32_t i = 0; i < extra; i++)
+                        S[nb + i] = b->elems[2 + i];
+                    fb->sp += extra;
+                    argc += extra;
+                    callee = b->elems[0];
+                    S[nb - 2] = callee;
+                }
                 if (!js_is_function(callee))
                     { fiber_throw_callee(ctx, fb, fn, op_ip, " is not a constructor"); RT_RAISE(); }
                 JsGcCell *cc = js_value_cell(callee);

@@ -1358,6 +1358,79 @@ static bool fm_call(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     return js_call(ctx, tv, self, argc > 1 ? args + 1 : NULL, argc > 1 ? argc - 1 : 0, r);
 }
 
+/* Calls fn with `this` = self and the arguments `pre` then `post`, gathered in one buffer (the
+ * values stay reachable through their owners: the bound array, the caller's stack). */
+static bool call_joined(JsContext *ctx, JsValue fn, JsValue self, const JsValue *pre, uint32_t npre,
+                        const JsValue *post, uint32_t npost, JsValue *r) {
+    size_t n = (size_t)npre + npost;
+    if (n > (1u << 24))
+        return native_throw(ctx, r, "RangeError: too many function arguments");
+    if (!n)
+        return js_call(ctx, fn, self, NULL, 0, r);
+    JsValue *buf = js_realloc_raw(ctx->vm, NULL, 0, n * sizeof *buf);
+    if (!buf) {
+        *r = js_oom_value(ctx->vm);
+        return false;
+    }
+    for (uint32_t i = 0; i < npre; i++)
+        buf[i] = pre[i];
+    for (uint32_t i = 0; i < npost; i++)
+        buf[npre + i] = post[i];
+    bool ok = js_call(ctx, fn, self, buf, (int)n, r);
+    js_realloc_raw(ctx->vm, buf, n * sizeof *buf, 0);
+    return ok;
+}
+
+/* Function.prototype.apply(thisArg, argsArray): call with the array's elements as arguments
+ * (undefined or null for none). */
+static bool fm_apply(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    if (!js_is_function(tv))
+        return native_throw(ctx, r, "TypeError: Function.prototype.apply called on a value that is not a function");
+    JsValue self = argc > 0 ? args[0] : js_undefined();
+    JsValue list = argc > 1 ? args[1] : js_undefined();
+    if (js_is_undefined(list) || js_is_null(list))
+        return js_call(ctx, tv, self, NULL, 0, r);
+    if (!js_is_array(list))
+        return native_throw(ctx, r, "TypeError: Function.prototype.apply: the arguments must be an array");
+    JsObject *a = js_value_object(list);
+    return call_joined(ctx, tv, self, a->elems, a->elem_count, NULL, 0, r);
+}
+
+/* A bound function's captured state: [target, thisArg, ...presetArgs], an array no script can reach. */
+bool js_bind_call(JsContext *ctx, JsValue bound, JsValue this_val, const JsValue *args, int argc,
+                  JsValue *r) {
+    (void)this_val; /* a bound function ignores the this it is called with */
+    JsObject *b = js_value_object(bound);
+    return call_joined(ctx, b->elems[0], b->elems[1], b->elems + 2, b->elem_count - 2, args,
+                       argc > 0 ? (uint32_t)argc : 0, r);
+}
+
+/* Function.prototype.bind(thisArg, ...args): a function that calls this one with that this and
+ * those arguments first. */
+static bool fm_bind(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    if (!js_is_function(tv))
+        return native_throw(ctx, r, "TypeError: Function.prototype.bind called on a value that is not a function");
+    JsVm *vm = ctx->vm;
+    JsValue state = js_array_new(ctx, (uint32_t)(argc > 0 ? argc + 1 : 2));
+    if (js_is_undefined(state)) {
+        *r = js_oom_value(vm);
+        return false;
+    }
+    js_gc_protect(vm, &state);
+    bool ok = js_array_push(vm, state, tv) &&
+              js_array_push(vm, state, argc > 0 ? args[0] : js_undefined());
+    for (int i = 1; ok && i < argc; i++)
+        ok = js_array_push(vm, state, args[i]);
+    JsValue fn = ok ? js_bound_native_new(ctx, js_bind_call, state) : js_undefined();
+    js_gc_unprotect(vm, &state);
+    if (js_is_undefined(fn)) {
+        *r = js_oom_value(vm);
+        return false;
+    }
+    *r = fn;
+    return true;
+}
+
 static bool nm_toFixed(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     double x = js_to_number_value(ctx, tv);
     double dd = to_int(js_to_number_value(ctx, ARG(0)));
@@ -2930,7 +3003,7 @@ bool js_builtins_init(JsContext *ctx) {
         {"flat", am_flat}, {"toString", am_toString},
         {NULL, NULL}};
     static const MethodDef function_methods[] = {
-        {"call", fm_call},
+        {"apply", fm_apply}, {"bind", fm_bind}, {"call", fm_call},
         {NULL, NULL}};
     static const MethodDef number_methods[] = {
         {"toFixed", nm_toFixed}, {"toString", nm_toString}, {"valueOf", nm_toString},

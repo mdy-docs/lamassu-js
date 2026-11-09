@@ -345,6 +345,31 @@ static void test_function(void) {
     eq_s("async function af(x) { return x * 2; } await af.call(null, 4);", "8");
     eq_s("typeof (function () {}).call;", "function");
     err("const call = (function () {}).call; call(1);", "TypeError");
+    /* Function.prototype.apply */
+    eq_s("function f(a, b) { return this.x + a + b; } f.apply({ x: 1 }, [2, 3]);", "6");
+    eq_s("function n() { return arguments.length; } n.apply(null) + n.apply(null, null) + n.apply(null, []);", "0");
+    eq_s("Math.max.apply(null, [3, 9, 4]);", "9");
+    eq_s("function f() { return Array.prototype.join.call(arguments, '-'); } function g() { return f.apply(null, arguments); } g(1, 2, 3);", "1-2-3");
+    eq_s("function f(a, b) { return a - b; } const xs = []; for (let i = 0; i < 1000; i++) xs.push(i); Math.max.apply(null, xs) + f.apply(null, [5, 2]);", "1002");
+    err("function f() {} f.apply(null, 3);", "TypeError");
+    err("function f() {} f.apply(null, { length: 1, 0: 'a' });", "TypeError");
+    /* Function.prototype.bind */
+    eq_s("function f(a, b) { return this.x + a + b; } const g = f.bind({ x: 1 }, 2); g(3);", "6");
+    eq_s("function f(a, b) { return this.x + a + b; } const g = f.bind({ x: 1 }); g(2, 3) + g(10, 10);", "27");
+    eq_s("function who() { return this.n; } const o = { n: 1, w: who.bind({ n: 2 }) }; o.w();", "2"); /* bound this wins */
+    eq_s("function who() { return this.n; } const b = who.bind({ n: 2 }); b.call({ n: 3 });", "2");
+    eq_s("function sum(...a) { return a.reduce((s, v) => s + v, 0); } sum.bind(null, 1, 2).bind(null, 3)(4);", "10");
+    eq_s("const pow = Math.pow.bind(null, 2); [1, 2, 3].map((e) => pow(e)).join();", "2,4,8");
+    eq_s("const o = { k: 5, get: function () { return this.k; } }; const fs = []; for (let i = 0; i < 300; i++) fs.push(o.get.bind({ k: i })); fs[299]() + fs[0]();", "299");
+    eq_s("typeof (function () {}).bind(null);", "function");
+    eq_s("async function af(x) { return this.m * x; } await af.bind({ m: 3 })(4);", "12");
+    eq_s("function t() { throw new RangeError('b'); } let m = ''; try { t.bind(null)(); } catch (e) { m = e.name; } m;", "RangeError");
+    err("const bind = (function () {}).bind; bind(1);", "TypeError");
+    /* new on a bound function constructs the target with the presets; the bound this is ignored */
+    eq_s("function P(x, y) { this.x = x; this.y = y; } const B = P.bind({ ignored: 1 }, 4); const p = new B(5); [p.x, p.y, p.ignored === undefined].join();", "4,5,true");
+    eq_s("function P(a, b, c) { this.s = a + b + c; } const B = P.bind(null, 1).bind(null, 2); new B(3).s;", "6");
+    eq_s("function P(x) { this.x = x; } P.prototype.twice = function () { return 2 * this.x; }; const B = P.bind(null); new B(...[21]).twice();", "42");
+    err("const B = (() => 1).bind(null); new B();", "TypeError");
 }
 
 static void test_math(void) {

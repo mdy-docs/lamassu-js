@@ -51,7 +51,7 @@ static const struct { const char *body; const char *message; } CASES[] = {
     { "const f = () => 1; f()();", "f(...) is not a function" },
     { "const g = () => ({}); g().x();", "g(...).x is not a function" },
     { "const o = { go: 1, run: function () { return this.go(); } }; o.run();", "this.go is not a function" },
-    { "function h() {} h.apply(null, []);", "h.apply is not a function" },
+    { "function h() {} h.bind(null)()();", "h.bind(...)(...) is not a function" },
     { "const o = {}; o?.m();", "o?.m is not a function" },
     { "const s = {}, args = [1, 2]; s.f(...args);", "s.f is not a function" },
     { "const n = 3; new n();", "n is not a constructor" },

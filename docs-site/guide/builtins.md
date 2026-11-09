@@ -93,12 +93,18 @@ than correctly rounded — `sqrt`/`floor`/`ceil`/`trunc`/`round` are exact nativ
 
 ## Functions
 
-Every function value, a script closure or a native, has `call`:
-`f.call(thisArg, ...args)` calls `f` with `this` set to `thisArg`. Modules are strict, so
-`undefined` and `null` are passed through as they are rather than replaced by the global object,
-and arrow functions keep their own `this`. `apply` and `bind` are not provided; spread arguments
-(`f(...args)`) and a closure (`(...a) => f.call(obj, ...a)`) cover them. Functions take no
-properties of their own.
+Every function value, a script closure or a native, has `call`, `apply` and `bind`:
+
+- `f.call(thisArg, ...args)` calls `f` with `this` set to `thisArg`.
+- `f.apply(thisArg, array)` does the same with the arguments in an array (`undefined` or `null`
+  for none; any other non-array is a `TypeError`, as there are no array-like objects here).
+- `f.bind(thisArg, ...args)` returns a function that calls `f` with that `this` and those arguments
+  first; calling it with another `this` (or through `call`) does not change it. `new` on a bound
+  function constructs `f` with the preset arguments and ignores the bound `this`.
+
+Modules are strict, so `undefined` and `null` are passed through as they are rather than replaced by
+the global object, and arrow functions keep their own `this`. Functions take no properties of their
+own, and a bound function has no `name` or `length`.
 
 ## `Boolean`
 
