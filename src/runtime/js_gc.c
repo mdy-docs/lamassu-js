@@ -208,6 +208,8 @@ void js_gc_free_cell(JsVm *vm, JsGcCell *c, bool remove_atoms) {
             size = js_mapobj_release(vm, o);
         if (o->obj_kind == JS_OBJ_SET)
             size = js_setobj_release(vm, o);
+        if (o->obj_kind == JS_OBJ_HOST)
+            size = js_host_object_release(vm, o);
         break;
     }
     case JS_KIND_FUNCTION: {
@@ -321,7 +323,7 @@ void js_gc_collect(JsVm *vm) {
     if (vm->mark_overflow) {
         for (JsGcCell *c = vm->cells; c; c = c->next)
             c->mark = 0;
-        vm->gc_threshold = vm->bytes_live * 2;
+        vm->gc_threshold = (vm->bytes_live + vm->external_bytes) * 2;
         vm->gc_running = false;
         return;
     }
@@ -338,7 +340,8 @@ void js_gc_collect(JsVm *vm) {
         }
     }
 
-    size_t want = vm->bytes_live * 2;
+    /* host memory held by what survived paces the next cycle like engine memory does */
+    size_t want = (vm->bytes_live + vm->external_bytes) * 2;
     vm->gc_threshold = want > vm->gc_threshold_init ? want : vm->gc_threshold_init;
     vm->gc_running = false;
 }
@@ -346,7 +349,7 @@ void js_gc_collect(JsVm *vm) {
 void js_gc_maybe(JsVm *vm) {
     if (vm->gc_running)
         return;
-    if (vm->gc_stress || vm->bytes_live >= vm->gc_threshold)
+    if (vm->gc_stress || vm->bytes_live + vm->external_bytes >= vm->gc_threshold)
         js_gc_collect(vm);
 }
 

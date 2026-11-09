@@ -309,6 +309,37 @@ A native that fails returns `false` with `*result` set to the value to throw. Th
 a real `TypeError`, `RangeError`, … with `name` and `message` set, catchable by guest code and
 reported by `js_error_cause` as `JS_CAUSE_GUEST`. Messages may be any length.
 
+### Host objects and finalizers
+
+```c
+typedef struct JsHostClass {
+    const char *name;
+    void (*finalize)(void *ptr, void *userdata);
+    void *userdata;
+} JsHostClass;
+
+JsValue js_host_object_new(JsContext *ctx, const JsHostClass *cls, void *ptr, size_t external_bytes);
+void   *js_host_object_ptr(JsValue v, const JsHostClass *cls);
+bool    js_host_object_set_external(JsVm *vm, JsValue v, const JsHostClass *cls, size_t external_bytes);
+size_t  js_gc_external_bytes(const JsVm *vm);
+```
+
+A host object gives guest code something the host owns: a mesh, a file, a native handle. To the
+script it is an ordinary object (`typeof` is `"object"`, it has `Object.prototype` and can take
+properties); the host gets its pointer back with `js_host_object_ptr`, which checks the class by
+address, so a script cannot pass one kind of resource, or a plain object, where another is expected.
+When the collector frees the object, or the VM is freed, the class's `finalize` runs once with the
+pointer: the resource lives exactly as long as the script can reach it.
+
+`finalize` runs inside a collection, so it must not call back into the engine: no allocation, no
+`js_*` calls, no rooting. Releasing the resource is all it is for. If `js_host_object_new` fails it
+returns `undefined` and the caller still owns the pointer.
+
+`external_bytes` is the host memory the object keeps alive. It does not count against the heap
+limit, but it counts toward the collection threshold, so a script that makes many objects small to
+the engine and large to the host collects as often as that memory warrants. A host that only learns
+the real size later (a lazily computed result) updates it with `js_host_object_set_external`.
+
 ### Evicting modules
 
 ```c

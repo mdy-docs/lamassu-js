@@ -289,6 +289,44 @@ JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *use
 void *js_native_userdata(JsContext *ctx);
 
 /*
+ * ---- host objects ----
+ *
+ * An object that owns something outside the engine: a pointer the host gets back from it, and a
+ * finalizer the collector runs once the object is unreachable (or when the VM is freed), so host
+ * resources live exactly as long as the script can reach them. To guest code it is an ordinary
+ * object: Object.prototype, own properties, typeof "object"; the pointer is invisible to it.
+ *
+ * The class is the host's static description, compared by address: js_host_object_ptr returns
+ * the pointer only for an object of that class, so a host with several kinds of resource can tell
+ * them apart and a script cannot pass one kind off as another (or a plain object as either).
+ *
+ * The finalizer runs during a collection, from inside the allocator that triggered it, so it must
+ * not touch the VM: no allocation, no js_* calls, no rooting. Releasing the host resource is all
+ * it is for. It runs at most once per object, in no particular order between objects.
+ *
+ * external_bytes is how much host memory the object keeps alive. It does not count against the
+ * heap limit (the engine cannot refuse memory it did not allocate), but it counts toward the
+ * collection threshold, so a script that makes many objects small to the engine but large to the
+ * host collects as often as that memory warrants. js_host_object_set_external updates it later
+ * (for a resource that grows or is computed lazily).
+ */
+typedef struct JsHostClass {
+    const char *name;                            /* for diagnostics; may be NULL */
+    void (*finalize)(void *ptr, void *userdata); /* may be NULL */
+    void *userdata;                              /* passed to finalize */
+} JsHostClass;
+
+/* A new host object of `cls` holding `ptr`; undefined on OOM (the finalizer is then NOT run:
+ * the caller still owns ptr). */
+JsValue js_host_object_new(JsContext *ctx, const JsHostClass *cls, void *ptr, size_t external_bytes);
+/* The pointer held by a host object of class `cls`; NULL for anything else. */
+void   *js_host_object_ptr(JsValue v, const JsHostClass *cls);
+/* Replaces the host memory a host object of class `cls` accounts for; false if v is not one. */
+bool    js_host_object_set_external(JsVm *vm, JsValue v, const JsHostClass *cls, size_t external_bytes);
+/* Host memory currently held by live host objects (what the collector paces against). */
+size_t  js_gc_external_bytes(const JsVm *vm);
+
+/*
  * The error classes a host can raise from a native: the value for `*result`
  * when it returns false. Instances carry `name` and `message` like a guest
  * `new TypeError(msg)`, and js_error_cause reports them as JS_CAUSE_GUEST.

@@ -87,6 +87,7 @@ typedef enum JsObjKind {
     JS_OBJ_MAP = 4,    /* JsMapObj (js_mapobj.h) */
     JS_OBJ_SET = 5,    /* JsSetObj (js_setobj.h) */
     JS_OBJ_ERROR = 6,  /* plain JsObject shape; see js_error.h */
+    JS_OBJ_HOST = 7,   /* JsHostObject: an ordinary object owning a host pointer (lamassu.h) */
 } JsObjKind;
 
 /* JsObject.obj_flags. Extensibility only — this engine has no per-property
@@ -112,6 +113,17 @@ typedef struct JsObject {
      * else or to create a cycle. */
     JsValue proto;
 } JsObject;
+
+/* A host object (js_host_object_new): an ordinary object in every way guest code can see, whose
+ * cell also carries a host pointer. The class's finalizer runs when the collector frees the cell
+ * or the VM is freed; external_bytes counts toward collection pacing (JsVm.external_bytes). */
+typedef struct JsHostObject {
+    JsObject obj; /* obj_kind == JS_OBJ_HOST */
+    const JsHostClass *cls;
+    void *ptr;
+    size_t external_bytes;
+} JsHostObject;
+size_t js_host_object_release(JsVm *vm, JsObject *o); /* js_object.c; finalizes, returns the cell size */
 
 /* Compiled function. code/consts/lines are raw allocations owned by the
  * cell; consts are traced by the GC. */
@@ -487,6 +499,8 @@ struct JsVm {
     JsReallocFn realloc_fn;
     void *alloc_ud;
     size_t bytes_live; /* all bytes obtained through js_realloc_raw */
+    size_t external_bytes; /* host memory owned by live host objects: paces the
+                            * collector (not charged against heap_limit) */
     size_t heap_limit; /* 0 = unlimited; enforced at cell allocation */
     uint64_t rng_state; /* Math.random xorshift state */
     uint32_t hash_seed; /* per-VM string-hash seed; 0 unless the embedder set a

@@ -19,6 +19,63 @@ JsValue js_object_new(JsContext *ctx) {
     return js_value_from_cell(c);
 }
 
+JsValue js_host_object_new(JsContext *ctx, const JsHostClass *cls, void *ptr, size_t external_bytes) {
+    if (!cls)
+        return js_undefined();
+    JsGcCell *c = js_gc_new_cell(ctx->vm, JS_KIND_OBJECT, sizeof(JsHostObject));
+    if (!c)
+        return js_undefined();
+    JsHostObject *h = (JsHostObject *)c;
+    h->obj.obj_kind = JS_OBJ_HOST;
+    h->obj.obj_flags = 0;
+    h->obj.error_cause = 0;
+    js_map_init(&h->obj.props);
+    h->obj.elems = NULL;
+    h->obj.elem_count = h->obj.elem_cap = 0;
+    h->obj.proto = ctx->object_proto ? js_value_from_cell(&ctx->object_proto->gc) : js_undefined();
+    h->cls = cls;
+    h->ptr = ptr;
+    h->external_bytes = external_bytes;
+    ctx->vm->external_bytes += external_bytes;
+    return js_value_from_cell(c);
+}
+
+static JsHostObject *host_of(JsValue v, const JsHostClass *cls) {
+    if (!js_is_object(v) || !cls)
+        return NULL;
+    JsObject *o = js_value_object(v);
+    if (o->obj_kind != JS_OBJ_HOST || ((JsHostObject *)o)->cls != cls)
+        return NULL;
+    return (JsHostObject *)o;
+}
+
+void *js_host_object_ptr(JsValue v, const JsHostClass *cls) {
+    JsHostObject *h = host_of(v, cls);
+    return h ? h->ptr : NULL;
+}
+
+bool js_host_object_set_external(JsVm *vm, JsValue v, const JsHostClass *cls, size_t external_bytes) {
+    JsHostObject *h = host_of(v, cls);
+    if (!h)
+        return false;
+    vm->external_bytes = vm->external_bytes - h->external_bytes + external_bytes;
+    h->external_bytes = external_bytes;
+    return true;
+}
+
+size_t js_gc_external_bytes(const JsVm *vm) { return vm->external_bytes; }
+
+/* Called by js_gc_free_cell: runs the class finalizer once and returns the cell's size. */
+size_t js_host_object_release(JsVm *vm, JsObject *o) {
+    JsHostObject *h = (JsHostObject *)o;
+    vm->external_bytes -= h->external_bytes;
+    h->external_bytes = 0;
+    if (h->cls && h->cls->finalize)
+        h->cls->finalize(h->ptr, h->cls->userdata);
+    h->ptr = NULL;
+    return sizeof(JsHostObject);
+}
+
 JsObject *js_array_new_cell(JsContext *ctx, uint32_t reserve) {
     JsVm *vm = ctx->vm;
     JsGcCell *c = js_gc_new_cell(vm, JS_KIND_OBJECT, sizeof(JsObject));
