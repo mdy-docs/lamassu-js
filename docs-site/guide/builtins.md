@@ -86,8 +86,10 @@ boxed `String` object — this engine has no boxed-primitive type at all).
   `MIN_VALUE`, `EPSILON`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`, `NaN`.
 - **`Number.prototype`**: `toFixed`, `toString`, `valueOf`.
 
-`toString()`/number-to-string formatting is exact for safe integers and for
-magnitudes within ~1e±22; transcendental `Math` functions are fdlibm-accurate
+`toString()`/number-to-string prints what V8 prints: the shortest digits that
+read back as the same double, and of those the nearest to its value (ties to
+even), across the whole range including subnormals; parsing a literal is
+correctly rounded. Transcendental `Math` functions are fdlibm-accurate
 (< 1 ulp, musl's fdlibm-derived kernel in `src/runtime/fdlibm/`, no libm) rather
 than correctly rounded — `sqrt`/`floor`/`ceil`/`trunc`/`round` are exact native ops.
 

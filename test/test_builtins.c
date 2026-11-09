@@ -304,6 +304,33 @@ static void test_array(void) {
 }
 
 static void test_number(void) {
+    /* shortest round-trip digits, nearest the value: the strings V8 prints (each was wrong before:
+     * a last digit one too high or a 17th digit, from rounding a rounded string; powers of two
+     * at the bottom of a binade need the neighbouring candidate) */
+    eq("String(0.09983341664682815);", "0.09983341664682815");
+    eq("String(6.557954545454544e-7);", "6.557954545454544e-7");
+    eq("String(8.273471959672337e-8);", "8.273471959672337e-8");
+    eq("String(9.542280822064698e-288);", "9.542280822064698e-288");
+    eq("String(-5.415468657893605e-309);", "-5.415468657893605e-309");
+    eq("String(-8.407692237696064e-252);", "-8.407692237696064e-252");
+    eq("String(6.784148124086405e-7);", "6.784148124086405e-7");
+    eq("String(8.475743555849305e-7);", "8.475743555849305e-7");
+    eq("String(7.678447687145631e-239);", "7.678447687145631e-239");
+    eq("String(6.142758149716505e-238);", "6.142758149716505e-238");
+    eq("String(6.290184345309701e-235);", "6.290184345309701e-235");
+    eq("String(0.1 + 0.2);", "0.30000000000000004");
+    eq("String(1 / 3);", "0.3333333333333333");
+    eq("String(5e-324);", "5e-324");
+    eq("String(1.7976931348623157e308);", "1.7976931348623157e+308");
+    eq("String(2 ** -1022);", "2.2250738585072014e-308");
+    eq("String(2 ** 60);", "1152921504606847000");
+    eq("String(1e21);", "1e+21");
+    eq("String(123456789012345680000);", "123456789012345680000");
+    eq("String(1e-7);", "1e-7");
+    eq("String(0.000001);", "0.000001");
+    eq("String(-0.0000015);", "-0.0000015");
+    eq("String(4.35);", "4.35");
+    eq("String(2 / 3 * 1e-300);", "6.666666666666667e-301");
     eq("(3.14159).toFixed(2);", "3.14");
     eq("(0).toFixed(2);", "0.00");
     eq("(255).toString(16);", "ff");

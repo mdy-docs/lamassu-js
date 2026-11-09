@@ -1,10 +1,10 @@
 /*
  * Number <-> string conversions and integer coercions, freestanding (no
- * libm, no snprintf). Double formatting picks the shortest digit string
- * (1..17 significant digits) that round-trips through js_make_double; for
- * magnitudes within ~1e±22 both directions are single-rounded and results
- * are exact. Extreme magnitudes may be ~1 ulp off (TODO exact big-num
- * path); differential tests against Node will quantify this.
+ * libm). Double formatting picks the shortest digit string (1..17 significant
+ * digits) that round-trips, and of those the one nearest the value (ties to
+ * even), as Number::toString specifies and V8 prints; the digits come from the
+ * C library's correctly rounded conversion. Parsing is correctly rounded too
+ * (js_make_double).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -217,41 +217,74 @@ static size_t put_u64(char *buf, size_t n, uint64_t v) {
  * d ~= digits * 10^(e10-16).
  */
 /*
- * The 17 significant digits of `d`, correctly rounded, and its decimal
- * exponent — `d == digits * 10^(e10 - 16)`.
- *
- * Taken from the platform's own conversion rather than computed by scaling.
- * Multiplying a double by a power of ten rounds at every step, and for a
- * value that needs all 17 digits the last one comes out wrong: the shortest
- * search above then settles on a 17-digit string that round-trips but is not
- * the one every other engine prints. A page of computed coordinates
- * disagreeing with Node in the final digit is how this was found.
- *
- * `%.16e` is one digit before the point and sixteen after, so seventeen in
- * all. The separator between them is whatever the locale uses, so the digits
- * are picked out by being digits rather than by position.
+ * The significant digits of d (> 0), correctly rounded by the C library: up to 26 digits as ASCII
+ * into digs (NUL-terminated), and the decimal exponent of the first one. `%.*e` is one digit before
+ * the point and the rest after; the separator is whatever the locale uses, so digits are picked out
+ * by being digits rather than by position. Returns the number of digits (0 on failure).
  */
-static void extract_digits(double d, uint64_t *digits, int *e10_out) {
-    char tmp[48];
-    int n = snprintf(tmp, sizeof tmp, "%.16e", d);
-    if (n <= 0 || (size_t)n >= sizeof tmp) { *digits = 0; *e10_out = 0; return; }
-
-    uint64_t D = 0;
+static int sci_digits(double d, int ndigits, char *digs, int *e10_out) {
+    char tmp[64];
+    int n = snprintf(tmp, sizeof tmp, "%.*e", ndigits - 1, d);
+    if (n <= 0 || (size_t)n >= sizeof tmp)
+        return 0;
     int seen = 0;
     const char *p = tmp;
     while (*p && *p != 'e' && *p != 'E') {
-        if (*p >= '0' && *p <= '9' && seen < 17) {
-            D = D * 10 + (uint64_t)(*p - '0');
-            seen++;
-        }
+        if (*p >= '0' && *p <= '9' && seen < ndigits)
+            digs[seen++] = *p;
         p++;
     }
-    int e10 = (*p) ? (int)strtol(p + 1, NULL, 10) : 0;
-    /* Defensive: a libc that gave fewer digits than asked. */
-    while (seen < 17) { D *= 10; seen++; }
+    digs[seen] = 0;
+    *e10_out = (*p) ? (int)strtol(p + 1, NULL, 10) : 0;
+    return seen;
+}
 
-    *digits = D;
-    *e10_out = e10;
+/*
+ * The p-digit decimal nearest to d, as an integer and the exponent of its first digit, from the
+ * 26-digit expansion in digs. Rounding that expansion again is only wrong when it lands exactly on
+ * a p-digit midpoint (digits p.. are "5000…"): the 26-digit rounding may have moved the value onto
+ * the midpoint from either side, or the value may truly be a tie (which goes to even). Only then
+ * is the library asked for the correctly rounded p digits directly; otherwise digit p decides.
+ *
+ * Rounding the 17-digit string instead (what this did before) was the bug: about 1% of doubles
+ * printed with the last digit one too high, or with 17 digits where 16 round-trip
+ * (0.09983341664682816 for what every other engine prints as 0.09983341664682815).
+ */
+static uint64_t nearest_digits(double d, const char *digs, int nd, int e10, int p, int *e_out) {
+    bool midpoint = p < nd && digs[p] == '5';
+    for (int i = p + 1; midpoint && i < nd; i++)
+        if (digs[i] != '0')
+            midpoint = false;
+    uint64_t D = 0;
+    int e = e10;
+    if (midpoint) {
+        char exact[32];
+        int got = sci_digits(d, p, exact, &e);
+        for (int i = 0; i < got; i++)
+            D = D * 10 + (uint64_t)(exact[i] - '0');
+        *e_out = e;
+        return D;
+    }
+    for (int i = 0; i < p; i++)
+        D = D * 10 + (uint64_t)(i < nd ? digs[i] - '0' : 0);
+    if (p < nd && digs[p] >= '5') {
+        D++;
+        uint64_t limit = 1;
+        for (int i = 0; i < p; i++)
+            limit *= 10;
+        if (D >= limit) { /* 999.. rounded up to 1000.. */
+            D /= 10;
+            e++;
+        }
+    }
+    *e_out = e;
+    return D;
+}
+
+static bool round_trips(uint64_t D, int p, int e, uint64_t bits) {
+    union { double dd; uint64_t u; } back;
+    back.dd = js_make_double(D, e - p + 1);
+    return back.u == bits;
 }
 
 /* Formats digit string (drop trailing zeros) per Number::toString rules. */
@@ -333,31 +366,35 @@ static size_t js_dtoa(double d, char *buf) {
     union { double dd; uint64_t u; } orig;
     orig.dd = d;
 
-    uint64_t D17;
+    char digs[32];
     int e10;
-    extract_digits(d, &D17, &e10);
+    int nd = sci_digits(d, 26, digs, &e10);
+    if (!nd)
+        return put_ascii(buf, n, "NaN"); /* unreachable: snprintf of a finite double */
+    /* An exact power of two sits at the edge of a binade: the gap to the next double below is half
+     * the gap above, so the nearest p-digit decimal can fall outside the round-trip interval on the
+     * narrow side while its neighbour fits on the wide side. That neighbour is the shortest form. */
+    bool binade_edge = (orig.u & (((uint64_t)1 << 52) - 1)) == 0 && (orig.u >> 52) > 1;
 
-    /* Shortest digits (1..17) that round-trip; verify by parsing back. */
+    /* Shortest digits (1..17) that round-trip; of those, the nearest to d. */
     for (int prec = 1; prec <= 17; prec++) {
-        uint64_t scale = 1;
-        for (int i = 0; i < 17 - prec; i++)
-            scale *= 10;
-        uint64_t Dr = (D17 + scale / 2) / scale; /* round half up */
-        int e = e10;
-        /* rounding may carry into an extra digit (e.g. 999.. -> 100..) */
-        uint64_t limit = 1;
-        for (int i = 0; i < prec; i++)
-            limit *= 10;
-        if (Dr >= limit) {
-            Dr /= 10;
-            e += 1;
-        }
-        union { double dd; uint64_t u; } back;
-        back.dd = js_make_double(Dr, e - prec + 1);
-        if (back.u == orig.u)
+        int e;
+        uint64_t Dr = nearest_digits(d, digs, nd, e10, prec, &e);
+        if (round_trips(Dr, prec, e, orig.u))
             return format_digits(buf, n, Dr, prec, e);
+        if (binade_edge) {
+            uint64_t up = Dr + 1, limit = 1;
+            int eu = e;
+            for (int i = 0; i < prec; i++)
+                limit *= 10;
+            if (up >= limit) { up /= 10; eu++; }
+            if (round_trips(up, prec, eu, orig.u))
+                return format_digits(buf, n, up, prec, eu);
+        }
     }
-    return format_digits(buf, n, D17, 17, e10);
+    int e;
+    uint64_t D17 = nearest_digits(d, digs, nd, e10, 17, &e);
+    return format_digits(buf, n, D17, 17, e);
 }
 
 JsString *js_number_to_string(JsVm *vm, double d) {
