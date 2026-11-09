@@ -309,6 +309,22 @@ A native that fails returns `false` with `*result` set to the value to throw. Th
 a real `TypeError`, `RangeError`, … with `name` and `message` set, catchable by guest code and
 reported by `js_error_cause` as `JS_CAUSE_GUEST`. Messages may be any length.
 
+### Evicting modules
+
+```c
+size_t  js_context_module_count(const JsContext *ctx);
+JsValue js_context_module_specifier(const JsContext *ctx, size_t index);
+bool    js_context_evict_module(JsContext *ctx, const uint16_t *specifier, size_t spec_len);
+```
+
+Loaded modules stay in the context's registry, so a second `js_eval_module` of the same
+specifier returns the cached graph. A host whose sources change between runs (an editor
+rebuilding the user's project) evicts the changed module first; every module that imports it goes
+with it, transitively, because their bindings point into it, and the next evaluation loads them
+afresh while unrelated modules (a library prelude) stay compiled. Modules still loading, linking or
+evaluating cannot be evicted. Closures from the old graph keep working — a function keeps its
+module alive — so evicting is safe at any quiet point.
+
 ### Stack traces
 
 ```c

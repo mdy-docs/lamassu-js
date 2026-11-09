@@ -132,6 +132,63 @@ static bool registry_add(JsContext *ctx, JsModule *m) {
     return true;
 }
 
+/* ---- eviction (lamassu.h) ---- */
+
+size_t js_context_module_count(const JsContext *ctx) { return ctx->module_count; }
+
+JsValue js_context_module_specifier(const JsContext *ctx, size_t index) {
+    if (index >= ctx->module_count || !ctx->modules[index] || !ctx->modules[index]->specifier)
+        return js_undefined();
+    return js_value_from_cell(&ctx->modules[index]->specifier->gc);
+}
+
+bool js_context_evict_module(JsContext *ctx, const uint16_t *specifier, size_t spec_len) {
+    JsValue key = js_atom(ctx->vm, specifier, spec_len);
+    if (!js_is_string(key))
+        return false;
+    JsModule *root = registry_find(ctx, js_value_string(key));
+    if (!root)
+        return false;
+    uint32_t n = ctx->module_count;
+    /* the VM's allocator, like the rest of the engine (no libc malloc) */
+    uint8_t *mark = js_realloc_raw(ctx->vm, NULL, 0, n ? n : 1);
+    if (!mark)
+        return false;
+    memset(mark, 0, n ? n : 1);
+    for (uint32_t i = 0; i < n; i++)
+        if (ctx->modules[i] == root)
+            mark[i] = 1;
+    /* dependents, to a fixpoint: a module goes when any of its deps goes */
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (uint32_t i = 0; i < n; i++) {
+            if (mark[i])
+                continue;
+            JsModule *m = ctx->modules[i];
+            for (uint32_t d = 0; d < m->dep_count && !mark[i]; d++)
+                for (uint32_t j = 0; j < n; j++)
+                    if (mark[j] && m->deps[d] == ctx->modules[j]) { mark[i] = 1; changed = true; break; }
+        }
+    }
+    /* nothing in flight may go */
+    for (uint32_t i = 0; i < n; i++)
+        if (mark[i]) {
+            uint8_t st = ctx->modules[i]->status;
+            if (st == JS_MOD_FETCHING || st == JS_MOD_LINKING || st == JS_MOD_EVALUATING) { js_realloc_raw(ctx->vm, mark, n ? n : 1, 0); return false; }
+        }
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (mark[i]) {
+            js_map_delete(&ctx->module_index, ctx->modules[i]->specifier);
+            continue;
+        }
+        ctx->modules[kept++] = ctx->modules[i];
+    }
+    ctx->module_count = kept;
+    js_realloc_raw(ctx->vm, mark, n ? n : 1, 0);
+    return true;
+}
+
 /* ---- small helpers ---- */
 
 /* JsModule cells tag as objects in js_value_from_cell — these make the

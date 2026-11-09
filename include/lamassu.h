@@ -427,6 +427,19 @@ void js_set_module_loader(JsContext *ctx, JsModuleLoader load,
  */
 JsValue js_eval_module(JsContext *ctx, const uint16_t *specifier, size_t spec_len);
 
+/*
+ * The module registry: every module the context has loaded, by canonical
+ * specifier, in load order. A host that re-runs an entry module with changed
+ * sources evicts it first; otherwise js_eval_module hands back the cached
+ * graph. Evicting a module also evicts every module that imports it
+ * (transitively), since their bindings point into it. A module still loading,
+ * linking or evaluating cannot be evicted (false). Closures created by the old
+ * graph keep working: they keep their module alive on their own.
+ */
+size_t  js_context_module_count(const JsContext *ctx);
+JsValue js_context_module_specifier(const JsContext *ctx, size_t index); /* a string; undefined past the end */
+bool    js_context_evict_module(JsContext *ctx, const uint16_t *specifier, size_t spec_len);
+
 /* Reads a named export from a module namespace object (host convenience). */
 JsValue js_module_get_export(JsContext *ctx, JsValue ns, const uint16_t *name,
                              size_t name_len);
