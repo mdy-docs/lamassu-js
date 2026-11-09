@@ -288,6 +288,8 @@ void js_gc_collect(JsVm *vm) {
             js_gc_mark_cell(vm, &ctx->string_methods->gc);
         if (ctx->number_methods)
             js_gc_mark_cell(vm, &ctx->number_methods->gc);
+        if (ctx->function_methods)
+            js_gc_mark_cell(vm, &ctx->function_methods->gc);
         if (ctx->promise_methods)
             js_gc_mark_cell(vm, &ctx->promise_methods->gc);
         if (ctx->object_proto)

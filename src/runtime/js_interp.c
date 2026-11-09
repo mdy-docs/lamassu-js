@@ -504,8 +504,13 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
             if (c->kind == JS_KIND_CLOSURE || c->kind == JS_KIND_NATIVE)
                 return JS_PROP_OOM;
         }
-        if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->statics)
-            return method_lookup(ctx, ((JsNative *)c)->statics, key, out);
+        if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->statics) {
+            JsPropStatus st = method_lookup(ctx, ((JsNative *)c)->statics, key, out);
+            if (st != JS_PROP_OK || !js_is_undefined(*out))
+                return st;
+        }
+        /* Function.prototype methods (call), shared by closures and natives */
+        return method_lookup(ctx, ctx->function_methods, key, out);
     }
     /* booleans: no properties */
     return JS_PROP_OK;

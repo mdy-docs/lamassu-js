@@ -328,6 +328,25 @@ static void test_number(void) {
     eq("isFinite(42);", "true");
 }
 
+static void test_function(void) {
+    /* Function.prototype.call */
+    eq_s("function f(a, b) { return this.x + a + b; } f.call({ x: 1 }, 2, 3);", "6");
+    eq_s("function g() { return this; } g.call() === undefined;", "true");
+    eq_s("function g() { return this; } g.call(null) === null;", "true");
+    eq_s("const o = { n: 5, get: function () { return this.n; } }; o.get.call({ n: 7 });", "7");
+    eq_s("const a = () => typeof this; a.call({ v: 1 });", "undefined"); /* arrows keep their own this */
+    eq_s("Math.max.call(null, 3, 9, 4);", "9");                         /* natives */
+    eq_s("Object.keys.call(null, { a: 1, b: 2 }).length;", "2");        /* a native with statics still has call */
+    eq_s("Array.prototype.join.call([1, 2], '+');", "1+2");
+    eq_s("function f() { return this.k; } f.call.call(f, { k: 2 });", "2");
+    eq_s("function fact(n) { return n <= 1 ? 1 : n * fact.call(null, n - 1); } fact.call(null, 10);", "3628800");
+    eq_s("const add = function (a, b) { return a + b; }; [[1, 2], [3, 4]].map((p) => add.call(null, p[0], p[1])).join();", "3,7");
+    eq_s("function t() { throw new RangeError('no'); } let m = ''; try { t.call(null); } catch (e) { m = e.name + ':' + e.message; } m;", "RangeError:no");
+    eq_s("async function af(x) { return x * 2; } await af.call(null, 4);", "8");
+    eq_s("typeof (function () {}).call;", "function");
+    err("const call = (function () {}).call; call(1);", "TypeError");
+}
+
 static void test_math(void) {
     eq("Math.abs(-5);", "5");
     eq("Math.floor(3.7);", "3");
@@ -799,6 +818,7 @@ int main(void) {
     test_string();
     test_array();
     test_number();
+    test_function();
     test_math();
     test_json();
     test_object();

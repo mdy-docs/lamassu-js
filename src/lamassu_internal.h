@@ -451,6 +451,7 @@ struct JsContext {
      * X.prototype objects instead — see array_proto etc. below. */
     JsObject *string_methods;
     JsObject *number_methods;
+    JsObject *function_methods; /* call, for every function value (closures and natives) */
     JsObject *promise_methods;
     /* Real, script-visible prototype objects — Ctor.prototype is this same
      * object, and instances' [[Prototype]] is set to it at allocation, so

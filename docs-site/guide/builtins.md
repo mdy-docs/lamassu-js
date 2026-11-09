@@ -91,6 +91,15 @@ magnitudes within ~1e±22; transcendental `Math` functions are fdlibm-accurate
 (< 1 ulp, musl's fdlibm-derived kernel in `src/runtime/fdlibm/`, no libm) rather
 than correctly rounded — `sqrt`/`floor`/`ceil`/`trunc`/`round` are exact native ops.
 
+## Functions
+
+Every function value, a script closure or a native, has `call`:
+`f.call(thisArg, ...args)` calls `f` with `this` set to `thisArg`. Modules are strict, so
+`undefined` and `null` are passed through as they are rather than replaced by the global object,
+and arrow functions keep their own `this`. `apply` and `bind` are not provided; spread arguments
+(`f(...args)`) and a closure (`(...a) => f.call(obj, ...a)`) cover them. Functions take no
+properties of their own.
+
 ## `Boolean`
 
 `Boolean(x)` converts to a primitive boolean. No instance methods table

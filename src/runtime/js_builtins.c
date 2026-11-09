@@ -1349,6 +1349,15 @@ static bool am_toString(JsContext *ctx, JsValue tv, const JsValue *args, int arg
  * Number methods
  * ===================================================================== */
 
+/* Function.prototype.call(thisArg, ...args): calls the function with `this` = thisArg (as given:
+ * module code is strict, so undefined and null are not replaced by the global object). */
+static bool fm_call(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    if (!js_is_function(tv))
+        return native_throw(ctx, r, "TypeError: Function.prototype.call called on a value that is not a function");
+    JsValue self = argc > 0 ? args[0] : js_undefined();
+    return js_call(ctx, tv, self, argc > 1 ? args + 1 : NULL, argc > 1 ? argc - 1 : 0, r);
+}
+
 static bool nm_toFixed(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     double x = js_to_number_value(ctx, tv);
     double dd = to_int(js_to_number_value(ctx, ARG(0)));
@@ -2889,6 +2898,10 @@ bool js_builtins_init(JsContext *ctx) {
     if (!js_is_object(num))
         return false;
     ctx->number_methods = js_value_object(num);
+    JsValue fnm = js_object_new(ctx);
+    if (!js_is_object(fnm))
+        return false;
+    ctx->function_methods = js_value_object(fnm);
 
     static const MethodDef string_methods[] = {
         {"charAt", sm_charAt}, {"charCodeAt", sm_charCodeAt},
@@ -2916,12 +2929,16 @@ bool js_builtins_init(JsContext *ctx) {
         {"findIndex", am_findIndex}, {"reduce", am_reduce}, {"sort", am_sort},
         {"flat", am_flat}, {"toString", am_toString},
         {NULL, NULL}};
+    static const MethodDef function_methods[] = {
+        {"call", fm_call},
+        {NULL, NULL}};
     static const MethodDef number_methods[] = {
         {"toFixed", nm_toFixed}, {"toString", nm_toString}, {"valueOf", nm_toString},
         {NULL, NULL}};
     if (!install_methods(ctx, ctx->string_methods, string_methods) ||
         !install_methods(ctx, ctx->array_proto, array_methods) ||
-        !install_methods(ctx, ctx->number_methods, number_methods))
+        !install_methods(ctx, ctx->number_methods, number_methods) ||
+        !install_methods(ctx, ctx->function_methods, function_methods))
         return false;
 
     /* Math */
