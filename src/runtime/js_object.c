@@ -206,12 +206,14 @@ size_t js_object_size(JsValue obj) {
 /*
  * The nth own property name — the same walk the interpreter does for
  * Object.keys, so a host and a script enumerating the same object see the
- * same order. Live slots only: an empty one and a tombstone are skipped.
+ * same order (index keys ascending, then insertion order). Live slots only:
+ * an empty one and a tombstone are skipped.
  */
 JsValue js_object_key_at(JsValue obj, size_t index) {
     if (!js_is_object(obj))
         return js_undefined();
-    const JsMap *m = &js_value_object(obj)->props;
+    JsMap *m = &js_value_object(obj)->props;
+    js_map_sort_keys(m);
     size_t seen = 0;
     for (uint32_t i = 0; i < m->capacity; i++) {
         JsString *k = m->entries[i].key;

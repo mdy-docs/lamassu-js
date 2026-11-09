@@ -287,6 +287,23 @@ static void test_keys(void) {
        js_is_string(js_object_key_at(obj, 0)) && js_is_string(js_object_key_at(obj, 1)) &&
        js_is_undefined(js_object_key_at(obj, 2)));
 
+    /* The order is the language's: index names first, ascending, then insertion order. */
+    JsValue ordered = js_object_new(ctx);
+    js_gc_protect(vm, &ordered);
+    const char *names[] = {"b", "10", "a", "2"};
+    for (int i = 0; i < 4; i++)
+        js_object_set(vm, ordered, key(vm, names[i]), js_number(i));
+    char walked[64] = {0};
+    size_t w = 0;
+    for (size_t i = 0; i < js_object_size(ordered); i++) {
+        size_t klen = 0;
+        const uint16_t *ku = js_string_units(js_object_key_at(ordered, i), &klen);
+        if (w) walked[w++] = ',';
+        for (size_t j = 0; ku && j < klen && w < sizeof walked - 1; j++) walked[w++] = (char)ku[j];
+    }
+    ok("the host walks index names first, then insertion order", strcmp(walked, "2,10,b,a") == 0);
+    js_gc_unprotect(vm, &ordered);
+
     js_gc_unprotect(vm, &obj);
     js_context_free(ctx);
     js_vm_free(vm);

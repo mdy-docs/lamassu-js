@@ -61,10 +61,13 @@ typedef struct JsMapEntry {
 
 /*
  * Insertion-ordered: `entries` is a DENSE array in the order keys were first
- * set, which is the order JavaScript enumerates string keys in and what
- * every walk over `entries[0..capacity)` therefore sees; `index` is the hash
- * table beside it, holding positions into `entries`. A deleted key leaves a
- * tombstone in place, so positions stay valid until the next rebuild.
+ * set; `index` is the hash table beside it, holding positions into `entries`.
+ * A deleted key leaves a tombstone in place, so positions stay valid until
+ * the next rebuild. JavaScript enumerates array-index keys ("0", "7", ...)
+ * first in ascending order and the other string keys after them in insertion
+ * order; `unsorted` says an index key was appended behind a key that belongs
+ * after it, and js_map_sort_keys puts the entries in that order. Every walk
+ * that enumerates (rather than marks or frees) calls it first.
  */
 typedef struct JsMap {
     JsMapEntry *entries; /* [0, used) written, in insertion order; NULL keys past that */
@@ -73,6 +76,7 @@ typedef struct JsMap {
     uint32_t used;       /* entries written, tombstones included */
     uint32_t capacity;   /* length of `entries`, or 0 */
     uint32_t index_cap;  /* length of `index`: power of two, or 0 */
+    bool unsorted;       /* entries are not in enumeration order (see above) */
 } JsMap;
 
 #define JS_MAP_EMPTY UINT32_MAX
@@ -651,6 +655,7 @@ bool    js_map_set(JsVm *vm, JsMap *m, JsString *key, JsValue value);
 JsValue js_map_get(const JsMap *m, const JsString *key, bool *found);
 bool    js_map_delete(JsMap *m, const JsString *key);
 void    js_map_free(JsVm *vm, JsMap *m);
+void    js_map_sort_keys(JsMap *m); /* enumeration order; no allocation, so safe anywhere */
 
 /* ---- strings / atoms (js_string.c) ---- */
 

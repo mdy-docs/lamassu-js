@@ -1786,12 +1786,13 @@ static bool json_str(JsContext *ctx, StrBuf *sb, JsValue v, const uint16_t *inde
         sb_unit(sb, ']');
         return true;
     }
-    /* plain object: own string keys (hash order — documented deviation).
-     * Values are written straight into `sb`; a property whose value emits
+    /* plain object: own string keys in enumeration order (index keys
+     * ascending, then insertion order). Values are written straight into `sb`; a property whose value emits
      * nothing (undefined/function) is undone by rewinding sb->len, so no
      * throwaway per-property buffer is needed. */
     sb_unit(sb, '{');
     bool first = true;
+    js_map_sort_keys(&o->props);
     for (uint32_t i = 0; i < o->props.capacity; i++) {
         JsMapEntry *e = &o->props.entries[i];
         if (!e->key || e->key == JS_MAP_TOMBSTONE)
@@ -2235,7 +2236,10 @@ static bool obj_keys_impl(JsContext *ctx, JsValue tv, const JsValue *args, int a
                 if (ok)
                     ok = js_array_append(ctx->vm, out, entry);
             }
-        } else {
+        }
+        /* Named properties, after an array's elements (index keys first, then insertion order). */
+        js_map_sort_keys(&o->props);
+        {
             for (uint32_t i = 0; i < o->props.capacity && ok; i++) {
                 JsMapEntry *e = &o->props.entries[i];
                 if (!e->key || e->key == JS_MAP_TOMBSTONE)

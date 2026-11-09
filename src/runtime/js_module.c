@@ -737,6 +737,7 @@ static bool apply_reexport(JsContext *ctx, JsModule *dst, const JsStarExport *re
     }
     /* export * from: copy all named exports (excluding default) */
     JsObject *so = src->exports;
+    js_map_sort_keys(&so->props);
     for (uint32_t i = 0; i < so->props.capacity; i++) {
         JsMapEntry *e = &so->props.entries[i];
         if (!e->key || e->key == JS_MAP_TOMBSTONE || str_is_default(e->key))

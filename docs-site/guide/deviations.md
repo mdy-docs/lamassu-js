@@ -18,12 +18,6 @@ that's known to differ, so you're not surprised by one in production.
   boxing it into a wrapper object — this engine has no boxed-primitive type
   at all. `Object()`/`Object(null)`/`Object(undefined)` (a new empty
   object) and `Object(anObject)` (identity) both match spec.
-- **Key order follows hash order, not insertion order.** Affects
-  `Object.keys`/`values`/`entries`, `for...of` over `Object.entries(...)`,
-  and `JSON.stringify` of plain objects. (Planned to resolve once the
-  engine's property storage moves to hidden-class "shapes," which store
-  properties in insertion order — see the roadmap in the project's
-  `docs/plan.md`.)
 - **Integrity is whole-object, not per-property.** `Object.freeze` and
   `Object.seal` are enforced — on property assignment, indexed array writes,
   `length`, `delete`, the in-place array mutators (`push`/`pop`/`shift`/

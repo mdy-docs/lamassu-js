@@ -212,12 +212,9 @@ size_t  js_object_size(JsValue obj);
  * an object and a script walking the same object agree, which is what matters
  * when both are looking at the same data.
  *
- * NOTE that order is the engine's hash order, not insertion order, and the
- * language specifies insertion order for string keys. That is a conformance
- * gap in this engine rather than a property of this function, and closing it
- * means giving plain objects the ordered-entries-plus-index shape Map and Set
- * already have (js_valindex.h). Until then, a host that needs a particular
- * order has to impose it.
+ * That is the language's order: array-index names ("0", "12") first in
+ * ascending numeric order, then the other names in the order they were first
+ * set — so `{ body, lid }` walks as body, lid.
  */
 JsValue js_object_key_at(JsValue obj, size_t index);
 

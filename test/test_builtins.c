@@ -355,6 +355,34 @@ static void test_number(void) {
     eq("isFinite(42);", "true");
 }
 
+/* Own keys enumerate as the language orders them: array-index names first, ascending, then the
+ * rest in the order they were first set. Object.keys/values/entries, JSON.stringify, spread and
+ * Object.assign all walk the same order. */
+static void test_key_order(void) {
+    eq_s("Object.keys({ zeta: 1, body: 2, lid: 3, alpha: 4 }).join();", "zeta,body,lid,alpha");
+    eq_s("const p = (() => { const body = 1, lid = 2; return { body, lid }; })(); Object.keys(p).join();", "body,lid");
+    eq_s("Object.keys({ b: 1, 10: 2, a: 3, 2: 4, 0: 5 }).join();", "0,2,10,b,a");
+    eq_s("Object.keys({ '-1': 1, '01': 2, '1.5': 3, 4294967295: 4, 4294967294: 5, x: 6 }).join();",
+         "4294967294,-1,01,1.5,4294967295,x");
+    eq_s("const o = { a: 1, b: 2, c: 3 }; delete o.a; o.a = 4; Object.keys(o).join();", "b,c,a");
+    eq_s("const o = { a: 1 }; o[5] = 1; o[3] = 1; delete o[5]; o.z = 1; o[1] = 1; Object.keys(o).join();", "1,3,a,z");
+    eq_s("Object.values({ y: 'Y', 1: 'one', x: 'X', 0: 'zero' }).join();", "zero,one,Y,X");
+    eq_s("Object.entries({ b: 1, 3: 2 }).map((e) => e.join('=')).join();", "3=2,b=1");
+    eq_s("JSON.stringify({ b: 1, 10: 2, a: { z: 1, 9: 2 }, 2: 3 });", "{\"2\":3,\"10\":2,\"b\":1,\"a\":{\"9\":2,\"z\":1}}");
+    eq_s("Object.keys({ ...{ b: 1, 7: 2 }, a: 3, 1: 4 }).join();", "1,7,b,a");
+    eq_s("Object.keys(Object.assign({ z: 0 }, { 4: 1, y: 2 })).join();", "4,z,y");
+    eq_s("const o = JSON.parse('{\"b\":1,\"3\":2,\"a\":3,\"1\":4}'); Object.keys(o).join();", "1,3,b,a");
+    /* an array's named properties come after its elements */
+    eq_s("const a = [10, 20]; a.x = 1; a.y = 2; Object.keys(a).join() + ':' + Object.values(a).join();", "0,1,x,y:10,20,1,2");
+    eq_s("const a = ['p']; a.n = 'q'; Object.entries(a).map((e) => e.join('=')).join();", "0=p,n=q");
+    /* a function's own properties too */
+    eq_s("function F() {} F.b = 1; F[2] = 1; F.a = 1; Object.keys(F).join();", "2,b,a");
+    /* many shuffled integer keys, then the walk after more writes */
+    eq_s("const o = {}; for (let i = 0; i < 5000; i++) o[(i * 7919) % 5003] = i; o.s = 1; o[1] = 0;"
+         " const k = Object.keys(o); let up = true; for (let i = 1; i < k.length - 1; i++) if (+k[i] <= +k[i - 1]) up = false;"
+         " [k.length, k[0], k[k.length - 2], k[k.length - 1], up].join();", "5001,0,5002,s,true");
+}
+
 static void test_function(void) {
     /* Function.prototype.call */
     eq_s("function f(a, b) { return this.x + a + b; } f.call({ x: 1 }, 2, 3);", "6");
@@ -890,6 +918,7 @@ int main(void) {
     test_array();
     test_number();
     test_function();
+    test_key_order();
     test_math();
     test_json();
     test_object();

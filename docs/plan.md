@@ -325,7 +325,7 @@ roadmap:
 
 | Phase | Contents | Sessions |
 |---|---|---|
-| opt | **Shapes + inline caches for property access** (see "Property storage") — only once benchmarks justify it. Today `JsObject.props` is a `JsMap` (`src/js_map.c`): an open-addressed hash table keyed by interned atom pointer with a cached per-string hash — tier 1 of the design. Shapes (hidden classes shared by objects with the same property-insertion history) plus per-call-site inline caches of `(shape, slot)` are tier 3, and also resolve the "object key order follows hash order" deviation below, since shapes store properties in insertion order. `make bench` (`bench/*.js`) runs the baseline: monomorphic vs. polymorphic property get/set, prototype-chain method calls, dense-array indexing, and a template-rendering composite closer to the actual target workload — re-run before/after to decide if this phase is worth its complexity. | 2–3 |
+| opt | **Shapes + inline caches for property access** (see "Property storage") — only once benchmarks justify it. Today `JsObject.props` is a `JsMap` (`src/js_map.c`): an open-addressed hash table keyed by interned atom pointer with a cached per-string hash — tier 1 of the design. Shapes (hidden classes shared by objects with the same property-insertion history) plus per-call-site inline caches of `(shape, slot)` are tier 3. (Key order no longer depends on them: `JsMap` already keeps it.) `make bench` (`bench/*.js`) runs the baseline: monomorphic vs. polymorphic property get/set, prototype-chain method calls, dense-array indexing, and a template-rendering composite closer to the actual target workload — re-run before/after to decide if this phase is worth its complexity. | 2–3 |
 
 ## Known deviations from spec
 
@@ -333,9 +333,12 @@ Tracked so differential testing against Node has a baseline.
 
 - ~~**Object key order follows hash order, not insertion order.**~~ Resolved:
   `JsMap` keeps a dense, insertion-ordered entry array with a hash index
-  beside it (js_map.c), so `Object.keys/values/entries`, `for` over object
-  props and `JSON.stringify` see string keys in the order they were added.
-  Shapes, when they land, will keep that order for free.
+  beside it (js_map.c), so `Object.keys/values/entries`, spread,
+  `Object.assign`, `JSON.stringify` and the host's `js_object_key_at` see
+  string keys in the order they were added — with array-index keys first in
+  ascending order, as the language specifies (`js_map_sort_keys` reorders
+  in place, without allocating, when an index key arrives out of order).
+  An array's named properties follow its elements.
 - **Case mapping is ASCII only** (`toUpperCase`/`toLowerCase`); full Unicode
   case folding would need the UCD tables the regex engine ships.
 - **`Array.prototype.sort` is a stable O(n²) binary insertion sort** — fine

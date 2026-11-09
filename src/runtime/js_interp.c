@@ -776,6 +776,7 @@ bool js_spread_into_object(JsContext *ctx, JsObject *dst, JsValue src) {
                 return false;
         }
     }
+    js_map_sort_keys(&o->props);
     for (uint32_t i = 0; i < o->props.capacity; i++) {
         JsMapEntry *e = &o->props.entries[i];
         if (e->key && e->key != JS_MAP_TOMBSTONE) {

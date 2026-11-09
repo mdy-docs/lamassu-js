@@ -26,6 +26,13 @@ nothing to box it into.
 `seal`, `isSealed`, `fromEntries`, `hasOwn`, `getPrototypeOf`,
 `setPrototypeOf`.
 
+Own keys come out in the language's order everywhere — `keys`/`values`/
+`entries`, spread, `assign` and `JSON.stringify`: array-index names (`"0"`,
+`"12"`) first in ascending numeric order, then every other name in the order
+it was first set, so `{ body, lid }` lists `body` then `lid`. A deleted and
+re-added key moves to the end. An array lists its elements, then any named
+properties.
+
 `freeze` and `seal` are enforced, not advisory: writing to a frozen object,
 or adding to or deleting from a sealed one, throws a `TypeError`. Sealing
 fixes the shape while leaving existing properties writable, so
