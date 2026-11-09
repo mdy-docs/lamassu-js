@@ -424,6 +424,55 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
         }
     }
 
+    /* callee names (only read when a call fails; validated so a bad cache cannot point outside) */
+    uint32_t callee_count = in_u32(b);
+    if (b->bad || callee_count > JSBC_MAX_LINES) {
+        *err = "SyntaxError: bad callee-table size";
+        goto done;
+    }
+    if (callee_count) {
+        fn->callees = js_realloc_raw(vm, NULL, 0, (size_t)callee_count * sizeof(JsCalleeName));
+        if (!fn->callees) {
+            *err = "out of memory";
+            goto done;
+        }
+        fn->callee_cap = callee_count;
+        for (uint32_t i = 0; i < callee_count; i++) {
+            fn->callees[i].off = in_u32(b);
+            fn->callees[i].start = in_u32(b);
+            fn->callees[i].len = in_u32(b);
+        }
+        fn->callee_count = callee_count;
+    }
+    uint32_t text_len = in_u32(b);
+    if (b->bad || text_len > JSBC_MAX_CALLEE_TEXT) {
+        *err = "SyntaxError: bad callee text";
+        goto done;
+    }
+    if (text_len) {
+        fn->callee_text = js_realloc_raw(vm, NULL, 0, (size_t)text_len * sizeof(uint16_t));
+        if (!fn->callee_text) {
+            *err = "out of memory";
+            goto done;
+        }
+        fn->callee_text_cap = text_len;
+        for (uint32_t i = 0; i < text_len; i++)
+            fn->callee_text[i] = in_u16(b);
+        fn->callee_text_len = text_len;
+    }
+    for (uint32_t i = 0; i < fn->callee_count; i++) {
+        const JsCalleeName *e = &fn->callees[i];
+        if (e->off >= fn->code_len || e->len > text_len || e->start > text_len - e->len ||
+            (i && e->off <= fn->callees[i - 1].off)) {
+            *err = "SyntaxError: bad callee table";
+            goto done;
+        }
+    }
+    if (b->bad) {
+        *err = "SyntaxError: truncated callee table";
+        goto done;
+    }
+
     result = fn;
 done:
     js_gc_unprotect(vm, &hold);

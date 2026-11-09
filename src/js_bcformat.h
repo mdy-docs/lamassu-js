@@ -17,7 +17,7 @@
 #ifndef JS_BCFORMAT_H
 #define JS_BCFORMAT_H
 
-#define JSBC_VERSION 3u /* 3: JS_FN_USES_ARGUMENTS function flag */
+#define JSBC_VERSION 4u /* 3: JS_FN_USES_ARGUMENTS function flag; 4: callee-name table after the line table */
 #define JSBC_FLAG_HAS_REGEX 1u /* producer had regex enabled (informational) */
 
 /* Sanity caps: reject absurd sizes early (before allocating) rather than
@@ -27,6 +27,7 @@
 #define JSBC_MAX_LOCALS 65536u
 #define JSBC_MAX_NAME 4096u
 #define JSBC_MAX_LINES (4u * 1024 * 1024)
+#define JSBC_MAX_CALLEE_TEXT (64u * 1024 * 1024) /* UTF-16 units of callee text per function */
 #define JSBC_MAX_STACK 1000000u
 #define JSBC_MAX_FN_DEPTH 200u /* nested-function recursion cap (matches parser) */
 

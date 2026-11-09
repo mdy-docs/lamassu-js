@@ -213,6 +213,123 @@ static void note_pos(JsCompiler *cx, uint32_t pos) {
     cx->cur->last_line_pos = pos;
 }
 
+/* ---- callee names ---- */
+
+/* Longest callee text recorded; a longer one is left out and the error says "value". */
+#define JS_CALLEE_MAX 120
+
+typedef struct CalleeBuf {
+    uint16_t u[JS_CALLEE_MAX];
+    uint32_t n;
+    bool ok;
+} CalleeBuf;
+
+static void cb_units(CalleeBuf *b, const uint16_t *u, uint32_t len) {
+    if (!b->ok || b->n + len > JS_CALLEE_MAX) { b->ok = false; return; }
+    for (uint32_t i = 0; i < len; i++)
+        b->u[b->n++] = u[i];
+}
+static void cb_ascii(CalleeBuf *b, const char *s) {
+    while (*s && b->ok) {
+        uint16_t c = (uint16_t)(unsigned char)*s++;
+        cb_units(b, &c, 1);
+    }
+}
+
+/* The callee as the source would show it: identifiers, this, property chains, literal or
+ * identifier subscripts, calls as f(...); anything else is "(intermediate value)" as V8 says. */
+static void render_callee(CalleeBuf *b, const JsAstNode *n, int depth) {
+    if (!b->ok)
+        return;
+    if (depth > 16) { b->ok = false; return; }
+    switch (n->kind) {
+    case JS_AST_IDENT:
+        cb_units(b, n->units, n->len);
+        return;
+    case JS_AST_THIS:
+        cb_ascii(b, "this");
+        return;
+    case JS_AST_CALL:
+        render_callee(b, n->a, depth + 1);
+        cb_ascii(b, "(...)");
+        return;
+    case JS_AST_MEMBER: {
+        render_callee(b, n->a, depth + 1);
+        if (!(n->flags & JS_F_COMPUTED)) {
+            cb_ascii(b, (n->flags & JS_F_OPTIONAL) ? "?." : ".");
+            cb_units(b, n->units, n->len);
+            return;
+        }
+        cb_ascii(b, (n->flags & JS_F_OPTIONAL) ? "?.[" : "[");
+        const JsAstNode *k = n->b;
+        if (k->kind == JS_AST_IDENT) {
+            cb_units(b, k->units, k->len);
+        } else if (k->kind == JS_AST_STRING) {
+            cb_ascii(b, "\"");
+            cb_units(b, k->units, k->len);
+            cb_ascii(b, "\"");
+        } else if (k->kind == JS_AST_NUMBER && k->number >= 0 && k->number < 1e9 &&
+                   k->number == (double)(uint32_t)k->number) {
+            char num[16];
+            uint32_t v = (uint32_t)k->number, i = 0;
+            char rev[16];
+            do { rev[i++] = (char)('0' + v % 10); v /= 10; } while (v);
+            for (uint32_t j = 0; j < i; j++) num[j] = rev[i - 1 - j];
+            num[i] = 0;
+            cb_ascii(b, num);
+        } else {
+            cb_ascii(b, "...");
+        }
+        cb_ascii(b, "]");
+        return;
+    }
+    default:
+        cb_ascii(b, "(intermediate value)");
+        return;
+    }
+}
+
+/* Records the callee of the CALL/NEW about to be emitted at FN->code_len. Best effort: on OOM
+ * or an over-long callee nothing is recorded and the error falls back to "value". */
+static void note_callee(JsCompiler *cx, const JsAstNode *callee) {
+    if (callee->kind != JS_AST_IDENT && callee->kind != JS_AST_MEMBER && callee->kind != JS_AST_THIS &&
+        callee->kind != JS_AST_CALL)
+        return;
+    CalleeBuf b;
+    b.n = 0;
+    b.ok = true;
+    render_callee(&b, callee, 0);
+    if (!b.ok || !b.n)
+        return;
+    JsFunctionCell *f = FN;
+    if (f->callee_count == f->callee_cap) {
+        uint32_t ncap = f->callee_cap ? f->callee_cap * 2 : 16;
+        JsCalleeName *nc = js_realloc_raw(cx->vm, f->callees, (size_t)f->callee_cap * sizeof *nc,
+                                          (size_t)ncap * sizeof *nc);
+        if (!nc)
+            return;
+        f->callees = nc;
+        f->callee_cap = ncap;
+    }
+    if (f->callee_text_len + b.n > f->callee_text_cap) {
+        uint32_t ncap = f->callee_text_cap ? f->callee_text_cap : 256;
+        while (ncap < f->callee_text_len + b.n)
+            ncap *= 2;
+        uint16_t *nt = js_realloc_raw(cx->vm, f->callee_text, (size_t)f->callee_text_cap * sizeof *nt,
+                                      (size_t)ncap * sizeof *nt);
+        if (!nt)
+            return;
+        f->callee_text = nt;
+        f->callee_text_cap = ncap;
+    }
+    JsCalleeName *e = &f->callees[f->callee_count++];
+    e->off = f->code_len;
+    e->start = f->callee_text_len;
+    e->len = b.n;
+    for (uint32_t i = 0; i < b.n; i++)
+        f->callee_text[f->callee_text_len++] = b.u[i];
+}
+
 /* ---- constants ---- */
 
 static bool const_add(JsCompiler *cx, JsValue v, uint16_t *idx) {
@@ -1259,6 +1376,7 @@ static bool compile_call(JsCompiler *cx, const JsAstNode *n) {
     bool varargs;
     if (!compile_args(cx, n->items, n->count, &varargs))
         return false;
+    note_callee(cx, callee);
     if (varargs) {
         if (!emit_op(cx, JS_OP_CALL_VARARGS, -2)) /* [callee this arr] -> [res] */
             return false;
@@ -1295,6 +1413,7 @@ static bool compile_new(JsCompiler *cx, const JsAstNode *n) {
     bool varargs;
     if (!compile_args(cx, n->items, n->count, &varargs))
         return false;
+    note_callee(cx, n->a);
     if (varargs) {
         if (!emit_op(cx, JS_OP_NEW_VARARGS, -2)) /* [callee this arr] -> [res] */
             return false;

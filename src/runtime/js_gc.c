@@ -218,6 +218,8 @@ void js_gc_free_cell(JsVm *vm, JsGcCell *c, bool remove_atoms) {
         js_realloc_raw(vm, f->consts, (size_t)f->const_cap * sizeof(JsValue), 0);
         js_realloc_raw(vm, f->lines, (size_t)f->line_cap * sizeof(JsLineEntry), 0);
         js_realloc_raw(vm, f->upvals, (size_t)f->upval_cap * sizeof(JsUpvalDesc), 0);
+        js_realloc_raw(vm, f->callees, (size_t)f->callee_cap * sizeof(JsCalleeName), 0);
+        js_realloc_raw(vm, f->callee_text, (size_t)f->callee_text_cap * sizeof(uint16_t), 0);
         if (f->insn_boundary)
             js_realloc_raw(vm, f->insn_boundary, f->code_len, 0);
         if (f->gosub_rets)

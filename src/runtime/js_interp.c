@@ -831,15 +831,15 @@ static void fiber_throw(JsContext *ctx, JsFiber *fb, const char *ascii_msg) {
  * mid-build — a bug that only surfaces once the heap is large enough to
  * collect during error formatting.
  */
-static void fiber_throw_name(JsContext *ctx, JsFiber *fb, const char *prefix,
-                             const JsString *name, const char *suffix) {
+static void fiber_throw_units(JsContext *ctx, JsFiber *fb, const char *prefix,
+                              const uint16_t *units, uint32_t len, const char *suffix) {
     JsVm *vm = ctx->vm;
     size_t plen = 0, slen = 0;
     while (prefix[plen])
         plen++;
     while (suffix[slen])
         slen++;
-    size_t total = plen + name->length + slen;
+    size_t total = plen + len + slen;
     uint16_t *buf = js_realloc_raw(vm, NULL, 0, total * sizeof(uint16_t));
     if (!buf) {
         fiber_throw(ctx, fb, prefix);
@@ -848,14 +848,36 @@ static void fiber_throw_name(JsContext *ctx, JsFiber *fb, const char *prefix,
     size_t n = 0;
     for (size_t i = 0; i < plen; i++)
         buf[n++] = (uint16_t)(unsigned char)prefix[i];
-    for (uint32_t i = 0; i < name->length; i++)
-        buf[n++] = name->units[i];
+    for (uint32_t i = 0; i < len; i++)
+        buf[n++] = units[i];
     for (size_t i = 0; i < slen; i++)
         buf[n++] = (uint16_t)(unsigned char)suffix[i];
     JsString *s = js_string_cell_new(vm, buf, (uint32_t)total);
     js_realloc_raw(vm, buf, total * sizeof(uint16_t), 0);
     fb->error = s ? js_error_from_cell(ctx, s) : js_oom_value(vm);
     fb->failed = true;
+}
+
+static void fiber_throw_name(JsContext *ctx, JsFiber *fb, const char *prefix,
+                             const JsString *name, const char *suffix) {
+    fiber_throw_units(ctx, fb, prefix, name->units, name->length, suffix);
+}
+
+/* "TypeError: <callee> is not a function" with the call site's callee text when the compiler
+ * recorded one (s.fillet, foo, a[0]), else "TypeError: value is not a function". */
+static void fiber_throw_callee(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip,
+                               const char *what) {
+    uint32_t lo = 0, hi = fn->callee_count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (fn->callees[mid].off < ip) lo = mid + 1; else hi = mid;
+    }
+    if (lo < fn->callee_count && fn->callees[lo].off == ip) {
+        const JsCalleeName *e = &fn->callees[lo];
+        fiber_throw_units(ctx, fb, "TypeError: ", fn->callee_text + e->start, e->len, what);
+        return;
+    }
+    fiber_throw_units(ctx, fb, "TypeError: value", NULL, 0, what);
 }
 
 /* ---- closures, upvalues, natives ---- */
@@ -1928,7 +1950,8 @@ run:; /* (re)load the top frame */
                         goto run;
                     }
                 }
-                RT_THROW("TypeError: value is not a function");
+                fiber_throw_callee(ctx, fb, fn, op_ip, " is not a function");
+                RT_RAISE();
             }
             case JS_OP_NEW:
             case JS_OP_NEW_VARARGS: {
@@ -1952,7 +1975,7 @@ run:; /* (re)load the top frame */
                 uint32_t nb = fb->sp - argc; /* callee=nb-2, this(placeholder)=nb-1 */
                 JsValue callee = S[nb - 2];
                 if (!js_is_function(callee))
-                    RT_THROW("TypeError: value is not a constructor");
+                    { fiber_throw_callee(ctx, fb, fn, op_ip, " is not a constructor"); RT_RAISE(); }
                 JsGcCell *cc = js_value_cell(callee);
                 if (cc->kind == JS_KIND_NATIVE) {
                     /* Builtins (Array, Object, RegExp, ...) are factory
@@ -1979,10 +2002,10 @@ run:; /* (re)load the top frame */
                     break;
                 }
                 if (cc->kind != JS_KIND_CLOSURE)
-                    RT_THROW("TypeError: value is not a constructor");
+                    { fiber_throw_callee(ctx, fb, fn, op_ip, " is not a constructor"); RT_RAISE(); }
                 JsClosure *ctor = (JsClosure *)cc;
                 if (ctor->fn->fn_flags & (JS_FN_ARROW | JS_FN_ASYNC))
-                    RT_THROW("TypeError: value is not a constructor");
+                    { fiber_throw_callee(ctx, fb, fn, op_ip, " is not a constructor"); RT_RAISE(); }
                 fr->ip = ip; /* GC-safe point before allocations below */
                 JsObject *proto = closure_prototype(ctx, ctor);
                 if (!proto)

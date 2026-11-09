@@ -136,6 +136,15 @@ static bool serialize_fn(OutBuf *b, JsFunctionCell *fn, uint32_t depth) {
         out_u32(b, fn->lines[i].off);
         out_u32(b, fn->lines[i].pos);
     }
+    /* callee names: entries, then the text they slice */
+    out_u32(b, fn->callee_count);
+    for (uint32_t i = 0; i < fn->callee_count; i++) {
+        out_u32(b, fn->callees[i].off);
+        out_u32(b, fn->callees[i].start);
+        out_u32(b, fn->callees[i].len);
+    }
+    out_u32(b, fn->callee_text_len);
+    out_units(b, fn->callee_text, fn->callee_text_len);
     return !b->oom;
 }
 

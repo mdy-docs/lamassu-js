@@ -78,7 +78,8 @@ void js_enable_source_modules(JsContext *ctx);
  *
  * The format is versioned and carries no source; runtime error positions
  * survive (line table is included) but mapping them to line:col needs the
- * original source. The byte order is canonical (little-endian), so a cache
+ * original source. Each call site's callee text ("s.fillet") is included, so
+ * "s.fillet is not a function" reads the same from a cache. The byte order is canonical (little-endian), so a cache
  * is portable across machines of the same pointer width.
  */
 bool js_bytecode_serialize(JsContext *ctx, JsValue fn, uint8_t **out, size_t *out_len);

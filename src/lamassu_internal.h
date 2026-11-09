@@ -132,6 +132,15 @@ typedef struct JsLineEntry {
     uint32_t pos; /* source offset */
 } JsLineEntry;
 
+/* A call or `new` site's callee as source-like text ("s.fillet", "foo", "a[0]"), so a failed call
+ * can say what it tried to call. off is the CALL/NEW instruction's code offset; the text is
+ * callee_text[start .. start + len). Entries are in increasing off order. */
+typedef struct JsCalleeName {
+    uint32_t off;
+    uint32_t start;
+    uint32_t len;
+} JsCalleeName;
+
 typedef struct JsUpvalDesc {
     uint16_t idx;      /* parent local slot, or parent upvalue index */
     uint8_t from_local;
@@ -174,6 +183,11 @@ typedef struct JsFunctionCell {
      * has no subroutines, or for compiler-emitted code. */
     uint32_t *gosub_rets;
     uint32_t gosub_ret_count;
+    /* Callee text per call site (JsCalleeName), read only when a call fails. */
+    JsCalleeName *callees;
+    uint32_t callee_count, callee_cap;
+    uint16_t *callee_text;
+    uint32_t callee_text_len, callee_text_cap;
 } JsFunctionCell;
 
 /* JsFunctionCell.insn_boundary bits. */
