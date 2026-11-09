@@ -256,6 +256,9 @@ JsValue js_module_dynamic_import(JsContext *ctx, JsModule *referrer, JsValue spe
 /* js_native_new: public, lamassu.h */
 /* Bound native carrying a captured value (js_interp.c). */
 JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound);
+/* A function value's own-property object (js_interp.c): with create, made on first use (NULL on
+ * OOM); without, NULL when it has none. Object builtins use it to treat functions as objects. */
+JsObject *js_function_props(JsContext *ctx, JsValue fn, bool create);
 /* The JsBoundFn of every function Function.prototype.bind makes (js_builtins.c); its bound value
  * is the array [target, thisArg, ...presetArgs]. `new` recognises it to construct the target. */
 bool js_bind_call(JsContext *ctx, JsValue bound, JsValue this_val, const JsValue *args, int argc,

@@ -2196,6 +2196,10 @@ static bool obj_keys_impl(JsContext *ctx, JsValue tv, const JsValue *args, int a
                           JsValue *r, int mode /*0 keys,1 values,2 entries*/) {
     (void)tv;
     JsValue v = ARG(0);
+    if (js_is_function(v)) { /* a function's own properties (none until a script writes one) */
+        JsObject *own = js_function_props(ctx, v, false);
+        v = own ? js_value_from_cell(&own->gc) : js_undefined();
+    }
     JsObject *out = js_array_new_cell(ctx, 0);
     if (!out)
         return oom(ctx, r);
@@ -2273,13 +2277,28 @@ static bool obj_entries(JsContext *ctx, JsValue tv, const JsValue *a, int c, JsV
 static bool obj_assign(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     JsValue target = ARG(0);
-    if (!js_is_object(target))
+    /* a function as target or source: its own-property object */
+    JsValue dst = target;
+    if (js_is_function(target)) {
+        JsObject *own = js_function_props(ctx, target, true);
+        if (!own)
+            return oom(ctx, r);
+        dst = js_value_from_cell(&own->gc);
+    }
+    if (!js_is_object(dst))
         return native_throw(ctx, r, "TypeError: Object.assign target must be an object");
+    if (js_value_object(dst)->obj_flags & JS_OBJ_FROZEN)
+        return native_throw(ctx, r, "TypeError: cannot assign to a property of a frozen object");
     js_gc_protect(ctx->vm, &target);
     bool ok = true;
     for (int i = 1; i < argc && ok; i++) {
-        if (js_is_object(args[i]))
-            ok = js_spread_into_object(ctx, js_value_object(target), args[i]);
+        JsValue src = args[i];
+        if (js_is_function(src)) {
+            JsObject *own = js_function_props(ctx, src, false);
+            src = own ? js_value_from_cell(&own->gc) : js_undefined();
+        }
+        if (js_is_object(src))
+            ok = js_spread_into_object(ctx, js_value_object(dst), src);
     }
     js_gc_unprotect(ctx->vm, &target);
     if (!ok)
@@ -2295,11 +2314,16 @@ static bool obj_assign(JsContext *ctx, JsValue tv, const JsValue *args, int argc
  */
 static bool obj_set_integrity(JsContext *ctx, const JsValue *args, int argc,
                               JsValue *r, uint8_t flags) {
-    (void)ctx;
     (void)argc;
     JsValue v = ARG(0);
     if (js_is_object(v))
         js_value_object(v)->obj_flags |= flags;
+    if (js_is_function(v)) { /* freezes the function's own properties (made now, so it sticks) */
+        JsObject *own = js_function_props(ctx, v, true);
+        if (!own)
+            return oom(ctx, r);
+        own->obj_flags |= flags;
+    }
     *r = v;
     return true;
 }
@@ -2321,6 +2345,11 @@ static bool obj_isFrozen(JsContext *ctx, JsValue tv, const JsValue *args, int ar
     (void)tv;
     (void)argc;
     JsValue v = ARG(0);
+    if (js_is_function(v)) {
+        JsObject *own = js_function_props(ctx, v, false);
+        *r = js_bool(own && (own->obj_flags & JS_OBJ_FROZEN) != 0);
+        return true;
+    }
     *r = js_bool(!js_is_object(v) ||
                  (js_value_object(v)->obj_flags & JS_OBJ_FROZEN) != 0);
     return true;
@@ -2331,6 +2360,11 @@ static bool obj_isSealed(JsContext *ctx, JsValue tv, const JsValue *args, int ar
     (void)tv;
     (void)argc;
     JsValue v = ARG(0);
+    if (js_is_function(v)) {
+        JsObject *own = js_function_props(ctx, v, false);
+        *r = js_bool(own && (own->obj_flags & JS_OBJ_SEALED) != 0);
+        return true;
+    }
     *r = js_bool(!js_is_object(v) ||
                  (js_value_object(v)->obj_flags & JS_OBJ_SEALED) != 0);
     return true;
@@ -2398,6 +2432,10 @@ static bool object_has_own_key(JsContext *ctx, JsObject *ob, JsValue key, bool *
 static bool obj_hasOwn(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     JsValue o = ARG(0);
+    if (js_is_function(o)) {
+        JsObject *own = js_function_props(ctx, o, false);
+        o = own ? js_value_from_cell(&own->gc) : js_undefined();
+    }
     if (!js_is_object(o)) {
         *r = js_bool(false);
         return true;
@@ -2418,6 +2456,10 @@ static bool obj_hasOwn(JsContext *ctx, JsValue tv, const JsValue *args, int argc
 
 static bool objp_hasOwnProperty(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                                 JsValue *r) {
+    if (js_is_function(tv)) {
+        JsObject *own = js_function_props(ctx, tv, false);
+        tv = own ? js_value_from_cell(&own->gc) : js_undefined();
+    }
     if (!js_is_object(tv)) {
         *r = js_bool(false);
         return true;
@@ -3004,6 +3046,7 @@ bool js_builtins_init(JsContext *ctx) {
         {NULL, NULL}};
     static const MethodDef function_methods[] = {
         {"apply", fm_apply}, {"bind", fm_bind}, {"call", fm_call},
+        {"hasOwnProperty", objp_hasOwnProperty},
         {NULL, NULL}};
     static const MethodDef number_methods[] = {
         {"toFixed", nm_toFixed}, {"toString", nm_toString}, {"valueOf", nm_toString},

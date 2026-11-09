@@ -220,6 +220,9 @@ typedef struct JsClosure {
     /* `new`: lazily-created .prototype object (constructor pattern); NULL
      * until first accessed via `fn.prototype` or `new fn()`. */
     JsObject *prototype_obj;
+    /* Properties a script gives the function (statics on a constructor: F.create = ...); a plain
+     * object, created on the first write. NULL until then. */
+    JsObject *props;
     JsUpvalue *upvals[];
 } JsClosure;
 
@@ -239,6 +242,7 @@ typedef struct JsNative {
      * [[Prototype]] here. NULL until first accessed via `Ctor.prototype`. */
     JsObject *prototype;
     JsValue bound;       /* captured value for bound natives */
+    JsObject *props;     /* properties a script gives it (like JsClosure.props); NULL until written */
     bool is_bound;
 } JsNative;
 

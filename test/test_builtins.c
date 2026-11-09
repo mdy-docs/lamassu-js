@@ -397,6 +397,25 @@ static void test_function(void) {
     eq_s("function P(a, b, c) { this.s = a + b + c; } const B = P.bind(null, 1).bind(null, 2); new B(3).s;", "6");
     eq_s("function P(x) { this.x = x; } P.prototype.twice = function () { return 2 * this.x; }; const B = P.bind(null); new B(...[21]).twice();", "42");
     err("const B = (() => 1).bind(null); new B();", "TypeError");
+    /* properties on function values: statics, constants, caches */
+    eq_s("function F(x) { this.x = x; } F.from = (v) => new F(v * 2); F.ORIGIN = new F(0); F.from(3).x + F.ORIGIN.x;", "6");
+    eq_s("const f = () => 1; f.tag = 'a'; f.tag + f();", "a1");
+    eq_s("function c() { c.n = (c.n || 0) + 1; return c.n; } c(); c(); c();", "3");
+    eq_s("function F() {} F.V = 2; ['V' in F, 'nope' in F, 'call' in F, 'prototype' in F].join();", "true,false,true,true");
+    eq_s("const f = () => 0; f.a = 1; delete f.a; [f.a === undefined, delete f.never].join();", "true,true");
+    eq_s("function F() {} F.b = 2; F.a = 1; Object.keys(F).sort().join() + ':' + Object.values(F).sort().join();", "a,b:1,2");
+    eq_s("[Object.keys(function () {}).length, Object.keys(Object).length, Object.entries(() => 0).length].join();", "0,0,0");
+    eq_s("function F() {} Object.assign(F, { a: 1, b: 2 }); const c = Object.assign({}, F); F.a + F.b + c.a + c.b;", "6");
+    eq_s("function F() {} F.x = 1; [F.hasOwnProperty('x'), F.hasOwnProperty('call'), Object.hasOwn(F, 'x'), Object.hasOwn(F, 'y')].join();", "true,false,true,false");
+    eq_s("const f = () => 0; f.a = 1; Object.freeze(f); let m = ''; try { f.a = 2; } catch (e) { m = e.name; } m + f.a + Object.isFrozen(f) + Object.isFrozen(() => 0);", "TypeError1truefalse");
+    eq_s("const f = () => 0; Object.seal(f); let m = ''; try { f.z = 1; } catch (e) { m = e.name; } m + Object.isSealed(f);", "TypeErrortrue");
+    eq_s("Math.max.tag = 1; Math.max.tag + Math.max(2, 3);", "4");
+    eq_s("const k = Object.keys; Object.keys = () => 'mine'; const r = Object.keys({ a: 1 }); Object.keys = k; r + Object.keys({ b: 1 }).join();", "mineb");
+    eq_s("function F() {} F.prototype.hi = function () { return 'hi'; }; F.s = 1; new F().hi() + F.s;", "hi1");
+    eq_s("function F() {} for (let i = 0; i < 500; i++) F['k' + i] = { v: i }; F.k499.v + Object.keys(F).length;", "999");
+    eq_s("const b = (function () {}).bind(null); b.z = 3; b.z;", "3");
+    eq_s("const f = () => 1; f.call = 5; f.call;", "5");
+    eq_s("const make = () => { const g = () => 0; g.big = []; for (let i = 0; i < 100; i++) g.big.push({ i }); return g; }; let t = 0; for (let j = 0; j < 50; j++) t += make().big[99].i; t;", "4950");
 }
 
 static void test_math(void) {

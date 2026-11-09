@@ -395,6 +395,24 @@ static JsPropStatus method_lookup(JsContext *ctx, JsObject *table, JsValue key,
     return JS_PROP_OK;
 }
 
+/* The own-property object of a function value (closure or native): what a script wrote onto it.
+ * With create, made on first use (NULL then means out of memory); without, NULL if it has none. */
+JsObject *js_function_props(JsContext *ctx, JsValue fn, bool create) {
+    if (!js_is_function(fn))
+        return NULL;
+    JsGcCell *c = js_value_cell(fn);
+    if (c->kind != JS_KIND_CLOSURE && c->kind != JS_KIND_NATIVE)
+        return NULL;
+    JsObject **slot = c->kind == JS_KIND_CLOSURE ? &((JsClosure *)c)->props : &((JsNative *)c)->props;
+    if (!*slot && create) {
+        JsValue o = js_object_new(ctx); /* fn is the caller's (rooted) value; cells do not move */
+        if (!js_is_object(o))
+            return NULL;
+        *slot = js_value_object(o);
+    }
+    return *slot;
+}
+
 static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
                                  JsValue *out) {
     JsVm *vm = ctx->vm;
@@ -504,6 +522,12 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
             if (c->kind == JS_KIND_CLOSURE || c->kind == JS_KIND_NATIVE)
                 return JS_PROP_OOM;
         }
+        JsObject *own = js_function_props(ctx, base, false);
+        if (own) {
+            JsPropStatus st = method_lookup(ctx, own, key, out);
+            if (st != JS_PROP_OK || !js_is_undefined(*out))
+                return st;
+        }
         if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->statics) {
             JsPropStatus st = method_lookup(ctx, ((JsNative *)c)->statics, key, out);
             if (st != JS_PROP_OK || !js_is_undefined(*out))
@@ -571,8 +595,21 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
             }
             return JS_PROP_OK;
         }
-        *errmsg = "TypeError: cannot create property on a primitive value";
-        return JS_PROP_TYPE_ERROR;
+        /* any other key: the function's own properties (statics, constants, caches) */
+        JsObject *own = js_function_props(ctx, base, true);
+        if (!own)
+            return JS_PROP_OOM;
+        const char *blocked = write_blocked(ctx, own, key);
+        if (blocked) {
+            *errmsg = blocked;
+            return JS_PROP_TYPE_ERROR;
+        }
+        JsString *k = to_prop_key(ctx, key);
+        if (!k)
+            return JS_PROP_OOM;
+        if (!js_map_set(vm, &own->props, k, val))
+            return JS_PROP_OOM;
+        return JS_PROP_OK;
     }
     if (!js_is_object(base)) {
         *errmsg = "TypeError: cannot create property on a primitive value";
@@ -640,6 +677,18 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
 static JsPropStatus has_property(JsContext *ctx, JsValue base, JsValue key,
                                  bool *out) {
     *out = false;
+    if (js_is_function(base)) {
+        /* `k in fn`: what reading fn[k] would find (own properties, builtin statics, methods) */
+        if (js_is_string(key) && units_is_ascii_str(js_value_string(key), "prototype")) {
+            *out = true;
+            return JS_PROP_OK;
+        }
+        JsValue v;
+        JsPropStatus st = get_property(ctx, base, key, &v);
+        if (st == JS_PROP_OK)
+            *out = !js_is_undefined(v);
+        return st;
+    }
     if (!js_is_object(base))
         return JS_PROP_TYPE_ERROR;
     JsObject *o = js_value_object(base);
@@ -912,6 +961,7 @@ static JsClosure *closure_new(JsVm *vm, JsFunctionCell *fn) {
     cl->this_val = js_undefined();
     cl->has_this = false;
     cl->prototype_obj = NULL;
+    cl->props = NULL;
     cl->n_upvals = fn->n_upvals;
     for (uint16_t i = 0; i < fn->n_upvals; i++)
         cl->upvals[i] = NULL;
@@ -971,6 +1021,7 @@ JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *ud)
     nf->ud = ud;
     nf->name = js_is_string(nmv) ? js_value_string(nmv) : NULL;
     nf->statics = NULL;
+    nf->props = NULL;
     nf->prototype = NULL;
     nf->bound = js_undefined();
     nf->is_bound = false;
@@ -991,6 +1042,7 @@ JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound) {
     nf->ud = NULL;
     nf->name = NULL;
     nf->statics = NULL;
+    nf->props = NULL;
     nf->prototype = NULL;
     nf->bound = bound;
     nf->is_bound = true;
@@ -1032,6 +1084,7 @@ bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
     nf->bound_fn = NULL;
     nf->ud = userdata;
     nf->statics = NULL;
+    nf->props = NULL;
     nf->prototype = NULL;
     nf->name = js_value_string(key);
     nf->bound = js_undefined();
@@ -1787,6 +1840,17 @@ run:; /* (re)load the top frame */
                         if (!k)
                             RT_THROW("out of memory");
                         js_map_delete(&o->props, k);
+                    }
+                } else if (js_is_function(b)) {
+                    JsObject *own = js_function_props(ctx, b, false);
+                    if (own) {
+                        if (own->obj_flags)
+                            RT_THROW("TypeError: cannot delete a property of a "
+                                     "sealed or frozen object");
+                        JsString *k = to_prop_key(ctx, key);
+                        if (!k)
+                            RT_THROW("out of memory");
+                        js_map_delete(&own->props, k);
                     }
                 } else if (is_nullish(b)) {
                     RT_THROW("TypeError: cannot convert undefined or null to object");

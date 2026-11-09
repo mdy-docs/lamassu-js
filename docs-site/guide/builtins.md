@@ -105,8 +105,14 @@ Every function value, a script closure or a native, has `call`, `apply` and `bin
   function constructs `f` with the preset arguments and ignores the bound `this`.
 
 Modules are strict, so `undefined` and `null` are passed through as they are rather than replaced by
-the global object, and arrow functions keep their own `this`. Functions take no properties of their
-own, and a bound function has no `name` or `length`.
+the global object, and arrow functions keep their own `this`. Functions have no `name` or `length`.
+
+A function can hold properties like any object, which is how a constructor gets statics with
+classes out of the language: `F.from = (v) => new F(v)`, `F.ORIGIN = new F(0)`, a cache on a helper.
+`in`, `delete`, `hasOwnProperty`, `Object.keys`/`values`/`entries`/`assign`/`hasOwn` and
+`freeze`/`seal` see them. A builtin constructor's own statics (`Object.keys`, `Array.isArray`) can be
+replaced but are not listed by `Object.keys(Object)`, as in other engines. `typeof` a function
+is still `"function"`, and `prototype` keeps its special meaning.
 
 ## `Boolean`
 
