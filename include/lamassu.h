@@ -290,7 +290,7 @@ void *js_native_userdata(JsContext *ctx);
  *
  * An object that owns something outside the engine: a pointer the host gets back from it, and a
  * finalizer the collector runs once the object is unreachable (or when the VM is freed), so host
- * resources live exactly as long as the script can reach them. To guest code it is an ordinary
+ * resources live at least as long as the script can reach them. To guest code it is an ordinary
  * object: Object.prototype, own properties, typeof "object"; the pointer is invisible to it.
  *
  * The class is the host's static description, compared by address: js_host_object_ptr returns
@@ -300,6 +300,16 @@ void *js_native_userdata(JsContext *ctx);
  * The finalizer runs during a collection, from inside the allocator that triggered it, so it must
  * not touch the VM: no allocation, no js_* calls, no rooting. Releasing the host resource is all
  * it is for. It runs at most once per object, in no particular order between objects.
+ *
+ * When it runs is unspecified: some time after the object becomes unreachable, at a collection
+ * whose timing follows everything allocated before it and the platform (the threshold is in bytes,
+ * so 32- and 64-bit builds collect at different moments), or never before the VM is freed. So
+ * nothing observable may depend on whether a finalizer has run yet. A resource that unreachable
+ * objects still hold must not change results: a reference-counted resource still counts them, so a
+ * library that decides something from its counts (sharing, caching, copy-on-write) must first be
+ * given counts that mean "reachable", by calling js_gc_collect and then consulting the library with
+ * no script running in between. (A geometry kernel that skips merging shared nodes gave different
+ * meshes on different platforms this way, until its host collected before evaluating.)
  *
  * external_bytes is how much host memory the object keeps alive. It does not count against the
  * heap limit (the engine cannot refuse memory it did not allocate), but it counts toward the
