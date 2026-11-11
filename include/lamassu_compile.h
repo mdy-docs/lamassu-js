@@ -38,8 +38,14 @@ extern "C" {
 /*
  * Compiles UTF-16 source as a strict-mode module body. Returns a function
  * value (root it per the GC contract), or undefined on error with *err_msg
- * (static ASCII) and *err_pos (source offset) set. If the source uses top-level
+ * and *err_pos (source offset) set. If the source uses top-level
  * import/export, compilation fails with *err_msg == JS_ERR_NEEDS_MODULE_LOADER.
+ *
+ * Compile error messages are worded as V8 words them ("Unexpected token ';'",
+ * "Identifier 'x' has already been declared"), without the "SyntaxError: "
+ * prefix. They are UTF-8 (a name in one may be any text) and stay valid until the
+ * next compile on the same VM: copy one to keep it. This holds for every compile
+ * entry point below.
  */
 JsValue js_compile_module(JsContext *ctx, const uint16_t *src, size_t len,
                           const char **err_msg, uint32_t *err_pos);
@@ -112,8 +118,8 @@ bool js_bytecode_compile_module(JsContext *ctx, const uint16_t *specifier,
  * the root of js_eval_entry), then discards the result: nothing is registered,
  * resolved, linked or run, and imported modules are not loaded. For an editor
  * checking a file as it is typed. Returns true when it compiles; otherwise false
- * with *err_msg (static ASCII, "out of memory" on OOM) and *err_pos (source
- * offset; js_source_line_col turns it into a line and column).
+ * with *err_msg (as for js_compile_module; "out of memory" on OOM) and *err_pos
+ * (source offset; js_source_line_col turns it into a line and column).
  */
 bool js_check_module(JsContext *ctx, const uint16_t *source, size_t source_len, bool entry,
                      const char **err_msg, uint32_t *err_pos);

@@ -1,3 +1,4 @@
+#include <string.h>
 #include "js_compile.h"
 #include "lamassu_compile.h"
 #ifdef LAMASSU_HAS_REGEX
@@ -55,6 +56,7 @@ typedef struct JsLocalVar {
     uint16_t slot;
     bool is_const;
     bool captured;             /* an inner function closes over it */
+    bool pending;              /* let/const not yet initialized here: a read may hit the TDZ */
 } JsLocalVar;
 
 typedef struct JsUpName {
@@ -86,6 +88,7 @@ typedef struct JsFuncState {
     JsFinallyInfo finallys[JS_MAX_FINALLY];
     int finally_count;
     int scope_depth; /* nesting of blocks/loops within this function */
+    int pattern_depth; /* nesting of destructuring patterns being compiled */
     uint32_t last_line_pos;
 } JsFuncState;
 
@@ -96,6 +99,9 @@ typedef struct JsCompiler {
     JsFuncState *cur;
     bool repl;       /* REPL: top-level declarations join the lexical scope */
     bool decl_const; /* const-ness of the declaration currently being compiled */
+    /* The expression a destructuring pattern about to be compiled takes apart (`o.b` in
+     * `const { a } = o.b`), for the error's wording; read and cleared by the pattern. */
+    const JsAstNode *pattern_src;
     const char *err_msg;
     uint32_t err_pos;
     int func_depth;
@@ -111,6 +117,9 @@ typedef struct JsCompiler {
 static bool compile_stmt(JsCompiler *cx, const JsAstNode *n);
 static bool compile_expr(JsCompiler *cx, const JsAstNode *n);
 static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat, bool declaring);
+static bool compile_array_pattern_items(JsCompiler *cx, const JsAstNode *pat, bool declaring);
+static bool compile_object_pattern_items(JsCompiler *cx, const JsAstNode *pat, bool declaring,
+                                         const JsAstNode *src, bool outer);
 static bool compile_function(JsCompiler *cx, const JsAstNode *fnode);
 static int emit_module_load(JsCompiler *cx, const JsAstNode *n);
 static bool compile_function(JsCompiler *cx, const JsAstNode *fnode);
@@ -222,6 +231,7 @@ typedef struct CalleeBuf {
     uint16_t u[JS_CALLEE_MAX];
     uint32_t n;
     bool ok;
+    JsVm *vm; /* for printing number literals */
 } CalleeBuf;
 
 static void cb_units(CalleeBuf *b, const uint16_t *u, uint32_t len) {
@@ -249,6 +259,26 @@ static void render_callee(CalleeBuf *b, const JsAstNode *n, int depth) {
     case JS_AST_THIS:
         cb_ascii(b, "this");
         return;
+    case JS_AST_NULL_LIT:
+        cb_ascii(b, "null");
+        return;
+    case JS_AST_BOOL_LIT:
+        cb_ascii(b, (n->flags & JS_F_TRUE) ? "true" : "false");
+        return;
+    case JS_AST_STRING:
+        cb_ascii(b, "\"");
+        cb_units(b, n->units, n->len);
+        cb_ascii(b, "\"");
+        return;
+    case JS_AST_NUMBER: {
+        /* as V8 prints it: the value, not the spelling (0x10 shows as 16) */
+        JsString *s = b->vm ? js_number_to_string(b->vm, n->number) : NULL;
+        if (s)
+            cb_units(b, s->units, s->length);
+        else
+            b->ok = false;
+        return;
+    }
     case JS_AST_CALL:
         render_callee(b, n->a, depth + 1);
         cb_ascii(b, "(...)");
@@ -289,19 +319,17 @@ static void render_callee(CalleeBuf *b, const JsAstNode *n, int depth) {
     }
 }
 
-/* Records the callee of the CALL/NEW about to be emitted at FN->code_len. Best effort: on OOM
- * or an over-long callee nothing is recorded and the error falls back to "value". */
-static void note_callee(JsCompiler *cx, const JsAstNode *callee) {
-    if (callee->kind != JS_AST_IDENT && callee->kind != JS_AST_MEMBER && callee->kind != JS_AST_THIS &&
-        callee->kind != JS_AST_CALL)
-        return;
-    CalleeBuf b;
-    b.n = 0;
-    b.ok = true;
-    render_callee(&b, callee, 0);
-    if (!b.ok || !b.n)
-        return;
+/* Records the text of N (rendered as the source shows it) against the instruction about to be
+ * emitted at FN->code_len, for that instruction's error: the callee of a CALL/NEW ("o.f is not
+ * a function"), the operand of ITER_NEW/ARRAY_SPREAD ("o is not iterable"), the source of a
+ * destructuring's first property read ("Cannot destructure property 'a' of 'o'"), the name of
+ * a binding read that may still be in its TDZ. N NULL records an empty text, which still marks
+ * the instruction (a destructuring with no nameable source). Best effort: on OOM, or for an
+ * expression with no readable form, nothing is recorded unless EMPTY_OK. */
+static void note_units(JsCompiler *cx, const uint16_t *u, uint32_t n) {
     JsFunctionCell *f = FN;
+    if (f->callee_count && f->callees[f->callee_count - 1].off >= f->code_len)
+        return; /* one text per instruction */
     if (f->callee_count == f->callee_cap) {
         uint32_t ncap = f->callee_cap ? f->callee_cap * 2 : 16;
         JsCalleeName *nc = js_realloc_raw(cx->vm, f->callees, (size_t)f->callee_cap * sizeof *nc,
@@ -311,9 +339,9 @@ static void note_callee(JsCompiler *cx, const JsAstNode *callee) {
         f->callees = nc;
         f->callee_cap = ncap;
     }
-    if (f->callee_text_len + b.n > f->callee_text_cap) {
+    if (f->callee_text_len + n > f->callee_text_cap) {
         uint32_t ncap = f->callee_text_cap ? f->callee_text_cap : 256;
-        while (ncap < f->callee_text_len + b.n)
+        while (ncap < f->callee_text_len + n)
             ncap *= 2;
         uint16_t *nt = js_realloc_raw(cx->vm, f->callee_text, (size_t)f->callee_text_cap * sizeof *nt,
                                       (size_t)ncap * sizeof *nt);
@@ -325,9 +353,37 @@ static void note_callee(JsCompiler *cx, const JsAstNode *callee) {
     JsCalleeName *e = &f->callees[f->callee_count++];
     e->off = f->code_len;
     e->start = f->callee_text_len;
-    e->len = b.n;
-    for (uint32_t i = 0; i < b.n; i++)
-        f->callee_text[f->callee_text_len++] = b.u[i];
+    e->len = n;
+    for (uint32_t i = 0; i < n; i++)
+        f->callee_text[f->callee_text_len++] = u[i];
+}
+
+static void note_text(JsCompiler *cx, const JsAstNode *n, bool empty_ok) {
+    CalleeBuf b;
+    b.n = 0;
+    b.ok = true;
+    b.vm = cx->vm;
+    if (n) {
+        switch (n->kind) {
+        case JS_AST_IDENT: case JS_AST_MEMBER: case JS_AST_THIS: case JS_AST_CALL:
+        case JS_AST_NULL_LIT: case JS_AST_BOOL_LIT: case JS_AST_STRING: case JS_AST_NUMBER:
+            render_callee(&b, n, 0);
+            break;
+        default:
+            b.ok = false;
+            break;
+        }
+    }
+    if (!b.ok || !b.n) {
+        if (empty_ok)
+            note_units(cx, NULL, 0);
+        return;
+    }
+    note_units(cx, b.u, b.n);
+}
+
+static void note_callee(JsCompiler *cx, const JsAstNode *callee) {
+    note_text(cx, callee, false);
 }
 
 /* ---- constants ---- */
@@ -458,7 +514,8 @@ static bool declare_local(JsCompiler *cx, const uint16_t *name, uint32_t len,
     JsFuncState *fs = cx->cur;
     for (uint32_t i = scope_floor; i < fs->local_count; i++) {
         if (units_equal(fs->locals[i].name, fs->locals[i].len, name, len))
-            return cerr(cx, pos, "identifier has already been declared in this scope");
+            return cerr(cx, pos, js_compile_error_fmt(cx->vm, "Identifier '%U' has already been declared",
+                                                      name, len));
     }
     if (fs->slot_count >= JS_MAX_LOCALS)
         return cerr(cx, pos, "too many local variables");
@@ -478,6 +535,7 @@ static bool declare_local(JsCompiler *cx, const uint16_t *name, uint32_t len,
     v->slot = fs->slot_count++;
     v->is_const = is_const;
     v->captured = false;
+    v->pending = false;
     if (fs->slot_count > fs->slot_max)
         fs->slot_max = fs->slot_count;
     if (slot_out)
@@ -574,6 +632,7 @@ static bool pattern_declare(JsCompiler *cx, const JsAstNode *pat, bool is_const,
         if (!declare_local(cx, pat->units, pat->len, is_const, pat->pos,
                            scope_floor, &slot))
             return false;
+        cx->cur->locals[cx->cur->local_count - 1].pending = tdz;
         return tdz ? emit_op_u16(cx, JS_OP_TDZ, slot, 0) : true;
     }
     case JS_AST_DEFAULT:
@@ -760,27 +819,45 @@ static int emit_module_store(JsCompiler *cx, const JsAstNode *target) {
     JsModBinding *b = resolve_module_binding(cx, target->units, target->len);
     if (!b)
         return 0;
-    if (b->kind != JS_MB_EXPORT)
-        return cerr(cx, target->pos, "cannot assign to an imported binding") ? -1 : -1;
-    if (b->is_const)
-        return cerr(cx, target->pos, "assignment to constant variable") ? -1 : -1;
+    /* an import or a const: a TypeError when the assignment runs, as in V8 */
+    if (b->kind != JS_MB_EXPORT || b->is_const)
+        return emit_op(cx, JS_OP_THROW_CONST_ASSIGN, 0) ? 1 : -1;
     uint16_t c;
     if (!atom_const(cx, b->export_name, b->export_len, target->pos, &c))
         return -1;
     return emit_op_u16(cx, JS_OP_SET_EXPORT, c, 0) ? 1 : -1;
 }
 
+/* Whether the binding NAME resolves to is a let/const whose declaration has not been compiled
+ * yet: a read of it here may come before it is initialized. Once the declaration is compiled,
+ * any later read in the source (and any closure made after it) sees it initialized, except a
+ * fall-through between switch cases, which the error words without the name. */
+static bool binding_pending(JsFuncState *fs, const uint16_t *name, uint32_t len) {
+    for (; fs; fs = fs->parent) {
+        int i = resolve_local_in(fs, name, len);
+        if (i >= 0)
+            return fs->locals[i].pending;
+    }
+    return false;
+}
+
 static bool compile_ident_load(JsCompiler *cx, const JsAstNode *n) {
     note_pos(cx, n->pos);
     int idx = resolve_local_in(cx->cur, n->units, n->len);
-    if (idx >= 0)
+    if (idx >= 0) {
+        if (cx->cur->locals[idx].pending)
+            note_units(cx, n->units, n->len);
         return emit_op_u16(cx, JS_OP_GET_LOCAL, cx->cur->locals[idx].slot, +1);
+    }
     bool is_const;
     int up = resolve_upvalue(cx, cx->cur, n->units, n->len, &is_const);
     if (cx->err_msg)
         return false;
-    if (up >= 0)
+    if (up >= 0) {
+        if (binding_pending(cx->cur->parent, n->units, n->len))
+            note_units(cx, n->units, n->len);
         return emit_op_u16(cx, JS_OP_GET_UPVAL, (uint16_t)up, +1);
+    }
     if (cx->module) {
         int m = emit_module_load(cx, n);
         if (m != 0)
@@ -798,7 +875,7 @@ static bool compile_ident_store(JsCompiler *cx, const JsAstNode *target) {
     int idx = resolve_local_in(cx->cur, target->units, target->len);
     if (idx >= 0) {
         if (cx->cur->locals[idx].is_const)
-            return cerr(cx, target->pos, "assignment to constant variable");
+            return emit_op(cx, JS_OP_THROW_CONST_ASSIGN, 0);
         return emit_op_u16(cx, JS_OP_SET_LOCAL, cx->cur->locals[idx].slot, 0);
     }
     bool is_const;
@@ -807,7 +884,7 @@ static bool compile_ident_store(JsCompiler *cx, const JsAstNode *target) {
         return false;
     if (up >= 0) {
         if (is_const)
-            return cerr(cx, target->pos, "assignment to constant variable");
+            return emit_op(cx, JS_OP_THROW_CONST_ASSIGN, 0);
         return emit_op_u16(cx, JS_OP_SET_UPVAL, (uint16_t)up, 0);
     }
     if (cx->module) {
@@ -914,6 +991,7 @@ static bool store_target(JsCompiler *cx, const JsAstNode *tgt, bool declaring) {
             }
             return cerr(cx, tgt->pos, "internal: undeclared binding");
         }
+        cx->cur->locals[idx].pending = false;
         return emit_op_u16(cx, JS_OP_SET_LOCAL, cx->cur->locals[idx].slot, 0) &&
                emit_op(cx, JS_OP_POP, -1);
     }
@@ -924,6 +1002,10 @@ static bool store_target(JsCompiler *cx, const JsAstNode *tgt, bool declaring) {
 
 static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat,
                                   bool declaring) {
+    const JsAstNode *src = cx->pattern_src; /* only the outermost pattern has one */
+    cx->pattern_src = NULL;
+    /* V8 words a failure in a nested pattern as a plain property read */
+    bool outer = cx->cur->pattern_depth == 0;
     switch ((JsAstKind)pat->kind) {
     case JS_AST_IDENT:
         return store_target(cx, pat, declaring);
@@ -950,6 +1032,29 @@ static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat,
     case JS_AST_DEFAULT:
         return compile_pattern_default(cx, pat, declaring);
     case JS_AST_ARRAY_PATTERN: {
+        /* the value must be iterable: ITER_NEW checks it (and turns a Map or Set into its
+         * entries or values), and the index it pushes is not needed */
+        note_text(cx, src, false);
+        if (!emit_op(cx, JS_OP_ITER_NEW, +1) || !emit_op(cx, JS_OP_POP, -1))
+            return false;
+        cx->cur->pattern_depth++;
+        bool ok = compile_array_pattern_items(cx, pat, declaring);
+        cx->cur->pattern_depth--;
+        return ok;
+    }
+    case JS_AST_OBJECT_PATTERN: {
+        cx->cur->pattern_depth++;
+        bool ok = compile_object_pattern_items(cx, pat, declaring, outer ? src : NULL, outer);
+        cx->cur->pattern_depth--;
+        return ok;
+    }
+    default:
+        return cerr(cx, pat->pos, "Invalid left-hand side in assignment");
+    }
+}
+
+static bool compile_array_pattern_items(JsCompiler *cx, const JsAstNode *pat, bool declaring) {
+    {
         uint32_t i = 0;
         for (; i < pat->count; i++) {
             const JsAstNode *el = pat->items[i];
@@ -972,26 +1077,42 @@ static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat,
         }
         return emit_op(cx, JS_OP_POP, -1);
     }
-    case JS_AST_OBJECT_PATTERN: {
+}
+
+static bool compile_object_pattern_items(JsCompiler *cx, const JsAstNode *pat, bool declaring,
+                                         const JsAstNode *src, bool outer) {
+    {
         for (uint32_t i = 0; i < pat->count; i++) {
             const JsAstNode *prop = pat->items[i];
             if (prop->kind == JS_AST_REST)
                 return cerr(cx, prop->pos, "object rest in destructuring is not supported yet");
             if (!emit_op(cx, JS_OP_DUP, +1))
                 return false;
+            /* The first read is where a null or undefined source fails: its note (even an
+             * empty one) marks it as a destructuring for the error's wording. */
             if (prop->flags & JS_F_COMPUTED) {
-                if (!compile_expr(cx, prop->a) || !emit_op(cx, JS_OP_GET_PROP, -1))
+                if (!compile_expr(cx, prop->a))
+                    return false;
+                if (i == 0 && outer)
+                    note_text(cx, src, true);
+                if (!emit_op(cx, JS_OP_GET_PROP, -1))
                     return false;
             } else {
                 const JsAstNode *key = prop->a;
                 if (key->kind == JS_AST_NUMBER) {
-                    if (!emit_number(cx, key->number, key->pos) ||
-                        !emit_op(cx, JS_OP_GET_PROP, -1))
+                    if (!emit_number(cx, key->number, key->pos))
+                        return false;
+                    if (i == 0 && outer)
+                        note_text(cx, src, true);
+                    if (!emit_op(cx, JS_OP_GET_PROP, -1))
                         return false;
                 } else {
                     uint16_t c;
-                    if (!atom_const(cx, key->units, key->len, key->pos, &c) ||
-                        !emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0))
+                    if (!atom_const(cx, key->units, key->len, key->pos, &c))
+                        return false;
+                    if (i == 0 && outer)
+                        note_text(cx, src, true);
+                    if (!emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0))
                         return false;
                 }
             }
@@ -999,9 +1120,6 @@ static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat,
                 return false;
         }
         return emit_op(cx, JS_OP_POP, -1);
-    }
-    default:
-        return cerr(cx, pat->pos, "invalid assignment target");
     }
 }
 
@@ -1081,6 +1199,7 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
         }
         if (!compile_expr(cx, n->b) || !emit_op(cx, JS_OP_DUP, +1))
             return false;
+        cx->pattern_src = n->b;
         return compile_pattern_store(cx, t, false);
     }
 
@@ -1138,7 +1257,7 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
             patch_here(cx, end);
             return true;
         }
-        return cerr(cx, t->pos, "invalid assignment target");
+        return cerr(cx, t->pos, "Invalid left-hand side in assignment");
     }
 
     JsOp op = compound_opcode(n->op);
@@ -1167,7 +1286,7 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
             return false;
         return emit_op(cx, JS_OP_SET_PROP, -2);
     }
-    return cerr(cx, t->pos, "invalid assignment target");
+    return cerr(cx, t->pos, "Invalid left-hand side in assignment");
 }
 
 static bool compile_update(JsCompiler *cx, const JsAstNode *n) {
@@ -1188,7 +1307,7 @@ static bool compile_update(JsCompiler *cx, const JsAstNode *n) {
         return emit_op(cx, JS_OP_POP, -1);
     }
     if (t->kind != JS_AST_MEMBER)
-        return cerr(cx, t->pos, "invalid increment/decrement target");
+        return cerr(cx, t->pos, "Invalid left-hand side expression in postfix operation");
 
     bool computed = (t->flags & JS_F_COMPUTED) != 0;
     uint16_t c = 0;
@@ -1285,7 +1404,10 @@ static bool compile_array(JsCompiler *cx, const JsAstNode *n) {
             if (!emit_op(cx, JS_OP_UNDEFINED, +1) || !emit_op(cx, JS_OP_ARRAY_APPEND, -1))
                 return false;
         } else if (el->kind == JS_AST_SPREAD) {
-            if (!compile_expr(cx, el->a) || !emit_op(cx, JS_OP_ARRAY_SPREAD, -1))
+            if (!compile_expr(cx, el->a))
+                return false;
+            note_text(cx, el->a, false);
+            if (!emit_op(cx, JS_OP_ARRAY_SPREAD, -1))
                 return false;
         } else {
             if (!compile_expr(cx, el) || !emit_op(cx, JS_OP_ARRAY_APPEND, -1))
@@ -1318,7 +1440,10 @@ static bool compile_args(JsCompiler *cx, JsAstNode *const *args, uint32_t count,
         return false;
     for (uint32_t i = 0; i < count; i++) {
         if (args[i]->kind == JS_AST_SPREAD) {
-            if (!compile_expr(cx, args[i]->a) || !emit_op(cx, JS_OP_ARRAY_SPREAD, -1))
+            if (!compile_expr(cx, args[i]->a))
+                return false;
+            note_text(cx, args[i]->a, false);
+            if (!emit_op(cx, JS_OP_ARRAY_SPREAD, -1))
                 return false;
         } else {
             if (!compile_expr(cx, args[i]) || !emit_op(cx, JS_OP_ARRAY_APPEND, -1))
@@ -1602,8 +1727,15 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
          * it at evaluation (a literal yields a fresh object each time) */
         const char *em = js_regexp_validate(cx->vm, n->units, n->len,
                                             n->units2, n->len2);
-        if (em)
+        if (em) {
+            /* V8: "Invalid regular expression flags", or the pattern and the reason */
+            if (strcmp(em, JS_REGEXP_FLAGS_ERROR) == 0)
+                return cerr(cx, n->pos, "Invalid regular expression flags");
+            if (strncmp(em, "SyntaxError: ", 13) == 0)
+                return cerr(cx, n->pos, js_compile_error_fmt(cx->vm, "Invalid regular expression: /%U/%U: %s",
+                                                             n->units, n->len, n->units2, n->len2, em + 13));
             return cerr(cx, n->pos, em);
+        }
         uint16_t csrc, cflags;
         if (!atom_const(cx, n->units, n->len, n->pos, &csrc) ||
             !atom_const(cx, n->units2, n->len2, n->pos, &cflags))
@@ -1806,6 +1938,7 @@ static bool compile_let_decl(JsCompiler *cx, const JsAstNode *n) {
         } else if (!emit_op(cx, JS_OP_UNDEFINED, +1)) {
             return false;
         }
+        cx->pattern_src = d->b;
         if (!compile_pattern_store(cx, d->a, true))
             return false;
     }
@@ -1878,7 +2011,10 @@ static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const uint16_t *l
                            uint32_t label_len) {
     JsScopeMark m = scope_enter(cx);
     note_pos(cx, n->pos);
-    if (!compile_expr(cx, n->b) || !emit_op(cx, JS_OP_ITER_NEW, +1))
+    if (!compile_expr(cx, n->b))
+        return false;
+    note_text(cx, n->b, false);
+    if (!emit_op(cx, JS_OP_ITER_NEW, +1))
         return false;
 
     JsLoopInfo *loop = loop_push(cx, true, label, label_len);
@@ -2258,7 +2394,7 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
     }
     case JS_AST_RETURN:
         if (cx->cur->is_module && !(cx->module && cx->module->entry))
-            return cerr(cx, n->pos, "'return' outside function");
+            return cerr(cx, n->pos, "Illegal return statement");
         note_pos(cx, n->pos);
         if (n->a) {
             if (!compile_expr(cx, n->a))

@@ -137,10 +137,10 @@ static void test_literal_and_props(void) {
     eq("Object.keys(/a/g).length;", "0"); /* built-ins are not own props */
     eq("const r = /a/; r.custom = 7; r.custom;", "7"); /* expandos allowed */
     eq("const r = /a/g; r.lastIndex = 3; r.lastIndex;", "3");
-    err("'use strict'; /a/.source = 'x';", "TypeError: cannot assign to read-only");
-    err("const r = /(/;", "SyntaxError:"); /* bad pattern: early error */
-    err("const r = /a/gg;", "SyntaxError: invalid regular expression flags");
-    err("const r = /a/uv;", "SyntaxError: invalid regular expression flags");
+    err("'use strict'; /a/.source = 'x';", "TypeError: Cannot set property source of [object Object] which has only a getter");
+    err("const r = /(/;", "Invalid regular expression: /(/: Unterminated group"); /* bad pattern: early error */
+    err("const r = /a/gg;", "Invalid regular expression flags");
+    err("const r = /a/uv;", "Invalid regular expression flags");
 }
 
 static void test_constructor(void) {
@@ -153,9 +153,9 @@ static void test_constructor(void) {
     eq("RegExp(/ab/gi, 'm').flags;", "m");   /* explicit flags win */
     eq("RegExp(/ab/g).source;", "ab");
     eq("RegExp(123).source;", "123");        /* ToString coercion */
-    err("RegExp('(');", "SyntaxError:");
-    err("RegExp('a', 'q');", "SyntaxError: invalid regular expression flags");
-    err("RegExp('a', 'gg');", "SyntaxError: invalid regular expression flags");
+    err("RegExp('(');", "SyntaxError: Invalid regular expression: /(/: Unterminated group");
+    err("RegExp('a', 'q');", "SyntaxError: Invalid flags supplied to RegExp constructor 'q'");
+    err("RegExp('a', 'gg');", "SyntaxError: Invalid flags supplied to RegExp constructor 'gg'");
     /* `new RegExp(...)`: natives are factories, so `new` behaves like a call */
     eq("new RegExp('ab+c').source;", "ab+c");
     eq("new RegExp('a', 'gi').flags;", "gi");
@@ -176,7 +176,7 @@ static void test_exec_and_test(void) {
     eq("/ab+c/.test('xabbc');", "true");
     eq("/ab+c/.test('xac');", "false");
     eq("/^a/.test('ba');", "false");
-    err("const e = /a/.exec; e('x');", "TypeError: exec called on a non-RegExp");
+    err("const e = /a/.exec; e('x');", "TypeError: Method RegExp.prototype.exec called on incompatible receiver undefined");
 }
 
 static void test_last_index(void) {
@@ -212,7 +212,7 @@ static void test_match_all(void) {
     eq_s("'x@y z@w'.matchAll(/(?<l>\\w)@/g)[1].groups.l;", "z");
     eq("'abc'.matchAll(/x/g).length;", "0");
     eq("'a1'.matchAll('\\\\d').length;", "1"); /* string arg gets /g */
-    err("'a1'.matchAll(/\\d/);", "TypeError: matchAll must be called with a global RegExp");
+    err("'a1'.matchAll(/\\d/);", "TypeError: String.prototype.matchAll called with a non-global RegExp argument");
 }
 
 static void test_search(void) {
@@ -237,7 +237,7 @@ static void test_replace(void) {
     eq_s("'The Quick'.replace(/\\w+/g, w => w.toUpperCase());", "THE QUICK");
     eq_s("'x@y'.replace(/(?<h>\\w)$/, (m, p1, i, s, g) => g.h);", "x@y");
     eq("'aXbXc'.replaceAll(/X/g, '-');", "a-b-c");
-    err("'a'.replaceAll(/a/, 'b');", "TypeError: replaceAll must be called with a global RegExp");
+    err("'a'.replaceAll(/a/, 'b');", "TypeError: String.prototype.replaceAll called with a non-global RegExp argument");
     err("'ab'.replace(/b/g, () => { throw 'boom'; });", "boom"); /* propagates */
 }
 

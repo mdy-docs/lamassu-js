@@ -249,8 +249,8 @@ void js_promise_resolve_with(JsContext *ctx, JsPromise *p, JsValue value) {
     }
     JsPromise *q = js_value_promise(value);
     if (q == p) { /* resolving with itself: reject per spec */
-        JsString *s = js_ascii_cell(ctx->vm, "TypeError: chaining cycle detected");
-        js_promise_reject(ctx, p, s ? js_value_from_cell(&s->gc) : js_undefined());
+        JsValue e = js_error_fmt(ctx, "TypeError: Chaining cycle detected for promise #<Promise>");
+        js_promise_reject(ctx, p, e);
         return;
     }
     /* pass-through then-reaction on q whose derived promise is p */
@@ -426,7 +426,7 @@ static JsPromise *coerce_promise(JsContext *ctx, JsValue v) {
 
 static bool pm_then(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     if (!js_is_promise(tv))
-        return nthrow(ctx, r, "TypeError: Promise.prototype.then called on non-promise");
+        return (*r = js_error_receiver(ctx, "Promise", tv)), false;
     JsPromise *res = js_promise_then(ctx, js_value_promise(tv), ARG(0), ARG(1));
     if (!res)
         return nthrow(ctx, r, "out of memory");
@@ -436,7 +436,7 @@ static bool pm_then(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
 
 static bool pm_catch(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     if (!js_is_promise(tv))
-        return nthrow(ctx, r, "TypeError: Promise.prototype.catch called on non-promise");
+        return (*r = js_error_receiver(ctx, "Promise", tv)), false;
     JsPromise *res = js_promise_then(ctx, js_value_promise(tv), js_undefined(), ARG(0));
     if (!res)
         return nthrow(ctx, r, "out of memory");
@@ -540,7 +540,7 @@ static bool finally_on_reject(JsContext *ctx, JsValue bound, JsValue tv,
 
 static bool pm_finally(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     if (!js_is_promise(tv))
-        return nthrow(ctx, r, "TypeError: Promise.prototype.finally called on non-promise");
+        return (*r = js_error_receiver(ctx, "Promise", tv)), false;
     JsValue onf = ARG(0);
     JsValue f = js_bound_native_new(ctx, finally_on_fulfill, onf);
     if (!js_is_function(f))
@@ -681,7 +681,8 @@ static bool all_element_reject(JsContext *ctx, JsValue bound, JsValue tv,
 static bool all_impl(JsContext *ctx, const JsValue *args, int argc, JsValue *r, int mode) {
     JsValue iterable = ARG(0);
     if (!js_is_object(iterable) || js_value_object(iterable)->obj_kind != JS_OBJ_ARRAY)
-        return nthrow(ctx, r, "TypeError: Promise.all expects an array");
+        return (*r = js_error_fmt(ctx, "TypeError: %t is not iterable (cannot read property Symbol(Symbol.iterator))",
+                                  iterable)), false;
     JsObject *input = js_value_object(iterable);
     uint32_t n = input->elem_count;
 
@@ -785,7 +786,8 @@ static bool ps_race(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     (void)tv;
     JsValue iterable = ARG(0);
     if (!js_is_object(iterable) || js_value_object(iterable)->obj_kind != JS_OBJ_ARRAY)
-        return nthrow(ctx, r, "TypeError: Promise.race expects an array");
+        return (*r = js_error_fmt(ctx, "TypeError: %t is not iterable (cannot read property Symbol(Symbol.iterator))",
+                                  iterable)), false;
     JsObject *input = js_value_object(iterable);
     JsValue rpv = js_promise_new(ctx);
     if (!js_is_promise(rpv))
@@ -827,7 +829,7 @@ static bool ps_race(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
 static bool promise_ctor(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     if (!js_is_function(ARG(0)))
-        return nthrow(ctx, r, "TypeError: Promise executor is not a function");
+        return (*r = js_error_fmt(ctx, "TypeError: Promise resolver %v is not a function", ARG(0))), false;
     JsValue pv = js_promise_new(ctx);
     if (!js_is_promise(pv))
         return nthrow(ctx, r, "out of memory");

@@ -352,7 +352,12 @@ static bool fetch_on_resolved(JsContext *ctx, JsValue bound, JsValue tv,
         }
         JsModError err = {NULL, 0, false};
         if (!ctx->compile_source(ctx, m, src->units, src->length, &err)) {
-            module_compile_fail(ctx, m, mod_error_value(ctx, &err), err.pos);
+            /* a SyntaxError object, as V8 rejects with; the message is the compiler's text */
+            JsValue reason = err.oom ? mod_error_value(ctx, &err)
+                                     : js_error_new_ascii(ctx, JS_ERROR_SYNTAX, err.msg ? err.msg : "module error");
+            if (js_is_undefined(reason))
+                reason = js_oom_value(ctx->vm);
+            module_compile_fail(ctx, m, reason, err.pos);
             return true;
         }
     } else if (js_value_is_cell(resolved) &&

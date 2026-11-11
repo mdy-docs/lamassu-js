@@ -233,7 +233,12 @@ static void test_scoping(void) {
     expect_result("let a = 1; { let b = a + 1; a = b; } a;", "2");
     expect_result("const c = 41; c + 1;", "42");
     expect_error("{ x; let x = 1; }", RUN_RUNTIME_ERR, "before initialization");
-    expect_error("const c = 1; c = 2;", RUN_COMPILE_ERR, "constant");
+    /* a TypeError when the assignment runs, as in V8; code that never runs it is fine */
+    expect_error("const c = 1; c = 2;", RUN_RUNTIME_ERR, "TypeError: Assignment to constant variable.");
+    expect_result("const c = 1; if (false) c = 2; c;", "1");
+    expect_error("const c = 1; c += 2;", RUN_RUNTIME_ERR, "Assignment to constant variable.");
+    expect_error("const c = 1; c++;", RUN_RUNTIME_ERR, "Assignment to constant variable.");
+    expect_error("const c = 1; const f = () => { c = 3; }; f();", RUN_RUNTIME_ERR, "Assignment to constant variable.");
     expect_error("let d = 1; let d = 2;", RUN_COMPILE_ERR, "already been declared");
     expect_error("x_undeclared = 1;", RUN_RUNTIME_ERR, "is not defined");
     expect_error("missing_global + 1;", RUN_RUNTIME_ERR, "missing_global is not defined");
@@ -334,8 +339,8 @@ static void test_errors(void) {
     expect_error("undefined.foo;", RUN_RUNTIME_ERR, "reading 'foo'");
     expect_error("let o; o.a.b;", RUN_RUNTIME_ERR, "TypeError");
     expect_error("throw 'boom';", RUN_RUNTIME_ERR, "boom");
-    expect_error("let x = 1; x.y = 2;", RUN_RUNTIME_ERR, "primitive");
-    expect_error("1 in 2;", RUN_RUNTIME_ERR, "requires an object");
+    expect_error("let x = 1; x.y = 2;", RUN_RUNTIME_ERR, "TypeError: Cannot create property 'y' on number '1'");
+    expect_error("1 in 2;", RUN_RUNTIME_ERR, "TypeError: Cannot use 'in' operator to search for '1' in 2");
     expect_error("for (const x of 42) {}", RUN_RUNTIME_ERR, "not iterable");
     /* regex landed (phase 10): a literal now evaluates to an object */
     expect_result("let r = /a+/; r.source;", "a+");
@@ -381,8 +386,8 @@ static void test_functions(void) {
     expect_result("function f() {} typeof f.arguments;", "undefined");
     expect_error("arguments;", RUN_RUNTIME_ERR, "arguments is not defined");
     expect_error("(() => arguments.length)();", RUN_RUNTIME_ERR, "arguments is not defined");
-    expect_error("function f(arguments) {}", RUN_COMPILE_ERR, "cannot bind");
-    expect_error("function f() { arguments = 1; }", RUN_COMPILE_ERR, "cannot assign");
+    expect_error("function f(arguments) {}", RUN_COMPILE_ERR, "Unexpected eval or arguments in strict mode");
+    expect_error("function f() { arguments = 1; }", RUN_COMPILE_ERR, "Unexpected eval or arguments in strict mode");
     /* destructuring params */
     expect_result("function p({x, y}) { return x + y; } p({x: 3, y: 4});", "7");
     expect_result("function q([a, b]) { return a * b; } q([5, 6]);", "30");
@@ -524,7 +529,7 @@ static void test_exceptions(void) {
                   " try { boom(); } catch (e) { r = e; } r;", "deep");
     /* runtime TypeError is catchable, and is a real TypeError object */
     expect_result("let r; try { null.x; } catch (e) { r = typeof e === 'object' && e.name === 'TypeError'"
-                  " && e.message === \"cannot read properties of undefined or null (reading 'x')\"; } r;",
+                  " && e.message === \"Cannot read properties of null (reading 'x')\"; } r;",
                   "true");
     /* finally runs even when catch rethrows */
     expect_result("let log = ''; try { try { throw 1; } catch { log += 'c'; throw 2; }"
@@ -566,7 +571,7 @@ static void test_heap_limit(void) {
     RunStatus st = run_src_opts(
         "let s = 'x'; while (true) { s = s + s; }", &opts, &out);
     CHECK(st == RUN_RUNTIME_ERR);
-    CHECK(strstr(out, "memory") != NULL || strstr(out, "too long") != NULL);
+    CHECK(strstr(out, "memory") != NULL || strstr(out, "Invalid string length") != NULL);
     free(out);
 }
 
@@ -819,8 +824,8 @@ static void test_audit_regressions(void) {
 /* Regressions for the P2/P3 spec-lite, hardening, and latent-overflow items. */
 static void test_audit_p2_p3(void) {
     /* ** requires a parenthesized unary left operand. */
-    expect_error("-2 ** 2;", RUN_COMPILE_ERR, "**");
-    expect_error("typeof x ** 2;", RUN_COMPILE_ERR, "**");
+    expect_error("-2 ** 2;", RUN_COMPILE_ERR, "Unary operator used immediately before exponentiation expression");
+    expect_error("typeof x ** 2;", RUN_COMPILE_ERR, "Unary operator used immediately before exponentiation expression");
     expect_result("(-2) ** 2;", "4");
     expect_result("2 ** -2;", "0.25");
     expect_result("2 ** 3 ** 2;", "512"); /* right-assoc */

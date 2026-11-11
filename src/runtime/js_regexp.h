@@ -82,6 +82,19 @@ static inline bool js_regexp_is(JsValue v) {
 JsValue js_regexp_new(JsContext *ctx, const uint16_t *pat, uint32_t pat_len,
                       const uint16_t *flags, uint32_t flags_len, const char **err);
 
+/* A write to a RegExp's source, flags, global, ...: set_property words it with the key as V8
+ * does ("Cannot set property source of [object Object] which has only a getter") */
+#define JS_REGEXP_GETTER_ONLY "TypeError: Cannot set property of a RegExp which has only a getter"
+
+/* The flags error both constructors report (compared by text) */
+#define JS_REGEXP_FLAGS_ERROR "SyntaxError: invalid regular expression flags"
+
+/* The thrown error for a js_regexp_new / js_regexp_validate failure ERR, worded as V8 words it:
+ * "Invalid regular expression: /(/: Unterminated group", "Invalid flags supplied to RegExp
+ * constructor 'zz'"; any other error (out of memory, a limit) as it is. */
+JsValue js_regexp_error(JsContext *ctx, const char *err, const uint16_t *pat, uint32_t pat_len,
+                        const uint16_t *flags, uint32_t flags_len);
+
 /* Compile-time syntax check for regex literals (no object created).
  * NULL if the pattern+flags are valid, else a static error message. */
 const char *js_regexp_validate(JsVm *vm, const uint16_t *pat, uint32_t pat_len,

@@ -144,7 +144,7 @@ const char *js_regexp_validate(JsVm *vm, const uint16_t *pat, uint32_t pat_len,
                                const uint16_t *flags, uint32_t flags_len) {
     int mask = flags_mask(flags, flags_len);
     if (mask < 0)
-        return "SyntaxError: invalid regular expression flags";
+        return JS_REGEXP_FLAGS_ERROR;
     Program *prog = js_realloc_raw(vm, NULL, 0, sizeof *prog);
     if (!prog)
         return "out of memory";
@@ -172,7 +172,7 @@ JsValue js_regexp_new(JsContext *ctx, const uint16_t *pat, uint32_t pat_len,
     *err = NULL;
     int mask = flags_mask(flags, flags_len);
     if (mask < 0) {
-        *err = "SyntaxError: invalid regular expression flags";
+        *err = JS_REGEXP_FLAGS_ERROR;
         return js_undefined();
     }
     if (vm->regexp_live >= JS_REGEXP_MAX_LIVE) {
@@ -319,7 +319,7 @@ bool js_regexp_prop_set(JsContext *ctx, JsObject *o, JsValue key, JsValue val,
         key_is(key, "ignoreCase") || key_is(key, "multiline") || key_is(key, "dotAll") ||
         key_is(key, "sticky") || key_is(key, "unicode") || key_is(key, "unicodeSets") ||
         key_is(key, "hasIndices")) {
-        *errmsg = "TypeError: cannot assign to read-only RegExp property";
+        *errmsg = JS_REGEXP_GETTER_ONLY;
         return false;
     }
     *handled = false;
@@ -673,12 +673,37 @@ static bool build_exec_result(JsContext *ctx, JsRegExp *re, JsValue sv,
     return true;
 }
 
+JsValue js_regexp_error(JsContext *ctx, const char *err, const uint16_t *pat, uint32_t pat_len,
+                        const uint16_t *flags, uint32_t flags_len) {
+    JsVm *vm = ctx->vm;
+    bool is_flags = strcmp(err, JS_REGEXP_FLAGS_ERROR) == 0;
+    if (!is_flags && strncmp(err, "SyntaxError: ", 13) != 0)
+        return js_error_from_ascii(ctx, err);
+    /* the texts become strings for %v; the caller holds what they point into */
+    JsString *ps = js_string_cell_new(vm, pat, pat_len);
+    JsValue pv = ps ? js_value_from_cell(&ps->gc) : js_undefined();
+    js_gc_protect(vm, &pv);
+    JsString *fs = js_string_cell_new(vm, flags, flags_len);
+    JsValue fv = fs ? js_value_from_cell(&fs->gc) : js_undefined();
+    js_gc_protect(vm, &fv);
+    JsValue e;
+    if (!ps || !fs)
+        e = js_oom_value(vm);
+    else if (is_flags)
+        e = js_error_fmt(ctx, "SyntaxError: Invalid flags supplied to RegExp constructor '%v'", fv);
+    else
+        e = js_error_fmt(ctx, "SyntaxError: Invalid regular expression: /%v/%v: %s", pv, fv, err + 13);
+    js_gc_unprotect(vm, &fv);
+    js_gc_unprotect(vm, &pv);
+    return e;
+}
+
 /* ---- RegExp methods ---- */
 
 static bool rexp_exec(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                       JsValue *r) {
     if (!js_regexp_is(tv))
-        return re_throw(ctx, r, "TypeError: exec called on a non-RegExp");
+        return (*r = js_error_receiver(ctx, "RegExp", tv)), false;
     JsRegExp *re = (JsRegExp *)js_value_object(tv);
     JsString *s = js_to_string_cell(ctx, ARG(0), 0);
     if (!s)
@@ -703,7 +728,7 @@ static bool rexp_exec(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
 static bool rexp_test(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                       JsValue *r) {
     if (!js_regexp_is(tv))
-        return re_throw(ctx, r, "TypeError: test called on a non-RegExp");
+        return (*r = js_error_receiver(ctx, "RegExp", tv)), false;
     JsRegExp *re = (JsRegExp *)js_value_object(tv);
     JsString *s = js_to_string_cell(ctx, ARG(0), 0);
     if (!s)
@@ -727,7 +752,7 @@ static bool rexp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int a
     (void)args;
     (void)argc;
     if (!js_regexp_is(tv))
-        return re_throw(ctx, r, "TypeError: toString called on a non-RegExp");
+        return (*r = js_error_receiver(ctx, "RegExp", tv)), false;
     JsString *s = js_regexp_repr(ctx, js_value_object(tv));
     if (!s)
         return re_oom(ctx, r);
@@ -785,8 +810,10 @@ static bool g_RegExp(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     js_gc_unprotect(vm, &pstr);
     if (!ok)
         return re_oom(ctx, r);
-    if (!js_is_object(rev))
-        return re_throw(ctx, r, err ? err : "out of memory");
+    if (!js_is_object(rev)) {
+        *r = js_regexp_error(ctx, err ? err : "out of memory", pu, pn, fu, fn);
+        return false;
+    }
     *r = rev;
     return true;
 }
@@ -828,9 +855,12 @@ static bool coerce_regexp(JsContext *ctx, JsValue pv, const char *extra_flags,
     }
     const char *err = NULL;
     *rev = js_regexp_new(ctx, pu, pn, fbuf, fn, &err);
+    if (!js_is_object(*rev)) {
+        *r = js_regexp_error(ctx, err ? err : "out of memory", pu, pn, fbuf, fn);
+        js_gc_unprotect(vm, &pstr);
+        return false;
+    }
     js_gc_unprotect(vm, &pstr);
-    if (!js_is_object(*rev))
-        return re_throw(ctx, r, err ? err : "out of memory");
     *out = (JsRegExp *)js_value_object(*rev);
     return true;
 }
@@ -895,7 +925,7 @@ bool js_re_str_matchAll(JsContext *ctx, JsValue tv, const JsValue *args, int arg
                         JsValue *r) {
     JsVm *vm = ctx->vm;
     if (js_regexp_is(ARG(0)) && !((JsRegExp *)js_value_object(args[0]))->global)
-        return re_throw(ctx, r, "TypeError: matchAll must be called with a global RegExp");
+        return re_throw(ctx, r, "TypeError: String.prototype.matchAll called with a non-global RegExp argument");
     JsString *s = js_to_string_cell(ctx, tv, 0);
     if (!s)
         return re_oom(ctx, r);
@@ -1141,7 +1171,7 @@ bool js_re_str_replace(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     JsVm *vm = ctx->vm;
     JsRegExp *re = (JsRegExp *)js_value_object(args[0]); /* caller-checked */
     if (all && !re->global)
-        return re_throw(ctx, r, "TypeError: replaceAll must be called with a global RegExp");
+        return re_throw(ctx, r, "TypeError: String.prototype.replaceAll called with a non-global RegExp argument");
     JsString *s = js_to_string_cell(ctx, tv, 0);
     if (!s)
         return re_oom(ctx, r);

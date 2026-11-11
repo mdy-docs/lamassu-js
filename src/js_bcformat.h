@@ -17,7 +17,9 @@
 #ifndef JS_BCFORMAT_H
 #define JS_BCFORMAT_H
 
-#define JSBC_VERSION 4u /* 3: JS_FN_USES_ARGUMENTS function flag; 4: callee-name table after the line table */
+#define JSBC_VERSION 5u /* 3: JS_FN_USES_ARGUMENTS function flag; 4: callee-name table after the line table;
+                           5: JS_OP_THROW_CONST_ASSIGN, and the name table also marks iteration,
+                           destructuring and TDZ-able reads */
 #define JSBC_FLAG_HAS_REGEX 1u /* producer had regex enabled (informational) */
 
 /* Sanity caps: reject absurd sizes early (before allocating) rather than

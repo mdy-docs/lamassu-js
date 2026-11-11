@@ -748,32 +748,32 @@ static void test_top_level_await(void) {
 static void test_errors(void) {
     check_err("var x = 1;", "'var' is not supported", 0);
     check_err("class Foo {}", "classes are not supported", 0);
-    check_err("with (o) {}", "'with' is not allowed", 0);
+    check_err("with (o) {}", "Strict mode code may not include a with statement", 0);
     check_err("let x = yield;", "reserved word", -1);
     check_err("for (let k in o) {}", "for-in is not supported", -1);
     check_err("for (k in o) {}", "for-in is not supported", -1);
     check_err("new.target;", "'new.target' is not supported", -1);
     check_err("x instanceof y;", "'instanceof' is not supported", -1);
-    check_err("function f() { await g(); }", "'await' is only valid in async", -1);
-    check_err("a ?? b || c;", "'?\?' cannot be mixed", -1);
-    check_err("const x;", "requires an initializer", -1);
-    check_err("let [a];", "destructuring declaration requires an initializer", -1);
-    check_err("break;", "'break' outside loop or switch", 0);
-    check_err("continue;", "'continue' outside loop", 0);
-    check_err("return 1;", "'return' outside function", 0);
-    check_err("throw\n1;", "no line break allowed after 'throw'", 0);
-    check_err("let s = 'abc", "unterminated string", -1);
-    check_err("t = `abc", "unterminated template", -1);
+    check_err("function f() { await g(); }", "Unexpected reserved word", -1);
+    check_err("a ?? b || c;", "Unexpected token '?\?'", -1);
+    check_err("const x;", "Missing initializer in const declaration", -1);
+    check_err("let [a];", "Missing initializer in destructuring declaration", -1);
+    check_err("break;", "Illegal break statement", 0);
+    check_err("continue;", "Illegal continue statement: no surrounding iteration statement", 0);
+    check_err("return 1;", "Illegal return statement", 0);
+    check_err("throw\n1;", "Illegal newline after throw", 0);
+    check_err("let s = 'abc", "Invalid or unexpected token", -1);
+    check_err("t = `abc", "Unexpected end of input", -1);
     check_err("x = ({a = 1});", "shorthand property initializer", -1);
-    check_err("0x;", "invalid number", 0);
-    check_err("01;", "legacy octal", 0);
+    check_err("0x;", "Invalid or unexpected token", 0);
+    check_err("01;", "Octal literals are not allowed in strict mode.", 0);
     check_err("1_000;", "numeric separators are not supported", -1);
     check_err("x = 5n;", "BigInt literals are not supported", -1);
-    check_err("eval = 1;", "cannot assign to 'eval'", -1);
-    check_err("let eval = 1;", "cannot bind 'eval'", -1);
+    check_err("eval = 1;", "Unexpected eval or arguments in strict mode", -1);
+    check_err("let eval = 1;", "Unexpected eval or arguments in strict mode", -1);
     check_err("o = {get x() { return 1; }};", "getter/setter properties are not supported", -1);
     check_err("tag`x`;", "tagged templates are not supported", -1);
-    check_err("if (x) import \"m\";", "top level", -1);
+    check_err("if (x) import \"m\";", "Unexpected token 'import'", -1);
     check_err("x = import.meta;", "import.meta is not supported", -1);
     check_err("p = import();", "import() takes 1 or 2 arguments", -1);
     check_err("p = import('a', 'b', 'c');", "import() takes 1 or 2 arguments", -1);
@@ -786,7 +786,7 @@ static void test_errors(void) {
               "import attributes are not supported", -1);
     check_err("export * from 'm' with { type: 'json' };",
               "import attributes are not supported", -1);
-    check_err("x = '\\101';", "octal escapes are not allowed", -1);
+    check_err("x = '\\101';", "Octal escape sequences are not allowed in strict mode.", -1);
     check_err("debugger;", "'debugger' is not supported", 0);
 }
 

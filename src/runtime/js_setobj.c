@@ -88,7 +88,7 @@ static bool alloc_setobj(JsContext *ctx, JsValue *out) {
 
 static bool this_set(JsContext *ctx, JsValue tv, JsSetObj **out, JsValue *r) {
     if (!js_setobj_is(tv))
-        return nthrow(ctx, r, "TypeError: Set.prototype method called on a non-Set value");
+        return (*r = js_error_receiver(ctx, "Set", tv)), false;
     *out = (JsSetObj *)js_value_object(tv);
     return true;
 }
@@ -119,7 +119,8 @@ static bool g_Set(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsV
                     return nthrow(ctx, r, "out of memory");
             }
         } else {
-            return nthrow(ctx, r, "TypeError: value is not iterable");
+            return (*r = js_error_fmt(ctx, "TypeError: %t is not iterable (cannot read property Symbol(Symbol.iterator))",
+                                      src)), false;
         }
     }
     *r = sv;
@@ -176,7 +177,7 @@ static bool set_forEach(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     if (!this_set(ctx, tv, &s, r))
         return false;
     if (!js_is_function(ARG(0)))
-        return nthrow(ctx, r, "TypeError: callback is not a function");
+        return (*r = js_error_fmt(ctx, "TypeError: %t is not a function", ARG(0))), false;
     JsValue cb = ARG(0), thisArg = ARG(1), setv = tv;
     js_gc_protect(ctx->vm, &setv);
     js_gc_protect(ctx->vm, &cb);

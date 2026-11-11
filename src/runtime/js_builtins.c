@@ -1,3 +1,4 @@
+#include <stdio.h>
 /*
  * Standard library. Array instance methods live on a real, script-visible
  * Array.prototype (ctx->array_proto is a construction-time cache of it, not
@@ -172,6 +173,19 @@ static JsValue sb_finish(StrBuf *sb) {
 static bool native_throw(JsContext *ctx, JsValue *result, const char *msg) {
     *result = js_error_from_ascii(ctx, msg); /* Error object; string on OOM */
     return false;
+}
+
+/* A formatted engine error (js_error_fmt: V8's wording with the values in it). */
+#define native_throw_fmt(ctx, result, ...) (*(result) = js_error_fmt((ctx), __VA_ARGS__), false)
+
+/* "a number", "an object", "undefined": how V8 names a value's type in a sentence */
+static const char *type_phrase(JsValue v) {
+    if (js_is_undefined(v)) return "undefined";
+    if (js_is_null(v)) return "null";
+    if (js_is_number(v)) return "a number";
+    if (js_is_string(v)) return "a string";
+    if (js_is_bool(v)) return "a boolean";
+    return "an object";
 }
 
 static bool oom(JsContext *ctx, JsValue *result) {
@@ -542,15 +556,15 @@ static bool sm_repeat(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
         return false;
     double d = to_int(js_to_number_value(ctx, ARG(0)));
     if (d < 0 || d == __builtin_inf())
-        return native_throw(ctx, r, "RangeError: invalid count value");
+        return native_throw_fmt(ctx, r, "RangeError: Invalid count value: %v", ARG(0));
     /* bounds-check before the cast: (uint32_t)d is UB above UINT32_MAX,
      * e.g. 'x'.repeat(1e20) — any count this large already fails the size
      * check below anyway, so throw the same error a step earlier. */
     if (d > 4294967295.0)
-        return native_throw(ctx, r, "RangeError: repeat count too large");
+        return native_throw(ctx, r, "RangeError: Invalid string length");
     uint32_t n = (uint32_t)d;
     if ((uint64_t)n * s->length > JS_MAX_STRING_UNITS)
-        return native_throw(ctx, r, "RangeError: repeat count too large");
+        return native_throw(ctx, r, "RangeError: Invalid string length");
     StrBuf sb;
     sb_init(&sb, ctx->vm);
     for (uint32_t i = 0; i < n; i++)
@@ -588,7 +602,7 @@ static bool sm_pad(JsContext *ctx, JsValue tv, const JsValue *args, int argc, Js
      * `"x".padStart(4294967295)` would still spin four billion times inside
      * this one native, where no fuel is charged. */
     if ((uint64_t)need + s->length > JS_MAX_STRING_UNITS)
-        return native_throw(ctx, r, "RangeError: pad length too large");
+        return native_throw(ctx, r, "RangeError: Invalid string length");
     StrBuf sb;
     sb_init(&sb, ctx->vm);
     if (!start)
@@ -773,21 +787,54 @@ static bool array_this(JsContext *ctx, JsValue tv, JsObject **out, JsValue *r) {
  * removing elements, freezing forbids touching them at all, so reverse/fill/
  * sort are legal on a sealed array but not a frozen one.
  */
-static bool array_this_mut(JsContext *ctx, JsValue tv, JsObject **out, JsValue *r,
-                           bool changes_length) {
+typedef enum {
+    MUT_ADD,          /* push, unshift: new elements at the end */
+    MUT_REMOVE_END,   /* pop: deletes the last element */
+    MUT_REMOVE_FRONT, /* shift: moves the elements down, then deletes the last */
+    MUT_WRITE,        /* reverse, fill, sort: writes elements in place */
+} ArrayMut;
+
+/* The refusal is worded as V8 words the first write such a method makes. */
+static bool array_this_mut(JsContext *ctx, JsValue tv, JsObject **out, JsValue *r, ArrayMut how) {
     if (!array_this(ctx, tv, out, r))
         return false;
-    uint8_t f = (*out)->obj_flags;
-    if (f & JS_OBJ_FROZEN)
-        return native_throw(ctx, r, "TypeError: cannot modify a frozen array");
-    if (changes_length && (f & JS_OBJ_SEALED))
-        return native_throw(ctx, r, "TypeError: cannot change the length of a sealed array");
+    JsObject *a = *out;
+    uint8_t f = a->obj_flags;
+    if (!f)
+        return true;
+    bool frozen = (f & JS_OBJ_FROZEN) != 0;
+    double n = (double)a->elem_count;
+    const char *read_only = "TypeError: Cannot assign to read only property '%s' of object '[object Array]'";
+    switch (how) {
+    case MUT_ADD:
+        *r = js_error_fmt(ctx, "TypeError: Cannot add property %v, object is not extensible", js_number(n));
+        return false;
+    case MUT_REMOVE_END:
+    case MUT_REMOVE_FRONT:
+        if (n == 0) {
+            if (!frozen)
+                return true;
+            *r = js_error_fmt(ctx, read_only, "length");
+            return false;
+        }
+        if (frozen && how == MUT_REMOVE_FRONT && n > 1) {
+            *r = js_error_fmt(ctx, read_only, "0");
+            return false;
+        }
+        *r = js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of [object Array]", js_number(n - 1));
+        return false;
+    case MUT_WRITE:
+        if (!frozen || n == 0)
+            return true;
+        *r = js_error_fmt(ctx, read_only, "0");
+        return false;
+    }
     return true;
 }
 
 static bool am_push(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsObject *a;
-    if (!array_this_mut(ctx, tv, &a, r, true))
+    if (!array_this_mut(ctx, tv, &a, r, MUT_ADD))
         return false;
     for (int i = 0; i < argc; i++) {
         if (!js_array_append(ctx->vm, a, args[i]))
@@ -801,7 +848,7 @@ static bool am_pop(JsContext *ctx, JsValue tv, const JsValue *args, int argc, Js
     (void)args;
     (void)argc;
     JsObject *a;
-    if (!array_this_mut(ctx, tv, &a, r, true))
+    if (!array_this_mut(ctx, tv, &a, r, MUT_REMOVE_END))
         return false;
     if (a->elem_count == 0) {
         *r = js_undefined();
@@ -815,7 +862,7 @@ static bool am_shift(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
     (void)args;
     (void)argc;
     JsObject *a;
-    if (!array_this_mut(ctx, tv, &a, r, true))
+    if (!array_this_mut(ctx, tv, &a, r, MUT_REMOVE_FRONT))
         return false;
     if (a->elem_count == 0) {
         *r = js_undefined();
@@ -831,7 +878,7 @@ static bool am_shift(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
 
 static bool am_unshift(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsObject *a;
-    if (!array_this_mut(ctx, tv, &a, r, true))
+    if (!array_this_mut(ctx, tv, &a, r, MUT_ADD))
         return false;
     for (int i = 0; i < argc; i++) {
         if (!js_array_append(ctx->vm, a, js_undefined())) /* grow */
@@ -969,7 +1016,7 @@ static bool am_reverse(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     (void)args;
     (void)argc;
     JsObject *a;
-    if (!array_this_mut(ctx, tv, &a, r, false))
+    if (!array_this_mut(ctx, tv, &a, r, MUT_WRITE))
         return false;
     uint32_t n = a->elem_count;
     for (uint32_t i = 0; i < n / 2; i++) {
@@ -983,7 +1030,7 @@ static bool am_reverse(JsContext *ctx, JsValue tv, const JsValue *args, int argc
 
 static bool am_fill(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsObject *a;
-    if (!array_this_mut(ctx, tv, &a, r, false))
+    if (!array_this_mut(ctx, tv, &a, r, MUT_WRITE))
         return false;
     uint32_t start = argc > 1 ? clamp_index(js_to_number_value(ctx, ARG(1)), a->elem_count) : 0;
     uint32_t end = argc > 2 && !js_is_undefined(ARG(2))
@@ -1039,7 +1086,7 @@ static bool array_iterate(JsContext *ctx, JsValue tv, const JsValue *args, int a
     if (!array_this(ctx, tv, &a, r))
         return false;
     if (!js_is_function(ARG(0)))
-        return native_throw(ctx, r, "TypeError: callback is not a function");
+        return native_throw_fmt(ctx, r, "TypeError: %t is not a function", ARG(0));
     JsValue cb = ARG(0);
     JsValue thisArg = ARG(1);
     JsValue arrv = tv;
@@ -1156,14 +1203,14 @@ static bool am_reduce(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     if (!array_this(ctx, tv, &a, r))
         return false;
     if (!js_is_function(ARG(0)))
-        return native_throw(ctx, r, "TypeError: callback is not a function");
+        return native_throw_fmt(ctx, r, "TypeError: %t is not a function", ARG(0));
     JsValue cb = ARG(0), arrv = tv, acc;
     uint32_t i = 0;
     if (argc > 1) {
         acc = ARG(1);
     } else {
         if (a->elem_count == 0)
-            return native_throw(ctx, r, "TypeError: reduce of empty array with no initial value");
+            return native_throw(ctx, r, "TypeError: Reduce of empty array with no initial value");
         acc = a->elems[0];
         i = 1;
     }
@@ -1194,12 +1241,12 @@ static bool am_reduce(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
 /* stable binary insertion sort; comparator optional */
 static bool am_sort(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsObject *a;
-    if (!array_this_mut(ctx, tv, &a, r, false))
+    if (!array_this_mut(ctx, tv, &a, r, MUT_WRITE))
         return false;
     JsValue cmp = ARG(0);
     bool has_cmp = js_is_function(cmp);
     if (argc > 0 && !has_cmp && !js_is_undefined(cmp))
-        return native_throw(ctx, r, "TypeError: comparator is not a function");
+        return native_throw_fmt(ctx, r, "TypeError: The comparison function must be either a function or undefined: %v", cmp);
     JsValue arrv = tv, key = js_undefined(), midstr = js_undefined();
     js_gc_protect(ctx->vm, &arrv);
     js_gc_protect(ctx->vm, &cmp);
@@ -1353,7 +1400,8 @@ static bool am_toString(JsContext *ctx, JsValue tv, const JsValue *args, int arg
  * module code is strict, so undefined and null are not replaced by the global object). */
 static bool fm_call(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     if (!js_is_function(tv))
-        return native_throw(ctx, r, "TypeError: Function.prototype.call called on a value that is not a function");
+        return native_throw_fmt(ctx, r, "TypeError: Function.prototype.call was called on %v, which is %s and not a function",
+                                tv, type_phrase(tv));
     JsValue self = argc > 0 ? args[0] : js_undefined();
     return js_call(ctx, tv, self, argc > 1 ? args + 1 : NULL, argc > 1 ? argc - 1 : 0, r);
 }
@@ -1385,13 +1433,14 @@ static bool call_joined(JsContext *ctx, JsValue fn, JsValue self, const JsValue 
  * (undefined or null for none). */
 static bool fm_apply(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     if (!js_is_function(tv))
-        return native_throw(ctx, r, "TypeError: Function.prototype.apply called on a value that is not a function");
+        return native_throw_fmt(ctx, r, "TypeError: Function.prototype.apply was called on %v, which is %s and not a function",
+                                tv, type_phrase(tv));
     JsValue self = argc > 0 ? args[0] : js_undefined();
     JsValue list = argc > 1 ? args[1] : js_undefined();
     if (js_is_undefined(list) || js_is_null(list))
         return js_call(ctx, tv, self, NULL, 0, r);
     if (!js_is_array(list))
-        return native_throw(ctx, r, "TypeError: Function.prototype.apply: the arguments must be an array");
+        return native_throw(ctx, r, "TypeError: CreateListFromArrayLike called on non-object");
     JsObject *a = js_value_object(list);
     return call_joined(ctx, tv, self, a->elems, a->elem_count, NULL, 0, r);
 }
@@ -1409,7 +1458,7 @@ bool js_bind_call(JsContext *ctx, JsValue bound, JsValue this_val, const JsValue
  * those arguments first. */
 static bool fm_bind(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     if (!js_is_function(tv))
-        return native_throw(ctx, r, "TypeError: Function.prototype.bind called on a value that is not a function");
+        return native_throw(ctx, r, "TypeError: Bind must be called on a function");
     JsVm *vm = ctx->vm;
     JsValue state = js_array_new(ctx, (uint32_t)(argc > 0 ? argc + 1 : 2));
     if (js_is_undefined(state)) {
@@ -1435,7 +1484,7 @@ static bool nm_toFixed(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     double x = js_to_number_value(ctx, tv);
     double dd = to_int(js_to_number_value(ctx, ARG(0)));
     if (dd < 0 || dd > 100)
-        return native_throw(ctx, r, "RangeError: toFixed() digits out of range");
+        return native_throw(ctx, r, "RangeError: toFixed() digits argument must be between 0 and 100");
     int d = (int)dd;
     /* x < 1e21 gives <=21 integer digits; plus up to 100 fraction digits, a
      * sign, a '.', and a NUL. Size both scratch buffers for the worst case so
@@ -1499,7 +1548,7 @@ static bool nm_toString(JsContext *ctx, JsValue tv, const JsValue *args, int arg
                     ? (int)to_integer_clamped(js_to_number_value(ctx, ARG(0)), 0, 37)
                     : 10;
     if (radix < 2 || radix > 36)
-        return native_throw(ctx, r, "RangeError: toString() radix must be 2..36");
+        return native_throw(ctx, r, "RangeError: toString() radix argument must be between 2 and 36");
     if (radix == 10 || x != x || x == __builtin_inf() || x == -__builtin_inf()) {
         JsString *s = js_number_to_string(ctx->vm, x);
         if (!s)
@@ -1857,17 +1906,41 @@ static bool json_stringify(JsContext *ctx, JsValue tv, const JsValue *args, int 
 
 /* --- JSON.parse --- */
 
+typedef enum { JE_NONE, JE_END, JE_TOKEN, JE_AT, JE_OOM, JE_DEPTH } JsonErr;
+
 typedef struct {
     JsContext *ctx;
     const uint16_t *u;
     uint32_t len, pos;
     bool error;
     int depth;
+    JsonErr err;      /* what went wrong, for V8's wording */
+    const char *why;  /* JE_AT: the message before " in JSON at position" */
+    uint32_t at;      /* JE_TOKEN / JE_AT: the offending offset */
 } JsonP;
 
 /* Nesting cap for JSON.parse — bounds C-stack recursion on hostile input like
  * `[`.repeat(N). Mirrors JSON.stringify's own depth limit. */
 #define JSON_PARSE_MAX_DEPTH 200
+
+/* The first failure is the one reported. Each returns false. */
+static bool json_fail(JsonP *p, JsonErr err, const char *why, uint32_t at) {
+    if (!p->error) {
+        p->error = true;
+        p->err = err;
+        p->why = why;
+        p->at = at;
+    }
+    return false;
+}
+/* the input ran out; V8 says so unless it names what it expected there */
+static bool json_end(JsonP *p) { return json_fail(p, JE_END, NULL, p->len); }
+/* a character that cannot start or continue what is being read */
+static bool json_token(JsonP *p, uint32_t at) {
+    return at >= p->len ? json_end(p) : json_fail(p, JE_TOKEN, NULL, at);
+}
+static bool json_at(JsonP *p, const char *why, uint32_t at) { return json_fail(p, JE_AT, why, at); }
+static bool json_oom(JsonP *p) { return json_fail(p, JE_OOM, NULL, 0); }
 
 static void json_ws(JsonP *p) {
     while (p->pos < p->len) {
@@ -1884,10 +1957,8 @@ static bool json_value_body(JsonP *p, JsValue *out);
 
 static bool json_lit(JsonP *p, const char *word, JsValue v, JsValue *out) {
     for (uint32_t i = 0; word[i]; i++) {
-        if (p->pos + i >= p->len || p->u[p->pos + i] != (uint16_t)word[i]) {
-            p->error = true;
-            return false;
-        }
+        if (p->pos + i >= p->len || p->u[p->pos + i] != (uint16_t)word[i])
+            return json_token(p, p->pos + i);
     }
     uint32_t wl = 0;
     while (word[wl])
@@ -1909,22 +1980,20 @@ static bool json_number(JsonP *p, JsValue *out) {
 #define JN_DIGIT(pos) ((pos) < p->len && p->u[(pos)] >= '0' && p->u[(pos)] <= '9')
     if (p->pos < p->len && p->u[p->pos] == '-')
         p->pos++;
-    if (!JN_DIGIT(p->pos)) {
-        p->error = true;
-        return false;
-    }
+    if (!JN_DIGIT(p->pos))
+        return json_at(p, "No number after minus sign", p->pos);
     if (p->u[p->pos] == '0') {
         p->pos++; /* a leading zero stands alone — no further integer digits */
+        if (JN_DIGIT(p->pos))
+            return json_at(p, "Unexpected number", p->pos);
     } else {
         while (JN_DIGIT(p->pos))
             p->pos++;
     }
     if (p->pos < p->len && p->u[p->pos] == '.') {
         p->pos++;
-        if (!JN_DIGIT(p->pos)) {
-            p->error = true;
-            return false;
-        }
+        if (!JN_DIGIT(p->pos))
+            return json_at(p, "Unterminated fractional number", p->pos);
         while (JN_DIGIT(p->pos))
             p->pos++;
     }
@@ -1932,10 +2001,8 @@ static bool json_number(JsonP *p, JsValue *out) {
         p->pos++;
         if (p->pos < p->len && (p->u[p->pos] == '+' || p->u[p->pos] == '-'))
             p->pos++;
-        if (!JN_DIGIT(p->pos)) {
-            p->error = true;
-            return false;
-        }
+        if (!JN_DIGIT(p->pos))
+            return json_at(p, "Exponent part is missing a number", p->pos);
         while (JN_DIGIT(p->pos))
             p->pos++;
     }
@@ -1949,18 +2016,25 @@ static bool json_string_raw(JsonP *p, JsString **out) {
     StrBuf sb;
     sb_init(&sb, p->ctx->vm);
     while (p->pos < p->len) {
+        uint32_t at = p->pos;
         uint16_t c = p->u[p->pos++];
         if (c == '"') {
             JsString *s = js_string_cell_new(p->ctx->vm, sb.u, sb.len);
             sb_free(&sb);
-            if (!s) {
-                p->error = true;
-                return false;
-            }
+            if (!s)
+                return json_oom(p);
             *out = s;
             return true;
         }
-        if (c == '\\' && p->pos < p->len) {
+        if (c < 0x20) {
+            sb_free(&sb);
+            return json_at(p, "Bad control character in string literal", at);
+        }
+        if (c == '\\') {
+            if (p->pos >= p->len) {
+                sb_free(&sb);
+                return json_end(p);
+            }
             uint16_t e = p->u[p->pos++];
             switch (e) {
             case '"': sb_unit(&sb, '"'); break;
@@ -1973,44 +2047,42 @@ static bool json_string_raw(JsonP *p, JsString **out) {
             case 'f': sb_unit(&sb, '\f'); break;
             case 'u': {
                 uint32_t cp = 0;
-                for (int i = 0; i < 4 && p->pos < p->len; i++) {
-                    uint16_t h = p->u[p->pos++];
+                for (int i = 0; i < 4; i++) {
+                    if (p->pos >= p->len) {
+                        sb_free(&sb);
+                        return json_end(p);
+                    }
+                    uint16_t h = p->u[p->pos];
                     int d = h >= '0' && h <= '9' ? h - '0'
                             : h >= 'a' && h <= 'f' ? h - 'a' + 10
                             : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
                     if (d < 0) {
-                        p->error = true;
                         sb_free(&sb);
-                        return false;
+                        return json_at(p, "Bad Unicode escape", p->pos);
                     }
+                    p->pos++;
                     cp = cp * 16 + (uint32_t)d;
                 }
                 sb_unit(&sb, (uint16_t)cp);
                 break;
             }
             default:
-                p->error = true;
                 sb_free(&sb);
-                return false;
+                return json_at(p, "Bad escaped character", p->pos - 1);
             }
-        } else if (c == '\\') {
-            p->error = true;
-            sb_free(&sb);
-            return false;
         } else {
             sb_unit(&sb, c);
         }
     }
-    p->error = true;
     sb_free(&sb);
-    return false;
+    return json_at(p, "Unterminated string", p->len);
 }
 
 /* Depth-guarded entry: bounds recursion before descending into json_value_body,
  * which recurses back through json_value for nested arrays/objects. */
 static bool json_value(JsonP *p, JsValue *out) {
     if (++p->depth > JSON_PARSE_MAX_DEPTH) {
-        p->error = true;
+        json_fail(p, JE_DEPTH, NULL, p->pos);
         p->depth--;
         return false;
     }
@@ -2021,18 +2093,14 @@ static bool json_value(JsonP *p, JsValue *out) {
 
 static bool json_value_body(JsonP *p, JsValue *out) {
     json_ws(p);
-    if (p->pos >= p->len) {
-        p->error = true;
-        return false;
-    }
+    if (p->pos >= p->len)
+        return json_end(p);
     uint16_t c = p->u[p->pos];
     if (c == '{') {
         p->pos++;
         JsValue ov = js_object_new(p->ctx);
-        if (!js_is_object(ov)) {
-            p->error = true;
-            return false;
-        }
+        if (!js_is_object(ov))
+            return json_oom(p);
         JsObject *o = js_value_object(ov);
         js_gc_protect(p->ctx->vm, &ov);
         json_ws(p);
@@ -2040,11 +2108,12 @@ static bool json_value_body(JsonP *p, JsValue *out) {
         if (p->pos < p->len && p->u[p->pos] == '}') {
             p->pos++;
         } else {
+            bool after_comma = false;
             for (;;) {
                 json_ws(p);
                 if (p->pos >= p->len || p->u[p->pos] != '"') {
-                    p->error = true;
-                    okc = false;
+                    okc = json_at(p, after_comma ? "Expected double-quoted property name"
+                                                 : "Expected property name or '}'", p->pos);
                     break;
                 }
                 JsString *key;
@@ -2054,8 +2123,7 @@ static bool json_value_body(JsonP *p, JsValue *out) {
                 }
                 JsString *ikey = js_intern_cell(p->ctx->vm, key);
                 if (!ikey) {
-                    p->error = true;
-                    okc = false;
+                    okc = json_oom(p);
                     break;
                 }
                 /* root the key across the value parse (a GC safe point) */
@@ -2064,8 +2132,7 @@ static bool json_value_body(JsonP *p, JsValue *out) {
                 json_ws(p);
                 if (p->pos >= p->len || p->u[p->pos] != ':') {
                     js_gc_unprotect(p->ctx->vm, &keyv);
-                    p->error = true;
-                    okc = false;
+                    okc = json_at(p, "Expected ':' after property name", p->pos);
                     break;
                 }
                 p->pos++;
@@ -2079,21 +2146,20 @@ static bool json_value_body(JsonP *p, JsValue *out) {
                                          js_value_string(keyv), val);
                 js_gc_unprotect(p->ctx->vm, &keyv);
                 if (!set_ok) {
-                    p->error = true;
-                    okc = false;
+                    okc = json_oom(p);
                     break;
                 }
                 json_ws(p);
                 if (p->pos < p->len && p->u[p->pos] == ',') {
                     p->pos++;
+                    after_comma = true;
                     continue;
                 }
                 if (p->pos < p->len && p->u[p->pos] == '}') {
                     p->pos++;
                     break;
                 }
-                p->error = true;
-                okc = false;
+                okc = json_at(p, "Expected ',' or '}' after property value", p->pos);
                 break;
             }
         }
@@ -2106,10 +2172,8 @@ static bool json_value_body(JsonP *p, JsValue *out) {
     if (c == '[') {
         p->pos++;
         JsObject *a = js_array_new_cell(p->ctx, 0);
-        if (!a) {
-            p->error = true;
-            return false;
-        }
+        if (!a)
+            return json_oom(p);
         JsValue av = js_value_from_cell(&a->gc);
         js_gc_protect(p->ctx->vm, &av);
         json_ws(p);
@@ -2124,8 +2188,7 @@ static bool json_value_body(JsonP *p, JsValue *out) {
                     break;
                 }
                 if (!js_array_append(p->ctx->vm, a, el)) {
-                    p->error = true;
-                    okc = false;
+                    okc = json_oom(p);
                     break;
                 }
                 json_ws(p);
@@ -2137,8 +2200,7 @@ static bool json_value_body(JsonP *p, JsValue *out) {
                     p->pos++;
                     break;
                 }
-                p->error = true;
-                okc = false;
+                okc = json_at(p, "Expected ',' or ']' after array element", p->pos);
                 break;
             }
         }
@@ -2163,8 +2225,59 @@ static bool json_value_body(JsonP *p, JsValue *out) {
         return json_lit(p, "null", js_null(), out);
     if (c == '-' || (c >= '0' && c <= '9'))
         return json_number(p, out);
-    p->error = true;
-    return false;
+    return json_token(p, p->pos);
+}
+
+/* V8's message for a failed parse: "Unexpected token 'x', "[1, x]" is not valid JSON" (the
+ * source, or up to 10 characters either side of the token when it is longer than 20),
+ * "Expected ':' after property name in JSON at position 4 (line 1 column 5)", "Unexpected end
+ * of JSON input". */
+static JsValue json_error(JsContext *ctx, const JsonP *p) {
+    JsVm *vm = ctx->vm;
+    if (p->err == JE_OOM)
+        return js_oom_value(vm);
+    if (p->err == JE_DEPTH)
+        return js_error_from_ascii(ctx, "RangeError: Maximum call stack size exceeded");
+    if (p->err == JE_END || p->err == JE_NONE)
+        return js_error_from_ascii(ctx, "SyntaxError: Unexpected end of JSON input");
+    if (p->err == JE_AT) {
+        uint32_t line = 1, col = 1;
+        for (uint32_t i = 0; i < p->at && i < p->len; i++) {
+            if (p->u[i] == '\n') {
+                line++;
+                col = 1;
+            } else {
+                col++;
+            }
+        }
+        char tail[96];
+        size_t wl = strlen(p->why); /* "...after JSON" already says where */
+        bool says_json = wl >= 4 && strcmp(p->why + wl - 4, "JSON") == 0;
+        snprintf(tail, sizeof tail, "%s at position %u (line %u column %u)", says_json ? "" : " in JSON",
+                 p->at, line, col);
+        return js_error_fmt(ctx, "SyntaxError: %s%s", p->why, tail);
+    }
+    /* JE_TOKEN */
+    uint32_t at = p->at, start = 0, end = p->len;
+    bool before = false, after = false;
+    if (p->len > 20) {
+        start = at < 10 ? 0 : at - 10;
+        end = at + 10 > p->len ? p->len : at + 10;
+        before = start > 0;
+        after = end < p->len;
+    }
+    JsString *tok = js_string_cell_new(vm, p->u + at, 1);
+    JsValue tv = tok ? js_value_from_cell(&tok->gc) : js_undefined();
+    js_gc_protect(vm, &tv);
+    JsString *ctxs = js_string_cell_new(vm, p->u + start, end - start);
+    JsValue cv = ctxs ? js_value_from_cell(&ctxs->gc) : js_undefined();
+    js_gc_protect(vm, &cv);
+    JsValue e = tok && ctxs ? js_error_fmt(ctx, "SyntaxError: Unexpected token '%v', %s\"%v\"%s is not valid JSON",
+                                           tv, before ? "..." : "", cv, after ? "..." : "")
+                            : js_oom_value(vm);
+    js_gc_unprotect(vm, &cv);
+    js_gc_unprotect(vm, &tv);
+    return e;
 }
 
 static bool json_parse(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
@@ -2174,17 +2287,20 @@ static bool json_parse(JsContext *ctx, JsValue tv, const JsValue *args, int argc
         return oom(ctx, r);
     JsValue sv = js_value_from_cell(&s->gc);
     js_gc_protect(ctx->vm, &sv);
-    JsonP p = {ctx, s->units, s->length, 0, false, 0};
+    JsonP p = {ctx, s->units, s->length, 0, false, 0, JE_NONE, NULL, 0};
     JsValue out;
     bool ok = json_value(&p, &out);
     if (ok) {
         json_ws(&p);
         if (p.pos != p.len)
-            ok = false;
+            ok = json_at(&p, "Unexpected non-whitespace character after JSON", p.pos);
+    }
+    if (!ok || p.error) {
+        *r = json_error(ctx, &p); /* s is still rooted: the message quotes it */
+        js_gc_unprotect(ctx->vm, &sv);
+        return false;
     }
     js_gc_unprotect(ctx->vm, &sv);
-    if (!ok || p.error)
-        return native_throw(ctx, r, "SyntaxError: invalid JSON");
     *r = out;
     return true;
 }
@@ -2290,7 +2406,7 @@ static bool obj_assign(JsContext *ctx, JsValue tv, const JsValue *args, int argc
         dst = js_value_from_cell(&own->gc);
     }
     if (!js_is_object(dst))
-        return native_throw(ctx, r, "TypeError: Object.assign target must be an object");
+        return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
     if (js_value_object(dst)->obj_flags & JS_OBJ_FROZEN)
         return native_throw(ctx, r, "TypeError: cannot assign to a property of a frozen object");
     js_gc_protect(ctx->vm, &target);
@@ -2378,7 +2494,10 @@ static bool obj_fromEntries(JsContext *ctx, JsValue tv, const JsValue *args, int
     (void)tv;
     JsValue src = ARG(0);
     if (!js_is_object(src) || js_value_object(src)->obj_kind != JS_OBJ_ARRAY)
-        return native_throw(ctx, r, "TypeError: Object.fromEntries expects an array of pairs");
+        return native_throw_fmt(ctx, r, js_is_undefined(src) || js_is_null(src)
+                                    ? "TypeError: %v is not iterable"
+                                    : "TypeError: %t is not iterable (cannot read property Symbol(Symbol.iterator))",
+                                src);
     JsValue outv = js_object_new(ctx);
     if (!js_is_object(outv))
         return oom(ctx, r);
@@ -2386,9 +2505,13 @@ static bool obj_fromEntries(JsContext *ctx, JsValue tv, const JsValue *args, int
     js_gc_protect(ctx->vm, &outv);
     JsObject *arr = js_value_object(src);
     bool ok = true;
+    JsValue bad = js_undefined();
+    bool have_bad = false;
     for (uint32_t i = 0; i < arr->elem_count && ok; i++) {
         JsValue pair = arr->elems[i];
         if (!js_is_object(pair) || js_value_object(pair)->obj_kind != JS_OBJ_ARRAY) {
+            bad = pair;
+            have_bad = true;
             ok = false;
             break;
         }
@@ -2400,8 +2523,10 @@ static bool obj_fromEntries(JsContext *ctx, JsValue tv, const JsValue *args, int
         ok = iks && js_map_set(ctx->vm, &out->props, iks, val);
     }
     js_gc_unprotect(ctx->vm, &outv);
+    if (have_bad) /* bad is an element of src, which the caller holds */
+        return native_throw_fmt(ctx, r, "TypeError: Iterator value %v is not an entry object", bad);
     if (!ok)
-        return native_throw(ctx, r, "TypeError: invalid entry in Object.fromEntries");
+        return oom(ctx, r);
     *r = outv;
     return true;
 }
@@ -2503,7 +2628,7 @@ static bool obj_getPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, 
     (void)tv;
     JsValue v = ARG(0);
     if (js_is_undefined(v) || js_is_null(v))
-        return native_throw(ctx, r, "TypeError: Object.getPrototypeOf called on null or undefined");
+        return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
     if (js_is_object(v)) {
         JsValue proto = js_value_object(v)->proto;
         *r = js_is_object(proto) ? proto : js_null();
@@ -2520,7 +2645,7 @@ static bool obj_setPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, 
     if (js_is_undefined(v) || js_is_null(v))
         return native_throw(ctx, r, "TypeError: Object.setPrototypeOf called on null or undefined");
     if (!js_is_object(proto) && !js_is_null(proto))
-        return native_throw(ctx, r, "TypeError: prototype must be an object or null");
+        return native_throw_fmt(ctx, r, "TypeError: Object prototype may only be an Object or null: %v", proto);
     if (js_is_object(v))
         js_value_object(v)->proto = js_is_object(proto) ? proto : js_undefined();
     *r = v;
@@ -2647,7 +2772,7 @@ static bool g_Array(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
         if ((double)n != d)
             return native_throw(ctx, r, "RangeError: Invalid array length");
         if (n > JS_MAX_ARRAY_GAP)
-            return native_throw(ctx, r, "RangeError: array length too large");
+            return native_throw(ctx, r, "RangeError: Invalid array length");
         JsObject *out = js_array_new_cell(ctx, n);
         if (!out)
             return oom(ctx, r);
@@ -2864,7 +2989,7 @@ static bool str_fromCodePoint(JsContext *ctx, JsValue tv, const JsValue *args, i
          * double straight to uint32_t (UB) */
         if (!(d >= 0 && d <= 0x10FFFF) || d != __builtin_floor(d)) {
             sb_free(&sb);
-            return native_throw(ctx, r, "RangeError: invalid code point");
+            return native_throw_fmt(ctx, r, "RangeError: Invalid code point %v", ARG(i));
         }
         uint32_t cp = (uint32_t)d;
         if (cp > 0xFFFF) {

@@ -108,7 +108,7 @@ static bool alloc_mapobj(JsContext *ctx, JsValue *out) {
 
 static bool this_map(JsContext *ctx, JsValue tv, JsMapObj **out, JsValue *r) {
     if (!js_mapobj_is(tv))
-        return nthrow(ctx, r, "TypeError: Map.prototype method called on a non-Map value");
+        return (*r = js_error_receiver(ctx, "Map", tv)), false;
     *out = (JsMapObj *)js_value_object(tv);
     return true;
 }
@@ -133,14 +133,15 @@ static bool g_Map(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsV
             JsObject *a = js_value_object(src);
             for (uint32_t i = 0; i < a->elem_count; i++) {
                 if (!is_pair_like(a->elems[i]))
-                    return nthrow(ctx, r,
-                                 "TypeError: iterable for new Map() must yield [key, value] pairs");
+                    return (*r = js_error_fmt(ctx, "TypeError: Iterator value %v is not an entry object",
+                                              a->elems[i])), false;
                 JsObject *pair = js_value_object(a->elems[i]);
                 if (!mapobj_set(ctx->vm, m, pair->elems[0], pair->elems[1]))
                     return nthrow(ctx, r, "out of memory");
             }
         } else {
-            return nthrow(ctx, r, "TypeError: value is not iterable");
+            return (*r = js_error_fmt(ctx, "TypeError: %t is not iterable (cannot read property Symbol(Symbol.iterator))",
+                                      src)), false;
         }
     }
     *r = mv;
@@ -207,7 +208,7 @@ static bool map_forEach(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     if (!this_map(ctx, tv, &m, r))
         return false;
     if (!js_is_function(ARG(0)))
-        return nthrow(ctx, r, "TypeError: callback is not a function");
+        return (*r = js_error_fmt(ctx, "TypeError: %t is not a function", ARG(0))), false;
     JsValue cb = ARG(0), thisArg = ARG(1), mapv = tv;
     js_gc_protect(ctx->vm, &mapv);
     js_gc_protect(ctx->vm, &cb);

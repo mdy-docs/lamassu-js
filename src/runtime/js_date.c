@@ -288,7 +288,7 @@ static bool alloc_date(JsContext *ctx, double time, JsValue *out) {
 
 static bool this_date(JsContext *ctx, JsValue tv, JsDateObject **out, JsValue *r) {
     if (!js_date_is(tv))
-        return nthrow(ctx, r, "TypeError: Date.prototype method called on a non-Date value");
+        return nthrow(ctx, r, "TypeError: this is not a Date object.");
     *out = (JsDateObject *)js_value_object(tv);
     return true;
 }
@@ -635,7 +635,7 @@ static bool date_toISOString(JsContext *ctx, JsValue tv, const JsValue *args, in
     if (!this_date(ctx, tv, &d, r))
         return false;
     if (d->time != d->time)
-        return nthrow(ctx, r, "RangeError: invalid date");
+        return nthrow(ctx, r, "RangeError: Invalid time value");
     DateParts p;
     decompose(d->time, &p);
     uint16_t buf[40];

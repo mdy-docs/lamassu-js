@@ -880,8 +880,15 @@ static void test_entry_return(void) {
     /* imports still load first, and their own top-level return is a SyntaxError */
     mod_add("dep", "export const v = 5;");
     eq_entry("import { v } from 'dep'; return v * 2;", true, "10");
+    /* a module that does not compile rejects with a SyntaxError object, worded as V8 words it */
+    mod_add("bad", "let x = ;");
+    eq_entry("try { await import('bad'); } catch (e) { return e.name + '|' + e.message; }", true,
+             "SyntaxError|Unexpected token ';'");
+    mod_add("bad", "let a = 1; let a = 2;");
+    eq_entry("try { await import('bad'); } catch (e) { return e.name + '|' + e.message; }", true,
+             "SyntaxError|Identifier 'a' has already been declared");
     mod_add("dep", "return 1; export const v = 5;");
-    eq_entry("import { v } from 'dep'; return v;", false, "'return' outside function");
+    eq_entry("import { v } from 'dep'; return v;", false, "Illegal return statement");
     /* a deferred (async) loader: the root's record is still marked while it waits */
     mod_add_mode("main", "return 'later';", MODE_DEFERRED);
     {
@@ -896,7 +903,7 @@ static void test_entry_return(void) {
     {
         bool ok;
         char *out = eval_export_spec("main", "x", &ok);
-        check(!ok && strstr(out, "'return' outside function"), "js_eval_module: top-level return is a SyntaxError");
+        check(!ok && strstr(out, "Illegal return statement"), "js_eval_module: top-level return is a SyntaxError");
         free(out);
         mods_reset();
     }
@@ -947,7 +954,7 @@ static void test_check_module(void) {
     check(check_src(tv.ctx, "import { v } from 'nowhere'; export const w = v + 1;", false, &msg, &pos) && !msg,
           "check: imports and exports compile; the import is not loaded");
     check(check_src(tv.ctx, "const a = 1;\nreturn a;", true, &msg, &pos), "check: an entry may return at top level");
-    check(!check_src(tv.ctx, "const a = 1;\nreturn a;", false, &msg, &pos) && strstr(msg, "'return' outside function"),
+    check(!check_src(tv.ctx, "const a = 1;\nreturn a;", false, &msg, &pos) && strstr(msg, "Illegal return statement"),
           "check: a module may not");
     check(!check_src(tv.ctx, "let x = 1;\nlet y = (x + ;", true, &msg, &pos) && msg && pos >= 11 && pos <= 24,
           "check: a parse error has a message and an offset on its line");

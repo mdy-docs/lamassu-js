@@ -84,7 +84,7 @@ static bool skip_space(JsLexer *lx, bool *newline) {
             lx->pos += 2;
             for (;;) {
                 if (lx->pos >= lx->len)
-                    return lex_fail(lx, start, "unterminated comment");
+                    return lex_fail(lx, start, "Invalid or unexpected token");
                 if (cur(lx) == '*' && at(lx, 1) == '/') {
                     lx->pos += 2;
                     break;
@@ -179,13 +179,19 @@ static bool lex_number(JsLexer *lx) {
             any = true;
         }
         if (!any)
-            return lex_fail(lx, start, "invalid number literal");
+            return lex_fail(lx, start, "Invalid or unexpected token");
     } else {
         uint64_t mant = 0;
         int digits = 0, exp_adjust = 0, exp_part = 0;
         bool dropped = false; /* digits past the 19th: the whole text decides the rounding */
-        if (cur(lx) == '0' && is_digit(at(lx, 1)))
-            return lex_fail(lx, start, "legacy octal literals are not allowed");
+        if (cur(lx) == '0' && is_digit(at(lx, 1))) {
+            /* V8 names 08 and 09-style literals apart from octal-looking ones */
+            for (uint32_t i = 1; is_digit(at(lx, i)); i++) {
+                if (at(lx, i) >= '8')
+                    return lex_fail(lx, start, "Decimals with leading zeros are not allowed in strict mode.");
+            }
+            return lex_fail(lx, start, "Octal literals are not allowed in strict mode.");
+        }
         while (is_digit(cur(lx))) {
             if (digits < 19) {
                 mant = mant * 10 + (uint64_t)(cur(lx) - '0');
@@ -219,7 +225,7 @@ static bool lex_number(JsLexer *lx) {
                 lx->pos++;
             }
             if (!is_digit(cur(lx)))
-                return lex_fail(lx, lx->pos, "missing exponent digits");
+                return lex_fail(lx, lx->pos, "Invalid or unexpected token");
             while (is_digit(cur(lx))) {
                 if (exp_part < 100000)
                     exp_part = exp_part * 10 + (cur(lx) - '0');
@@ -237,7 +243,7 @@ static bool lex_number(JsLexer *lx) {
     if (cur(lx) == 'n')
         return lex_fail(lx, lx->pos, "BigInt literals are not supported");
     if (is_id_start(cur(lx)) || is_digit(cur(lx)))
-        return lex_fail(lx, lx->pos, "unexpected character after number");
+        return lex_fail(lx, lx->pos, "Invalid or unexpected token");
 
     lx->tok.kind = JS_T_NUM;
     lx->tok.u.number = value;
@@ -272,16 +278,16 @@ static bool cook_escape(JsLexer *lx, uint16_t *out, uint32_t *outlen) {
     case 'v': out[0] = '\v'; return true;
     case '0':
         if (is_digit(cur(lx)))
-            return lex_fail(lx, bs, "octal escapes are not allowed");
+            return lex_fail(lx, bs, "Octal escape sequences are not allowed in strict mode.");
         out[0] = 0;
         return true;
     case '1': case '2': case '3': case '4':
     case '5': case '6': case '7': case '8': case '9':
-        return lex_fail(lx, bs, "octal escapes are not allowed");
+        return lex_fail(lx, bs, "Octal escape sequences are not allowed in strict mode.");
     case 'x': {
         int h = hex_val(cur(lx)), l = hex_val(at(lx, 1));
         if (h < 0 || l < 0)
-            return lex_fail(lx, bs, "invalid \\x escape");
+            return lex_fail(lx, bs, "Invalid hexadecimal escape sequence");
         out[0] = (uint16_t)(h * 16 + l);
         lx->pos += 2;
         return true;
@@ -294,12 +300,12 @@ static bool cook_escape(JsLexer *lx, uint16_t *out, uint32_t *outlen) {
             while (hex_val(cur(lx)) >= 0) {
                 cp = cp * 16 + (uint32_t)hex_val(cur(lx));
                 if (cp > 0x10FFFF)
-                    return lex_fail(lx, bs, "code point out of range");
+                    return lex_fail(lx, bs, "Undefined Unicode code-point");
                 lx->pos++;
                 any = true;
             }
             if (!any || cur(lx) != '}')
-                return lex_fail(lx, bs, "invalid \\u{...} escape");
+                return lex_fail(lx, bs, "Invalid Unicode escape sequence");
             lx->pos++;
             if (cp > 0xFFFF) {
                 cp -= 0x10000;
@@ -315,7 +321,7 @@ static bool cook_escape(JsLexer *lx, uint16_t *out, uint32_t *outlen) {
         for (int i = 0; i < 4; i++) {
             int h = hex_val(cur(lx));
             if (h < 0)
-                return lex_fail(lx, bs, "invalid \\u escape");
+                return lex_fail(lx, bs, "Invalid Unicode escape sequence");
             cp = cp * 16 + (uint32_t)h;
             lx->pos++;
         }
@@ -337,7 +343,7 @@ static bool lex_string(JsLexer *lx) {
     uint32_t scan = lx->pos;
     for (;;) {
         if (scan >= lx->len)
-            return lex_fail(lx, start, "unterminated string");
+            return lex_fail(lx, start, "Invalid or unexpected token");
         uint16_t u = lx->src[scan];
         if (u == quote)
             break;
@@ -347,10 +353,10 @@ static bool lex_string(JsLexer *lx) {
                 scan + 1 < lx->len && lx->src[scan + 1] == '\n')
                 scan++;
             if (scan >= lx->len)
-                return lex_fail(lx, start, "unterminated string");
+                return lex_fail(lx, start, "Invalid or unexpected token");
             scan++;
         } else if (is_line_term(u)) {
-            return lex_fail(lx, start, "unterminated string");
+            return lex_fail(lx, start, "Invalid or unexpected token");
         } else {
             scan++;
         }
@@ -389,7 +395,7 @@ static bool lex_template_chunk(JsLexer *lx, uint32_t err_from) {
     uint32_t scan = lx->pos;
     for (;;) {
         if (scan >= lx->len)
-            return lex_fail(lx, err_from, "unterminated template literal");
+            return lex_fail(lx, err_from, "Unexpected end of input");
         uint16_t u = lx->src[scan];
         if (u == '`')
             break;
@@ -398,7 +404,7 @@ static bool lex_template_chunk(JsLexer *lx, uint32_t err_from) {
         if (u == '\\') {
             scan += 2;
             if (scan > lx->len)
-                return lex_fail(lx, err_from, "unterminated template literal");
+                return lex_fail(lx, err_from, "Unexpected end of input");
         } else {
             scan++;
         }
@@ -460,12 +466,12 @@ bool js_lexer_rescan_regex(JsLexer *lx) {
     bool in_class = false;
     for (;;) {
         if (p >= lx->len || is_line_term(lx->src[p]))
-            return lex_fail(lx, start, "unterminated regex literal");
+            return lex_fail(lx, start, "Invalid regular expression: missing /");
         uint16_t u = lx->src[p];
         if (u == '\\') {
             p++;
             if (p >= lx->len || is_line_term(lx->src[p]))
-                return lex_fail(lx, start, "unterminated regex literal");
+                return lex_fail(lx, start, "Invalid regular expression: missing /");
             p++;
         } else if (u == '[') {
             in_class = true;
@@ -586,7 +592,7 @@ static bool lex_punct(JsLexer *lx) {
         else k = JS_T_CARET;
         break;
     default:
-        return lex_fail(lx, lx->pos, "unexpected character");
+        return lex_fail(lx, lx->pos, "Invalid or unexpected token");
     }
     lx->tok.kind = k;
     lx->pos += n;

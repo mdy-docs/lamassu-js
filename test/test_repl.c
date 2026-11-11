@@ -122,11 +122,11 @@ static void run_session(bool stress) {
     /* const enforcement across evals */
     expect(r, "const K = 3;", "undefined");
     expect(r, "K;", "3");
-    expect(r, "K = 4;", "!TypeError: assignment to constant variable");
+    expect(r, "K = 4;", "!TypeError: Assignment to constant variable.");
     expect(r, "K;", "3");
 
     /* const enforcement within a single eval */
-    expect(r, "const Z = 1; Z = 2;", "!TypeError: assignment to constant variable");
+    expect(r, "const Z = 1; Z = 2;", "!TypeError: Assignment to constant variable.");
 
     /* functions persist and are hoisted within an eval */
     expect(r, "function sq(n) { return n * n; }", "undefined");

@@ -42,6 +42,20 @@ JsValue js_error_new(JsContext *ctx, JsErrorKind kind, JsString *message);
 JsValue js_error_from_ascii(JsContext *ctx, const char *msg); /* <=128 chars */
 JsValue js_error_from_cell(JsContext *ctx, JsString *msg);
 
+/* An engine-raised error from a format, worded as V8 words it: "TypeError: Cannot read
+ * properties of %v (reading '%S')". The leading "Name: " selects the kind, as for
+ * js_error_from_ascii. Directives: %s ASCII text, %S a JsString, %v a value as V8 shows it in
+ * a message (a primitive by ToString, an array as [object Array], another object as
+ * #<Object>, a function as its name), %t a value in V8's typed form for built-ins (number 5,
+ * string "x", boolean true, object null, undefined, object, function), %% a percent sign. At
+ * most 6 arguments; a %S or %v
+ * longer than 120 units is cut short with "...". Allocates; the arguments need no rooting. */
+JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...);
+
+/* V8's error for a built-in method called on the wrong kind of value: "Method Map.prototype.get
+ * called on incompatible receiver 5". The method's name is the running native's. */
+JsValue js_error_receiver(JsContext *ctx, const char *cls, JsValue receiver);
+
 /* "name: message" (either half omitted when empty). `depth` guards against
  * an error whose message/name refers back to itself. NULL on OOM. */
 JsString *js_error_repr(JsContext *ctx, JsObject *o, int depth);

@@ -90,9 +90,12 @@ typedef enum JsOp {
     /* phase 11: dynamic import() — legal in modules AND plain scripts
      * (fn->module NULL = empty referrer), so NOT a module-gated opcode */
     JS_OP_DYNAMIC_IMPORT,  /* pops specifier, pushes the load's promise */
+    /* an assignment to a const or an import: throws "TypeError: Assignment to constant
+     * variable." when it runs, as V8 does (the value stays, for the validator's sake) */
+    JS_OP_THROW_CONST_ASSIGN,
 } JsOp;
 
-#define JS_OP__COUNT (JS_OP_DYNAMIC_IMPORT + 1)
+#define JS_OP__COUNT (JS_OP_THROW_CONST_ASSIGN + 1)
 
 /*
  * Per-opcode metadata, the single source of truth the bytecode verifier

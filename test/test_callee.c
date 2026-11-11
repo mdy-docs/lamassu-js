@@ -1,7 +1,8 @@
 /*
  * A failed call names its callee: "s.fillet is not a function", "foo is not a function",
  * "a[0] is not a function", "n is not a constructor", as V8 words them; an expression with no
- * readable name stays "value is not a function". The names survive a bytecode-cache round trip.
+ * readable name shows its value, as V8 does ("3 is not a function"). The names survive a
+ * bytecode-cache round trip. Literals read as V8 prints them ("null is not a function").
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,7 +57,34 @@ static const struct { const char *body; const char *message; } CASES[] = {
     { "const s = {}, args = [1, 2]; s.f(...args);", "s.f is not a function" },
     { "const n = 3; new n();", "n is not a constructor" },
     { "const m = { K: 1 }; new m.K(...[1]);", "m.K is not a constructor" },
-    { "(1 + 2)();", "value is not a function" },
+    { "(1 + 2)();", "3 is not a function" },
+    { "null();", "null is not a function" },
+    { "\"abc\"();", "\"abc\" is not a function" },
+    { "(0x10)();", "16 is not a function" },
+    { "const f = () => 1; new f();", "f is not a constructor" },
+    /* the same table names what was iterated, destructured or read too early */
+    { "const o = {}; for (const k of o) {}", "o is not iterable" },
+    { "const o = { p: 1 }; for (const k of o.p) {}", "o.p is not iterable" },
+    { "const o = {}; const [x] = o;", "o is not iterable" },
+    { "const [x] = 5;", "5 is not iterable" },
+    { "const n = 5; [...n];", "n is not iterable" },
+    { "const n = 5; Math.max(...n);", "n is not iterable" },
+    { "const [[a]] = [5];", "5 is not iterable" },
+    { "let o; const { a } = o;", "Cannot destructure property 'a' of 'o' as it is undefined." },
+    { "const o = {}; const { a } = o.b;", "Cannot destructure property 'a' of 'o.b' as it is undefined." },
+    { "const { a } = null;", "Cannot destructure property 'a' of 'null' as it is null." },
+    { "function f({ a }) {} f();", "Cannot destructure property 'a' of 'undefined' as it is undefined." },
+    { "const { a: { b } } = {};", "Cannot read properties of undefined (reading 'b')" },
+    { "let x = 1; ({ x } = null);", "Cannot destructure property 'x' of 'null' as it is null." },
+    { "null.x;", "Cannot read properties of null (reading 'x')" },
+    { "const a = []; a[0].b;", "Cannot read properties of undefined (reading 'b')" },
+    { "const o = {}; o.a.b = 1;", "Cannot set properties of undefined (setting 'b')" },
+    { "const o = {}; o.a[0] = 1;", "Cannot set properties of undefined (setting '0')" },
+    { "const c = 1; c = 2;", "Assignment to constant variable." },
+    { "function f() { return K; } f(); const K = 1;", "ReferenceError: Cannot access 'K' before initialization" },
+    { "const g = () => K2; g(); const K2 = 1;", "ReferenceError: Cannot access 'K2' before initialization" },
+    { "const q = q + 1;", "ReferenceError: Cannot access 'q' before initialization" },
+    { "{ h(); let v = 1; function h() { return v; } }", "ReferenceError: Cannot access 'v' before initialization" },
 };
 
 static bool message_of(JsContext *ctx, JsValue fn, char *msg, size_t cap) {
@@ -76,7 +104,9 @@ int main(void) {
         char src[512], msg[256], what[700];
         snprintf(src, sizeof src, "let msg = 'no error';\ntry { %s } catch (e) { msg = e.name + ': ' + e.message; }\nmsg", CASES[i].body);
         char want[300];
-        snprintf(want, sizeof want, "TypeError: %s", CASES[i].message);
+        /* a TypeError unless the case names its kind */
+        bool named = strncmp(CASES[i].message, "ReferenceError: ", 16) == 0;
+        snprintf(want, sizeof want, "%s%s", named ? "" : "TypeError: ", CASES[i].message);
         size_t len;
         uint16_t *u = to_u16(src, &len);
         const char *em = NULL; uint32_t ep = 0;

@@ -210,7 +210,11 @@ JsValue js_compile_module(JsContext *ctx, const uint16_t *src, size_t len,
 
 Compiles UTF-16 source as a strict-mode module body. Returns a function
 value (root it per the GC contract), or `undefined` on error with
-`*err_msg` (a static ASCII string) and `*err_pos` (a source offset) set.
+`*err_msg` and `*err_pos` (a source offset) set. The message is worded as V8
+words it (`Unexpected token ';'`, `Identifier 'x' has already been declared`),
+without the `SyntaxError: ` prefix; it is UTF-8, since a name in it may be any
+text, and it stays valid until the next compile on the same VM, so copy it to
+keep it. The same holds for every compile entry point.
 Source that uses top-level `import`/`export` has to go through the module
 pipeline instead, and says so by failing with `*err_msg` equal to
 `JS_ERR_NEEDS_MODULE_LOADER` — compare against that constant rather than

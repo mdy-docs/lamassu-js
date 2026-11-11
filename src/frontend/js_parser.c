@@ -1,3 +1,4 @@
+#include <string.h>
 #include "js_syntax.h"
 
 /*
@@ -26,6 +27,7 @@ typedef struct JsParser {
     uint32_t cover_init_pos;
     bool module_tla;
     bool allow_return; /* the entry module: `return` at top level ends it (js_eval_entry) */
+    int pattern_depth; /* expr_to_pattern nesting: V8 words a bad target inside a pattern apart */
 } JsParser;
 
 typedef struct JsNodeVec {
@@ -47,8 +49,105 @@ static JsAstNode *parse_func_common(JsParser *p, uint8_t flags, bool need_name,
                                     uint32_t pos, uint8_t kind);
 static JsAstNode *expr_to_pattern(JsParser *p, JsAstNode *n, bool binding);
 
+static bool units_is(const uint16_t *u, uint32_t len, const char *ascii);
+
+/* V8's wording for a parse that stops at the current token: "Unexpected token ';'",
+ * "Unexpected identifier 'x'", "Unexpected end of input". */
+static const char *unexpected_text(JsParser *p) {
+    const JsToken *t = &TOK(p);
+    JsVm *vm = p->arena->vm;
+    switch (t->kind) {
+    case JS_T_EOF:
+        return "Unexpected end of input";
+    case JS_T_IDENT:
+        return js_compile_error_fmt(vm, "Unexpected identifier '%U'", t->u.str.units, t->u.str.len);
+    case JS_T_NUM:
+        return "Unexpected number";
+    case JS_T_STR:
+        return "Unexpected string";
+    case JS_T_TEMPLATE:
+        return "Unexpected template string";
+    case JS_T_REGEX:
+        return "Unexpected regular expression";
+    case JS_T_RESERVED:
+        if (units_is(t->u.str.units, t->u.str.len, "enum"))
+            return "Unexpected reserved word";
+        if (units_is(t->u.str.units, t->u.str.len, "yield") ||
+            units_is(t->u.str.units, t->u.str.len, "static") ||
+            units_is(t->u.str.units, t->u.str.len, "implements") ||
+            units_is(t->u.str.units, t->u.str.len, "interface") ||
+            units_is(t->u.str.units, t->u.str.len, "package") ||
+            units_is(t->u.str.units, t->u.str.len, "private") ||
+            units_is(t->u.str.units, t->u.str.len, "protected") ||
+            units_is(t->u.str.units, t->u.str.len, "public"))
+            return "Unexpected strict mode reserved word";
+        break;
+    default:
+        break;
+    }
+    return js_compile_error_fmt(vm, "Unexpected token '%U'", p->lx.src + t->pos, t->end - t->pos);
+}
+
+/* The parser's own messages, worded as V8 words the same errors. */
+static const char *v8_message(const char *msg) {
+    static const char *const map[][2] = {
+        {"'return' outside function", "Illegal return statement"},
+        {"'break' outside loop or switch", "Illegal break statement"},
+        {"'continue' outside loop", "Illegal continue statement: no surrounding iteration statement"},
+        {"no line break allowed after 'throw'", "Illegal newline after throw"},
+        {"rest element must be last", "Rest element must be last element"},
+        {"rest parameter must be last", "Rest parameter must be last formal parameter"},
+        {"invalid assignment target", "Invalid left-hand side in assignment"},
+        {"optional chain is not a valid assignment target", "Invalid left-hand side in assignment"},
+        {"invalid destructuring target", "Invalid destructuring assignment target"},
+        {"property access is not a valid binding target", "Invalid destructuring assignment target"},
+        {"method is not a valid destructuring target", "Invalid destructuring assignment target"},
+        {"invalid rest target in object pattern", "Invalid destructuring assignment target"},
+        {"parenthesized destructuring pattern", "Invalid left-hand side in assignment"},
+        {"'await' is only valid in async functions", "Unexpected reserved word"},
+        {"cannot assign to 'eval' or 'arguments' in strict mode", "Unexpected eval or arguments in strict mode"},
+        {"cannot bind 'eval' or 'arguments' in strict mode", "Unexpected eval or arguments in strict mode"},
+        {"'delete' target must be a property access", "Delete of an unqualified identifier in strict mode."},
+        {"'const' declaration requires an initializer", "Missing initializer in const declaration"},
+        {"destructuring declaration requires an initializer", "Missing initializer in destructuring declaration"},
+        {"duplicate 'default' clause", "More than one default clause in switch statement"},
+        {"expected function name", "Function statements require a function name"},
+        /* the token after a trailing comma in parentheses is always the ')' */
+        {"trailing comma is only valid in arrow parameters here", "Unexpected token ')'"},
+        {"unary operator before '**' must be parenthesized",
+         "Unary operator used immediately before exponentiation expression. Parenthesis must be used to "
+         "disambiguate operator precedence"},
+        {"'with' is not allowed in strict mode", "Strict mode code may not include a with statement"},
+    };
+    for (size_t i = 0; i < sizeof map / sizeof map[0]; i++) {
+        if (strcmp(msg, map[i][0]) == 0)
+            return map[i][1];
+    }
+    return NULL;
+}
+
+/* Errors V8 reports as the token where parsing stopped */
+static bool reported_as_token(const char *msg) {
+    return strncmp(msg, "expected", 8) == 0 ||
+           strcmp(msg, "import/export is only allowed at the top level of a module") == 0 ||
+           strcmp(msg, "'import' is only allowed at the top level of a module") == 0 ||
+           strcmp(msg, "no line break allowed before '=>'") == 0 ||
+           strcmp(msg, "'...' is only valid in arrow parameters here") == 0 ||
+           strcmp(msg, "reserved word cannot be used as an identifier") == 0;
+}
+
 static JsAstNode *perr(JsParser *p, uint32_t pos, const char *msg) {
     if (!p->err_msg) {
+        const char *v8 = v8_message(msg);
+        if (v8) {
+            msg = v8;
+        } else if (reported_as_token(msg)) {
+            if (strcmp(msg, "expected binding identifier") == 0 && TOK(p).kind == JS_T_LET)
+                msg = "let is disallowed as a lexically bound name";
+            else
+                msg = unexpected_text(p);
+            pos = TOK(p).pos;
+        }
         p->err_msg = msg;
         p->err_pos = pos;
     }
@@ -262,6 +361,8 @@ static JsAstNode *parse_object_pattern(JsParser *p) {
             rest->a = check_binding_name(p, parse_ident(p, "expected identifier after '...'"));
             if (!rest->a || !vec_push(p, &props, rest))
                 return NULL;
+            if (TOK(p).kind == JS_T_COMMA)
+                return perr_here(p, "rest element must be last");
             break; /* rest must be last */
         }
         JsAstNode *prop = new_node(p, JS_AST_PROPERTY, TOK(p).pos);
@@ -357,6 +458,8 @@ static JsAstNode *parse_array_pattern(JsParser *p) {
             rest->a = parse_binding_target(p);
             if (!rest->a || !vec_push(p, &elems, rest))
                 return NULL;
+            if (TOK(p).kind == JS_T_COMMA)
+                return perr_here(p, "rest element must be last");
             break;
         }
         JsAstNode *el = parse_binding_element(p);
@@ -423,7 +526,16 @@ static bool is_simple_target(const JsAstNode *n) {
     return true;
 }
 
+static JsAstNode *expr_to_pattern_inner(JsParser *p, JsAstNode *n, bool binding);
+
 static JsAstNode *expr_to_pattern(JsParser *p, JsAstNode *n, bool binding) {
+    p->pattern_depth++;
+    JsAstNode *r = expr_to_pattern_inner(p, n, binding);
+    p->pattern_depth--;
+    return r;
+}
+
+static JsAstNode *expr_to_pattern_inner(JsParser *p, JsAstNode *n, bool binding) {
     if (!n)
         return NULL;
     switch (n->kind) {
@@ -525,7 +637,7 @@ static JsAstNode *expr_to_pattern(JsParser *p, JsAstNode *n, bool binding) {
     case JS_AST_REST:
         return n; /* already a pattern (nested conversion) */
     default:
-        return perr(p, n->pos, "invalid assignment target");
+        return perr(p, n->pos, p->pattern_depth > 1 ? "invalid destructuring target" : "invalid assignment target");
     }
 }
 
@@ -641,6 +753,8 @@ static JsAstNode *parse_params(JsParser *p, JsNodeVec *out) {
             rest->a = parse_binding_target(p);
             if (!rest->a || !vec_push(p, out, rest))
                 return NULL;
+            if (TOK(p).kind == JS_T_COMMA)
+                return perr_here(p, "rest parameter must be last");
             break;
         }
         JsAstNode *el = parse_binding_element(p);
@@ -1073,6 +1187,8 @@ static JsAstNode *parse_arguments(JsParser *p, JsNodeVec *out) {
         }
         if (!e || !vec_push(p, out, e))
             return NULL;
+        if (TOK(p).kind != JS_T_RPAREN && TOK(p).kind != JS_T_COMMA && TOK(p).kind != JS_T_EOF)
+            return perr_here(p, "missing ) after argument list");
         if (TOK(p).kind != JS_T_RPAREN && !expect(p, JS_T_COMMA, "expected ',' or ')'"))
             return NULL;
     }
@@ -1428,10 +1544,10 @@ static JsAstNode *parse_binary(JsParser *p, int min_prec) {
         bool logical = k == JS_T_ANDAND || k == JS_T_OROR || k == JS_T_QUESQUES;
         if (k == JS_T_QUESQUES &&
             (is_unparen_logical(left, true) || is_unparen_logical(right, true)))
-            return perr(p, pos, "'?\?' cannot be mixed with '&&'/'||' without parentheses");
+            return perr(p, pos, "Unexpected token '?\?'");
         if ((k == JS_T_ANDAND || k == JS_T_OROR) &&
             (is_unparen_logical(left, false) || is_unparen_logical(right, false)))
-            return perr(p, pos, "'?\?' cannot be mixed with '&&'/'||' without parentheses");
+            return perr(p, pos, k == JS_T_ANDAND ? "Unexpected token '&&'" : "Unexpected token '||'");
         JsAstNode *n = new_node(p, logical ? JS_AST_LOGICAL : JS_AST_BINARY, pos);
         if (!n)
             return NULL;

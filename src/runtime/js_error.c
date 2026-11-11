@@ -1,3 +1,4 @@
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include "js_error.h"
@@ -159,6 +160,203 @@ JsErrorCause js_error_cause(JsContext *ctx, JsValue error) {
     return JS_CAUSE_GUEST;
 }
 
+/* ---- formatted engine errors ---- */
+
+#define FMT_MAX_ARGS 6
+#define FMT_MAX_PIECE 120
+
+typedef struct {
+    uint16_t *u;
+    size_t n, cap;
+    bool oom;
+} FmtBuf;
+
+static void fb_units(FmtBuf *b, const uint16_t *u, size_t n) {
+    if (b->oom || n == 0) /* an empty piece: nothing to copy (u or b->u may be NULL) */
+        return;
+    if (b->n + n > b->cap) {
+        size_t cap = b->cap ? b->cap : 64;
+        while (cap < b->n + n)
+            cap *= 2;
+        uint16_t *nu = realloc(b->u, cap * sizeof *nu);
+        if (!nu) {
+            b->oom = true;
+            return;
+        }
+        b->u = nu;
+        b->cap = cap;
+    }
+    memcpy(b->u + b->n, u, n * sizeof *u);
+    b->n += n;
+}
+
+static void fb_ascii(FmtBuf *b, const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        uint16_t c = (uint16_t)(unsigned char)s[i];
+        fb_units(b, &c, 1);
+    }
+}
+
+/* A piece of at most FMT_MAX_PIECE units, cut short with "..." */
+static void fb_piece(FmtBuf *b, const uint16_t *u, size_t n) {
+    if (n > FMT_MAX_PIECE) {
+        fb_units(b, u, FMT_MAX_PIECE);
+        fb_ascii(b, "...", 3);
+    } else {
+        fb_units(b, u, n);
+    }
+}
+
+/* A function's name for a message, or "anonymous" */
+static void fb_function_name(JsContext *ctx, FmtBuf *b, JsValue v) {
+    JsGcCell *c = js_value_cell(v);
+    const JsString *name = NULL;
+    if (c->kind == JS_KIND_CLOSURE)
+        name = ((JsClosure *)c)->fn->name;
+    else if (c->kind == JS_KIND_NATIVE)
+        name = ((JsNative *)c)->name;
+    (void)ctx;
+    if (name && name->length)
+        fb_piece(b, name->units, name->length);
+    else
+        fb_ascii(b, "anonymous", 9);
+}
+
+JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
+    JsVm *vm = ctx->vm;
+    /* First the arguments that need no allocation are copied out (text, strings), so the
+     * conversions of %v values below, which allocate and may collect, cannot free them. */
+    FmtBuf pieces[FMT_MAX_ARGS] = {{0}};
+    JsValue values[FMT_MAX_ARGS];
+    char kinds[FMT_MAX_ARGS];
+    int nargs = 0;
+    va_list ap;
+    va_start(ap, fmt);
+    for (const char *f = fmt; *f; f++) {
+        if (*f != '%' || !f[1] || f[1] == '%') {
+            if (*f == '%' && f[1])
+                f++;
+            continue;
+        }
+        f++;
+        if (nargs == FMT_MAX_ARGS)
+            break;
+        int i = nargs++;
+        kinds[i] = *f;
+        values[i] = js_undefined();
+        if (*f == 's') {
+            const char *s = va_arg(ap, const char *);
+            fb_ascii(&pieces[i], s, strlen(s));
+        } else if (*f == 'S') {
+            const JsString *s = va_arg(ap, const JsString *);
+            if (s)
+                fb_piece(&pieces[i], s->units, s->length);
+        } else if (*f == 'v' || *f == 't') {
+            values[i] = va_arg(ap, JsValue);
+        }
+    }
+    va_end(ap);
+    for (int i = 0; i < nargs; i++)
+        js_gc_protect(vm, &values[i]);
+    for (int i = 0; i < nargs; i++) {
+        if (kinds[i] != 'v' && kinds[i] != 't')
+            continue;
+        JsValue v = values[i];
+        FmtBuf *b = &pieces[i];
+        if (kinds[i] == 't') {
+            /* V8's typed form for built-ins' messages: number 5, string "x", boolean true,
+             * object null, undefined, object (any object), function */
+            if (js_is_undefined(v)) {
+                fb_ascii(b, "undefined", 9);
+                continue;
+            }
+            if (js_is_null(v)) {
+                fb_ascii(b, "object null", 11);
+                continue;
+            }
+            if (js_is_function(v)) {
+                fb_ascii(b, "function", 8);
+                continue;
+            }
+            if (js_is_object(v) || js_is_promise(v)) {
+                fb_ascii(b, "object", 6);
+                continue;
+            }
+            if (js_is_string(v)) {
+                JsString *s = js_value_string(v);
+                fb_ascii(b, "string \"", 8);
+                fb_piece(b, s->units, s->length);
+                fb_ascii(b, "\"", 1);
+                continue;
+            }
+            if (js_is_number(v))
+                fb_ascii(b, "number ", 7);
+            else if (js_is_bool(v))
+                fb_ascii(b, "boolean ", 8);
+        }
+        if (js_is_string(v)) {
+            JsString *s = js_value_string(v);
+            fb_piece(b, s->units, s->length);
+        } else if (js_is_function(v)) {
+            fb_function_name(ctx, b, v);
+        } else if (js_is_object(v)) {
+            if (js_value_object(v)->obj_kind == JS_OBJ_ARRAY)
+                fb_ascii(b, "[object Array]", 14);
+            else
+                fb_ascii(b, "#<Object>", 9);
+        } else if (js_is_promise(v)) {
+            fb_ascii(b, "#<Promise>", 10);
+        } else {
+            JsString *s = js_to_string_cell(ctx, v, 0); /* a primitive: no guest code runs */
+            if (s)
+                fb_piece(b, s->units, s->length);
+            else
+                b->oom = true;
+        }
+    }
+    for (int i = 0; i < nargs; i++)
+        js_gc_unprotect(vm, &values[i]);
+
+    FmtBuf out = {0};
+    int arg = 0;
+    for (const char *f = fmt; *f; f++) {
+        if (*f == '%' && f[1] == '%') {
+            fb_ascii(&out, "%", 1);
+            f++;
+        } else if (*f == '%' && f[1]) {
+            f++;
+            if (arg < nargs) {
+                if (pieces[arg].oom)
+                    out.oom = true;
+                fb_units(&out, pieces[arg].u, pieces[arg].n);
+                arg++;
+            }
+        } else {
+            fb_ascii(&out, f, 1);
+        }
+    }
+    for (int i = 0; i < nargs; i++)
+        free(pieces[i].u);
+    JsValue r;
+    if (out.oom) {
+        r = js_oom_value(vm);
+    } else {
+        JsString *s = js_string_cell_new(vm, out.u, (uint32_t)out.n);
+        r = s ? js_error_from_cell(ctx, s) : js_oom_value(vm);
+    }
+    free(out.u);
+    return r;
+}
+
+JsValue js_error_receiver(JsContext *ctx, const char *cls, JsValue receiver) {
+    const JsString *name = ctx->running_native ? ctx->running_native->name : NULL;
+    if (name && name->length)
+        return js_error_fmt(ctx, "TypeError: Method %s.prototype.%S called on incompatible receiver %v",
+                            cls, name, receiver);
+    return js_error_fmt(ctx, "TypeError: Method %s.prototype method called on incompatible receiver %v",
+                        cls, receiver);
+}
+
 /* Public constructors (lamassu.h): a message of any length, no "Name: " prefix parsing. */
 JsValue js_error_new_utf16(JsContext *ctx, JsErrorKind kind, const uint16_t *message, size_t len) {
     if ((unsigned)kind >= JS_ERROR_KIND_COUNT)
@@ -286,7 +484,7 @@ static bool errp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int a
     (void)args;
     (void)argc;
     if (!js_is_object(tv))
-        return nthrow(ctx, r, "TypeError: Error.prototype.toString called on a non-object");
+        return (*r = js_error_receiver(ctx, "Error", tv)), false;
     JsString *s = js_error_repr(ctx, js_value_object(tv), 0);
     if (!s)
         return nthrow(ctx, r, "out of memory");

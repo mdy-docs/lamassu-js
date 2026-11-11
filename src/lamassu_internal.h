@@ -569,6 +569,9 @@ struct JsVm {
      * fails too, and the run then rejected with `undefined` — a host could see
      * that something went wrong but not what. */
     JsString *oom_error;
+    /* A compile error whose text is built (V8's "Unexpected token ';'"): the message a
+     * compile entry point hands back points here, valid until the next compile on this VM. */
+    char compile_error[256];
 
     /* microtask FIFO queue (raw allocations; a GC root) */
     JsJob *jobs_head, *jobs_tail;

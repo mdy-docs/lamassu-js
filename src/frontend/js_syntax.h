@@ -26,6 +26,11 @@ void  js_arena_init(JsArena *a, JsVm *vm);
 void *js_arena_alloc(JsArena *a, size_t size); /* 8-aligned; NULL on OOM */
 void  js_arena_free(JsArena *a);
 
+/* A compile error's text built in the VM's buffer (vm->compile_error), so it outlives the
+ * arena: %s ASCII text, %U UTF-16 text (const uint16_t *, uint32_t), written as UTF-8 and cut
+ * short with "..." past 60 units. Returns the buffer. */
+const char *js_compile_error_fmt(JsVm *vm, const char *fmt, ...);
+
 /* ---- tokens ---- */
 
 typedef enum JsTokKind {

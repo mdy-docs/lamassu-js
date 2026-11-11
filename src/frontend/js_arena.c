@@ -1,4 +1,7 @@
+#include <stdarg.h>
+#include <string.h>
 #include "js_syntax.h"
+#include "lamassu_internal.h"
 
 struct JsArenaChunk {
     JsArenaChunk *next;
@@ -44,4 +47,57 @@ void js_arena_free(JsArena *a) {
         c = next;
     }
     a->chunks = NULL;
+}
+
+const char *js_compile_error_fmt(JsVm *vm, const char *fmt, ...) {
+    char *out = vm->compile_error;
+    size_t cap = sizeof vm->compile_error - 4, n = 0; /* room for one more UTF-8 sequence */
+    va_list ap;
+    va_start(ap, fmt);
+    for (const char *f = fmt; *f && n < cap; f++) {
+        if (*f != '%' || !f[1]) {
+            out[n++] = *f;
+            continue;
+        }
+        f++;
+        if (*f == 's') {
+            for (const char *s = va_arg(ap, const char *); *s && n < cap; s++)
+                out[n++] = *s;
+        } else if (*f == 'U') {
+            const uint16_t *u = va_arg(ap, const uint16_t *);
+            uint32_t len = va_arg(ap, uint32_t);
+            bool cut = len > 60;
+            if (cut)
+                len = 60;
+            for (uint32_t i = 0; i < len && n < cap; i++) {
+                uint32_t c = u[i];
+                if (c >= 0xD800 && c <= 0xDBFF && i + 1 < len && u[i + 1] >= 0xDC00 && u[i + 1] <= 0xDFFF) {
+                    c = 0x10000 + ((c - 0xD800) << 10) + (u[i + 1] - 0xDC00);
+                    i++;
+                }
+                if (c < 0x80) {
+                    out[n++] = (char)c;
+                } else if (c < 0x800) {
+                    out[n++] = (char)(0xC0 | (c >> 6));
+                    out[n++] = (char)(0x80 | (c & 0x3F));
+                } else if (c < 0x10000) {
+                    out[n++] = (char)(0xE0 | (c >> 12));
+                    out[n++] = (char)(0x80 | ((c >> 6) & 0x3F));
+                    out[n++] = (char)(0x80 | (c & 0x3F));
+                } else {
+                    out[n++] = (char)(0xF0 | (c >> 18));
+                    out[n++] = (char)(0x80 | ((c >> 12) & 0x3F));
+                    out[n++] = (char)(0x80 | ((c >> 6) & 0x3F));
+                    out[n++] = (char)(0x80 | (c & 0x3F));
+                }
+            }
+            for (const char *s = "..."; cut && *s && n < cap; s++)
+                out[n++] = *s;
+        } else {
+            out[n++] = *f;
+        }
+    }
+    va_end(ap);
+    out[n] = '\0';
+    return out;
 }

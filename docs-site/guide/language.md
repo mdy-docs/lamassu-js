@@ -92,11 +92,20 @@ try {
   null.x;
 } catch (e) {
   e.name;     // "TypeError"
-  e.message;  // "cannot read properties of undefined or null (reading 'x')"
-  String(e);  // "TypeError: cannot read properties of ..."
+  e.message;  // "Cannot read properties of null (reading 'x')"
+  String(e);  // "TypeError: Cannot read properties of null (reading 'x')"
 }
 throw new RangeError('out of bounds', { cause: previous });
 ```
+
+The messages are worded as V8 words them, names and values included:
+`o.f is not a function`, `o is not iterable`, `Cannot destructure property 'a'
+of 'o' as it is undefined.`, `Cannot access 'K' before initialization`,
+`Assignment to constant variable.` (thrown when the assignment runs, not when
+the script compiles), and for a script that does not compile `Unexpected token
+';'` or `Unexpected end of input`. A module that does not compile rejects with a
+`SyntaxError` object. [Deviations](./deviations.md#errors) lists where they
+still differ.
 
 There is no `instanceof` (see [Deviations](./deviations.md)); discriminate
 on `e.name` or `Object.getPrototypeOf(e) === RangeError.prototype`.

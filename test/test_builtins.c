@@ -506,6 +506,26 @@ static void test_json(void) {
     eq("JSON.stringify([1,2], null, 2).indexOf('\\n') > 0;", "true");
     /* parse */
     eq("JSON.parse('42');", "42");
+    /* JSON.parse errors say what was expected and where, as V8 words them */
+    err("JSON.parse('');", "SyntaxError: Unexpected end of JSON input");
+    err("JSON.parse('[1,');", "SyntaxError: Unexpected end of JSON input");
+    err("JSON.parse('tru');", "SyntaxError: Unexpected end of JSON input");
+    err("JSON.parse('[1, x]');", "SyntaxError: Unexpected token 'x', \"[1, x]\" is not valid JSON");
+    err("JSON.parse('[1,2,3,4,5,6,7,8,9,10,11,12, x,13,14,15,16,17,18,19,20,21,22,23,24,25]');",
+        "SyntaxError: Unexpected token 'x', ...\"10,11,12, x,13,14,15\"... is not valid JSON");
+    err("JSON.parse('{\"a\":1,}');", "SyntaxError: Expected double-quoted property name in JSON at position 7 (line 1 column 8)");
+    err("JSON.parse('{,}');", "SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)");
+    err("JSON.parse('{\"a\" 1}');", "SyntaxError: Expected ':' after property name in JSON at position 5 (line 1 column 6)");
+    err("JSON.parse('[1 2]');", "SyntaxError: Expected ',' or ']' after array element in JSON at position 3 (line 1 column 4)");
+    err("JSON.parse('\\n\\n  {\"a\" 1}');", "SyntaxError: Expected ':' after property name in JSON at position 9 (line 3 column 8)");
+    err("JSON.parse('\"abc');", "SyntaxError: Unterminated string in JSON at position 4 (line 1 column 5)");
+    err("JSON.parse('\"a\\tb\"');", "SyntaxError: Bad control character in string literal in JSON at position 2");
+    err("JSON.parse('\"\\\\q\"');", "SyntaxError: Bad escaped character in JSON at position 2");
+    err("JSON.parse('01');", "SyntaxError: Unexpected number in JSON at position 1");
+    err("JSON.parse('-a');", "SyntaxError: No number after minus sign in JSON at position 1");
+    err("JSON.parse('1.e5');", "SyntaxError: Unterminated fractional number in JSON at position 2");
+    err("JSON.parse('1e+');", "SyntaxError: Exponent part is missing a number in JSON at position 3");
+    err("JSON.parse('1 2');", "SyntaxError: Unexpected non-whitespace character after JSON at position 2 (line 1 column 3)");
     eq("JSON.parse('\"hello\"');", "hello");
     eq("JSON.parse('[1,2,3]').join(',');", "1,2,3");
     eq("JSON.parse('{\"a\":1,\"b\":2}').a;", "1");
@@ -691,9 +711,9 @@ static void test_map(void) {
     eq("let m = new Map(); m.custom = 5; m.custom;", "5");
 
     /* error paths */
-    err("new Map().forEach(5);", "TypeError: callback is not a function");
-    err("new Map([1, 2]);", "TypeError: iterable for new Map() must yield");
-    err("let s = new Map().set; s();", "TypeError: Map.prototype method called on a non-Map value");
+    err("new Map().forEach(5);", "TypeError: number 5 is not a function");
+    err("new Map([1, 2]);", "TypeError: Iterator value 1 is not an entry object");
+    err("let s = new Map().set; s();", "TypeError: Method Map.prototype.set called on incompatible receiver undefined");
 }
 
 /* Set: same O(n) linear-scan storage and SameValueZero equality as Map
@@ -747,9 +767,29 @@ static void test_set(void) {
     eq("let s = new Set(); s.custom = 5; s.custom;", "5");
 
     /* error paths */
-    err("new Set().forEach(5);", "TypeError: callback is not a function");
-    err("new Set(5);", "TypeError: value is not iterable");
-    err("let a = new Set().add; a();", "TypeError: Set.prototype method called on a non-Set value");
+    err("new Set().forEach(5);", "TypeError: number 5 is not a function");
+    /* array destructuring takes an iterable apart: a Map or Set by its entries or values */
+    eq("const [[k, v]] = new Map([[1, 2]]); k + v;", "3");
+    eq("const [a, b] = new Set([4, 5]); a * b;", "20");
+    eq("const [c, d] = 'xy'; c + d;", "xy");
+    /* refused writes to frozen and sealed arrays, as V8 words the first write */
+    err("Object.freeze([1]).push(2);", "TypeError: Cannot add property 1, object is not extensible");
+    err("Object.freeze([1, 2]).reverse();", "TypeError: Cannot assign to read only property '0' of object '[object Array]'");
+    err("Object.seal([1, 2]).pop();", "TypeError: Cannot delete property '1' of [object Array]");
+    eq("Object.seal([]).pop();", "undefined");
+    err("Object.freeze([]).pop();", "TypeError: Cannot assign to read only property 'length' of object '[object Array]'");
+    err("const a = Object.freeze([1]); a[0] = 2;", "TypeError: Cannot assign to read only property '0' of object '[object Array]'");
+    err("const a = Object.freeze([1]); a.length = 0;", "TypeError: Cannot assign to read only property 'length' of object '[object Array]'");
+    err("const o = Object.seal({ a: 1 }); o.b = 1;", "TypeError: Cannot add property b, object is not extensible");
+    err("const o = Object.freeze({ a: 1 }); delete o.a;", "TypeError: Cannot delete property 'a' of #<Object>");
+    err("[1].map('x');", "TypeError: string \"x\" is not a function");
+    err("[1].map(null);", "TypeError: object null is not a function");
+    err("'a'.repeat(-1);", "RangeError: Invalid count value: -1");
+    err("String.fromCodePoint(-1);", "RangeError: Invalid code point -1");
+    err("Object.fromEntries([[1, 2], 5]);", "TypeError: Iterator value 5 is not an entry object");
+    err("new Promise(5);", "TypeError: Promise resolver 5 is not a function");
+    err("new Set(5);", "TypeError: number 5 is not iterable (cannot read property Symbol(Symbol.iterator))");
+    err("let a = new Set().add; a();", "TypeError: Method Set.prototype.add called on incompatible receiver undefined");
 }
 
 /* GC-sensitive cases: allocation-heavy methods and callbacks that call back
@@ -803,9 +843,9 @@ static void test_error(void) {
     eq("try { new Map([1]); } catch (e) { e.name + '|' + (e.message.length > 0); }", "TypeError|true");
     eq("try { null.x; } catch (e) { typeof e + '|' + (e.message === String(e).slice(11)); }",
        "object|true");
-    /* engine errors render exactly as the old bare strings did */
+    /* engine errors are worded as V8 words them */
     eq("try { null.x; } catch (e) { '' + e; }",
-       "TypeError: cannot read properties of undefined or null (reading 'x')");
+       "TypeError: Cannot read properties of null (reading 'x')");
     /* rejections from builtins are Error objects too */
     eq("await Promise.resolve().then(() => { null.x; }).catch(e => e.name);", "TypeError");
     eq("await Promise.reject(new SyntaxError('s')).catch(e => e.name + '|' + e.message);",

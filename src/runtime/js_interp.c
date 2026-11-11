@@ -1,3 +1,4 @@
+#include <string.h>
 #include "js_bytecode.h"
 #include "js_error.h"
 #include "js_date.h"
@@ -550,6 +551,8 @@ static bool own_prop_present(JsContext *ctx, JsObject *o, JsValue key) {
     uint32_t idx;
     if (o->obj_kind == JS_OBJ_ARRAY && key_to_index(key, &idx))
         return idx < o->elem_count;
+    if (o->obj_kind == JS_OBJ_ARRAY && js_is_string(key) && units_is_ascii_str(js_value_string(key), "length"))
+        return true;
     JsString *k = to_prop_key(ctx, key);
     if (!k)
         return false;
@@ -564,13 +567,38 @@ static bool own_prop_present(JsContext *ctx, JsObject *o, JsValue key) {
  * `length` assignment reach here too. The in-place array mutators in
  * js_builtins.c write a->elems directly and are gated separately.
  */
+/* Refused writes, worded as V8 words them in strict code. set_property hands back one of these
+ * templates, which set_error fills in with the base and the key (by identity: any other message
+ * is thrown as it is). */
+static const char SET_NULLISH[] = "TypeError: Cannot set properties of %v (setting '%v')";
+static const char SET_READ_ONLY[] = "TypeError: Cannot assign to read only property '%v' of %s '%v'";
+static const char SET_NOT_EXTENSIBLE[] = "TypeError: Cannot add property %v, object is not extensible";
+static const char SET_PRIMITIVE[] = "TypeError: Cannot create property '%v' on %s '%v'";
+
+static JsValue set_error(JsContext *ctx, const char *msg, JsValue base, JsValue key) {
+    if (msg == SET_NULLISH)
+        return js_error_fmt(ctx, msg, base, key);
+    if (msg == SET_READ_ONLY)
+        return js_error_fmt(ctx, msg, key, js_is_function(base) ? "function" : "object", base);
+    if (msg == SET_NOT_EXTENSIBLE)
+        return js_error_fmt(ctx, msg, key);
+#ifdef LAMASSU_HAS_REGEX
+    if (strcmp(msg, JS_REGEXP_GETTER_ONLY) == 0)
+        return js_error_fmt(ctx, "TypeError: Cannot set property %v of [object Object] which has only a getter", key);
+#endif
+    if (msg == SET_PRIMITIVE)
+        return js_error_fmt(ctx, msg, key, js_is_string(base) ? "string"
+                                           : js_is_number(base) ? "number" : "boolean", base);
+    return js_error_from_ascii(ctx, msg);
+}
+
 static const char *write_blocked(JsContext *ctx, JsObject *o, JsValue key) {
     if (!o->obj_flags)
         return NULL; /* the overwhelmingly common case: one predictable branch */
-    if (o->obj_flags & JS_OBJ_FROZEN)
-        return "TypeError: cannot assign to a property of a frozen object";
     if (!own_prop_present(ctx, o, key))
-        return "TypeError: cannot add a property to a sealed object";
+        return SET_NOT_EXTENSIBLE; /* sealed or frozen: no new properties */
+    if (o->obj_flags & JS_OBJ_FROZEN)
+        return SET_READ_ONLY;
     return NULL;
 }
 
@@ -578,7 +606,7 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
                                  JsValue val, const char **errmsg) {
     JsVm *vm = ctx->vm;
     if (is_nullish(base)) {
-        *errmsg = "TypeError: cannot set properties of undefined or null";
+        *errmsg = SET_NULLISH;
         return JS_PROP_TYPE_ERROR;
     }
     if (js_is_function(base)) {
@@ -612,7 +640,7 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
         return JS_PROP_OK;
     }
     if (!js_is_object(base)) {
-        *errmsg = "TypeError: cannot create property on a primitive value";
+        *errmsg = SET_PRIMITIVE;
         return JS_PROP_TYPE_ERROR;
     }
     JsObject *o = js_value_object(base);
@@ -645,12 +673,12 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
             /* bounds-check before the cast: (uint32_t)d is UB for d outside
              * [0, UINT32_MAX], e.g. arr.length = -1 or arr.length = 1e20 */
             if (!(d >= 0 && d < 4294967296.0)) {
-                *errmsg = "RangeError: invalid array length";
+                *errmsg = "RangeError: Invalid array length";
                 return JS_PROP_TYPE_ERROR;
             }
             uint32_t n = (uint32_t)d;
             if ((double)n != d) {
-                *errmsg = "RangeError: invalid array length";
+                *errmsg = "RangeError: Invalid array length";
                 return JS_PROP_TYPE_ERROR;
             }
             if (n <= o->elem_count) {
@@ -658,7 +686,7 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
                 return JS_PROP_OK;
             }
             if (n - o->elem_count > JS_MAX_ARRAY_GAP) {
-                *errmsg = "RangeError: array length growth too large";
+                *errmsg = "RangeError: Invalid array length";
                 return JS_PROP_TYPE_ERROR;
             }
             if (!js_array_set_index(vm, o, n - 1, js_undefined()))
@@ -918,21 +946,83 @@ static void fiber_throw_name(JsContext *ctx, JsFiber *fb, const char *prefix,
     fiber_throw_units(ctx, fb, prefix, name->units, name->length, suffix);
 }
 
-/* "TypeError: <callee> is not a function" with the call site's callee text when the compiler
- * recorded one (s.fillet, foo, a[0]), else "TypeError: value is not a function". */
-static void fiber_throw_callee(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip,
-                               const char *what) {
+/* The text the compiler recorded for the instruction at IP (a callee, an iterated or destructured
+ * expression, a binding's name), or false when it recorded none. An empty text still counts. */
+static bool find_note(const JsFunctionCell *fn, uint32_t ip, const uint16_t **units, uint32_t *len) {
     uint32_t lo = 0, hi = fn->callee_count;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
         if (fn->callees[mid].off < ip) lo = mid + 1; else hi = mid;
     }
     if (lo < fn->callee_count && fn->callees[lo].off == ip) {
-        const JsCalleeName *e = &fn->callees[lo];
-        fiber_throw_units(ctx, fb, "TypeError: ", fn->callee_text + e->start, e->len, what);
+        *units = fn->callee_text + fn->callees[lo].start;
+        *len = fn->callees[lo].len;
+        return true;
+    }
+    return false;
+}
+
+static void fiber_throw_value(JsFiber *fb, JsValue error) {
+    fb->error = error;
+    fb->failed = true;
+}
+
+/* "<text><what>" with the instruction's recorded text (s.fillet, foo, a[0]), else with the value
+ * as V8 shows it: "TypeError: o.f is not a function", "TypeError: 5 is not iterable". */
+static void fiber_throw_operand(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip,
+                                JsValue value, const char *what) {
+    const uint16_t *u;
+    uint32_t len;
+    if (find_note(fn, ip, &u, &len) && len) {
+        fiber_throw_units(ctx, fb, "TypeError: ", u, len, what);
         return;
     }
-    fiber_throw_units(ctx, fb, "TypeError: value", NULL, 0, what);
+    JsValue e = js_error_fmt(ctx, "TypeError: %v%s", value, what);
+    fiber_throw_value(fb, e);
+}
+
+static void fiber_throw_callee(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip,
+                               JsValue callee, const char *what) {
+    fiber_throw_operand(ctx, fb, fn, ip, callee, what);
+}
+
+/* V8's ReferenceError for a let/const read before its declaration ran, named when the compiler
+ * recorded the name for this read. */
+static void fiber_throw_tdz(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip) {
+    const uint16_t *u;
+    uint32_t len;
+    if (find_note(fn, ip, &u, &len) && len)
+        fiber_throw_units(ctx, fb, "ReferenceError: Cannot access '", u, len, "' before initialization");
+    else
+        fiber_throw(ctx, fb, "ReferenceError: Cannot access a variable before initialization");
+}
+
+/* A property read from null or undefined: "Cannot read properties of null (reading 'x')", or
+ * at a destructuring's first read (which the compiler marks with a note, empty when the source
+ * has no readable form) "Cannot destructure property 'x' of 'o' as it is undefined." */
+static void fiber_throw_read(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip,
+                             JsValue base, JsValue key) {
+    const uint16_t *u;
+    uint32_t len;
+    JsValue e;
+    if (find_note(fn, ip, &u, &len)) {
+        if (len) {
+            JsVm *vm = ctx->vm;
+            JsString *src = js_string_cell_new(vm, u, len);
+            JsValue sv = src ? js_value_from_cell(&src->gc) : js_undefined();
+            js_gc_protect(vm, &sv);
+            e = src ? js_error_fmt(ctx, "TypeError: Cannot destructure property '%v' of '%v' as it is %v.",
+                                   key, sv, base)
+                    : js_oom_value(vm);
+            js_gc_unprotect(vm, &sv);
+        } else {
+            e = js_error_fmt(ctx, "TypeError: Cannot destructure property '%v' of '%v' as it is %v.",
+                             key, base, base);
+        }
+    } else {
+        e = js_error_fmt(ctx, "TypeError: Cannot read properties of %v (reading '%v')", base, key);
+    }
+    fiber_throw_value(fb, e);
 }
 
 /* ---- closures, upvalues, natives ---- */
@@ -1295,8 +1385,10 @@ run:; /* (re)load the top frame */
             case JS_OP_GET_LOCAL: {
                 uint16_t slot = READ_U16();
                 JsValue v = S[base + slot];
-                if (v.bits == JS_SPECIAL_TDZ)
-                    RT_THROW("ReferenceError: cannot access variable before initialization");
+                if (v.bits == JS_SPECIAL_TDZ) {
+                    fiber_throw_tdz(ctx, fb, fn, op_ip);
+                    RT_RAISE();
+                }
                 PUSH(v);
                 break;
             }
@@ -1311,8 +1403,10 @@ run:; /* (re)load the top frame */
                 /* an open upvalue aliases the stack of the fiber that owns
                  * it, which may differ from fb during a nested call */
                 JsValue v = uv->open ? uv->fiber->stack[uv->slot] : uv->closed;
-                if (v.bits == JS_SPECIAL_TDZ)
-                    RT_THROW("ReferenceError: cannot access variable before initialization");
+                if (v.bits == JS_SPECIAL_TDZ) {
+                    fiber_throw_tdz(ctx, fb, fn, op_ip);
+                    RT_RAISE();
+                }
                 PUSH(v);
                 break;
             }
@@ -1369,8 +1463,10 @@ run:; /* (re)load the top frame */
                 if (ctx->repl_scope)
                     v = js_map_get(&ctx->repl_scope->props, name, &found);
                 if (found) {
-                    if (v.bits == JS_SPECIAL_TDZ)
-                        RT_THROW("ReferenceError: cannot access variable before initialization");
+                    if (v.bits == JS_SPECIAL_TDZ) {
+                        fiber_throw_name(ctx, fb, "ReferenceError: Cannot access '", name, "' before initialization");
+                        RT_RAISE();
+                    }
                     PUSH(v);
                     break;
                 }
@@ -1396,7 +1492,7 @@ run:; /* (re)load the top frame */
                     if (ctx->repl_const)
                         js_map_get(&ctx->repl_const->props, name, &is_const);
                     if (is_const)
-                        RT_THROW("TypeError: assignment to constant variable");
+                        RT_THROW("TypeError: Assignment to constant variable.");
                     if (!js_map_set(vm, &ctx->repl_scope->props, name, PEEK(0)))
                         RT_THROW("out of memory");
                     break;
@@ -1465,7 +1561,7 @@ run:; /* (re)load the top frame */
                     PEEK(0) = js_value_from_cell(&sb->gc);
                     JsString *r = js_concat_cells(vm, sa, sb);
                     if (!r)
-                        RT_THROW("RangeError: string too long");
+                        RT_THROW("RangeError: Invalid string length");
                     fb->sp--;
                     PEEK(0) = js_value_from_cell(&r->gc);
                     break;
@@ -1550,8 +1646,11 @@ run:; /* (re)load the top frame */
             case JS_OP_IN: {
                 bool has;
                 JsPropStatus st = has_property(ctx, PEEK(0), PEEK(1), &has);
-                if (st == JS_PROP_TYPE_ERROR)
-                    RT_THROW("TypeError: 'in' requires an object");
+                if (st == JS_PROP_TYPE_ERROR) {
+                    fiber_throw_value(fb, js_error_fmt(ctx, "TypeError: Cannot use 'in' operator to search for '%v' in %v",
+                                                       PEEK(1), PEEK(0)));
+                    RT_RAISE();
+                }
                 if (st == JS_PROP_OOM)
                     RT_THROW("out of memory");
                 fb->sp--;
@@ -1656,8 +1755,11 @@ run:; /* (re)load the top frame */
                 const char *em = NULL;
                 JsValue re = js_regexp_new(ctx, src->units, src->length,
                                            flg->units, flg->length, &em);
-                if (!js_is_object(re))
-                    RT_THROW(em ? em : "out of memory");
+                if (!js_is_object(re)) {
+                    fiber_throw_value(fb, js_regexp_error(ctx, em ? em : "out of memory", src->units, src->length,
+                                                          flg->units, flg->length));
+                    RT_RAISE();
+                }
                 PUSH(re);
 #else
                 (void)csrc;
@@ -1717,7 +1819,8 @@ run:; /* (re)load the top frame */
                         i += n;
                     }
                 } else {
-                    RT_THROW("TypeError: value is not iterable");
+                    fiber_throw_operand(ctx, fb, fn, op_ip, src, " is not iterable");
+                    RT_RAISE();
                 }
                 fb->sp--;
                 break;
@@ -1767,8 +1870,10 @@ run:; /* (re)load the top frame */
                 JsPropStatus st = set_property(ctx, PEEK(2), PEEK(1), PEEK(0), &msg);
                 if (st == JS_PROP_OOM)
                     RT_THROW("out of memory");
-                if (st == JS_PROP_TYPE_ERROR)
-                    RT_THROW(msg);
+                if (st == JS_PROP_TYPE_ERROR) {
+                    fiber_throw_value(fb, set_error(ctx, msg, PEEK(2), PEEK(1)));
+                    RT_RAISE();
+                }
                 fb->sp -= 2;
                 break;
             }
@@ -1777,8 +1882,10 @@ run:; /* (re)load the top frame */
                 JsPropStatus st = get_property(ctx, PEEK(1), PEEK(0), &out);
                 if (st == JS_PROP_OOM)
                     RT_THROW("out of memory");
-                if (st == JS_PROP_TYPE_ERROR)
-                    RT_THROW("TypeError: cannot read properties of undefined or null");
+                if (st == JS_PROP_TYPE_ERROR) {
+                    fiber_throw_read(ctx, fb, fn, op_ip, PEEK(1), PEEK(0));
+                    RT_RAISE();
+                }
                 fb->sp--;
                 PEEK(0) = out;
                 break;
@@ -1790,9 +1897,7 @@ run:; /* (re)load the top frame */
                 if (st == JS_PROP_OOM)
                     RT_THROW("out of memory");
                 if (st == JS_PROP_TYPE_ERROR) {
-                    fiber_throw_name(ctx, fb,
-                                     "TypeError: cannot read properties of undefined or null (reading '",
-                                     js_value_string(key), "')");
+                    fiber_throw_read(ctx, fb, fn, op_ip, PEEK(0), key);
                     RT_RAISE();
                 }
                 PEEK(0) = out;
@@ -1803,8 +1908,10 @@ run:; /* (re)load the top frame */
                 JsPropStatus st = set_property(ctx, PEEK(2), PEEK(1), PEEK(0), &msg);
                 if (st == JS_PROP_OOM)
                     RT_THROW("out of memory");
-                if (st == JS_PROP_TYPE_ERROR)
-                    RT_THROW(msg);
+                if (st == JS_PROP_TYPE_ERROR) {
+                    fiber_throw_value(fb, set_error(ctx, msg, PEEK(2), PEEK(1)));
+                    RT_RAISE();
+                }
                 JsValue v = PEEK(0);
                 fb->sp -= 2;
                 PEEK(0) = v;
@@ -1816,8 +1923,10 @@ run:; /* (re)load the top frame */
                 JsPropStatus st = set_property(ctx, PEEK(1), key, PEEK(0), &msg);
                 if (st == JS_PROP_OOM)
                     RT_THROW("out of memory");
-                if (st == JS_PROP_TYPE_ERROR)
-                    RT_THROW(msg);
+                if (st == JS_PROP_TYPE_ERROR) {
+                    fiber_throw_value(fb, set_error(ctx, msg, PEEK(1), key));
+                    RT_RAISE();
+                }
                 JsValue v = PEEK(0);
                 fb->sp--;
                 PEEK(0) = v;
@@ -1829,9 +1938,10 @@ run:; /* (re)load the top frame */
                     JsObject *o = js_value_object(b);
                     /* Sealing exists precisely to stop the shape changing, so
                      * delete is refused on both sealed and frozen objects. */
-                    if (o->obj_flags)
-                        RT_THROW("TypeError: cannot delete a property of a "
-                                 "sealed or frozen object");
+                    if (o->obj_flags) {
+                        fiber_throw_value(fb, js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of %v", key, b));
+                        RT_RAISE();
+                    }
                     uint32_t idx;
                     if (o->obj_kind == JS_OBJ_ARRAY && value_to_index(key, &idx)) {
                         if (idx < o->elem_count)
@@ -1845,16 +1955,17 @@ run:; /* (re)load the top frame */
                 } else if (js_is_function(b)) {
                     JsObject *own = js_function_props(ctx, b, false);
                     if (own) {
-                        if (own->obj_flags)
-                            RT_THROW("TypeError: cannot delete a property of a "
-                                     "sealed or frozen object");
+                        if (own->obj_flags) {
+                            fiber_throw_value(fb, js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of %v", key, b));
+                            RT_RAISE();
+                        }
                         JsString *k = to_prop_key(ctx, key);
                         if (!k)
                             RT_THROW("out of memory");
                         js_map_delete(&own->props, k);
                     }
                 } else if (is_nullish(b)) {
-                    RT_THROW("TypeError: cannot convert undefined or null to object");
+                    RT_THROW("TypeError: Cannot convert undefined or null to object");
                 }
                 fb->sp -= 2;
                 PUSH(js_bool(true));
@@ -1878,8 +1989,10 @@ run:; /* (re)load the top frame */
                 }
                 bool ok = js_is_string(it) ||
                           (js_is_object(it) && js_value_object(it)->obj_kind == JS_OBJ_ARRAY);
-                if (!ok)
-                    RT_THROW("TypeError: value is not iterable");
+                if (!ok) {
+                    fiber_throw_operand(ctx, fb, fn, op_ip, it, " is not iterable");
+                    RT_RAISE();
+                }
                 PUSH(js_number(0));
                 break;
             }
@@ -2016,11 +2129,11 @@ run:; /* (re)load the top frame */
                         if (rc == -1)
                             RT_THROW("out of memory");
                         if (rc == -2)
-                            RT_THROW("RangeError: maximum call stack size exceeded");
+                            RT_THROW("RangeError: Maximum call stack size exceeded");
                         goto run;
                     }
                 }
-                fiber_throw_callee(ctx, fb, fn, op_ip, " is not a function");
+                fiber_throw_callee(ctx, fb, fn, op_ip, callee, " is not a function");
                 RT_RAISE();
             }
             case JS_OP_NEW:
@@ -2066,7 +2179,7 @@ run:; /* (re)load the top frame */
                     S[nb - 2] = callee;
                 }
                 if (!js_is_function(callee))
-                    { fiber_throw_callee(ctx, fb, fn, op_ip, " is not a constructor"); RT_RAISE(); }
+                    { fiber_throw_callee(ctx, fb, fn, op_ip, callee, " is not a constructor"); RT_RAISE(); }
                 JsGcCell *cc = js_value_cell(callee);
                 if (cc->kind == JS_KIND_NATIVE) {
                     /* Builtins (Array, Object, RegExp, ...) are factory
@@ -2093,10 +2206,10 @@ run:; /* (re)load the top frame */
                     break;
                 }
                 if (cc->kind != JS_KIND_CLOSURE)
-                    { fiber_throw_callee(ctx, fb, fn, op_ip, " is not a constructor"); RT_RAISE(); }
+                    { fiber_throw_callee(ctx, fb, fn, op_ip, callee, " is not a constructor"); RT_RAISE(); }
                 JsClosure *ctor = (JsClosure *)cc;
                 if (ctor->fn->fn_flags & (JS_FN_ARROW | JS_FN_ASYNC))
-                    { fiber_throw_callee(ctx, fb, fn, op_ip, " is not a constructor"); RT_RAISE(); }
+                    { fiber_throw_callee(ctx, fb, fn, op_ip, callee, " is not a constructor"); RT_RAISE(); }
                 fr->ip = ip; /* GC-safe point before allocations below */
                 JsObject *proto = closure_prototype(ctx, ctor);
                 if (!proto)
@@ -2110,7 +2223,7 @@ run:; /* (re)load the top frame */
                 if (rc == -1)
                     RT_THROW("out of memory");
                 if (rc == -2)
-                    RT_THROW("RangeError: maximum call stack size exceeded");
+                    RT_THROW("RangeError: Maximum call stack size exceeded");
                 goto run;
             }
             case JS_OP_TRY_PUSH: {
@@ -2252,6 +2365,8 @@ run:; /* (re)load the top frame */
                 PUSH(js_value_from_cell(&imp->source->exports->gc));
                 break;
             }
+            case JS_OP_THROW_CONST_ASSIGN:
+                RT_THROW("TypeError: Assignment to constant variable.");
             case JS_OP_THROW:
                 fb->error = POPV();
                 fb->failed = true;
@@ -2401,7 +2516,7 @@ static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
     fb->sp = (uint32_t)(2 + argc);
     int rc = frame_setup(ctx, fb, cl, 2, (uint32_t)argc, false);
     if (rc != 0) {
-        *err = rc == -2 ? "RangeError: maximum call stack size exceeded" : "out of memory";
+        *err = rc == -2 ? "RangeError: Maximum call stack size exceeded" : "out of memory";
         goto done;
     }
     result = fb;
@@ -2423,7 +2538,7 @@ static JsRunStatus advance_fiber(JsContext *ctx, JsFiber *fb, JsValue *out) {
      * calling back into JS) cannot exhaust the C stack — the per-fiber frame
      * limit can't see across the fresh fibers each re-entry spawns. */
     if (ctx->reentry_depth >= JS_MAX_REENTRY) {
-        JsString *s = js_ascii_cell(ctx->vm, "RangeError: maximum call stack size exceeded");
+        JsString *s = js_ascii_cell(ctx->vm, "RangeError: Maximum call stack size exceeded");
         fb->error = s ? js_value_from_cell(&s->gc) : js_undefined();
         fb->failed = true;
         *out = fb->error;

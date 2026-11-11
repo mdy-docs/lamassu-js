@@ -80,6 +80,19 @@ iterator (`for...of` over the result behaves the same either way).
 - **`Object.prototype.toString` reports `[object Object]`** for errors.
 - **Subclassing is not possible** (no classes); set `name` on an instance
   for a custom discriminator.
+- **Messages follow V8's wording**, with these differences: an error about
+  a feature lamassu leaves out says so (`'var' is not supported; use 'let' or
+  'const'`, `classes are not supported`) where V8 would compile the script;
+  a few of V8's own quirks are not copied (in a module V8 reports `let let`
+  and `let 1x` as `Unexpected strict mode reserved word`, and spreading a
+  non-iterable object into a call as `Spread syntax requires
+  ...iterable[Symbol.iterator] to be a function`; lamassu says `let is
+  disallowed as a lexically bound name`, `Invalid or unexpected token` and
+  `o is not iterable`); a callee with no readable name shows its value
+  (`undefined is not a function` for `(void 0)()`, where V8 prints the
+  expression); a `let`/`const` read too early after a fall-through between
+  `switch` cases says `Cannot access a variable before initialization`
+  without the name; and a duplicate label is not an error.
 - **Out-of-memory errors may still be bare strings**: when the engine
   cannot allocate an Error object, it throws the message text instead so
   the failure is never lost.
@@ -97,12 +110,14 @@ iterator (`for...of` over the result behaves the same either way).
 
 ## Modules
 
-- **Cross-module cycles degrade to `undefined`** for a binding read before
-  the exporting module has initialized it, rather than throwing a
-  real-JS-style TDZ error. Hoisted `export function` declarations are
-  available throughout, so mutually recursive function modules work fine —
-  this only bites a cyclic read of a `let`/`const` binding before its
-  module finishes evaluating.
+- **An exported `let`/`const` read before its declaration runs is
+  `undefined`**, rather than a TDZ error (`Cannot access 'x' before
+  initialization`, which a binding that is not exported does throw). Exports
+  live in the module's exports object, which has no uninitialized state. It
+  happens in a cross-module cycle, and in the exporting module itself when a
+  hoisted function reads the export before its declaration. Hoisted `export
+  function` declarations are available throughout, so mutually recursive
+  function modules work fine.
 - **Named and `export *` re-exports are snapshots**, taken once the source
   module finishes evaluating (dependency order guarantees this has already
   happened). A later mutation of a re-exported *mutable* binding isn't
