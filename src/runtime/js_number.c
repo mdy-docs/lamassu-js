@@ -33,7 +33,10 @@ double js_make_double(uint64_t mant, int exp10) {
     }
 
     /*
-     * Otherwise the platform's decimal conversion, which is correctly rounded.
+     * Otherwise musl's decimal conversion (fdlibm/floatscan.c), correctly rounded and the same on
+     * every host. The C library's strtod was used here until it turned out not to be correctly
+     * rounded everywhere: next to a power of two, Windows' (UCRT) returns the neighbouring double,
+     * which printed 7.678447687145631e-239 as 7.67844768714563e-239.
      *
      * Scaling by powers of ten rounds at EVERY step, and for a 17-digit
      * mantissa — the exact shape of a coordinate written out in full, or of
@@ -42,15 +45,20 @@ double js_make_double(uint64_t mant, int exp10) {
      * engine produces for the same literal, and it prints differently: a page
      * of computed positions disagreed with Node in the last digit, which is
      * how this was found.
-     *
-     * Written as `<digits>e<exp>` with NO decimal point, so the locale's
-     * decimal separator cannot come into it.
      */
-    char buf[32];
-    int n = snprintf(buf, sizeof buf, "%llue%d", (unsigned long long)mant, exp10);
-    if (n <= 0 || (size_t)n >= sizeof buf)
-        return __builtin_inf();     /* unreachable: 20 digits + "e" + 5 */
-    return strtod(buf, NULL);
+    uint16_t buf[32];
+    size_t n = 0;
+    char digs[24];
+    int nd = 0;
+    do { digs[nd++] = (char)('0' + mant % 10); mant /= 10; } while (mant);
+    while (nd) buf[n++] = (uint16_t)digs[--nd];
+    buf[n++] = 'e';
+    unsigned e = exp10 < 0 ? (unsigned)-(long)exp10 : (unsigned)exp10;
+    if (exp10 < 0) buf[n++] = '-';
+    nd = 0;
+    do { digs[nd++] = (char)('0' + e % 10); e /= 10; } while (e);
+    while (nd) buf[n++] = (uint16_t)digs[--nd];
+    return js_k_decimal(buf, n);
 }
 
 int32_t js_to_int32(double d) {
@@ -141,7 +149,8 @@ double js_units_to_number(const uint16_t *units, size_t len) {
 
     uint64_t mant = 0;
     int digits = 0, exp_adjust = 0, exp_part = 0;
-    bool any = false;
+    bool any = false, dropped = false; /* digits past the 19th: the whole text decides the rounding */
+    size_t num_start = i;
     while (i < end && units[i] >= '0' && units[i] <= '9') {
         if (digits < 19) {
             mant = mant * 10 + (uint64_t)(units[i] - '0');
@@ -149,6 +158,7 @@ double js_units_to_number(const uint16_t *units, size_t len) {
                 digits++;
         } else {
             exp_adjust++;
+            dropped = true;
         }
         i++;
         any = true;
@@ -161,6 +171,8 @@ double js_units_to_number(const uint16_t *units, size_t len) {
                 if (mant)
                     digits++;
                 exp_adjust--;
+            } else {
+                dropped = true;
             }
             i++;
             any = true;
@@ -187,7 +199,7 @@ double js_units_to_number(const uint16_t *units, size_t len) {
     }
     if (i != end)
         return JS_NAN;
-    double v = js_make_double(mant, exp_part + exp_adjust);
+    double v = dropped ? js_k_decimal(units + num_start, end - num_start) : js_make_double(mant, exp_part + exp_adjust);
     return neg ? -v : v;
 }
 
@@ -287,6 +299,32 @@ static bool round_trips(uint64_t D, int p, int e, uint64_t bits) {
     return back.u == bits;
 }
 
+/* The p-digit candidate that round-trips to bits, if any: the nearest to d, else (at a binade edge,
+ * where the interval is wider above) the one above it. */
+static bool shortest_at(double d, const char *digs, int nd, int e10, int p, bool binade_edge,
+                        uint64_t bits, uint64_t *D_out, int *e_out) {
+    int e;
+    uint64_t Dr = nearest_digits(d, digs, nd, e10, p, &e);
+    if (round_trips(Dr, p, e, bits)) {
+        *D_out = Dr;
+        *e_out = e;
+        return true;
+    }
+    if (binade_edge) {
+        uint64_t up = Dr + 1, limit = 1;
+        int eu = e;
+        for (int i = 0; i < p; i++)
+            limit *= 10;
+        if (up >= limit) { up /= 10; eu++; }
+        if (round_trips(up, p, eu, bits)) {
+            *D_out = up;
+            *e_out = eu;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Formats digit string (drop trailing zeros) per Number::toString rules. */
 static size_t format_digits(char *buf, size_t n, uint64_t D, int ndigits, int e10) {
     char digs[20];
@@ -376,21 +414,27 @@ static size_t js_dtoa(double d, char *buf) {
      * narrow side while its neighbour fits on the wide side. That neighbour is the shortest form. */
     bool binade_edge = (orig.u & (((uint64_t)1 << 52) - 1)) == 0 && (orig.u >> 52) > 1;
 
-    /* Shortest digits (1..17) that round-trip; of those, the nearest to d. */
-    for (int prec = 1; prec <= 17; prec++) {
+    /* Shortest digits (1..17) that round-trip; of those, the nearest to d. Whether some p-digit
+     * decimal round-trips only goes from false to true as p grows (p-digit decimals are (p+1)-digit
+     * ones too), and 17 always does, so the shortest p is found by bisection: about four parses
+     * instead of up to seventeen, which matters now that parsing is musl's exact scan rather than
+     * the C library's strtod. At each p the candidates are the nearest, and at a binade edge the
+     * one above it (see binade_edge). */
+    int lo = 1, hi = 17;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
         int e;
-        uint64_t Dr = nearest_digits(d, digs, nd, e10, prec, &e);
-        if (round_trips(Dr, prec, e, orig.u))
-            return format_digits(buf, n, Dr, prec, e);
-        if (binade_edge) {
-            uint64_t up = Dr + 1, limit = 1;
-            int eu = e;
-            for (int i = 0; i < prec; i++)
-                limit *= 10;
-            if (up >= limit) { up /= 10; eu++; }
-            if (round_trips(up, prec, eu, orig.u))
-                return format_digits(buf, n, up, prec, eu);
-        }
+        uint64_t D;
+        if (shortest_at(d, digs, nd, e10, mid, binade_edge, orig.u, &D, &e))
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    {
+        int e;
+        uint64_t D;
+        if (shortest_at(d, digs, nd, e10, lo, binade_edge, orig.u, &D, &e))
+            return format_digits(buf, n, D, lo, e);
     }
     int e;
     uint64_t D17 = nearest_digits(d, digs, nd, e10, 17, &e);

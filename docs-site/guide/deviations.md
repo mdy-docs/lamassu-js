@@ -51,10 +51,11 @@ that's known to differ, so you're not surprised by one in production.
   bits. V8 now uses LLVM libc's correctly-rounded functions, so about 2% of
   results differ from Node by one ulp; the rest are identical.
   `sqrt`/`floor`/`ceil`/`trunc`/`round` are exact (native ops).
-- **Number-to-string formatting is exact for safe integers and for
-  magnitudes within ~1e±22**; extreme magnitudes may differ from Node in
-  the last digit (shortest-round-trip via float scaling, not a full
-  big-integer `dtoa`).
+- **Number-to-string formatting matches V8** (the shortest digits that read
+  back as the same double, the nearest of those), and parsing is correctly
+  rounded, on every host. Printing a number with a very large or very small
+  exponent (beyond about 1e±22) is slower than in V8: each candidate is checked
+  by parsing it back exactly.
 
 ## Strings
 

@@ -95,8 +95,11 @@ boxed `String` object — this engine has no boxed-primitive type at all).
 
 `toString()`/number-to-string prints what V8 prints: the shortest digits that
 read back as the same double, and of those the nearest to its value (ties to
-even), across the whole range including subnormals; parsing a literal is
-correctly rounded. Transcendental `Math` functions are fdlibm-accurate
+even), across the whole range including subnormals. Parsing a literal or a
+string (`Number('…')`) is correctly rounded however many digits it has, by
+musl's decimal scanner (`src/runtime/fdlibm/floatscan.c`) rather than the C
+library's `strtod`, so every host reads the same digits as the same double.
+Transcendental `Math` functions are fdlibm-accurate
 (< 1 ulp, musl's fdlibm-derived kernel in `src/runtime/fdlibm/`, no libm) rather
 than correctly rounded — `sqrt`/`floor`/`ceil`/`trunc`/`round` are exact native ops.
 

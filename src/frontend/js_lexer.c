@@ -183,6 +183,7 @@ static bool lex_number(JsLexer *lx) {
     } else {
         uint64_t mant = 0;
         int digits = 0, exp_adjust = 0, exp_part = 0;
+        bool dropped = false; /* digits past the 19th: the whole text decides the rounding */
         if (cur(lx) == '0' && is_digit(at(lx, 1)))
             return lex_fail(lx, start, "legacy octal literals are not allowed");
         while (is_digit(cur(lx))) {
@@ -192,6 +193,7 @@ static bool lex_number(JsLexer *lx) {
                     digits++;
             } else {
                 exp_adjust++;
+                dropped = true;
             }
             lx->pos++;
         }
@@ -203,6 +205,8 @@ static bool lex_number(JsLexer *lx) {
                     if (mant)
                         digits++;
                     exp_adjust--;
+                } else {
+                    dropped = true;
                 }
                 lx->pos++;
             }
@@ -224,7 +228,8 @@ static bool lex_number(JsLexer *lx) {
             if (neg)
                 exp_part = -exp_part;
         }
-        value = js_make_double(mant, exp_part + exp_adjust);
+        value = dropped ? js_k_decimal(lx->src + start, lx->pos - start)
+                        : js_make_double(mant, exp_part + exp_adjust);
     }
 
     if (cur(lx) == '_')

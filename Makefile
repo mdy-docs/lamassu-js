@@ -70,7 +70,7 @@ RUNTIME_SRC := src/runtime/js_vm.c src/runtime/js_gc.c src/runtime/js_string.c \
                src/runtime/fdlibm/scalbn.c src/runtime/fdlibm/rem_pio2_large.c src/runtime/fdlibm/rem_pio2.c \
                src/runtime/fdlibm/k_sin.c src/runtime/fdlibm/k_cos.c src/runtime/fdlibm/k_tan.c src/runtime/fdlibm/sin.c src/runtime/fdlibm/cos.c src/runtime/fdlibm/tan.c src/runtime/fdlibm/atan.c \
                src/runtime/fdlibm/atan2.c src/runtime/fdlibm/asin.c src/runtime/fdlibm/acos.c src/runtime/fdlibm/exp.c src/runtime/fdlibm/log.c src/runtime/fdlibm/pow.c \
-               src/runtime/fdlibm/log2.c src/runtime/fdlibm/log10.c src/runtime/fdlibm/cbrt.c
+               src/runtime/fdlibm/log2.c src/runtime/fdlibm/log10.c src/runtime/fdlibm/cbrt.c src/runtime/fdlibm/floatscan.c
 
 # js_arena.c is here and not in the runtime because the arena's only users are
 # the parser and the two compile entry points — the runtime never allocates one.
