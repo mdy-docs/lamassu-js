@@ -103,7 +103,7 @@ double js_k_log(double x)
 	hx += 0x3ff00000 - 0x3fe6a09e;
 	k += (int)(hx>>20) - 0x3ff;
 	hx = (hx&0x000fffff) + 0x3fe6a09e;
-	u.i = (uint64_t)hx<<32 | (u.i&0xffffffff);
+	u.i = ((uint64_t)hx<<32) | (u.i&0xffffffff);
 	x = u.f;
 
 	f = x - 1.0;

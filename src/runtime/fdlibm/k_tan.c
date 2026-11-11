@@ -70,7 +70,7 @@ double k_tan(double x, double y, int odd)
 	double_t z, r, v, w, s, a;
 	double w0, a0;
 	uint32_t hx;
-	int big, sign;
+	int big, sign = 0; /* set and read only when big; zeroed for GCC, which cannot see that */
 
 	GET_HIGH_WORD(hx,x);
 	big = (hx&0x7fffffff) >= 0x3FE59428; /* |x| >= 0.6744 */
