@@ -104,6 +104,20 @@ bool js_bytecode_compile_module(JsContext *ctx, const uint16_t *specifier,
                                 size_t source_len, uint8_t **out, size_t *out_len,
                                 const char **err_msg, uint32_t *err_pos);
 
+/* ---- syntax check ---- */
+
+/*
+ * Parses and compiles `source` as a module exactly as the module loader would
+ * (top-level import/export allowed; top-level `return` too when `entry`, as for
+ * the root of js_eval_entry), then discards the result: nothing is registered,
+ * resolved, linked or run, and imported modules are not loaded. For an editor
+ * checking a file as it is typed. Returns true when it compiles; otherwise false
+ * with *err_msg (static ASCII, "out of memory" on OOM) and *err_pos (source
+ * offset; js_source_line_col turns it into a line and column).
+ */
+bool js_check_module(JsContext *ctx, const uint16_t *source, size_t source_len, bool entry,
+                     const char **err_msg, uint32_t *err_pos);
+
 #ifdef __cplusplus
 }
 #endif

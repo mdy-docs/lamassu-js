@@ -111,3 +111,39 @@ bool js_bytecode_compile_module(JsContext *ctx, const uint16_t *specifier,
     return ok;
 }
 
+
+/* ---- syntax check (editors) ---- */
+
+bool js_check_module(JsContext *ctx, const uint16_t *source, size_t source_len, bool entry,
+                     const char **err_msg, uint32_t *err_pos) {
+    JsVm *vm = ctx->vm;
+    *err_msg = NULL;
+    *err_pos = 0;
+
+    static const uint16_t name[] = {'<', 'c', 'h', 'e', 'c', 'k', '>'};
+    JsValue specv = js_atom(vm, name, sizeof name / sizeof name[0]);
+    if (!js_is_string(specv)) {
+        *err_msg = "out of memory";
+        return false;
+    }
+    js_gc_protect(vm, &specv);
+    /* The same compile a loaded module gets, on a record nothing registers, links or runs. */
+    JsModule *m = js_module_alloc_placeholder(ctx, js_value_string(specv));
+    if (!m) {
+        js_gc_unprotect(vm, &specv);
+        *err_msg = "out of memory";
+        return false;
+    }
+    m->entry = entry;
+    JsValue mv = module_value(m);
+    js_gc_protect(vm, &mv);
+    JsModError err = {NULL, 0, false};
+    bool ok = module_compile_source(ctx, m, source, source_len, &err);
+    if (!ok) {
+        *err_msg = err.oom ? "out of memory" : (err.msg ? err.msg : "module compile error");
+        *err_pos = err.pos;
+    }
+    js_gc_unprotect(vm, &mv);
+    js_gc_unprotect(vm, &specv);
+    return ok;
+}

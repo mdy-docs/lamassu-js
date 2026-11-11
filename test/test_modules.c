@@ -930,6 +930,41 @@ static void test_entry_return(void) {
     }
 }
 
+/* js_check_module: the loader's compile without registering, linking or running. */
+static bool check_src(JsContext *ctx, const char *src, bool entry, const char **msg, uint32_t *pos) {
+    size_t n;
+    uint16_t *u = to_u16(src, &n);
+    bool ok = js_check_module(ctx, u, n, entry, msg, pos);
+    free(u);
+    return ok;
+}
+
+static void test_check_module(void) {
+    TestVm tv;
+    tv_open(&tv, NULL);
+    const char *msg;
+    uint32_t pos;
+    check(check_src(tv.ctx, "import { v } from 'nowhere'; export const w = v + 1;", false, &msg, &pos) && !msg,
+          "check: imports and exports compile; the import is not loaded");
+    check(check_src(tv.ctx, "const a = 1;\nreturn a;", true, &msg, &pos), "check: an entry may return at top level");
+    check(!check_src(tv.ctx, "const a = 1;\nreturn a;", false, &msg, &pos) && strstr(msg, "'return' outside function"),
+          "check: a module may not");
+    check(!check_src(tv.ctx, "let x = 1;\nlet y = (x + ;", true, &msg, &pos) && msg && pos >= 11 && pos <= 24,
+          "check: a parse error has a message and an offset on its line");
+    check(!check_src(tv.ctx, "var x = 1;", true, &msg, &pos) && msg, "check: words outside the subset are errors");
+    check(check_src(tv.ctx, "throw new Error('not run');", true, &msg, &pos), "check: nothing runs");
+    /* the context is unchanged: a checked declaration is not a global */
+    check(check_src(tv.ctx, "const leaked = 1; export const k = 2;", false, &msg, &pos), "check: declarations compile");
+    {
+        size_t n;
+        uint16_t *k = to_u16("leaked", &n);
+        JsValue g = js_object_get(tv.vm, js_context_globals(tv.ctx), js_atom(tv.vm, k, n));
+        free(k);
+        check(js_is_undefined(g), "check: leaves no globals behind");
+    }
+    tv_close(&tv, "check");
+}
+
 int main(void) {
     test_basic_exports();
     test_imports();
@@ -953,6 +988,7 @@ int main(void) {
     test_tla_dep_cross_turn();
     test_source_modules_gated();
     test_entry_return();
+    test_check_module();
     mods_reset();
     if (checks_failed) {
         fprintf(stderr, "%d/%d module checks FAILED\n", checks_failed, checks_run);

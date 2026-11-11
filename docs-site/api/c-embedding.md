@@ -227,6 +227,20 @@ context share state, i.e. a REPL session. This is what the npm package's
 `eval` uses.
 
 ```c
+bool js_check_module(JsContext *ctx, const uint16_t *source, size_t source_len, bool entry,
+                     const char **err_msg, uint32_t *err_pos);
+```
+
+A syntax check for an editor: compiles `source` exactly as the module loader
+would (top-level `import`/`export` allowed, and top-level `return` too when
+`entry`, as for the root of `js_eval_entry`) and throws the result away.
+Nothing is registered, resolved, linked or run, and imports are not loaded, so
+it is cheap enough to run on every pause in typing. Returns `true` when the
+source compiles, otherwise `false` with `*err_msg` and `*err_pos` set as for
+`js_compile_module`; `js_source_line_col` turns the offset into a line and
+column.
+
+```c
 JsValue js_run_module(JsContext *ctx, JsValue fn);
 ```
 
