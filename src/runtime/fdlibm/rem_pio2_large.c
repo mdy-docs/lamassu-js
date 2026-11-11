@@ -275,7 +275,9 @@ static const double PIo2[] = {
 int k_rem_pio2_large(double *x, double *y, int e0, int nx, int prec)
 {
 	int32_t jz,jx,jv,jp,jk,carry,n,iq[20],i,j,k,m,q0,ih;
-	double z,fw,f[20],fq[20],q[20];
+	/* fq is zeroed only for GCC: it cannot see that jz >= 0, so that fq[0..jz] is written before it is
+	 * read, and -Wmaybe-uninitialized under -Werror stops the build. Every value read is still written first. */
+	double z,fw,f[20],fq[20] = {0},q[20];
 
 	/* initialize jk*/
 	jk = init_jk[prec];
