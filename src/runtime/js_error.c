@@ -811,10 +811,13 @@ static JsValue error_object_new(JsContext *ctx, JsErrorKind kind, JsString *mess
         eo->frames = NULL;
         eo->frame_count = 0;
         eo->stack_state = JS_STACK_PENDING;
+        eo->hidden = 0;
         ev = js_value_from_cell(c);
         js_gc_protect(vm, &ev);
-        if (message)
+        if (message) {
             ok = js_object_set_ascii(ctx, e, "message", mv);
+            eo->hidden |= JS_ERR_HIDE_MESSAGE;
+        }
         if (ok && js_in_native(ctx))
             ok = js_error_capture(ctx, e, skip);
         js_gc_unprotect(vm, &ev);
@@ -852,6 +855,8 @@ static bool error_ctor(JsContext *ctx, JsErrorKind kind, const JsValue *args, in
         bool found;
         bool ok = chain_get(ctx, js_value_object(opts), "cause", &cause, &found) &&
                   (!found || js_object_set_ascii(ctx, js_value_object(ev), "cause", cause));
+        if (ok && found)
+            ((JsErrorObject *)js_value_object(ev))->hidden |= JS_ERR_HIDE_CAUSE;
         js_gc_unprotect(vm, &ev);
         if (!ok)
             return nthrow(ctx, r, "out of memory");

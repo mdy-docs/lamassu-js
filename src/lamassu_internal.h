@@ -158,7 +158,33 @@ typedef struct JsErrorObject {
     uint32_t frame_count;
     uint8_t stack_state;   /* JS_STACK_*: PENDING = made by the interpreter for a raise,
                             * captured when the raise unwinds */
+    uint8_t hidden;        /* JS_ERR_HIDE_*: own properties made with the error, which V8 makes
+                            * non-enumerable (deleting one clears its bit) */
 } JsErrorObject;
+#define JS_ERR_HIDE_MESSAGE 1u
+#define JS_ERR_HIDE_CAUSE 2u
+
+static inline bool js_units_are(const JsString *s, const char *a, uint32_t n) {
+    if (s->length != n)
+        return false;
+    for (uint32_t i = 0; i < n; i++)
+        if (s->units[i] != (uint16_t)(unsigned char)a[i])
+            return false;
+    return true;
+}
+
+/* The JS_ERR_HIDE_* bit KEY names on an error, or 0 */
+static inline uint8_t js_error_hide_bit(const JsString *key) {
+    return js_units_are(key, "message", 7) ? JS_ERR_HIDE_MESSAGE
+           : js_units_are(key, "cause", 5) ? JS_ERR_HIDE_CAUSE : 0;
+}
+
+/* Whether enumerating O's own properties leaves KEY out: an error's `message` and `cause`, as
+ * V8 makes them non-enumerable (Object.keys, JSON.stringify, spread, Object.assign) */
+static inline bool js_prop_hidden(const JsObject *o, const JsString *key) {
+    return o->obj_kind == JS_OBJ_ERROR && ((const JsErrorObject *)o)->hidden &&
+           (((const JsErrorObject *)o)->hidden & js_error_hide_bit(key));
+}
 
 typedef struct JsHostObject {
     JsObject obj; /* obj_kind == JS_OBJ_HOST */

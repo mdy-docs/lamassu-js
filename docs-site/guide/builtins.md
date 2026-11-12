@@ -190,7 +190,9 @@ signature and `Error.prototype` in their chain.
 
 - **Instances**: own `message` (ToString of the argument; absent when the
   argument is `undefined`, inheriting `""`), own `cause` when the options
-  object has one.
+  object has one. As in V8 neither is enumerated: `JSON.stringify(new Error('x'))` is `{}`, and
+  `Object.keys`, spread and `Object.assign` leave them out (one deleted and made again, or
+  assigned to an error that had none, is ordinary).
 - **`Error.prototype`**: `name` (`"Error"`; each subclass prototype
   overrides it), `message` (`""`), `toString` → `"name: message"`, dropping
   either half when it is empty.

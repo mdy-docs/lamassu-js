@@ -852,8 +852,16 @@ static void test_error(void) {
        "SyntaxError|s");
     eq_s("let s = ''; for (let i = 0; i < 200; i++) { try { null.x; } catch (e) { s = e.name; } } s;",
          "TypeError");
-    /* JSON: message is an ordinary own property (see deviations) */
-    eq("JSON.stringify(new Error('j'));", "{\"message\":\"j\"}");
+    /* message and cause are own properties V8 does not enumerate; one made later is ordinary */
+    eq("JSON.stringify(new Error('j', { cause: 1 }));", "{}");
+    eq("const e = new Error('x', { cause: 2 }); [Object.keys(e).length, JSON.stringify({ ...e }),"
+       " JSON.stringify(Object.assign({}, e)), e.hasOwnProperty('message'), e.cause].join('|');",
+       "0|{}|{}|true|2");
+    eq("const e = new Error('x'); e.message = 'y'; const a = Object.keys(e).length;"
+       " delete e.message; e.message = 'z'; [a, Object.keys(e).join()].join('|');", "0|message");
+    eq("const f = new Error(); f.message = 'later'; f.code = 1; JSON.stringify(f);",
+       "{\"message\":\"later\",\"code\":1}");
+    eq("let t; try { null.x; } catch (e) { t = e; } JSON.stringify(t);", "{}");
     /* uncaught: the completion is the Error object; the host sees its text */
     err("throw new RangeError('top');", "RangeError: top");
     err("throw new Error('top');", "Error: top");

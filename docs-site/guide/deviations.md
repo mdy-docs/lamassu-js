@@ -87,9 +87,6 @@ iterator (`for...of` over the result behaves the same either way).
   `stack` property; an anonymous function's inferred name comes only from a member assignment
   (`x.y = function () {}` is `x.y`, `F.prototype.m = ...` is `F.m`), where V8 also infers from
   other places (`const a = [function () {}]` is `a` there); a host's natives have no frame.
-- **`message` and `cause` are ordinary enumerable own properties** (the
-  engine has no property attributes), so `JSON.stringify(new Error('x'))`
-  is `{"message":"x"}` rather than `{}`, and `Object.keys` lists them.
 - **`Object.prototype.toString` reports `[object Object]`** for errors.
 - **Subclassing is not possible** (no classes); set `name` on an instance
   for a custom discriminator.

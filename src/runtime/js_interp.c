@@ -950,7 +950,7 @@ bool js_spread_into_object(JsContext *ctx, JsObject *dst, JsValue src, JsString 
     js_map_sort_keys(&o->props);
     for (uint32_t i = 0; i < o->props.capacity; i++) {
         JsMapEntry *e = &o->props.entries[i];
-        if (e->key && e->key != JS_MAP_TOMBSTONE) {
+        if (e->key && e->key != JS_MAP_TOMBSTONE && !js_prop_hidden(o, e->key)) {
             if (e->value.bits == JS_SPECIAL_TDZ) { /* a namespace's uninitialized export */
                 *uninit = e->key;
                 return false;
@@ -1065,7 +1065,8 @@ __attribute__((noinline)) static bool delete_object_prop(JsContext *ctx, JsObjec
     JsString *k = to_prop_key(ctx, key);
     if (!k)
         return false;
-    js_map_delete(&o->props, k);
+    if (js_map_delete(&o->props, k) && o->obj_kind == JS_OBJ_ERROR) /* made again, it enumerates */
+        ((JsErrorObject *)o)->hidden &= (uint8_t)~js_error_hide_bit(k);
     return true;
 }
 

@@ -1876,7 +1876,7 @@ static bool json_str(JsContext *ctx, StrBuf *sb, JsValue v, const uint16_t *inde
     js_map_sort_keys(&o->props);
     for (uint32_t i = 0; i < o->props.capacity; i++) {
         JsMapEntry *e = &o->props.entries[i];
-        if (!e->key || e->key == JS_MAP_TOMBSTONE)
+        if (!e->key || e->key == JS_MAP_TOMBSTONE || js_prop_hidden(o, e->key))
             continue;
         uint32_t mark = sb->len; /* rewind point if the value emits nothing */
         if (!first)
@@ -2397,7 +2397,7 @@ static bool obj_keys_impl(JsContext *ctx, JsValue tv, const JsValue *args, int a
         {
             for (uint32_t i = 0; i < o->props.capacity && ok; i++) {
                 JsMapEntry *e = &o->props.entries[i];
-                if (!e->key || e->key == JS_MAP_TOMBSTONE)
+                if (!e->key || e->key == JS_MAP_TOMBSTONE || js_prop_hidden(o, e->key))
                     continue;
                 if (e->value.bits == JS_SPECIAL_TDZ) { /* a namespace's uninitialized export */
                     js_gc_unprotect(ctx->vm, &outv);

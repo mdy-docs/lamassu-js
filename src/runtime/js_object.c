@@ -200,11 +200,26 @@ bool js_object_delete(JsVm *vm, JsValue obj, JsValue key) {
     JsString *k = js_object_key_lookup(vm, key);
     if (!k)
         return false;
-    return js_map_delete(&js_value_object(obj)->props, k);
+    JsObject *o = js_value_object(obj);
+    if (!js_map_delete(&o->props, k))
+        return false;
+    if (o->obj_kind == JS_OBJ_ERROR) /* made again, an error's message or cause enumerates */
+        ((JsErrorObject *)o)->hidden &= (uint8_t)~js_error_hide_bit(k);
+    return true;
 }
 
 size_t js_object_size(JsValue obj) {
-    return js_is_object(obj) ? js_value_object(obj)->props.count : 0;
+    if (!js_is_object(obj))
+        return 0;
+    const JsObject *o = js_value_object(obj);
+    size_t n = o->props.count;
+    if (o->obj_kind == JS_OBJ_ERROR && ((const JsErrorObject *)o)->hidden)
+        for (uint32_t i = 0; i < o->props.capacity; i++) {
+            const JsString *k = o->props.entries[i].key;
+            if (k && k != JS_MAP_TOMBSTONE && js_prop_hidden(o, k))
+                n--;
+        }
+    return n;
 }
 
 /*
@@ -216,12 +231,13 @@ size_t js_object_size(JsValue obj) {
 JsValue js_object_key_at(JsValue obj, size_t index) {
     if (!js_is_object(obj))
         return js_undefined();
+    const JsObject *o = js_value_object(obj);
     JsMap *m = &js_value_object(obj)->props;
     js_map_sort_keys(m);
     size_t seen = 0;
     for (uint32_t i = 0; i < m->capacity; i++) {
         JsString *k = m->entries[i].key;
-        if (!k || k == JS_MAP_TOMBSTONE)
+        if (!k || k == JS_MAP_TOMBSTONE || js_prop_hidden(o, k))
             continue;
         if (seen == index)
             return js_value_from_cell(&k->gc);
