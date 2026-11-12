@@ -186,6 +186,7 @@ typedef struct JsFunctionCell {
     JsUpvalDesc *upvals;
     uint16_t n_upvals, upval_cap;
     uint16_t n_params;
+    uint16_t length;    /* `length`: the parameters before the first default or rest */
     uint8_t fn_flags;
     uint32_t n_locals, max_stack;
     JsString *name;     /* may be NULL */
@@ -235,6 +236,7 @@ typedef struct JsClosure {
     JsFunctionCell *fn;
     JsValue this_val; /* arrows: lexically captured `this` */
     bool has_this;
+    bool length_deleted; /* `delete f.length` ran: it reads 0 (Function.prototype's) */
     uint16_t n_upvals;
     /* `new`: lazily-created .prototype object (constructor pattern); NULL
      * until first accessed via `fn.prototype` or `new fn()`. */
@@ -265,6 +267,7 @@ typedef struct JsNative {
     JsValue bound;       /* captured value for bound natives */
     JsObject *props;     /* properties a script gives it (like JsClosure.props); NULL until written */
     bool is_bound;
+    uint8_t length;      /* `length`: V8's for a builtin (js_builtin_lengths_apply), else 0 */
 } JsNative;
 
 /* ---- promises & microtasks ---- */

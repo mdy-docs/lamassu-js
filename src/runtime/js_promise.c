@@ -842,6 +842,9 @@ static bool promise_ctor(JsContext *ctx, JsValue tv, const JsValue *args, int ar
     js_gc_protect(ctx->vm, &reject);
     bool ok = js_is_function(resolve) && js_is_function(reject);
     if (ok) {
+        /* the executor's resolving functions take one argument, as V8's say */
+        ((JsNative *)js_value_cell(resolve))->length = 1;
+        ((JsNative *)js_value_cell(reject))->length = 1;
         JsValue ex_args[2] = {resolve, reject};
         JsValue ex_res;
         if (!js_call(ctx, executor, js_undefined(), ex_args, 2, &ex_res))

@@ -110,6 +110,7 @@ static bool serialize_fn(OutBuf *b, JsFunctionCell *fn, uint32_t depth) {
     if (depth > JSBC_MAX_FN_DEPTH)
         return false;
     out_u16(b, fn->n_params);
+    out_u16(b, fn->length);
     out_u8(b, fn->fn_flags);
     out_u32(b, fn->n_locals);
     out_u16(b, fn->n_upvals);

@@ -1265,6 +1265,33 @@ static void test_function_names(void) {
                  "TypeError: Assignment to constant variable.");
 }
 
+/* A function's length, as V8 gives it: the parameters before the first default or rest, a
+ * builtin's, a bound one's less the arguments bound; read-only. */
+static void test_function_lengths(void) {
+    expect_result("function three(a, b, c) {}"
+                  "[three.length, (() => 0).length, ((a, b) => 0).length, ((a, b = 1, c) => 0).length,"
+                  " ((...r) => 0).length, ((a, ...r) => 0).length, (({ x }, [y]) => 0).length,"
+                  " (async (a) => 0).length, ({ m(a, b) {} }).m.length].join();",
+                  "3,0,2,1,0,1,2,1,2");
+    expect_result("function three(a, b, c) {}"
+                  "[three.bind(null).length, three.bind(null, 1).length, three.bind(null, 1, 2, 3, 4).length,"
+                  " Math.max.bind(null, 1).length, three.bind(null, 1).bind(null, 2).length].join();",
+                  "3,2,0,1,1");
+    expect_result("[Math.max.length, JSON.stringify.length, [].slice.length, ''.replace.length,"
+                  " Date.UTC.length, Promise.resolve().then.length, Map.length, parseInt.length,"
+                  " (0).toFixed.length].join();",
+                  "2,3,2,2,7,2,0,2,1");
+    expect_result("let l; new Promise((res, rej) => { l = [res.length, rej.length]; }); l.join();", "1,1");
+    expect_result("function f(a) {} ['length' in f, Object.keys(f).length, f.hasOwnProperty('length'),"
+                  " Object.hasOwn(f, 'length')].join();", "true,0,true,true");
+    expect_error("function f(a) {} f.length = 3;", RUN_RUNTIME_ERR,
+                 "TypeError: Cannot assign to read only property 'length' of function 'f'");
+    expect_error("const f = (a) => 0; Object.assign(f, { length: 4 });", RUN_RUNTIME_ERR,
+                 "TypeError: Cannot assign to read only property 'length' of function 'f'");
+    expect_result("const f = (a, b) => 0; const s = [].slice; delete f.length; delete s.length;"
+                  "[f.length, s.length].join();", "0,0");
+}
+
 int main(void) {
     test_heap_limit_is_a_hard_cap();
     test_regex_memory_is_capped();
@@ -1284,6 +1311,7 @@ int main(void) {
     test_errors();
     test_functions();
     test_function_names();
+    test_function_lengths();
     test_new();
     test_real_prototypes();
     test_closures();

@@ -526,7 +526,8 @@ static bool declare_local(JsCompiler *cx, const uint16_t *name, uint32_t len,
                           bool is_const, uint32_t pos, uint32_t scope_floor,
                           uint16_t *slot_out) {
     JsFuncState *fs = cx->cur;
-    for (uint32_t i = scope_floor; i < fs->local_count; i++) {
+    for (uint32_t i = scope_floor; len && i < fs->local_count; i++) {
+        /* unnamed slots (destructuring parameters) never clash */
         if (units_equal(fs->locals[i].name, fs->locals[i].len, name, len))
             return cerr(cx, pos, js_compile_error_fmt(cx->vm, "Identifier '%U' has already been declared",
                                                       name, len));
@@ -2023,6 +2024,11 @@ static bool compile_function_as(JsCompiler *cx, const JsAstNode *fnode, const ui
     }
 
     fn->n_params = n_params;
+    /* `length`: the parameters before the first default or rest */
+    fn->length = 0;
+    while (fn->length < fnode->count && fnode->items[fn->length]->kind != JS_AST_DEFAULT &&
+           fnode->items[fn->length]->kind != JS_AST_REST)
+        fn->length++;
     fn->fn_flags = (uint8_t)((fs.is_arrow ? JS_FN_ARROW : 0) |
                              (has_rest ? JS_FN_HAS_REST : 0) |
                              ((fnode->flags & JS_F_ASYNC) ? JS_FN_ASYNC : 0) |

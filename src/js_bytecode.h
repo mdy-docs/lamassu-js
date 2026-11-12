@@ -291,6 +291,10 @@ JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound);
 JsObject *js_function_props(JsContext *ctx, JsValue fn, bool create);
 /* A function value's `name` (closure or native); NULL for none, which reads as "". */
 JsString *js_function_name(JsValue fn);
+/* A function value's `length` (closure or native). */
+uint32_t js_function_length(JsValue fn);
+/* Gives the builtins V8's `length` (js_builtin_lengths.h); false on OOM. */
+bool js_builtin_lengths_apply(JsContext *ctx);
 /* The JsBoundFn of every function Function.prototype.bind makes (js_builtins.c); its bound value
  * is the array [target, thisArg, ...presetArgs]. `new` recognises it to construct the target. */
 bool js_bind_call(JsContext *ctx, JsValue bound, JsValue this_val, const JsValue *args, int argc,

@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include <string.h>
 #include "js_bytecode.h"
 #include "js_error.h"
@@ -425,9 +426,61 @@ JsString *js_function_name(JsValue fn) {
     return ((JsFunctionCell *)c)->name;
 }
 
+uint32_t js_function_length(JsValue fn) {
+    if (!js_is_function(fn))
+        return 0;
+    JsGcCell *c = js_value_cell(fn);
+    if (c->kind == JS_KIND_CLOSURE)
+        return ((JsClosure *)c)->length_deleted ? 0 : ((JsClosure *)c)->fn->length;
+    if (c->kind == JS_KIND_NATIVE)
+        return ((JsNative *)c)->length;
+    return ((JsFunctionCell *)c)->length;
+}
+
 /* `name`: a read-only own property of every function, as in V8 */
 static bool is_name_key(JsValue key) {
     return js_is_string(key) && units_is_ascii_str(js_value_string(key), "name");
+}
+
+/* `length`: likewise */
+static bool is_length_key(JsValue key) {
+    return js_is_string(key) && units_is_ascii_str(js_value_string(key), "length");
+}
+
+/* `delete fn[key]`, out of the dispatch loop: 0 done, 1 refused (*err the TypeError), 2 OOM.
+ * name and length are configurable: deleting one leaves Function.prototype's, "" or 0. */
+JS_COLD static int delete_function_prop(JsContext *ctx, JsValue fn, JsValue key, JsValue *err) {
+    JsObject *own = js_function_props(ctx, fn, false);
+    bool special = is_name_key(key) || is_length_key(key);
+    if (own && own->obj_flags) {
+        *err = js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of %v", key, fn);
+        return 1;
+    }
+    JsGcCell *fc = js_value_cell(fn);
+    if (special && is_length_key(key)) {
+        if (fc->kind == JS_KIND_CLOSURE)
+            ((JsClosure *)fc)->length_deleted = true;
+        else if (fc->kind == JS_KIND_NATIVE)
+            ((JsNative *)fc)->length = 0;
+        return 0;
+    }
+    if (special) {
+        JsString *empty = js_ascii_cell(ctx->vm, ""); /* fn is on the caller's stack: rooted */
+        if (!empty)
+            return 2;
+        if (fc->kind == JS_KIND_CLOSURE)
+            ((JsClosure *)fc)->name = empty;
+        else if (fc->kind == JS_KIND_NATIVE)
+            ((JsNative *)fc)->name = empty;
+        return 0;
+    }
+    if (own) {
+        JsString *k = to_prop_key(ctx, key);
+        if (!k)
+            return 2;
+        js_map_delete(&own->props, k);
+    }
+    return 0;
 }
 
 /* A module namespace's let/const export reads as JS_SPECIAL_TDZ until its declaration has run
@@ -551,6 +604,10 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
             *out = js_value_from_cell(&nm->gc);
             return JS_PROP_OK;
         }
+        if (is_length_key(key)) {
+            *out = js_number(js_function_length(base));
+            return JS_PROP_OK;
+        }
         JsObject *own = js_function_props(ctx, base, false);
         if (own) {
             JsPropStatus st = method_lookup(ctx, own, key, out);
@@ -654,7 +711,7 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
             }
             return JS_PROP_OK;
         }
-        if (is_name_key(key)) {
+        if (is_name_key(key) || is_length_key(key)) {
             *errmsg = SET_READ_ONLY;
             return JS_PROP_TYPE_ERROR;
         }
@@ -1113,6 +1170,7 @@ static JsClosure *closure_new(JsVm *vm, JsFunctionCell *fn) {
     cl->prototype_obj = NULL;
     cl->props = NULL;
     cl->name = NULL;
+    cl->length_deleted = false;
     cl->n_upvals = fn->n_upvals;
     for (uint16_t i = 0; i < fn->n_upvals; i++)
         cl->upvals[i] = NULL;
@@ -1176,6 +1234,7 @@ JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *ud)
     nf->prototype = NULL;
     nf->bound = js_undefined();
     nf->is_bound = false;
+    nf->length = 0;
     return js_value_from_cell(c);
 }
 
@@ -1197,6 +1256,7 @@ JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound) {
     nf->prototype = NULL;
     nf->bound = bound;
     nf->is_bound = true;
+    nf->length = 0;
     return js_value_from_cell(c);
 }
 
@@ -1240,6 +1300,7 @@ bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
     nf->name = js_value_string(key);
     nf->bound = js_undefined();
     nf->is_bound = false;
+    nf->length = 0;
     return js_map_set(vm, &ctx->globals->props, js_value_string(key),
                       js_value_from_cell(c));
 }
@@ -2044,33 +2105,15 @@ run:; /* (re)load the top frame */
                             RT_THROW("out of memory");
                         js_map_delete(&o->props, k);
                     }
-                } else if (js_is_function(b) && is_name_key(key)) {
-                    /* name is configurable: deleting it leaves Function.prototype's, "" */
-                    JsObject *own = js_function_props(ctx, b, false);
-                    if (own && own->obj_flags) {
-                        fiber_throw_value(fb, js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of %v", key, b));
+                } else if (js_is_function(b)) {
+                    JsValue derr;
+                    int dst = delete_function_prop(ctx, b, key, &derr);
+                    if (dst == 1) {
+                        fiber_throw_value(fb, derr);
                         RT_RAISE();
                     }
-                    JsString *empty = js_ascii_cell(vm, "");
-                    if (!empty)
+                    if (dst == 2)
                         RT_THROW("out of memory");
-                    JsGcCell *fc = js_value_cell(fb->stack[fb->sp - 2]);
-                    if (fc->kind == JS_KIND_CLOSURE)
-                        ((JsClosure *)fc)->name = empty;
-                    else if (fc->kind == JS_KIND_NATIVE)
-                        ((JsNative *)fc)->name = empty;
-                } else if (js_is_function(b)) {
-                    JsObject *own = js_function_props(ctx, b, false);
-                    if (own) {
-                        if (own->obj_flags) {
-                            fiber_throw_value(fb, js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of %v", key, b));
-                            RT_RAISE();
-                        }
-                        JsString *k = to_prop_key(ctx, key);
-                        if (!k)
-                            RT_THROW("out of memory");
-                        js_map_delete(&own->props, k);
-                    }
                 } else if (is_nullish(b)) {
                     RT_THROW("TypeError: Cannot convert undefined or null to object");
                 }
@@ -2954,4 +2997,74 @@ JsValue js_run_module(JsContext *ctx, JsValue fnv) {
 JsValue js_to_string(JsContext *ctx, JsValue v) {
     JsString *s = js_to_string_cell(ctx, v, 0);
     return s ? js_value_from_cell(&s->gc) : js_undefined();
+}
+
+/* ---- builtin lengths ---- */
+
+#include "js_builtin_lengths.h"
+
+/* The object a builtin's owner names: a global, a global's static, or a prototype — the method
+ * table a primitive's methods come from, or the constructor's real prototype object. */
+static bool lengths_owner(JsContext *ctx, const char *owner, JsValue *out) {
+    *out = js_value_from_cell(&ctx->globals->gc);
+    if (!*owner)
+        return true;
+    static const struct { const char *name; size_t off; } tables[] = {
+        {"String.prototype", offsetof(JsContext, string_methods)},
+        {"Number.prototype", offsetof(JsContext, number_methods)},
+        {"Function.prototype", offsetof(JsContext, function_methods)},
+        {"Promise.prototype", offsetof(JsContext, promise_methods)},
+        {"Object.prototype", offsetof(JsContext, object_proto)},
+    };
+    for (size_t i = 0; i < sizeof tables / sizeof tables[0]; i++) {
+        if (strcmp(owner, tables[i].name) == 0) {
+            JsObject *o = *(JsObject **)((char *)ctx + tables[i].off);
+            *out = o ? js_value_from_cell(&o->gc) : js_undefined();
+            return true;
+        }
+    }
+    const char *dot = strchr(owner, '.');
+    size_t n = dot ? (size_t)(dot - owner) : strlen(owner);
+    uint16_t u[32];
+    if (n > 32)
+        return true;
+    for (size_t i = 0; i < n; i++)
+        u[i] = (uint16_t)owner[i];
+    JsValue k = js_atom(ctx->vm, u, n);
+    if (!js_is_string(k))
+        return false;
+    if (get_property(ctx, *out, k, out) == JS_PROP_OOM)
+        return false;
+    if (dot) {
+        JsValue pk = js_atom(ctx->vm, (const uint16_t[]){'p','r','o','t','o','t','y','p','e'}, 9);
+        if (!js_is_string(pk) || get_property(ctx, *out, pk, out) == JS_PROP_OOM)
+            return false;
+    }
+    return true;
+}
+
+bool js_builtin_lengths_apply(JsContext *ctx) {
+    for (size_t i = 0; i < sizeof js_builtin_lengths / sizeof js_builtin_lengths[0]; i++) {
+        const JsBuiltinLength *e = &js_builtin_lengths[i];
+        JsValue owner;
+        if (!lengths_owner(ctx, e->owner, &owner))
+            return false;
+        if (js_is_undefined(owner))
+            continue;
+        uint16_t u[32];
+        size_t n = strlen(e->name);
+        if (n > 32)
+            continue;
+        for (size_t j = 0; j < n; j++)
+            u[j] = (uint16_t)e->name[j];
+        JsValue k = js_atom(ctx->vm, u, n);
+        if (!js_is_string(k))
+            return false;
+        JsValue f;
+        if (get_property(ctx, owner, k, &f) == JS_PROP_OOM)
+            return false;
+        if (js_is_function(f) && js_value_cell(f)->kind == JS_KIND_NATIVE)
+            ((JsNative *)js_value_cell(f))->length = e->length;
+    }
+    return true;
 }

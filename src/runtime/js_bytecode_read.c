@@ -230,6 +230,7 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
         return NULL;
     }
     uint16_t n_params = in_u16(b);
+    uint16_t length = in_u16(b);
     uint8_t fn_flags = in_u8(b);
     uint32_t n_locals = in_u32(b);
     uint16_t n_upvals = in_u16(b);
@@ -250,7 +251,7 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
      */
     if ((fn_flags & ~(uint8_t)(JS_FN_ARROW | JS_FN_HAS_REST | JS_FN_ASYNC |
                                JS_FN_USES_ARGUMENTS)) ||
-        n_locals > JSBC_MAX_LOCALS || n_params > n_locals ||
+        n_locals > JSBC_MAX_LOCALS || n_params > n_locals || length > n_params ||
         ((fn_flags & JS_FN_HAS_REST) && n_params == 0) ||
         ((fn_flags & JS_FN_USES_ARGUMENTS) &&
          ((fn_flags & JS_FN_ARROW) || n_locals <= n_params))) {
@@ -275,6 +276,7 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
      * gc.next would orphan every older cell in the allocation chain */
     memset((char *)fn + sizeof(JsGcCell), 0, sizeof *fn - sizeof(JsGcCell));
     fn->n_params = n_params;
+    fn->length = length;
     fn->fn_flags = fn_flags;
     fn->n_locals = n_locals;
 

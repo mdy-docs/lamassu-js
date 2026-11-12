@@ -280,7 +280,7 @@ JsContext *js_context_new(JsVm *vm) {
         js_context_free(ctx);
         return NULL;
     }
-    if (!js_builtins_init(ctx)) {
+    if (!js_builtins_init(ctx) || !js_builtin_lengths_apply(ctx)) {
         js_context_free(ctx);
         return NULL;
     }

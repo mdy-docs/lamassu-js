@@ -237,6 +237,7 @@ static void test_roundtrip(void) {
        "const f = function inner(n) { return n ? inner(n - 1) : inner.name; };"
        "[arrow.name, o.dyn.name, o.m.name, f(2)].join();",
        "arrow,dyn,m,inner");
+    eq("[((a, b = 1) => 0).length, (function (a, b, ...c) {}).length].join();", "1,2");
 }
 
 static void test_vs_direct(void) {

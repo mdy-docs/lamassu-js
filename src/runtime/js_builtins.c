@@ -1492,6 +1492,10 @@ static bool fm_bind(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
         return false;
     }
     ((JsNative *)js_value_cell(fn))->name = nm;
+    /* and the target's length less the arguments bound */
+    uint32_t tl = js_function_length(tv), bound = argc > 1 ? (uint32_t)(argc - 1) : 0;
+    uint32_t bl = tl > bound ? tl - bound : 0;
+    ((JsNative *)js_value_cell(fn))->length = (uint8_t)(bl > 255 ? 255 : bl);
     *r = fn;
     return true;
 }
@@ -2469,14 +2473,20 @@ static bool obj_assign(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     if (!ok)
         return oom(ctx, r);
     if (js_is_function(target)) {
-        /* a function's name is read-only: the copy that landed among its own properties goes */
-        static const uint16_t nm[] = {'n', 'a', 'm', 'e'};
-        JsValue k = js_atom(ctx->vm, nm, 4);
-        if (!js_is_string(k))
+        /* a function's name and length are read-only: a copy that landed among its own
+         * properties goes */
+        static const uint16_t nm[] = {'n', 'a', 'm', 'e'}, ln[] = {'l', 'e', 'n', 'g', 't', 'h'};
+        JsValue kn = js_atom(ctx->vm, nm, 4);
+        js_gc_protect(ctx->vm, &kn);
+        JsValue kl = js_atom(ctx->vm, ln, 6);
+        js_gc_unprotect(ctx->vm, &kn);
+        if (!js_is_string(kn) || !js_is_string(kl))
             return oom(ctx, r);
-        if (js_map_delete(&js_value_object(dst)->props, js_value_string(k)))
-            return native_throw_fmt(ctx, r, "TypeError: Cannot assign to read only property 'name' of function '%v'",
-                                    target);
+        bool had_name = js_map_delete(&js_value_object(dst)->props, js_value_string(kn));
+        bool had_length = js_map_delete(&js_value_object(dst)->props, js_value_string(kl));
+        if (had_name || had_length)
+            return native_throw_fmt(ctx, r, "TypeError: Cannot assign to read only property '%s' of function '%v'",
+                                    had_name ? "name" : "length", target);
     }
     *r = target;
     return true;
@@ -2618,11 +2628,22 @@ static bool object_has_own_key(JsContext *ctx, JsObject *ob, JsValue key, bool *
     return true;
 }
 
-/* Every function has `name` as an own property (read-only, not enumerable), as in V8. */
+static bool str_is_ascii(JsValue key, const char *a) {
+    if (!js_is_string(key))
+        return false;
+    const JsString *s = js_value_string(key);
+    size_t n = strlen(a);
+    if (s->length != n)
+        return false;
+    for (size_t i = 0; i < n; i++)
+        if (s->units[i] != (uint16_t)(unsigned char)a[i])
+            return false;
+    return true;
+}
+
+/* Every function has `name` and `length` as own properties (read-only, not enumerable), as in V8. */
 static bool is_function_name_key(JsValue fn, JsValue key) {
-    return js_is_function(fn) && js_is_string(key) && js_value_string(key)->length == 4 &&
-           js_value_string(key)->units[0] == 'n' && js_value_string(key)->units[1] == 'a' &&
-           js_value_string(key)->units[2] == 'm' && js_value_string(key)->units[3] == 'e';
+    return js_is_function(fn) && (str_is_ascii(key, "name") || str_is_ascii(key, "length"));
 }
 
 static bool obj_hasOwn(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {

@@ -125,8 +125,13 @@ own name; for an anonymous function or arrow, the name of what it is defined as 
 `f = () => {}`, `export default () => {}` as `default`); a builtin's (`Math.max.name` is `max`);
 `bound f` for `f.bind(...)`; otherwise `""`. Assigning it throws `TypeError: Cannot assign to read
 only property 'name' of function 'f'`; `delete f.name` leaves `""`. A named function expression
-sees its own name inside its body, as a constant holding the function. Functions have no `length`
-and `String(f)` is `"[function]"`.
+sees its own name inside its body, as a constant holding the function.
+
+`length` is V8's too, and read-only: a script function's parameters before the first default or
+rest (`(a, b = 1, c) => 0` has 1); a builtin's (`Math.max.length` is 2, `Date.UTC.length` 7); for
+`f.bind(t, ...args)`, `f.length` less the arguments bound, never below 0. `delete f.length` leaves
+0. A native the host registers (`js_register_native`) has length 0. `String(f)` is
+`"[function]"`.
 
 A function can hold properties like any object, which is how a constructor gets statics with
 classes out of the language: `F.from = (v) => new F(v)`, `F.ORIGIN = new F(0)`, a cache on a helper.
