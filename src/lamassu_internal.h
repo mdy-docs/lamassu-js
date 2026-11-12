@@ -313,6 +313,7 @@ typedef enum JsRunStatus {
     JS_RUN_DONE = 0,
     JS_RUN_ERROR = 1,
     JS_RUN_SUSPENDED = 2, /* parked at await */
+    JS_RUN_READY = 3,     /* a module body parked at JS_OP_MODULE_READY (stop_at_ready) */
 } JsRunStatus;
 
 /* ---- ES modules ---- */
@@ -383,6 +384,10 @@ struct JsModule {
      * Fulfills with the module itself (disguised as a JsValue), rejects with
      * the load error. Rooted through the registry for the module's lifetime. */
     JsPromise *fetch_promise;
+    /* The body's fiber between instantiation (its functions made, parked at JS_OP_MODULE_READY)
+     * and evaluation, which resumes it; NULL before and after. */
+    JsFiber *fiber;
+    bool env_ready;           /* instantiation ran (or this module has no body to run) */
 };
 
 /* Opaque host-provided module bytecode; bytes owned by the cell. */
@@ -422,6 +427,7 @@ struct JsFiber {
     JsValue error;
     bool failed;
     bool is_async;   /* body may suspend at await */
+    bool stop_at_ready; /* a module body being instantiated: park at JS_OP_MODULE_READY */
     uint32_t err_pos;
     /* frames at the last raise, innermost first (js_context_error_stack) */
     JsStackFrame trace[JS_TRACE_MAX];

@@ -379,10 +379,12 @@ Tracked so differential testing against Node has a baseline.
 - **Cross-module cycles:** a `let`/`const` export (or an `export default`
   expression) read before the exporting module initialized it throws the TDZ
   error, as real ESM does: the exports object holds `JS_SPECIAL_TDZ` for it
-  from compile time (a module bytecode buffer lists those names). An `export
-  function` exists once its module's body starts, not at instantiation, so the
-  module that runs first in a cycle cannot call it from top-level code;
-  mutually recursive function modules work.
+  from compile time (a module bytecode buffer lists those names). Functions
+  are made at instantiation, as V8's InitializeEnvironment does: after
+  linking, every body in the graph runs up to `JS_OP_MODULE_READY` (emitted
+  after its hoisted functions) and parks its fiber there; evaluation resumes
+  the parked fibers in dependency order, so the module that runs first in a
+  cycle can call what the others export.
 - **Module evaluation drains the whole microtask queue** after each module
   body (via `js_run_module`); there is no cross-module async evaluation
   ordering beyond dependency order.

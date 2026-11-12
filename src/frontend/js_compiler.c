@@ -671,6 +671,14 @@ static bool pattern_declare(JsCompiler *cx, const JsAstNode *pat, bool is_const,
     }
 }
 
+/* `export default function name() {}`: the declaration's FUNC_EXPR when it has a name, which it
+ * binds in the module like any function declaration; else NULL. */
+static const JsAstNode *named_default_decl(const JsAstNode *s) {
+    if (s->kind == JS_AST_EXPORT_DEFAULT && (s->flags & JS_F_DEFAULT_DECL) && s->a && s->a->len)
+        return s->a;
+    return NULL;
+}
+
 /* Hoists let/const (TDZ) and function-declaration names for one block. */
 static bool prescan_declarations(JsCompiler *cx, JsAstNode *const *stmts,
                                  uint32_t count, uint32_t scope_floor) {
@@ -679,6 +687,15 @@ static bool prescan_declarations(JsCompiler *cx, JsAstNode *const *stmts,
         /* unwrap `export <decl>` */
         if (s->kind == JS_AST_EXPORT_NAMED && s->a)
             s = s->a;
+        if (named_default_decl(s) && cx->module && cx->cur->is_module) {
+            const JsAstNode *f = named_default_decl(s);
+            JsModBinding *b = resolve_module_binding(cx, f->units, f->len);
+            uint16_t slot;
+            if ((!b || b->kind != JS_MB_EXPORT) &&
+                !declare_local(cx, f->units, f->len, false, f->pos, scope_floor, &slot))
+                return false;
+            continue;
+        }
         if (s->kind == JS_AST_LET_DECL) {
             for (uint32_t d = 0; d < s->count; d++) {
                 if (!pattern_declare(cx, s->items[d]->a, (s->flags & JS_F_CONST) != 0,
@@ -1997,8 +2014,39 @@ static bool hoist_functions(JsCompiler *cx, JsAstNode *const *stmts, uint32_t co
         /* `export function f(){}` wraps the FUNC_DECL; unwrap it */
         bool exported = false;
         if (s->kind == JS_AST_EXPORT_NAMED && s->a && s->a->kind == JS_AST_FUNC_DECL) {
+            if (!cx->module)
+                return cerr(cx, s->pos, JS_ERR_NEEDS_MODULE_LOADER);
             s = s->a;
             exported = true;
+        }
+        if (s->kind == JS_AST_EXPORT_DEFAULT && (s->flags & JS_F_DEFAULT_DECL)) {
+            /* `export default function` is a declaration: made at instantiation like the rest */
+            if (!cx->module)
+                return cerr(cx, s->pos, JS_ERR_NEEDS_MODULE_LOADER);
+            static const uint16_t def_name[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
+            uint16_t c;
+            note_pos(cx, s->pos);
+            if (!compile_function(cx, s->a) || !atom_const(cx, def_name, 7, s->pos, &c) ||
+                !emit_op_u16(cx, JS_OP_INIT_EXPORT, c, 0))
+                return false;
+            const JsAstNode *f = named_default_decl(s);
+            if (f) {
+                /* its name too: a local, or the export binding of `export { name }` */
+                JsModBinding *b = resolve_module_binding(cx, f->units, f->len);
+                if (b && b->kind == JS_MB_EXPORT) {
+                    if (emit_export_writes(cx, f->units, f->len, f->pos, JS_OP_INIT_EXPORT) <= 0)
+                        return cx->err_msg ? false : cerr(cx, f->pos, "internal: export not bound");
+                } else {
+                    int idx = resolve_local_in(cx->cur, f->units, f->len);
+                    if (idx < 0)
+                        return cerr(cx, f->pos, "internal: function not pre-declared");
+                    if (!emit_op_u16(cx, JS_OP_SET_LOCAL, cx->cur->locals[idx].slot, 0))
+                        return false;
+                }
+            }
+            if (!emit_op(cx, JS_OP_POP, -1))
+                return false;
+            continue;
         }
         if (s->kind != JS_AST_FUNC_DECL)
             continue;
@@ -2471,14 +2519,12 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
     case JS_AST_EXPORT_DEFAULT: {
         if (!cx->module)
             return cerr(cx, n->pos, JS_ERR_NEEDS_MODULE_LOADER);
+        if (n->flags & JS_F_DEFAULT_DECL)
+            return true; /* a function declaration: hoisted (hoist_functions) */
         /* exports.default = value */
         note_pos(cx, n->pos);
-        if (n->a->kind == JS_AST_FUNC_EXPR || n->a->kind == JS_AST_FUNC_DECL) {
-            if (!compile_function(cx, n->a))
-                return false;
-        } else if (!compile_expr(cx, n->a)) {
+        if (!compile_expr(cx, n->a))
             return false;
-        }
         uint16_t c;
         static const uint16_t def_name[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
         if (!atom_const(cx, def_name, 7, n->pos, &c))
@@ -2719,7 +2765,9 @@ static bool list_export(JsCompiler *cx, uint32_t *cap, const JsAstNode *module, 
                 if (pattern_binds(d->items[k]->a, name, len))
                     return mbind_add_export(cx, cap, name, len, exp, exp_len,
                                             (d->flags & JS_F_CONST) != 0, true);
-        } else if (d->kind == JS_AST_FUNC_DECL && units_equal(d->units, d->len, name, len)) {
+        } else if ((d->kind == JS_AST_FUNC_DECL && units_equal(d->units, d->len, name, len)) ||
+                   (named_default_decl(d) &&
+                    units_equal(named_default_decl(d)->units, named_default_decl(d)->len, name, len))) {
             return mbind_add_export(cx, cap, name, len, exp, exp_len, false, false);
         }
     }
@@ -2879,8 +2927,17 @@ JsFunctionCell *js_compile_module_body(JsContext *ctx, const JsAstNode *module,
     js_gc_protect(vm, &fs.fn_value);
 
     bool ok = analyze_module(&cx, module, mod) && exports_start_in_tdz(&cx, module, mod);
-    if (ok)
-        ok = compile_block_stmts(&cx, module->items, module->count);
+    if (ok) {
+        /* compile_block_stmts, with the end of instantiation marked after the hoisting: the
+         * loader runs every body in the graph up to there before any body goes on */
+        JsScopeMark m = scope_enter(&cx);
+        ok = prescan_declarations(&cx, module->items, module->count, m.local_count) &&
+             hoist_functions(&cx, module->items, module->count) &&
+             emit_op(&cx, JS_OP_MODULE_READY, 0);
+        for (uint32_t i = 0; ok && i < module->count; i++)
+            ok = compile_stmt(&cx, module->items[i]);
+        ok = ok && scope_leave(&cx, m);
+    }
     /* an entry that runs off its end returned undefined, not its last expression */
     if (ok)
         ok = (mod->entry ? emit_op(&cx, JS_OP_UNDEFINED, +1)

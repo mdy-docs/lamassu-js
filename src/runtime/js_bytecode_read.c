@@ -128,6 +128,7 @@ const JsOpInfo js_op_info[JS_OP__COUNT] = {
     OP(JS_OP_SET_LOCAL_CHECKED, OPF_LOCAL, CF_NEXT, 0, 1, 2),
     OP(JS_OP_SET_UPVAL_CHECKED, OPF_UPVAL, CF_NEXT, 0, 1, 2),
     OP(JS_OP_INIT_EXPORT, OPF_CONST_STR, CF_NEXT, 0, 1, 2),
+    OP(JS_OP_MODULE_READY, OPF_NONE, CF_NEXT, 0, 0, 0),
 };
 #undef OP
 
@@ -523,7 +524,7 @@ static bool const_is_function(JsFunctionCell *fn, uint16_t idx) {
 /* True for the opcodes that dereference fn->module. */
 static bool is_module_opcode(uint8_t opb) {
     return opb == JS_OP_GET_EXPORT || opb == JS_OP_SET_EXPORT || opb == JS_OP_INIT_EXPORT ||
-           opb == JS_OP_GET_IMPORT || opb == JS_OP_IMPORT_NS;
+           opb == JS_OP_GET_IMPORT || opb == JS_OP_IMPORT_NS || opb == JS_OP_MODULE_READY;
 }
 
 static bool verify_pass1(JsFunctionCell *fn, uint8_t *boundary, bool is_module,

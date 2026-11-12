@@ -17,11 +17,12 @@
 #ifndef JS_BCFORMAT_H
 #define JS_BCFORMAT_H
 
-#define JSBC_VERSION 6u /* 3: JS_FN_USES_ARGUMENTS function flag; 4: callee-name table after the line table;
+#define JSBC_VERSION 7u /* 3: JS_FN_USES_ARGUMENTS function flag; 4: callee-name table after the line table;
                            5: JS_OP_THROW_CONST_ASSIGN, and the name table also marks iteration,
                            destructuring and TDZ-able reads;
                            6: JS_OP_SET_LOCAL_CHECKED, JS_OP_SET_UPVAL_CHECKED, JS_OP_INIT_EXPORT,
-                           and a module's let/const export names after its dependency list */
+                           and a module's let/const export names after its dependency list;
+                           7: JS_OP_MODULE_READY after a module's hoisted functions */
 #define JSBC_FLAG_HAS_REGEX 1u /* producer had regex enabled (informational) */
 
 /* Sanity caps: reject absurd sizes early (before allocating) rather than

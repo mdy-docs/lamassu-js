@@ -108,15 +108,6 @@ iterator (`for...of` over the result behaves the same either way).
 
 ## Modules
 
-- **An exported function exists once its own module starts running**, not
-  before any module of the graph runs as in V8. In a cycle, the module that
-  runs first cannot call, from its top-level code, a function exported by a
-  module that runs after it (`f is not a function`). Calls made later (from a
-  function, once both modules have run) work, which covers mutually recursive
-  function modules. `export default function` behaves the same way. (Exported
-  `let`/`const` and `export default` expressions follow V8: read or written
-  before their declaration runs, they throw `Cannot access 'x' before
-  initialization`.)
 - **Named and `export *` re-exports are snapshots**, taken once the source
   module finishes evaluating (dependency order guarantees this has already
   happened). A later mutation of a re-exported *mutable* binding isn't

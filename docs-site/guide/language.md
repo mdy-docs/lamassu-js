@@ -122,7 +122,12 @@ functions.
 `export * from`, `export { a as b } from`, and `export * as ns from`.
 Cyclic and diamond import graphs are supported.
 
-The declaration rules are V8's. An exported `let`/`const` (and an `export
+The declaration rules are V8's. Every module's function declarations
+(`export function`, `export default function` and the module's own) are
+made, and the exported ones bound, before any module of the graph runs, so in
+a cycle the module that runs first can already call a function another one
+exports; an `export default function name() {}` also binds `name` in its
+module. An exported `let`/`const` (and an `export
 default` expression) is in the TDZ until its declaration runs: another module
 of a cycle, or a hoisted function, that reads or writes it first gets
 `ReferenceError: Cannot access 'x' before initialization`. A name in `export {
@@ -131,8 +136,8 @@ not defined in module`) and keeps that declaration's rules, so assigning a
 listed `const` throws; one binding may be exported under several names; an
 imported name exported again is a re-export. A namespace object (`import * as
 ns`) is sealed and read-only, and lists its exports in name order. See the
-[Deviations](/guide/deviations) page for the edge cases (functions in cycles,
-snapshot vs. live re-exports).
+[Deviations](/guide/deviations) page for the edge cases (snapshot vs. live
+re-exports).
 
 ## Regular expressions
 

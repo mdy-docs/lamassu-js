@@ -2416,6 +2416,15 @@ run:; /* (re)load the top frame */
                     RT_THROW("out of memory");
                 break;
             }
+            case JS_OP_MODULE_READY:
+                /* the loader is instantiating this body: its functions exist, so park until
+                 * every module in the graph has reached this point */
+                if (fb->stop_at_ready && fb->frame_count == 1) {
+                    fb->stop_at_ready = false;
+                    fr->ip = ip;
+                    return JS_RUN_READY;
+                }
+                break;
             case JS_OP_GET_IMPORT: {
                 JsModuleImport *imp = &fn->module->imports[READ_U16()];
                 /* imported_name is legitimately NULL for a side-effect-only or
@@ -2530,6 +2539,15 @@ on_error:
 
 /* ---- fiber entry ---- */
 
+/* The fuel a fiber starts (or restarts) with: the caller's remainder, as spawn_fiber explains. */
+static uint64_t fiber_start_fuel(JsContext *ctx) {
+    if (ctx->fiber)
+        return ctx->fiber->fuel;
+    if (!ctx->fuel)
+        return UINT64_MAX;
+    return ctx->fuel_left ? ctx->fuel_left : 1;
+}
+
 /* Allocates a fiber and sets up frame 0 for a call; NULL + *err set on OOM. */
 static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
                             const JsValue *args, int argc, const char **err) {
@@ -2563,12 +2581,7 @@ static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
      * run forever under any budget. A remainder of 0 means the turn is spent:
      * start at 1 so the very first instruction throws (0 would underflow into
      * an unlimited budget). */
-    if (ctx->fiber)
-        fb->fuel = ctx->fiber->fuel;
-    else if (!ctx->fuel)
-        fb->fuel = UINT64_MAX;
-    else
-        fb->fuel = ctx->fuel_left ? ctx->fuel_left : 1;
+    fb->fuel = fiber_start_fuel(ctx);
 
     /*
      * Root the new fiber for the rest of setup. Until the caller installs it as
@@ -2742,6 +2755,76 @@ bool js_call(JsContext *ctx, JsValue fn, JsValue this_val, const JsValue *args,
  * and live in src/frontend/js_compile_api.c — they were only ever here because
  * this file happened to own the public-API banner. Everything below runs
  * already-compiled code and needs no parser. */
+
+JsFiber *js_module_instantiate_body(JsContext *ctx, JsFunctionCell *body, JsValue *error) {
+    JsVm *vm = ctx->vm;
+    *error = js_undefined();
+    JsClosure *cl = closure_new(vm, body);
+    JsFiber *fb = NULL;
+    const char *err = "out of memory";
+    if (cl)
+        fb = spawn_fiber(ctx, cl, js_undefined(), NULL, 0, &err);
+    if (!fb) {
+        JsString *s = js_ascii_cell(vm, err);
+        *error = s ? js_value_from_cell(&s->gc) : js_undefined();
+        return NULL;
+    }
+    fb->is_async = (body->fn_flags & JS_FN_ASYNC) != 0; /* top-level await */
+    fb->stop_at_ready = true;
+    JsValue fbv = js_value_from_cell(&fb->gc);
+    js_gc_protect(vm, &fbv);
+    JsValue out;
+    JsRunStatus st = advance_fiber(ctx, fb, &out);
+    js_gc_unprotect(vm, &fbv);
+    fb->caller = NULL; /* parked: nothing to return to until evaluation resumes it */
+    if (st == JS_RUN_READY)
+        return fb;
+    /* the prologue only makes functions, so this is OOM or the frame limit; a body compiled
+     * before JS_OP_MODULE_READY existed cannot load (the bytecode version is checked) */
+    *error = st == JS_RUN_ERROR ? fb->error : js_undefined();
+    if (st != JS_RUN_ERROR) {
+        JsString *s = js_ascii_cell(vm, "internal error: module body ran past instantiation");
+        *error = s ? js_value_from_cell(&s->gc) : js_undefined();
+    }
+    return NULL;
+}
+
+JsValue js_module_finish_body(JsContext *ctx, JsFiber *fb) {
+    JsVm *vm = ctx->vm;
+    JsValue fbv = js_value_from_cell(&fb->gc);
+    js_gc_protect(vm, &fbv);
+    JsPromise *p = js_promise_alloc(ctx);
+    if (!p) {
+        js_gc_unprotect(vm, &fbv);
+        return js_undefined();
+    }
+    JsValue pv = js_value_from_cell(&p->gc);
+    js_gc_protect(vm, &pv);
+    /* the time since it parked belongs to whoever runs it now */
+    fb->fuel = fiber_start_fuel(ctx);
+    JsValue out;
+    if (fb->is_async) {
+        /* TLA module: as js_run_module — the promise may still be pending, the suspended fiber
+         * kept alive by its AWAIT reaction */
+        fb->result_promise = p;
+        advance_fiber(ctx, fb, &out);
+        js_run_jobs(ctx);
+    } else {
+        /* sync module: run to completion, drain the microtasks it scheduled, settle */
+        JsRunStatus st = advance_fiber(ctx, fb, &out);
+        js_gc_protect(vm, &out);
+        js_run_jobs(ctx);
+        js_gc_unprotect(vm, &out);
+        if (st == JS_RUN_DONE)
+            js_promise_fulfill(ctx, js_value_promise(pv), out);
+        else
+            js_promise_reject(ctx, js_value_promise(pv), fb->error);
+    }
+    JsValue result = pv;
+    js_gc_unprotect(vm, &pv);
+    js_gc_unprotect(vm, &fbv);
+    return result;
+}
 
 JsValue js_run_module(JsContext *ctx, JsValue fnv) {
     JsVm *vm = ctx->vm;

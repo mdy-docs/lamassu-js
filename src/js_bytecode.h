@@ -102,9 +102,14 @@ typedef enum JsOp {
     /* the declaration's own write of an exported binding (SET_EXPORT is an assignment, which
      * throws while the export is still in the TDZ) */
     JS_OP_INIT_EXPORT,       /* u16 name; peeks; module.exports[name] = value */
+    /* a module body's end of instantiation: its functions exist and its exported ones are in
+     * the exports object, and nothing else has run. The loader runs every body in a graph up to
+     * here before any body goes on (a fiber started with stop_at_ready parks here); elsewhere it
+     * does nothing */
+    JS_OP_MODULE_READY,
 } JsOp;
 
-#define JS_OP__COUNT (JS_OP_INIT_EXPORT + 1)
+#define JS_OP__COUNT (JS_OP_MODULE_READY + 1)
 
 /*
  * Per-opcode metadata, the single source of truth the bytecode verifier
@@ -200,6 +205,13 @@ bool js_promise_builtins_init(JsContext *ctx);
 
 /* Resumes a fiber suspended at await (js_interp.c); settles its result promise. */
 void js_resume_fiber(JsContext *ctx, JsFiber *fiber, JsValue value, bool is_throw);
+
+/* A module body in two steps (js_interp.c), so a graph's functions all exist before any body
+ * runs. js_module_instantiate_body runs the body up to JS_OP_MODULE_READY and returns its parked
+ * fiber, or NULL with *error set; js_module_finish_body runs the rest and returns the completion
+ * promise as js_run_module does (undefined on OOM). */
+JsFiber *js_module_instantiate_body(JsContext *ctx, JsFunctionCell *body, JsValue *error);
+JsValue js_module_finish_body(JsContext *ctx, JsFiber *fiber);
 
 /* ---- js_module.c ---- */
 

@@ -45,6 +45,8 @@ void js_gc_mark_module(JsVm *vm, JsModule *m) {
         js_gc_mark_cell(vm, &m->exports->gc);
     if (m->fetch_promise)
         js_gc_mark_cell(vm, &m->fetch_promise->gc);
+    if (m->fiber)
+        js_gc_mark_cell(vm, &m->fiber->gc);
     js_gc_mark_value(vm, m->eval_error);
     js_gc_mark_value(vm, m->returned);
     for (uint32_t i = 0; i < m->import_count; i++) {
@@ -725,6 +727,44 @@ static bool link_module(JsContext *ctx, JsModule *m, JsModError *err) {
     return true;
 }
 
+/* ---- instantiate the bodies (functions made before any body runs) ---- */
+
+/*
+ * V8's InitializeEnvironment: every module in a linked graph gets its function declarations
+ * made and its exported ones bound before any module body runs, so in a cycle the module that
+ * runs first can already call the functions the others export. Each body runs up to
+ * JS_OP_MODULE_READY and parks there (m->fiber); evaluation resumes it. Depth first, a module's
+ * dependencies before it, as V8 orders it. A module evaluated, evaluating or parked already is
+ * left alone, so a later graph (a dynamic import) only instantiates what it brings.
+ */
+static bool init_environments(JsContext *ctx, JsModule *m, JsValue *error) {
+    if (m->env_ready)
+        return true;
+    m->env_ready = true; /* before the dependencies: a cycle comes back here */
+    JsValue mv = module_value(m);
+    js_gc_protect(ctx->vm, &mv);
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < value_module(mv)->dep_count; i++) {
+        JsModule *dep = value_module(mv)->deps[i];
+        if (dep)
+            ok = init_environments(ctx, dep, error);
+    }
+    m = value_module(mv);
+    if (ok && m->body && !m->synthetic && m->status == JS_MOD_LINKED) {
+        JsFiber *fb = js_module_instantiate_body(ctx, m->body, error);
+        m = value_module(mv);
+        if (fb) {
+            m->fiber = fb;
+        } else {
+            m->status = JS_MOD_ERRORED;
+            m->eval_error = *error;
+            ok = false;
+        }
+    }
+    js_gc_unprotect(ctx->vm, &mv);
+    return ok;
+}
+
 /* ---- evaluate (promise-chained; deps strictly left-to-right) ---- */
 
 /* Applies one re-export from `src` (already evaluated) into dst->exports. */
@@ -845,9 +885,13 @@ static bool eval_step(JsContext *ctx, JsValue statev) {
             eval_fail_state(ctx, state, ascii_value(ctx, "out of memory"));
             return true;
         }
+        /* dp is held only here (and by whatever the dependency awaits) across the
+         * allocations below */
+        js_gc_protect(ctx->vm, &dp);
         mstate_set(ctx, state, "index", js_number(i));
         if (!then_bound(ctx, dp, eval_on_dep_done, eval_on_fail, statev))
             eval_fail_state(ctx, state, ascii_value(ctx, "out of memory"));
+        js_gc_unprotect(ctx->vm, &dp);
         return true;
     }
     mstate_set(ctx, state, "index", js_number(i));
@@ -860,8 +904,15 @@ static bool eval_step(JsContext *ctx, JsValue statev) {
         }
     }
 
-    JsValue bodyv = js_value_from_cell(&m->body->gc);
-    JsValue bp = js_run_module(ctx, bodyv);
+    /* the body parked at the end of its instantiation (init_environments): run the rest */
+    JsValue bp;
+    if (m->fiber) {
+        JsFiber *fb = m->fiber;
+        m->fiber = NULL; /* the fiber roots itself while it runs, and its promise after */
+        bp = js_module_finish_body(ctx, fb);
+    } else {
+        bp = js_run_module(ctx, js_value_from_cell(&m->body->gc));
+    }
     int st = js_promise_state(bp);
     if (st == 1) {
         m->status = JS_MOD_EVALUATED;
@@ -974,6 +1025,14 @@ static void root_fetched(JsContext *ctx, JsValue bound, const JsValue *args, int
         js_promise_reject(ctx, done, mod_error_value(ctx, &err));
         return;
     }
+    JsValue ierr = js_undefined();
+    js_gc_protect(ctx->vm, &ierr);
+    bool envs = init_environments(ctx, inst, &ierr);
+    if (!envs)
+        js_promise_reject(ctx, done, ierr);
+    js_gc_unprotect(ctx->vm, &ierr);
+    if (!envs)
+        return;
 
     JsValue ep = evaluate(ctx, root);
     int st = js_promise_state(ep);

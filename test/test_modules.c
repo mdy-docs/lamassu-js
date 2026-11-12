@@ -260,10 +260,13 @@ typedef struct {
     CountAlloc ca;
 } TestVm;
 
+/* set for a second pass of the module-loading tests with a collection at every safe point */
+static bool g_gc_stress;
+
 static void tv_open(TestVm *tv, JsModuleCanonicalizer canon) {
     tv->ca.net_bytes = 0;
     tv->ca.live_allocs = 0;
-    JsVmConfig cfg = {.realloc_fn = count_realloc, .alloc_ud = &tv->ca};
+    JsVmConfig cfg = {.realloc_fn = count_realloc, .alloc_ud = &tv->ca, .gc_stress = g_gc_stress};
     tv->vm = js_vm_new(&cfg);
     tv->ctx = js_context_new(tv->vm);
     g_pending.count = 0;
@@ -763,11 +766,15 @@ static void test_tla_dep_cross_turn(void) {
     js_register_native(tv.ctx, n_defer, 5, native_defer, NULL);
     g_defer_count = 0;
 
+    /* the host keeps the promise it handed out alive from the start: the suspended evaluation
+     * hangs from it */
+    g_defer_promise = js_undefined();
+    g_defer_value = js_undefined();
+    js_gc_protect(tv.vm, &g_defer_promise);
+    js_gc_protect(tv.vm, &g_defer_value);
     static const uint16_t spec[] = {'m', 'a', 'i', 'n'};
     JsValue p = js_eval_module(tv.ctx, spec, 4);
     js_gc_protect(tv.vm, &p);
-    js_gc_protect(tv.vm, &g_defer_promise);
-    js_gc_protect(tv.vm, &g_defer_value);
 
     check(js_promise_state(p) == 0 && g_defer_count == 1 && !js_has_pending_jobs(tv.ctx),
           "tla-dep: root pending while a dependency body awaits the host");
@@ -1057,6 +1064,62 @@ static void test_declaration_rules(void) {
                      "fz,out,q");
 }
 
+/* V8's InitializeEnvironment: every module's functions exist before any module body runs, so
+ * in a cycle the module that runs first can call what the others export */
+static void test_functions_at_instantiation(void) {
+    mods_reset();
+    mod_add("fa",
+            "import { fromB } from 'fb';"
+            "let n = 1;"
+            "export function f() { return 'f'; }"
+            "export function g() { return n; }"
+            "export default function named() { return 'named'; }"
+            "function h() { return 'h' + typeof named; }"
+            "export { h as alias };"
+            "export const out = fromB + ' ' + named() + ' ' + g();");
+    mod_add("fb",
+            "import d, { f, g, alias } from 'fa';" TRY_ALL
+            "export const fromB = t([f, d, alias, g]);");
+    eq_export("import { out } from 'fa'; export const r = out;", "r",
+              "f|named|hfunction|ReferenceError: Cannot access 'n' before initialization named 1");
+
+    /* an anonymous default function, and `export { name }` of a named one */
+    mods_reset();
+    mod_add("da", "import { early } from 'db'; export const r = early;"
+                  "export default function () { return 'anon'; }");
+    mod_add("db", "import d from 'da'; export const early = d();");
+    mod_add("dc", "export default function nd() { return 'nd'; } export { nd, nd as nd2 };");
+    eq_export("import { r } from 'da'; import d, { nd, nd2 } from 'dc';"
+              "export const out = r + ' ' + (d === nd && nd === nd2) + ' ' + nd();",
+              "out", "anon true nd");
+
+    /* three modules and top-level await: each body runs after its dependencies, in V8's order */
+    mods_reset();
+    mod_add("log", "export const log = [];");
+    mod_add("ca", "import { log } from 'log'; import { b } from 'cb';"
+                  "export function a() { return 'a'; } log.push('a:' + b());");
+    mod_add("cb", "import { log } from 'log'; import { c } from 'cc'; await 0;"
+                  "export function b() { return 'b'; } log.push('b:' + c());");
+    mod_add("cc", "import { log } from 'log'; import { a } from 'ca';"
+                  "export function c() { return 'c'; } log.push('c:' + a());");
+    eq_export("import { log } from 'log'; import 'ca'; export const out = log.join(' ');",
+              "out", "c:a b:c a:b");
+
+    /* a body that throws after calling into the module that runs later */
+    mods_reset();
+    mod_add("ea", "import { g } from 'eb'; export function f() { return 1; }");
+    mod_add("eb", "import { f } from 'ea'; export function g() {}"
+                  "if (f() === 1) throw new Error('boom');");
+    {
+        mod_add("main", "import 'ea';");
+        bool ok;
+        char *msg = eval_export_spec("main", "x", &ok);
+        check(!ok && strstr(msg, "boom"), "a cycle body that throws rejects the graph");
+        free(msg);
+    }
+    mods_reset();
+}
+
 int main(void) {
     test_basic_exports();
     test_imports();
@@ -1082,6 +1145,15 @@ int main(void) {
     test_entry_return();
     test_check_module();
     test_declaration_rules();
+    test_functions_at_instantiation();
+    /* parked bodies, cycles and top-level await again with the collector running at every
+     * safe point: the rooting of a fiber between instantiation and evaluation */
+    g_gc_stress = true;
+    test_cycle();
+    test_async_module();
+    test_tla_dep_cross_turn();
+    test_functions_at_instantiation();
+    g_gc_stress = false;
     mods_reset();
     if (checks_failed) {
         fprintf(stderr, "%d/%d module checks FAILED\n", checks_failed, checks_run);

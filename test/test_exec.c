@@ -353,6 +353,9 @@ static void test_errors(void) {
     /* regex landed (phase 10): a literal now evaluates to an object */
     expect_result("let r = /a+/; r.source;", "a+");
     expect_error("import 'm';", RUN_COMPILE_ERR, "module loader");
+    /* a hoisted export is reported the same way, not as an internal error */
+    expect_error("export function f() {} f();", RUN_COMPILE_ERR, "module loader");
+    expect_error("export default function () {}", RUN_COMPILE_ERR, "module loader");
     expect_error("let x = await y;", RUN_RUNTIME_ERR, "y is not defined");
 }
 

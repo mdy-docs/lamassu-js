@@ -319,6 +319,13 @@ static void test_graphs(void) {
     mod_add("main", "import { k } from 'k'; export { k as k2 }; import * as me from 'main'; export function r() { return me.k2; }");
     mod_add("root", "import { r } from 'main'; export const out = r();");
     expect("root", "out", "1");
+
+    /* and its functions exist before any body runs, so the module running first can call them */
+    mod_add("fa", "import { early } from 'fb'; export const r = early;"
+                  "export function f() { return 'f'; } export default function () { return 'd'; }");
+    mod_add("fb", "import d, { f } from 'fa'; export const early = f() + d();");
+    mod_add("fmain", "import { r } from 'fa'; export const out = r;");
+    expect("fmain", "out", "fd");
 }
 
 /* ---- kind confusion + tamper resistance ---- */
