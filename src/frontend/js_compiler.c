@@ -73,6 +73,8 @@ typedef struct JsFuncState {
     JsValue fn_value;          /* GC root while building */
     bool is_module;
     bool is_arrow;
+    /* a named function expression: its name is bound inside it to the function itself */
+    bool binds_own_name;
     /* Hidden local named `arguments` (non-arrow functions only): index into
      * locals, or -1. uses_arguments flips when any lookup resolves to it,
      * including an inner arrow capturing it as an upvalue. */
@@ -125,6 +127,16 @@ static bool compile_object_pattern_items(JsCompiler *cx, const JsAstNode *pat, b
 static bool compile_function(JsCompiler *cx, const JsAstNode *fnode);
 static int emit_module_load(JsCompiler *cx, const JsAstNode *n);
 static bool compile_function(JsCompiler *cx, const JsAstNode *fnode);
+static bool compile_function_as(JsCompiler *cx, const JsAstNode *fnode, const uint16_t *name,
+                                uint32_t name_len);
+static bool compile_named_value(JsCompiler *cx, const JsAstNode *value, const uint16_t *name,
+                                uint32_t name_len);
+
+/* An anonymous function definition (a function expression without a name, or an arrow; a
+ * parenthesized one too): the kind that takes its name from where it is defined. */
+static bool is_anonymous_function(const JsAstNode *n) {
+    return n->kind == JS_AST_FUNC_EXPR && (n->len == 0 || (n->flags & JS_F_ARROW));
+}
 
 static bool cerr(JsCompiler *cx, uint32_t pos, const char *msg) {
     if (!cx->err_msg) {
@@ -1018,7 +1030,8 @@ static bool compile_pattern_default(JsCompiler *cx, const JsAstNode *def,
         return false;
     if (!emit_op(cx, JS_OP_POP, -1))
         return false;
-    if (!compile_expr(cx, def->b))
+    if (def->a->kind == JS_AST_IDENT ? !compile_named_value(cx, def->b, def->a->units, def->a->len)
+                                     : !compile_expr(cx, def->b))
         return false;
     patch_here(cx, skip);
     return compile_pattern_store(cx, def->a, declaring);
@@ -1249,7 +1262,7 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
 
     if (n->op == JS_T_EQ) {
         if (t->kind == JS_AST_IDENT)
-            return compile_expr(cx, n->b) && compile_ident_store(cx, t);
+            return compile_named_value(cx, n->b, t->units, t->len) && compile_ident_store(cx, t);
         if (t->kind == JS_AST_MEMBER) {
             if (!compile_member_target_base(cx, t) || !compile_expr(cx, n->b))
                 return false;
@@ -1272,7 +1285,7 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
             uint32_t end;
             if (!compile_ident_load(cx, t) || !emit_jump(cx, peek, 0, &end))
                 return false;
-            if (!emit_op(cx, JS_OP_POP, -1) || !compile_expr(cx, n->b) ||
+            if (!emit_op(cx, JS_OP_POP, -1) || !compile_named_value(cx, n->b, t->units, t->len) ||
                 !compile_ident_store(cx, t))
                 return false;
             patch_here(cx, end);
@@ -1446,8 +1459,15 @@ static bool compile_object(JsCompiler *cx, const JsAstNode *n) {
             if (!emit_string_const(cx, prop->a->units, prop->a->len, prop->a->pos))
                 return false;
         }
-        if (prop->flags & JS_F_METHOD) {
-            if (!compile_function(cx, prop->b))
+        /* a function value takes the key as its name: a plain key now, a computed or number key
+         * at run time (SET_FUNCTION_NAME, from the key under it on the stack) */
+        bool static_key = !(prop->flags & JS_F_COMPUTED) && prop->a->kind != JS_AST_NUMBER;
+        bool named = (prop->flags & JS_F_METHOD) || is_anonymous_function(prop->b);
+        if (named && static_key) {
+            if (!compile_function_as(cx, prop->b, prop->a->units, prop->a->len))
+                return false;
+        } else if (named) {
+            if (!compile_function(cx, prop->b) || !emit_op(cx, JS_OP_SET_FUNCTION_NAME, 0))
                 return false;
         } else if (!compile_expr(cx, prop->b)) {
             return false;
@@ -1883,6 +1903,19 @@ static bool bind_params(JsCompiler *cx, const JsAstNode *fnode, uint16_t *n_para
         }
     }
 
+    /* A named function expression sees its own name, as a constant holding the function, unless
+     * a parameter has that name (and a declaration in the body shadows it, being a scope in). */
+    if (fs->binds_own_name) {
+        bool taken = false;
+        for (uint32_t i = 0; i < fs->local_count && !taken; i++)
+            taken = units_equal(fs->locals[i].name, fs->locals[i].len, fnode->units, fnode->len);
+        uint16_t slot;
+        if (!taken && (!declare_local(cx, fnode->units, fnode->len, true, fnode->pos, 0, &slot) ||
+                       !emit_op(cx, JS_OP_GET_CALLEE, +1) ||
+                       !emit_op_u16(cx, JS_OP_SET_LOCAL, slot, 0) || !emit_op(cx, JS_OP_POP, -1)))
+            return false;
+    }
+
     /* Pass 3: prologue for defaults and destructuring. */
     for (uint32_t i = 0; i < count; i++) {
         const JsAstNode *p = fnode->items[i];
@@ -1902,7 +1935,11 @@ static bool bind_params(JsCompiler *cx, const JsAstNode *fnode, uint16_t *n_para
                 !emit_op(cx, JS_OP_STRICT_EQ, -1) ||
                 !emit_jump(cx, JS_OP_JUMP_IF_FALSE, -1, &skip))
                 return false;
-            if (!emit_op(cx, JS_OP_POP, -1) || !compile_expr(cx, p->b))
+            if (!emit_op(cx, JS_OP_POP, -1))
+                return false;
+            if (target->kind == JS_AST_IDENT
+                    ? !compile_named_value(cx, p->b, target->units, target->len)
+                    : !compile_expr(cx, p->b))
                 return false;
             patch_here(cx, skip);
         }
@@ -1920,7 +1957,23 @@ static bool bind_params(JsCompiler *cx, const JsAstNode *fnode, uint16_t *n_para
 
 static bool compile_block_stmts(JsCompiler *cx, JsAstNode *const *stmts, uint32_t count);
 
+/* V8's NamedEvaluation: `const f = () => {}`, `f = function () {}`, `{ f: () => {} }`, a default
+ * `f = () => {}` and `export default () => {}` name the function f (or default). Anything else
+ * compiles as it is. */
+static bool compile_named_value(JsCompiler *cx, const JsAstNode *value, const uint16_t *name,
+                                uint32_t name_len) {
+    if (is_anonymous_function(value))
+        return compile_function_as(cx, value, name, name_len);
+    return compile_expr(cx, value);
+}
+
 static bool compile_function(JsCompiler *cx, const JsAstNode *fnode) {
+    return compile_function_as(cx, fnode, NULL, 0);
+}
+
+/* name: the name the function takes from where it is defined, used when it has none of its own */
+static bool compile_function_as(JsCompiler *cx, const JsAstNode *fnode, const uint16_t *name,
+                                uint32_t name_len) {
     if (++cx->func_depth > 200)
         return cerr(cx, fnode->pos, "functions nested too deeply");
 
@@ -1939,10 +1992,17 @@ static bool compile_function(JsCompiler *cx, const JsAstNode *fnode) {
     fs.scratch_slot = -1;
     fs.arguments_local = -1;
     fs.is_arrow = (fnode->flags & JS_F_ARROW) != 0;
+    /* not for `export default function f` (a declaration: f is the module's binding), which is
+     * the one named function compiled with a name given from outside */
+    fs.binds_own_name = fnode->kind == JS_AST_FUNC_EXPR && fnode->len && !fs.is_arrow && !name;
     js_gc_protect(cx->vm, &fs.fn_value);
     /* Intern the name only after fn is rooted (interning may collect). */
     if (fnode->len && !fs.is_arrow) {
-        JsValue nm = js_atom(cx->vm, fnode->units, fnode->len);
+        name = fnode->units;
+        name_len = fnode->len;
+    }
+    if (name && name_len) {
+        JsValue nm = js_atom(cx->vm, name, name_len);
         if (js_is_string(nm))
             ((JsFunctionCell *)js_value_cell(fs.fn_value))->name = js_value_string(nm);
     }
@@ -1996,7 +2056,8 @@ static bool compile_let_decl(JsCompiler *cx, const JsAstNode *n) {
         const JsAstNode *d = n->items[i];
         note_pos(cx, d->pos);
         if (d->b) {
-            if (!compile_expr(cx, d->b))
+            if (d->a->kind == JS_AST_IDENT ? !compile_named_value(cx, d->b, d->a->units, d->a->len)
+                                           : !compile_expr(cx, d->b))
                 return false;
         } else if (!emit_op(cx, JS_OP_UNDEFINED, +1)) {
             return false;
@@ -2026,7 +2087,7 @@ static bool hoist_functions(JsCompiler *cx, JsAstNode *const *stmts, uint32_t co
             static const uint16_t def_name[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
             uint16_t c;
             note_pos(cx, s->pos);
-            if (!compile_function(cx, s->a) || !atom_const(cx, def_name, 7, s->pos, &c) ||
+            if (!compile_function_as(cx, s->a, def_name, 7) || !atom_const(cx, def_name, 7, s->pos, &c) ||
                 !emit_op_u16(cx, JS_OP_INIT_EXPORT, c, 0))
                 return false;
             const JsAstNode *f = named_default_decl(s);
@@ -2521,9 +2582,10 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
             return cerr(cx, n->pos, JS_ERR_NEEDS_MODULE_LOADER);
         if (n->flags & JS_F_DEFAULT_DECL)
             return true; /* a function declaration: hoisted (hoist_functions) */
-        /* exports.default = value */
+        /* exports.default = value (an anonymous function is named default) */
         note_pos(cx, n->pos);
-        if (!compile_expr(cx, n->a))
+        static const uint16_t dflt[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
+        if (!compile_named_value(cx, n->a, dflt, 7))
             return false;
         uint16_t c;
         static const uint16_t def_name[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};

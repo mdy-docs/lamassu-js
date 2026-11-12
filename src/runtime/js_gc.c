@@ -152,6 +152,8 @@ static void js_gc_trace(JsVm *vm) {
                 js_gc_mark_cell(vm, &cl->prototype_obj->gc);
             if (cl->props)
                 js_gc_mark_cell(vm, &cl->props->gc);
+            if (cl->name)
+                js_gc_mark_cell(vm, &cl->name->gc);
             for (uint16_t i = 0; i < cl->n_upvals; i++) {
                 if (cl->upvals[i])
                     js_gc_mark_cell(vm, &cl->upvals[i]->gc);

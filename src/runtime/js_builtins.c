@@ -1478,6 +1478,20 @@ static bool fm_bind(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
         *r = js_oom_value(vm);
         return false;
     }
+    /* named "bound " and the target's name, as in V8 */
+    js_gc_protect(vm, &fn);
+    JsString *prefix = js_ascii_cell(vm, "bound ");
+    JsValue pv = prefix ? js_value_from_cell(&prefix->gc) : js_undefined();
+    js_gc_protect(vm, &pv);
+    const JsString *target = js_function_name(tv); /* tv's, so rooted by the caller */
+    JsString *nm = prefix && target && target->length ? js_concat_cells(vm, prefix, target) : prefix;
+    js_gc_unprotect(vm, &pv);
+    js_gc_unprotect(vm, &fn);
+    if (!nm) {
+        *r = js_oom_value(vm);
+        return false;
+    }
+    ((JsNative *)js_value_cell(fn))->name = nm;
     *r = fn;
     return true;
 }
@@ -2454,6 +2468,16 @@ static bool obj_assign(JsContext *ctx, JsValue tv, const JsValue *args, int argc
         return native_throw_fmt(ctx, r, "ReferenceError: %S is not defined", uninit);
     if (!ok)
         return oom(ctx, r);
+    if (js_is_function(target)) {
+        /* a function's name is read-only: the copy that landed among its own properties goes */
+        static const uint16_t nm[] = {'n', 'a', 'm', 'e'};
+        JsValue k = js_atom(ctx->vm, nm, 4);
+        if (!js_is_string(k))
+            return oom(ctx, r);
+        if (js_map_delete(&js_value_object(dst)->props, js_value_string(k)))
+            return native_throw_fmt(ctx, r, "TypeError: Cannot assign to read only property 'name' of function '%v'",
+                                    target);
+    }
     *r = target;
     return true;
 }
@@ -2594,9 +2618,20 @@ static bool object_has_own_key(JsContext *ctx, JsObject *ob, JsValue key, bool *
     return true;
 }
 
+/* Every function has `name` as an own property (read-only, not enumerable), as in V8. */
+static bool is_function_name_key(JsValue fn, JsValue key) {
+    return js_is_function(fn) && js_is_string(key) && js_value_string(key)->length == 4 &&
+           js_value_string(key)->units[0] == 'n' && js_value_string(key)->units[1] == 'a' &&
+           js_value_string(key)->units[2] == 'm' && js_value_string(key)->units[3] == 'e';
+}
+
 static bool obj_hasOwn(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     JsValue o = ARG(0);
+    if (is_function_name_key(o, ARG(1))) {
+        *r = js_bool(true);
+        return true;
+    }
     if (js_is_function(o)) {
         JsObject *own = js_function_props(ctx, o, false);
         o = own ? js_value_from_cell(&own->gc) : js_undefined();
@@ -2621,6 +2656,10 @@ static bool obj_hasOwn(JsContext *ctx, JsValue tv, const JsValue *args, int argc
 
 static bool objp_hasOwnProperty(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                                 JsValue *r) {
+    if (is_function_name_key(tv, ARG(0))) {
+        *r = js_bool(true);
+        return true;
+    }
     if (js_is_function(tv)) {
         JsObject *own = js_function_props(ctx, tv, false);
         tv = own ? js_value_from_cell(&own->gc) : js_undefined();

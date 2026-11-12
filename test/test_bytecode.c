@@ -232,6 +232,11 @@ static void test_roundtrip(void) {
     /* JS_OP_DYNAMIC_IMPORT survives the round-trip (no loader registered, so
      * calling it yields a rejected promise — typeof proves the value shape) */
     eq("function load(s) { return import(s); } typeof load(0).then;", "function");
+    /* function names, inferred and computed, and a named expression's own name */
+    eq("const k = 'dyn'; const arrow = () => 0; const o = { [k]: () => 0, m() {} };"
+       "const f = function inner(n) { return n ? inner(n - 1) : inner.name; };"
+       "[arrow.name, o.dyn.name, o.m.name, f(2)].join();",
+       "arrow,dyn,m,inner");
 }
 
 static void test_vs_direct(void) {

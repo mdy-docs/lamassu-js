@@ -214,11 +214,8 @@ static void fb_piece(FmtBuf *b, const uint16_t *u, size_t n) {
 /* A function's name for a message, or "anonymous" */
 static void fb_function_name(JsContext *ctx, FmtBuf *b, JsValue v) {
     JsGcCell *c = js_value_cell(v);
-    const JsString *name = NULL;
-    if (c->kind == JS_KIND_CLOSURE)
-        name = ((JsClosure *)c)->fn->name;
-    else if (c->kind == JS_KIND_NATIVE)
-        name = ((JsNative *)c)->name;
+    (void)c;
+    const JsString *name = js_function_name(v);
     (void)ctx;
     if (name && name->length)
         fb_piece(b, name->units, name->length);

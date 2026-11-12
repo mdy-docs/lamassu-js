@@ -107,9 +107,12 @@ typedef enum JsOp {
      * here before any body goes on (a fiber started with stop_at_ready parks here); elsewhere it
      * does nothing */
     JS_OP_MODULE_READY,
+    /* stack [key, fn]: an anonymous function defined under a computed (or number) key takes the
+     * key, as a string, as its name; peeks both */
+    JS_OP_SET_FUNCTION_NAME,
 } JsOp;
 
-#define JS_OP__COUNT (JS_OP_MODULE_READY + 1)
+#define JS_OP__COUNT (JS_OP_SET_FUNCTION_NAME + 1)
 
 /*
  * Per-opcode metadata, the single source of truth the bytecode verifier
@@ -286,6 +289,8 @@ JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound);
 /* A function value's own-property object (js_interp.c): with create, made on first use (NULL on
  * OOM); without, NULL when it has none. Object builtins use it to treat functions as objects. */
 JsObject *js_function_props(JsContext *ctx, JsValue fn, bool create);
+/* A function value's `name` (closure or native); NULL for none, which reads as "". */
+JsString *js_function_name(JsValue fn);
 /* The JsBoundFn of every function Function.prototype.bind makes (js_builtins.c); its bound value
  * is the array [target, thisArg, ...presetArgs]. `new` recognises it to construct the target. */
 bool js_bind_call(JsContext *ctx, JsValue bound, JsValue this_val, const JsValue *args, int argc,

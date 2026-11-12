@@ -117,7 +117,16 @@ Every function value, a script closure or a native, has `call`, `apply` and `bin
   function constructs `f` with the preset arguments and ignores the bound `this`.
 
 Modules are strict, so `undefined` and `null` are passed through as they are rather than replaced by
-the global object, and arrow functions keep their own `this`. Functions have no `name` or `length`.
+the global object, and arrow functions keep their own `this`.
+
+Every function has V8's `name`, a read-only own property: a declaration's or a named expression's
+own name; for an anonymous function or arrow, the name of what it is defined as (`const f = () =>
+{}`, `f = function () {}`, `{ f: () => {} }` and `{ f() {} }`, a computed key's string, a default
+`f = () => {}`, `export default () => {}` as `default`); a builtin's (`Math.max.name` is `max`);
+`bound f` for `f.bind(...)`; otherwise `""`. Assigning it throws `TypeError: Cannot assign to read
+only property 'name' of function 'f'`; `delete f.name` leaves `""`. A named function expression
+sees its own name inside its body, as a constant holding the function. Functions have no `length`
+and `String(f)` is `"[function]"`.
 
 A function can hold properties like any object, which is how a constructor gets statics with
 classes out of the language: `F.from = (v) => new F(v)`, `F.ORIGIN = new F(0)`, a cache on a helper.

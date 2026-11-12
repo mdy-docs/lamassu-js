@@ -242,6 +242,8 @@ typedef struct JsClosure {
     /* Properties a script gives the function (statics on a constructor: F.create = ...); a plain
      * object, created on the first write. NULL until then. */
     JsObject *props;
+    /* The name a computed key gave it (JS_OP_SET_FUNCTION_NAME); NULL: fn->name. */
+    JsString *name;
     JsUpvalue *upvals[];
 } JsClosure;
 

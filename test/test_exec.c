@@ -1212,6 +1212,59 @@ static void test_heap_limit_is_a_hard_cap(void) {
         512u * 1024);
 }
 
+/* A function's name, as V8 gives it: its own, the one inferred from where an anonymous one is
+ * defined, a builtin's, a bound one's; read-only; and a named function expression sees itself. */
+static void test_function_names(void) {
+    expect_result("function decl() {} const arrow = () => 1; let fx = function () {};"
+                  "const named = function inner() {}; let later; later = () => 2;"
+                  "let lor = null; lor ?\?= function () {};"
+                  "[decl.name, arrow.name, fx.name, named.name, later.name, lor.name].join();",
+                  "decl,arrow,fx,inner,later,lor");
+    expect_result("const k = 'dyn'; const o = { prop: () => 1, m() {}, async am() {},"
+                  "  'str key': function () {}, 7: () => 0, 1.5: () => 0, [k]: () => 0,"
+                  "  keep: function own() {} };"
+                  "[o.prop.name, o.m.name, o.am.name, o['str key'].name, o[7].name, o[1.5].name,"
+                  " o.dyn.name, o.keep.name].join();",
+                  "prop,m,am,str key,7,1.5,dyn,own");
+    expect_result("const fs = []; for (const key of ['p', 'q']) fs.push({ [key]: () => 0 }[key]);"
+                  "fs.map(f => f.name).join();", "p,q");
+    expect_result("const { dflt = () => 0, x: renamed = function () {} } = {};"
+                  "const [adflt = () => 0] = [];"
+                  "function params(p = () => 0) { return p.name; }"
+                  "let a, b; a = b = () => 0;"
+                  "[dflt.name, renamed.name, adflt.name, params(), a.name, b.name].join();",
+                  "dflt,renamed,adflt,p,b,b");
+    /* not a naming position: an IIFE, a comma, a member, a conditional */
+    expect_result("const seq = (0, function () {}); const m = {}; m.f = () => 0;"
+                  "const c = true ? () => 0 : null; const paren = (function () {});"
+                  "JSON.stringify([(() => 0).name, seq.name, m.f.name, c.name, paren.name]);",
+                  "[\"\",\"\",\"\",\"\",\"paren\"]");
+    expect_result("function decl() {} function nm() {}"
+                  "[decl.bind(null).name, (() => 0).bind(null).name, nm.bind(null).bind(null).name,"
+                  " Math.max.name, JSON.stringify.name, [].map.name, String.name].join();",
+                  "bound decl,bound ,bound bound nm,max,stringify,map,String");
+    expect_result("function decl() {} ['name' in decl, Object.keys(decl).length,"
+                  " decl.hasOwnProperty('name'), Object.hasOwn(decl, 'name')].join();",
+                  "true,0,true,true");
+    expect_error("function decl() {} decl.name = 'x';", RUN_RUNTIME_ERR,
+                 "TypeError: Cannot assign to read only property 'name' of function 'decl'");
+    expect_error("const f = () => 0; Object.assign(f, { name: 'z' });", RUN_RUNTIME_ERR,
+                 "TypeError: Cannot assign to read only property 'name' of function 'f'");
+    expect_result("const f = () => 0; delete f.name; JSON.stringify(f.name);", "\"\"");
+    expect_error("const f = () => 0; Object.freeze(f); delete f.name;", RUN_RUNTIME_ERR,
+                 "TypeError: Cannot delete property 'name' of f");
+    /* a named function expression's own name: the function, constant, shadowed by a parameter
+     * or a declaration in its body */
+    expect_result("const f = function inner(n) { return n ? inner(n - 1) + 1 : 0; };"
+                  "[f(3), typeof inner, (function g(g) { return g; })(5),"
+                  " (function h() { const h = 2; return h; })(),"
+                  " (function c() { return () => c; })()().name,"
+                  " (function d(x = d) { return x === d; })()].join();",
+                  "3,undefined,5,2,c,true");
+    expect_error("(function k() { k = 1; })();", RUN_RUNTIME_ERR,
+                 "TypeError: Assignment to constant variable.");
+}
+
 int main(void) {
     test_heap_limit_is_a_hard_cap();
     test_regex_memory_is_capped();
@@ -1230,6 +1283,7 @@ int main(void) {
     test_update_ops();
     test_errors();
     test_functions();
+    test_function_names();
     test_new();
     test_real_prototypes();
     test_closures();

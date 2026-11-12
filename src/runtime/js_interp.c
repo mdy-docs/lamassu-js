@@ -414,6 +414,22 @@ JsObject *js_function_props(JsContext *ctx, JsValue fn, bool create) {
     return *slot;
 }
 
+JsString *js_function_name(JsValue fn) {
+    if (!js_is_function(fn))
+        return NULL;
+    JsGcCell *c = js_value_cell(fn);
+    if (c->kind == JS_KIND_CLOSURE)
+        return ((JsClosure *)c)->name ? ((JsClosure *)c)->name : ((JsClosure *)c)->fn->name;
+    if (c->kind == JS_KIND_NATIVE)
+        return ((JsNative *)c)->name;
+    return ((JsFunctionCell *)c)->name;
+}
+
+/* `name`: a read-only own property of every function, as in V8 */
+static bool is_name_key(JsValue key) {
+    return js_is_string(key) && units_is_ascii_str(js_value_string(key), "name");
+}
+
 /* A module namespace's let/const export reads as JS_SPECIAL_TDZ until its declaration has run
  * (also through a prototype chain): every caller that hands the value to a script checks it. */
 static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
@@ -525,6 +541,16 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
             if (c->kind == JS_KIND_CLOSURE || c->kind == JS_KIND_NATIVE)
                 return JS_PROP_OOM;
         }
+        if (is_name_key(key)) {
+            JsString *nm = js_function_name(base);
+            if (!nm) {
+                nm = js_ascii_cell(vm, "");
+                if (!nm)
+                    return JS_PROP_OOM;
+            }
+            *out = js_value_from_cell(&nm->gc);
+            return JS_PROP_OK;
+        }
         JsObject *own = js_function_props(ctx, base, false);
         if (own) {
             JsPropStatus st = method_lookup(ctx, own, key, out);
@@ -627,6 +653,10 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
                     ((JsNative *)c)->prototype = js_value_object(val);
             }
             return JS_PROP_OK;
+        }
+        if (is_name_key(key)) {
+            *errmsg = SET_READ_ONLY;
+            return JS_PROP_TYPE_ERROR;
         }
         /* any other key: the function's own properties (statics, constants, caches) */
         JsObject *own = js_function_props(ctx, base, true);
@@ -866,7 +896,8 @@ static void frame_record(JsStackFrame *out, const JsFrame *fr, uint32_t ip) {
     out->specifier = fn->module && fn->module->specifier
                          ? js_value_from_cell(&fn->module->specifier->gc)
                          : js_undefined();
-    out->function = fn->name ? js_value_from_cell(&fn->name->gc) : js_undefined();
+    JsString *name = fr->closure->name ? fr->closure->name : fn->name;
+    out->function = name ? js_value_from_cell(&name->gc) : js_undefined();
     out->pos = lookup_pos(fn, ip);
 }
 
@@ -1081,6 +1112,7 @@ static JsClosure *closure_new(JsVm *vm, JsFunctionCell *fn) {
     cl->has_this = false;
     cl->prototype_obj = NULL;
     cl->props = NULL;
+    cl->name = NULL;
     cl->n_upvals = fn->n_upvals;
     for (uint16_t i = 0; i < fn->n_upvals; i++)
         cl->upvals[i] = NULL;
@@ -2012,6 +2044,21 @@ run:; /* (re)load the top frame */
                             RT_THROW("out of memory");
                         js_map_delete(&o->props, k);
                     }
+                } else if (js_is_function(b) && is_name_key(key)) {
+                    /* name is configurable: deleting it leaves Function.prototype's, "" */
+                    JsObject *own = js_function_props(ctx, b, false);
+                    if (own && own->obj_flags) {
+                        fiber_throw_value(fb, js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of %v", key, b));
+                        RT_RAISE();
+                    }
+                    JsString *empty = js_ascii_cell(vm, "");
+                    if (!empty)
+                        RT_THROW("out of memory");
+                    JsGcCell *fc = js_value_cell(fb->stack[fb->sp - 2]);
+                    if (fc->kind == JS_KIND_CLOSURE)
+                        ((JsClosure *)fc)->name = empty;
+                    else if (fc->kind == JS_KIND_NATIVE)
+                        ((JsNative *)fc)->name = empty;
                 } else if (js_is_function(b)) {
                     JsObject *own = js_function_props(ctx, b, false);
                     if (own) {
@@ -2414,6 +2461,18 @@ run:; /* (re)load the top frame */
                 }
                 if (!js_map_set(vm, &fn->module->exports->props, name, PEEK(0)))
                     RT_THROW("out of memory");
+                break;
+            }
+            case JS_OP_SET_FUNCTION_NAME: {
+                /* the compiler emits this only after an anonymous function definition, so the
+                 * value is a fresh closure with no name of its own */
+                JsValue f = PEEK(0);
+                if (js_is_function(f) && js_value_cell(f)->kind == JS_KIND_CLOSURE) {
+                    JsString *nm = js_to_string_cell(ctx, PEEK(1), 0);
+                    if (!nm)
+                        RT_THROW("out of memory");
+                    ((JsClosure *)js_value_cell(PEEK(0)))->name = nm;
+                }
                 break;
             }
             case JS_OP_MODULE_READY:

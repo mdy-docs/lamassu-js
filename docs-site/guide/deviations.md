@@ -30,6 +30,14 @@ that's known to differ, so you're not surprised by one in production.
   one. That covers everything guest code can observe of an ordinary frozen
   object; it only differs if you were reaching for a partially frozen one.
 
+## Functions
+
+- **No `length`, and no source text**: `f.length` is `undefined`, `String(f)` is `"[function]"`,
+  and a message that names a function (`Cannot assign to read only property 'name' of function
+  'f'`) gives its name where V8 quotes its source.
+- **After `delete f.name`**, `f.name` is `""` as in V8, but `f.hasOwnProperty('name')` still says
+  `true`.
+
 ## Arrays
 
 - **No holes.** Array storage is a flat vector, not a sparse structure —
