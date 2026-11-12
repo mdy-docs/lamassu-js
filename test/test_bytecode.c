@@ -238,6 +238,12 @@ static void test_roundtrip(void) {
        "[arrow.name, o.dyn.name, o.m.name, f(2)].join();",
        "arrow,dyn,m,inner");
     eq("[((a, b = 1) => 0).length, (function (a, b, ...c) {}).length].join();", "1,2");
+    /* functions' source text, sliced from the one copy the cache carries */
+    eq("const o = { m(a) { return a } }; const f = async (x) => x;"
+       "function g() { return function () { return 'e' }; }"
+       "[o.m, f, g, g(), Math.max].join('|');",
+       "m(a) { return a }|async (x) => x|function g() { return function () { return 'e' }; }|"
+       "function () { return 'e' }|function max() { [native code] }");
 }
 
 static void test_vs_direct(void) {

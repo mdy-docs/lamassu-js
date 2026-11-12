@@ -141,6 +141,7 @@ typedef struct {
     const uint8_t *p;
     const uint8_t *end;
     bool bad;
+    JsString *source; /* the root function's source text, which nested functions' ranges slice */
 } InBuf;
 
 static uint8_t in_u8(InBuf *b) {
@@ -315,6 +316,45 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
             goto done;
         }
         fn->name = js_value_string(nm);
+    }
+
+    /* source range, then (the root only) the source text */
+    uint32_t src_start = in_u32(b), src_end = in_u32(b);
+    if (depth == 0) {
+        uint32_t n = in_u32(b);
+        if (b->bad || n > JSBC_MAX_SOURCE || (size_t)(b->end - b->p) < (size_t)n * 2) {
+            *err = "SyntaxError: bad or truncated bytecode source";
+            goto done;
+        }
+        b->source = NULL;
+        if (n) {
+            /* a scratch copy (the input may be unaligned), then the string; fn roots it */
+            uint16_t *u = js_realloc_raw(vm, NULL, 0, (size_t)n * sizeof *u);
+            if (!u) {
+                *err = "out of memory";
+                goto done;
+            }
+            for (uint32_t i = 0; i < n; i++)
+                u[i] = (uint16_t)(b->p[i * 2] | ((uint16_t)b->p[i * 2 + 1] << 8));
+            b->p += (size_t)n * 2;
+            fn->source = js_string_cell_new(vm, u, n);
+            js_realloc_raw(vm, u, (size_t)n * sizeof *u, 0);
+            if (!fn->source) {
+                *err = "out of memory";
+                goto done;
+            }
+            b->source = fn->source;
+        }
+    }
+    if (b->bad || (src_end && (!b->source || src_start >= src_end || src_end > b->source->length)) ||
+        (!src_end && src_start)) {
+        *err = "SyntaxError: bad bytecode source range";
+        goto done;
+    }
+    if (src_end) {
+        fn->source = b->source;
+        fn->src_start = src_start;
+        fn->src_end = src_end;
     }
 
     /* code */
@@ -1001,7 +1041,7 @@ static int read_header(InBuf *b, const char **err) {
 }
 
 int js_bytecode_kind(const uint8_t *buf, size_t len) {
-    InBuf b = {buf, buf + len, false};
+    InBuf b = {buf, buf + len, false, NULL};
     const char *err = NULL;
     return read_header(&b, &err);
 }
@@ -1016,7 +1056,7 @@ JsValue js_bytecode_load(JsContext *ctx, const uint8_t *buf, size_t len,
         err_msg = &dummy;
     *err_msg = NULL;
 
-    InBuf b = {buf, buf + len, false};
+    InBuf b = {buf, buf + len, false, NULL};
     int kind = read_header(&b, err_msg);
     if (kind < 0)
         return js_undefined();
@@ -1095,7 +1135,7 @@ bool js_bc_load_module(JsContext *ctx, JsModule *m, const uint8_t *buf, size_t l
                        const char **err) {
     JsVm *vm = ctx->vm;
     *err = NULL;
-    InBuf b = {buf, buf + len, false};
+    InBuf b = {buf, buf + len, false, NULL};
     int kind = read_header(&b, err);
     if (kind < 0)
         return false;

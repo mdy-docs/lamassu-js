@@ -215,6 +215,7 @@ static const JsBuiltinLength js_builtin_lengths[] = {
     {"Function.prototype", "apply", 2},
     {"Function.prototype", "bind", 1},
     {"Function.prototype", "call", 1},
+    {"Function.prototype", "toString", 0},
 };
 
 #endif

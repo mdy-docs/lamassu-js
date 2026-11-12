@@ -32,9 +32,8 @@ that's known to differ, so you're not surprised by one in production.
 
 ## Functions
 
-- **No source text**: `String(f)` is `"[function]"`, and a message that names a function
-  (`Cannot assign to read only property 'name' of function 'f'`) gives its name where V8 quotes
-  its source.
+- **There is no `Function` global** (the constructor is left out, as `eval` is), so
+  `Function.prototype.toString.call(x)` is written `(() => {}).toString.call(x)`.
 - **After `delete f.name` or `delete f.length`**, it reads `""` or `0` as in V8, but
   `f.hasOwnProperty(...)` still says `true`.
 

@@ -17,7 +17,7 @@
 #ifndef JS_BCFORMAT_H
 #define JS_BCFORMAT_H
 
-#define JSBC_VERSION 9u /* 3: JS_FN_USES_ARGUMENTS function flag; 4: callee-name table after the line table;
+#define JSBC_VERSION 10u /* 3: JS_FN_USES_ARGUMENTS function flag; 4: callee-name table after the line table;
                            5: JS_OP_THROW_CONST_ASSIGN, and the name table also marks iteration,
                            destructuring and TDZ-able reads;
                            6: JS_OP_SET_LOCAL_CHECKED, JS_OP_SET_UPVAL_CHECKED, JS_OP_INIT_EXPORT,
@@ -25,12 +25,15 @@
                            7: JS_OP_MODULE_READY after a module's hoisted functions;
                            8: JS_OP_SET_FUNCTION_NAME, inferred names (arrows too), and a named function expression's
                            own name (JS_OP_GET_CALLEE);
-                           9: a function's length after its parameter count */
+                           9: a function's length after its parameter count;
+                           10: a function's source range after its name, and the root's source text
+                           (u32 length, then UTF-16 units; length 0 for none) after its range */
 #define JSBC_FLAG_HAS_REGEX 1u /* producer had regex enabled (informational) */
 
 /* Sanity caps: reject absurd sizes early (before allocating) rather than
  * trusting the buffer. Generous vs. anything the compiler emits. */
 #define JSBC_MAX_CODE (4u * 1024 * 1024)
+#define JSBC_MAX_SOURCE (64u * 1024 * 1024) /* UTF-16 units of the source text */
 #define JSBC_MAX_CONSTS 65536u /* const indices are u16 */
 #define JSBC_MAX_LOCALS 65536u
 #define JSBC_MAX_NAME 4096u

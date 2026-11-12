@@ -251,6 +251,14 @@ static void expect(const char *root, const char *exp, const char *expected) {
 }
 
 static void test_graphs(void) {
+    /* functions' source text, from source and from each module's cache alike: an exported
+     * declaration's from `function` or `async`, an anonymous default's too */
+    mod_add("srcs", "export default function () { return 1 }\n"
+                    "export async function g(a) { return a }\n"
+                    "export const ar = (x) => x * 2;");
+    mod_add("main", "import d, { g, ar } from 'srcs'; export const r = [d, g, ar].join('|');");
+    expect("main", "r", "function () { return 1 }|async function g(a) { return a }|(x) => x * 2");
+
     /* basic import/export */
     mod_add("util", "export const g = 'hi'; export function up(s){ return s.toUpperCase(); }");
     mod_add("main", "import { g, up } from 'util'; export const r = up(g);");

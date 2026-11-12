@@ -105,6 +105,8 @@ static void js_gc_trace(JsVm *vm) {
                 js_gc_mark_value(vm, f->consts[i]);
             if (f->name)
                 js_gc_mark_cell(vm, &f->name->gc);
+            if (f->source)
+                js_gc_mark_cell(vm, &f->source->gc);
             if (f->module)
                 js_gc_mark_cell(vm, &f->module->gc);
             break;

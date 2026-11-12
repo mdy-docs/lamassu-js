@@ -79,7 +79,7 @@ JsString *js_to_string_cell(JsContext *ctx, JsValue v, int depth) {
     if (v.bits == JS_SPECIAL_FALSE)
         return js_ascii_cell(vm, "false");
     if (js_is_function(v))
-        return js_ascii_cell(vm, "[function]");
+        return js_function_source(ctx, v);
     if (js_is_promise(v))
         return js_ascii_cell(vm, "[object Promise]");
     if (js_is_object(v)) {
@@ -422,8 +422,43 @@ JsString *js_function_name(JsValue fn) {
     if (c->kind == JS_KIND_CLOSURE)
         return ((JsClosure *)c)->name ? ((JsClosure *)c)->name : ((JsClosure *)c)->fn->name;
     if (c->kind == JS_KIND_NATIVE)
-        return ((JsNative *)c)->name;
+        return ((JsNative *)c)->name_deleted ? NULL : ((JsNative *)c)->name;
     return ((JsFunctionCell *)c)->name;
+}
+
+/* Function.prototype.toString, as V8 gives it: a function's own source text, from `function`,
+ * `async`, its first parameter or its method key to its last token; for a built-in or a host
+ * function, `function NAME() { [native code] }` with the name it was made with; for a bound
+ * function, `function () { [native code] }`. NULL only on OOM. */
+JsString *js_function_source(JsContext *ctx, JsValue fn) {
+    JsGcCell *c = js_value_cell(fn);
+    JsFunctionCell *f = c->kind == JS_KIND_CLOSURE ? ((JsClosure *)c)->fn
+                        : c->kind == JS_KIND_FUNCTION ? (JsFunctionCell *)c : NULL;
+    if (f && f->source && f->src_end > f->src_start && f->src_end <= f->source->length)
+        return js_string_cell_new(ctx->vm, f->source->units + f->src_start, f->src_end - f->src_start);
+    const JsString *name = NULL;
+    if (f)
+        name = f->name;
+    else if (c->kind == JS_KIND_NATIVE && !(((JsNative *)c)->is_bound &&
+                                           ((JsNative *)c)->bound_fn == js_bind_call))
+        name = ((JsNative *)c)->name;
+    static const char pre[] = "function ", post[] = "() { [native code] }";
+    size_t np = sizeof pre - 1, nq = sizeof post - 1, nn = name ? name->length : 0;
+    size_t n = np + nn + nq;
+    uint16_t stackbuf[128];
+    uint16_t *u = n <= 128 ? stackbuf : js_realloc_raw(ctx->vm, NULL, 0, n * sizeof *u);
+    if (!u)
+        return NULL;
+    for (size_t i = 0; i < np; i++)
+        u[i] = (uint16_t)pre[i];
+    for (size_t i = 0; i < nn; i++)
+        u[np + i] = name->units[i];
+    for (size_t i = 0; i < nq; i++)
+        u[np + nn + i] = (uint16_t)post[i];
+    JsString *s = js_string_cell_new(ctx->vm, u, n); /* the name is copied out first: may collect */
+    if (u != stackbuf)
+        js_realloc_raw(ctx->vm, u, n * sizeof *u, 0);
+    return s;
 }
 
 uint32_t js_function_length(JsValue fn) {
@@ -471,7 +506,7 @@ JS_COLD static int delete_function_prop(JsContext *ctx, JsValue fn, JsValue key,
         if (fc->kind == JS_KIND_CLOSURE)
             ((JsClosure *)fc)->name = empty;
         else if (fc->kind == JS_KIND_NATIVE)
-            ((JsNative *)fc)->name = empty;
+            ((JsNative *)fc)->name_deleted = true;
         return 0;
     }
     if (own) {
@@ -1234,6 +1269,7 @@ JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *ud)
     nf->prototype = NULL;
     nf->bound = js_undefined();
     nf->is_bound = false;
+    nf->name_deleted = false;
     nf->length = 0;
     return js_value_from_cell(c);
 }
@@ -1256,6 +1292,7 @@ JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound) {
     nf->prototype = NULL;
     nf->bound = bound;
     nf->is_bound = true;
+    nf->name_deleted = false;
     nf->length = 0;
     return js_value_from_cell(c);
 }
@@ -1300,6 +1337,7 @@ bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
     nf->name = js_value_string(key);
     nf->bound = js_undefined();
     nf->is_bound = false;
+    nf->name_deleted = false;
     nf->length = 0;
     return js_map_set(vm, &ctx->globals->props, js_value_string(key),
                       js_value_from_cell(c));

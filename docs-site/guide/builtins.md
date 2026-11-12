@@ -107,7 +107,7 @@ than correctly rounded — `sqrt`/`floor`/`ceil`/`trunc`/`round` are exact nativ
 
 ## Functions
 
-Every function value, a script closure or a native, has `call`, `apply` and `bind`:
+Every function value, a script closure or a native, has `call`, `apply`, `bind` and `toString`:
 
 - `f.call(thisArg, ...args)` calls `f` with `this` set to `thisArg`.
 - `f.apply(thisArg, array)` does the same with the arguments in an array (`undefined` or `null`
@@ -124,14 +124,23 @@ own name; for an anonymous function or arrow, the name of what it is defined as 
 {}`, `f = function () {}`, `{ f: () => {} }` and `{ f() {} }`, a computed key's string, a default
 `f = () => {}`, `export default () => {}` as `default`); a builtin's (`Math.max.name` is `max`);
 `bound f` for `f.bind(...)`; otherwise `""`. Assigning it throws `TypeError: Cannot assign to read
-only property 'name' of function 'f'`; `delete f.name` leaves `""`. A named function expression
+only property 'name' of function 'function f() {}'` (a message shows a function as its source
+text, as V8's do); `delete f.name` leaves `""`. A named function expression
 sees its own name inside its body, as a constant holding the function.
 
 `length` is V8's too, and read-only: a script function's parameters before the first default or
 rest (`(a, b = 1, c) => 0` has 1); a builtin's (`Math.max.length` is 2, `Date.UTC.length` 7); for
 `f.bind(t, ...args)`, `f.length` less the arguments bound, never below 0. `delete f.length` leaves
-0. A native the host registers (`js_register_native`) has length 0. `String(f)` is
-`"[function]"`.
+0. A native the host registers (`js_register_native`) has length 0.
+
+`f.toString()`, and `String(f)`, a template or a concatenation, give V8's text: a script function's
+own source exactly as written, from `function` (or `async`), its first parameter, or its method key
+to its last token (`"(a) => a + 1"`, `"m(x) { return x }"`, `"['k']() {}"`); for a builtin or a
+host native, `"function max() { [native code] }"` with the name it was made with; for a bound
+function or a promise's `resolve`/`reject`, `"function () { [native code] }"`. Calling it on
+anything else is V8's `TypeError: Function.prototype.toString requires that 'this' be a Function`.
+The engine keeps one copy of each module's source (two bytes a character) for as long as a function
+compiled from it is alive, and the bytecode cache carries it too.
 
 A function can hold properties like any object, which is how a constructor gets statics with
 classes out of the language: `F.from = (v) => new F(v)`, `F.ORIGIN = new F(0)`, a cache on a helper.

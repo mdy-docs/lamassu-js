@@ -211,16 +211,13 @@ static void fb_piece(FmtBuf *b, const uint16_t *u, size_t n) {
     }
 }
 
-/* A function's name for a message, or "anonymous" */
-static void fb_function_name(JsContext *ctx, FmtBuf *b, JsValue v) {
-    JsGcCell *c = js_value_cell(v);
-    (void)c;
-    const JsString *name = js_function_name(v);
-    (void)ctx;
-    if (name && name->length)
-        fb_piece(b, name->units, name->length);
+/* A function in a message, as V8 shows one: its source text (Function.prototype.toString) */
+static void fb_function(JsContext *ctx, FmtBuf *b, JsValue v) {
+    JsString *s = js_function_source(ctx, v); /* v is rooted by the caller */
+    if (s)
+        fb_units(b, s->units, s->length);
     else
-        fb_ascii(b, "anonymous", 9);
+        b->oom = true;
 }
 
 JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
@@ -299,7 +296,7 @@ JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
             JsString *s = js_value_string(v);
             fb_piece(b, s->units, s->length);
         } else if (js_is_function(v)) {
-            fb_function_name(ctx, b, v);
+            fb_function(ctx, b, v);
         } else if (js_is_object(v)) {
             if (js_value_object(v)->obj_kind == JS_OBJ_ARRAY)
                 fb_ascii(b, "[object Array]", 14);

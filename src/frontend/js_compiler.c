@@ -114,6 +114,11 @@ typedef struct JsCompiler {
     JsModule *module;
     JsModBinding *mbind; /* top-level module bindings (exports/imports) */
     uint32_t mbind_count;
+    /* the unit's source (the parser's buffer) and the root function, which holds the copy of
+     * it every function's text slices, made when the first function is compiled */
+    const uint16_t *src;
+    uint32_t src_len;
+    JsFunctionCell *root;
 } JsCompiler;
 
 #define FN (cx->cur->fn)
@@ -2010,9 +2015,19 @@ static bool compile_function_as(JsCompiler *cx, const JsAstNode *fnode, const ui
     cx->cur = &fs;
 
     bool ok = true;
+    /* its text, for Function.prototype.toString: a slice of the one copy of the source */
+    if (cx->src && fnode->src_end > fnode->src_start && fnode->src_end <= cx->src_len) {
+        if (!cx->root->source) /* the root is rooted; so, through it, is the copy */
+            cx->root->source = js_string_cell_new(cx->vm, cx->src, cx->src_len);
+        ok = cx->root->source ? true : cerr(cx, fnode->pos, "out of memory");
+        fn->source = cx->root->source;
+        fn->src_start = fnode->src_start;
+        fn->src_end = fnode->src_end;
+    }
     uint16_t n_params = 0;
     bool has_rest = false;
-    ok = bind_params(cx, fnode, &n_params, &has_rest);
+    if (ok)
+        ok = bind_params(cx, fnode, &n_params, &has_rest);
     if (ok) {
         if (fnode->flags & JS_F_EXPR_BODY) { /* arrow with expression body */
             ok = compile_expr(cx, fnode->a) && emit_op(cx, JS_OP_RETURN, -1);
@@ -2614,6 +2629,8 @@ JsFunctionCell *js_compile_ast(JsContext *ctx, const JsAstNode *module, bool rep
     cx.ctx = ctx;
     cx.vm = vm;
     cx.repl = repl;
+    cx.src = module->units;
+    cx.src_len = module->len;
     js_arena_init(&cx.arena, vm);
 
     JsGcCell *cell = js_gc_new_cell(vm, JS_KIND_FUNCTION, sizeof(JsFunctionCell));
@@ -2630,6 +2647,7 @@ JsFunctionCell *js_compile_ast(JsContext *ctx, const JsAstNode *module, bool rep
     fs.fn = fn;
     fs.fn_value = js_value_from_cell(cell);
     fs.is_module = true;
+    cx.root = fn;
     fs.scratch_slot = -1;
     fs.slot_count = 1; /* slot 0: completion value */
     fs.slot_max = 1;
@@ -2971,6 +2989,8 @@ JsFunctionCell *js_compile_module_body(JsContext *ctx, const JsAstNode *module,
     cx.ctx = ctx;
     cx.vm = vm;
     cx.module = mod;
+    cx.src = module->units;
+    cx.src_len = module->len;
     js_arena_init(&cx.arena, vm);
 
     JsGcCell *cell = js_gc_new_cell(vm, JS_KIND_FUNCTION, sizeof(JsFunctionCell));
@@ -2988,6 +3008,7 @@ JsFunctionCell *js_compile_module_body(JsContext *ctx, const JsAstNode *module,
     fs.fn = fn;
     fs.fn_value = js_value_from_cell(cell);
     fs.is_module = true;
+    cx.root = fn;
     fs.scratch_slot = -1;
     fs.slot_count = 1;
     fs.slot_max = 1;

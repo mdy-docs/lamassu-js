@@ -28,6 +28,7 @@ typedef struct JsParser {
     bool module_tla;
     bool allow_return; /* the entry module: `return` at top level ends it (js_eval_entry) */
     int pattern_depth; /* expr_to_pattern nesting: V8 words a bad target inside a pattern apart */
+    uint32_t prev_end; /* end of the token before the current one: where a function's text ends */
 } JsParser;
 
 typedef struct JsNodeVec {
@@ -46,7 +47,7 @@ static JsAstNode *parse_arguments(JsParser *p, JsNodeVec *out);
 static JsAstNode *parse_binding_target(JsParser *p);
 static JsAstNode *parse_binding_element(JsParser *p);
 static JsAstNode *parse_func_common(JsParser *p, uint8_t flags, bool need_name,
-                                    uint32_t pos, uint8_t kind);
+                                    uint32_t pos, uint8_t kind, uint32_t src_start);
 static JsAstNode *expr_to_pattern(JsParser *p, JsAstNode *n, bool binding);
 
 static bool units_is(const uint16_t *u, uint32_t len, const char *ascii);
@@ -161,6 +162,7 @@ static JsAstNode *perr_here(JsParser *p, const char *msg) {
 static bool advance(JsParser *p) {
     if (p->err_msg)
         return false;
+    p->prev_end = p->lx.tok.end;
     if (!js_lexer_next(&p->lx)) {
         p->err_msg = p->lx.err_msg;
         p->err_pos = p->lx.err_pos;
@@ -651,6 +653,7 @@ static JsAstNode *parse_paren_cover(JsParser *p, uint8_t extra_flags) {
     if (!cover)
         return NULL;
     cover->flags = extra_flags;
+    cover->src_start = pos; /* an async arrow's caller moves it back to `async` */
     JsNodeVec items = {0};
     while (TOK(p).kind != JS_T_RPAREN) {
         if (TOK(p).kind == JS_T_DOTDOTDOT) {
@@ -768,8 +771,9 @@ static JsAstNode *parse_params(JsParser *p, JsNodeVec *out) {
     return (JsAstNode *)1; /* success marker; params are in *out */
 }
 
+/* SRC_START: where the function's text begins (`function`, or `async` before it) */
 static JsAstNode *parse_func_common(JsParser *p, uint8_t flags, bool need_name,
-                                    uint32_t pos, uint8_t kind) {
+                                    uint32_t pos, uint8_t kind, uint32_t src_start) {
     JsAstNode *fn = new_node(p, kind, pos);
     if (!fn)
         return NULL;
@@ -790,10 +794,13 @@ static JsAstNode *parse_func_common(JsParser *p, uint8_t flags, bool need_name,
     JsSavedCtx s = ctx_enter_function(p, (flags & JS_F_ASYNC) != 0);
     fn->a = parse_block(p);
     ctx_leave_function(p, s);
+    fn->src_start = src_start;
+    fn->src_end = p->prev_end;
     return fn->a ? fn : NULL;
 }
 
-static JsAstNode *build_arrow(JsParser *p, JsAstNode *params_src, bool is_async) {
+/* SRC_START: where the arrow's text begins (its parameters, or `async` before them) */
+static JsAstNode *build_arrow(JsParser *p, JsAstNode *params_src, bool is_async, uint32_t src_start) {
     /* current token is `=>` */
     if (TOK(p).newline_before)
         return perr_here(p, "no line break allowed before '=>'");
@@ -837,6 +844,8 @@ static JsAstNode *build_arrow(JsParser *p, JsAstNode *params_src, bool is_async)
         fn->a = parse_assign(p);
     }
     ctx_leave_function(p, s);
+    fn->src_start = src_start;
+    fn->src_end = p->prev_end;
     return fn->a ? fn : NULL;
 }
 
@@ -989,6 +998,8 @@ static JsAstNode *parse_object_literal(JsParser *p) {
                 ctx_leave_function(p, s);
                 if (!fn->a)
                     return NULL;
+                fn->src_start = prop->pos; /* a method's text starts at its key (or `async`) */
+                fn->src_end = p->prev_end;
                 prop->b = fn;
             } else if (prop->flags & JS_F_PROP_ASYNC) {
                 return perr_here(p, "expected '(' after async method name");
@@ -1089,10 +1100,12 @@ static JsAstNode *parse_primary(JsParser *p) {
     case JS_T_THIS:
         n = new_node(p, JS_AST_THIS, t->pos);
         return n && advance(p) ? n : NULL;
-    case JS_T_FUNCTION:
+    case JS_T_FUNCTION: {
+        uint32_t start = t->pos;
         if (!advance(p))
             return NULL;
-        return parse_func_common(p, 0, false, t->pos, JS_AST_FUNC_EXPR);
+        return parse_func_common(p, 0, false, t->pos, JS_AST_FUNC_EXPR, start);
+    }
     case JS_T_LBRACK:
         return parse_array_literal(p);
     case JS_T_LBRACE:
@@ -1102,17 +1115,21 @@ static JsAstNode *parse_primary(JsParser *p) {
     case JS_T_IDENT: {
         if (tok_is_name(t, "async")) {
             JsToken nx = peek(p);
+            uint32_t async_pos = t->pos;
             if (!nx.newline_before) {
                 if (nx.kind == JS_T_FUNCTION) {
                     uint32_t pos = t->pos;
                     if (!advance(p) || !advance(p))
                         return NULL;
-                    return parse_func_common(p, JS_F_ASYNC, false, pos, JS_AST_FUNC_EXPR);
+                    return parse_func_common(p, JS_F_ASYNC, false, pos, JS_AST_FUNC_EXPR, pos);
                 }
                 if (nx.kind == JS_T_LPAREN) {
                     if (!advance(p))
                         return NULL;
-                    return parse_paren_cover(p, JS_F_COVER_ASYNC);
+                    JsAstNode *cover = parse_paren_cover(p, JS_F_COVER_ASYNC);
+                    if (cover)
+                        cover->src_start = async_pos;
+                    return cover;
                 }
                 if (nx.kind == JS_T_IDENT) {
                     /* `async x => ...` needs a second peek for the arrow */
@@ -1126,7 +1143,7 @@ static JsAstNode *parse_primary(JsParser *p) {
                         JsAstNode *param = parse_ident(p, "expected parameter");
                         if (!param || TOK(p).kind != JS_T_ARROW)
                             return perr_here(p, "expected '=>'");
-                        return build_arrow(p, param, true);
+                        return build_arrow(p, param, true, async_pos);
                     }
                 }
             }
@@ -1605,7 +1622,7 @@ static JsAstNode *parse_assign(JsParser *p) {
         (lhs->kind == JS_AST_IDENT || lhs->kind == JS_AST_COVER) &&
         !(lhs->flags & JS_F_PAREN)) {
         bool is_async = lhs->kind == JS_AST_COVER && (lhs->flags & JS_F_COVER_ASYNC);
-        result = build_arrow(p, lhs, is_async);
+        result = build_arrow(p, lhs, is_async, lhs->kind == JS_AST_COVER ? lhs->src_start : lhs->pos);
         goto out;
     }
     if (lhs->kind == JS_AST_COVER) {
@@ -2123,7 +2140,7 @@ static JsAstNode *parse_statement(JsParser *p) {
     case JS_T_FUNCTION:
         if (!advance(p))
             break;
-        result = parse_func_common(p, 0, true, pos, JS_AST_FUNC_DECL);
+        result = parse_func_common(p, 0, true, pos, JS_AST_FUNC_DECL, pos);
         break;
     case JS_T_IMPORT: {
         JsToken nx = peek(p);
@@ -2153,7 +2170,7 @@ static JsAstNode *parse_statement(JsParser *p) {
             if (nx.kind == JS_T_FUNCTION && !nx.newline_before) {
                 if (!advance(p) || !advance(p))
                     break;
-                result = parse_func_common(p, JS_F_ASYNC, true, pos, JS_AST_FUNC_DECL);
+                result = parse_func_common(p, JS_F_ASYNC, true, pos, JS_AST_FUNC_DECL, pos);
                 break;
             }
         }
@@ -2328,18 +2345,20 @@ static JsAstNode *parse_export(JsParser *p) {
         if (!n)
             return NULL;
         if (TOK(p).kind == JS_T_FUNCTION) {
+            uint32_t start = TOK(p).pos;
             if (!advance(p))
                 return NULL;
             n->flags |= JS_F_DEFAULT_DECL;
-            n->a = parse_func_common(p, 0, false, pos, JS_AST_FUNC_EXPR);
+            n->a = parse_func_common(p, 0, false, pos, JS_AST_FUNC_EXPR, start);
             return n->a ? n : NULL;
         }
         if (tok_is_name(&TOK(p), "async") && peek(p).kind == JS_T_FUNCTION &&
             !peek(p).newline_before) {
+            uint32_t start = TOK(p).pos;
             if (!advance(p) || !advance(p))
                 return NULL;
             n->flags |= JS_F_DEFAULT_DECL;
-            n->a = parse_func_common(p, JS_F_ASYNC, false, pos, JS_AST_FUNC_EXPR);
+            n->a = parse_func_common(p, JS_F_ASYNC, false, pos, JS_AST_FUNC_EXPR, start);
             return n->a ? n : NULL;
         }
         n->a = parse_assign(p);
@@ -2423,14 +2442,16 @@ static JsAstNode *parse_export(JsParser *p) {
         if (decl && !expect_semicolon(p))
             decl = NULL;
     } else if (TOK(p).kind == JS_T_FUNCTION) {
+        uint32_t start = TOK(p).pos;
         if (!advance(p))
             return NULL;
-        decl = parse_func_common(p, 0, true, TOK(p).pos, JS_AST_FUNC_DECL);
+        decl = parse_func_common(p, 0, true, TOK(p).pos, JS_AST_FUNC_DECL, start);
     } else if (tok_is_name(&TOK(p), "async") && peek(p).kind == JS_T_FUNCTION &&
                !peek(p).newline_before) {
+        uint32_t start = TOK(p).pos;
         if (!advance(p) || !advance(p))
             return NULL;
-        decl = parse_func_common(p, JS_F_ASYNC, true, TOK(p).pos, JS_AST_FUNC_DECL);
+        decl = parse_func_common(p, JS_F_ASYNC, true, TOK(p).pos, JS_AST_FUNC_DECL, start);
     } else {
         return perr_here(p, "expected declaration or '{' after 'export'");
     }
@@ -2463,6 +2484,8 @@ bool js_parse_module(JsArena *arena, const uint16_t *src, size_t len, bool allow
     JsAstNode *mod = new_node(&p, JS_AST_MODULE, 0);
     if (!mod)
         goto fail;
+    mod->units = src; /* the source, which the compiler keeps for its functions' text */
+    mod->len = (uint32_t)len;
     JsNodeVec stmts = {0};
     while (TOK(&p).kind != JS_T_EOF) {
         JsAstNode *item;

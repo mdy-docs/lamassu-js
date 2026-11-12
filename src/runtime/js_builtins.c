@@ -1458,6 +1458,18 @@ bool js_bind_call(JsContext *ctx, JsValue bound, JsValue this_val, const JsValue
 
 /* Function.prototype.bind(thisArg, ...args): a function that calls this one with that this and
  * those arguments first. */
+static bool fm_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args;
+    (void)argc;
+    if (!js_is_function(tv))
+        return native_throw(ctx, r, "TypeError: Function.prototype.toString requires that 'this' be a Function");
+    JsString *s = js_function_source(ctx, tv);
+    if (!s)
+        return oom(ctx, r);
+    *r = js_value_from_cell(&s->gc);
+    return true;
+}
+
 static bool fm_bind(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     if (!js_is_function(tv))
         return native_throw(ctx, r, "TypeError: Bind must be called on a function");
@@ -3277,7 +3289,7 @@ bool js_builtins_init(JsContext *ctx) {
         {NULL, NULL}};
     static const MethodDef function_methods[] = {
         {"apply", fm_apply}, {"bind", fm_bind}, {"call", fm_call},
-        {"hasOwnProperty", objp_hasOwnProperty},
+        {"hasOwnProperty", objp_hasOwnProperty}, {"toString", fm_toString},
         {NULL, NULL}};
     static const MethodDef number_methods[] = {
         {"toFixed", nm_toFixed}, {"toString", nm_toString}, {"valueOf", nm_toString},

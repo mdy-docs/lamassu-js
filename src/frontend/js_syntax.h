@@ -171,6 +171,7 @@ struct JsAstNode {
     const uint16_t *units2; uint32_t len2; /* second name (regex flags, spec local, export alias) */
     JsAstNode *a, *b, *c, *d;
     JsAstNode **items; uint32_t count;
+    uint32_t src_start, src_end; /* FUNC_*: the source text Function.prototype.toString gives */
 };
 
 /* ---- parser ---- */

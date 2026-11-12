@@ -125,6 +125,16 @@ static bool serialize_fn(OutBuf *b, JsFunctionCell *fn, uint32_t depth) {
     } else {
         out_u8(b, 0);
     }
+    /* the function's text, for Function.prototype.toString: its range, then (the root only)
+     * the source every range slices */
+    out_u32(b, fn->source ? fn->src_start : 0);
+    out_u32(b, fn->source ? fn->src_end : 0);
+    if (depth == 0) {
+        uint32_t n = fn->source ? fn->source->length : 0;
+        out_u32(b, n);
+        if (n)
+            out_units(b, fn->source->units, n);
+    }
     out_u32(b, fn->code_len);
     out_bytes(b, fn->code, fn->code_len);
     out_u32(b, fn->const_count);

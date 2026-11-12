@@ -208,6 +208,12 @@ typedef struct JsFunctionCell {
     uint32_t callee_count, callee_cap;
     uint16_t *callee_text;
     uint32_t callee_text_len, callee_text_cap;
+    /* The text Function.prototype.toString gives: units [src_start, src_end) of SOURCE, the
+     * whole compilation unit's source, which every function compiled from it shares. The root
+     * function holds it too (src_end 0) so the bytecode writer has it. NULL when no function in
+     * the unit has text. Cold: last. */
+    JsString *source;
+    uint32_t src_start, src_end;
 } JsFunctionCell;
 
 /* JsFunctionCell.insn_boundary bits. */
@@ -267,6 +273,7 @@ typedef struct JsNative {
     JsValue bound;       /* captured value for bound natives */
     JsObject *props;     /* properties a script gives it (like JsClosure.props); NULL until written */
     bool is_bound;
+    bool name_deleted;   /* `delete f.name`: reads "", while toString still gives the name */
     uint8_t length;      /* `length`: V8's for a builtin (js_builtin_lengths_apply), else 0 */
 } JsNative;
 

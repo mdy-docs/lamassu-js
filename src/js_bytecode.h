@@ -290,6 +290,7 @@ JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound);
  * OOM); without, NULL when it has none. Object builtins use it to treat functions as objects. */
 JsObject *js_function_props(JsContext *ctx, JsValue fn, bool create);
 /* A function value's `name` (closure or native); NULL for none, which reads as "". */
+JsString *js_function_source(JsContext *ctx, JsValue fn); /* Function.prototype.toString */
 JsString *js_function_name(JsValue fn);
 /* A function value's `length` (closure or native). */
 uint32_t js_function_length(JsValue fn);

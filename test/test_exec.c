@@ -1247,12 +1247,12 @@ static void test_function_names(void) {
                   " decl.hasOwnProperty('name'), Object.hasOwn(decl, 'name')].join();",
                   "true,0,true,true");
     expect_error("function decl() {} decl.name = 'x';", RUN_RUNTIME_ERR,
-                 "TypeError: Cannot assign to read only property 'name' of function 'decl'");
+                 "TypeError: Cannot assign to read only property 'name' of function 'function decl() {}'");
     expect_error("const f = () => 0; Object.assign(f, { name: 'z' });", RUN_RUNTIME_ERR,
-                 "TypeError: Cannot assign to read only property 'name' of function 'f'");
+                 "TypeError: Cannot assign to read only property 'name' of function '() => 0'");
     expect_result("const f = () => 0; delete f.name; JSON.stringify(f.name);", "\"\"");
     expect_error("const f = () => 0; Object.freeze(f); delete f.name;", RUN_RUNTIME_ERR,
-                 "TypeError: Cannot delete property 'name' of f");
+                 "TypeError: Cannot delete property 'name' of () => 0");
     /* a named function expression's own name: the function, constant, shadowed by a parameter
      * or a declaration in its body */
     expect_result("const f = function inner(n) { return n ? inner(n - 1) + 1 : 0; };"
@@ -1285,11 +1285,53 @@ static void test_function_lengths(void) {
     expect_result("function f(a) {} ['length' in f, Object.keys(f).length, f.hasOwnProperty('length'),"
                   " Object.hasOwn(f, 'length')].join();", "true,0,true,true");
     expect_error("function f(a) {} f.length = 3;", RUN_RUNTIME_ERR,
-                 "TypeError: Cannot assign to read only property 'length' of function 'f'");
+                 "TypeError: Cannot assign to read only property 'length' of function 'function f(a) {}'");
     expect_error("const f = (a) => 0; Object.assign(f, { length: 4 });", RUN_RUNTIME_ERR,
-                 "TypeError: Cannot assign to read only property 'length' of function 'f'");
+                 "TypeError: Cannot assign to read only property 'length' of function '(a) => 0'");
     expect_result("const f = (a, b) => 0; const s = [].slice; delete f.length; delete s.length;"
                   "[f.length, s.length].join();", "0,0");
+}
+
+/* Function.prototype.toString, as V8 gives it: the function's own source text, exactly as
+ * written; `function NAME() { [native code] }` for a builtin; `function () { [native code] }` for
+ * a bound function or a promise's resolvers. */
+static void test_function_source(void) {
+    expect_result("function  decl ( a , b ) { return a } // after\n String(decl);",
+                  "function  decl ( a , b ) { return a }");
+    expect_result("[String(function (x) {}), String(function nm(x) {}), String((a) => a + 1),"
+                  " String(a => a), String(((a, b) => { return b; }))].join('|');",
+                  "function (x) {}|function nm(x) {}|(a) => a + 1|a => a|(a, b) => { return b; }");
+    expect_result("[String(async function af() {}), String(async (x) => x), String(async x => x)].join('|');",
+                  "async function af() {}|async (x) => x|async x => x");
+    expect_result("const o = { m(a) { return 1 }, async am() {}, ['c' + 'k']() {}, 'str'() {}, 7() {},"
+                  " f: function () {}, ar: () => 0 };"
+                  "[o.m, o.am, o.ck, o.str, o[7], o.f, o.ar].join('|');",
+                  "m(a) { return 1 }|async am() {}|['c' + 'k']() {}|'str'() {}|7() {}|function () {}|() => 0");
+    expect_result("[Math.max, [].map, Map, parseInt].join('|');",
+                  "function max() { [native code] }|function map() { [native code] }|"
+                  "function Map() { [native code] }|function parseInt() { [native code] }");
+    expect_result("function f(a) {} [String(f.bind(null)), String((() => 0).bind(null, 1))].join('|');",
+                  "function () { [native code] }|function () { [native code] }");
+    expect_result("let s; new Promise((res) => { s = String(res); }); s;", "function () { [native code] }");
+    expect_result("function f() {} [f.toString(), f.toString.call(Math.min), f.toString.length].join('|');",
+                  "function f() {}|function min() { [native code] }|0");
+    expect_error("(() => 0).toString.call({});", RUN_RUNTIME_ERR,
+                 "TypeError: Function.prototype.toString requires that 'this' be a Function");
+    /* where a function becomes a string: templates, concatenation, join, a property key */
+    expect_result("const o = {}; o[(a) => a] = 1; [`${x => x}`, '' + (y => y), Object.keys(o)[0]].join('|');",
+                  "x => x|y => y|(a) => a");
+    /* nested functions, defaults, line breaks kept as they are */
+    expect_result("const outer = function () { return (q) => q * 2; }; String(outer());", "(q) => q * 2");
+    expect_result("String(function (a = () => 1, { b } = {}) {});", "function (a = () => 1, { b } = {}) {}");
+    expect_result("JSON.stringify(String(function (a)\r\n{\n  return a\n}));",
+                  "\"function (a)\\r\\n{\\n  return a\\n}\"");
+    /* deleting the name changes `name`, not the text */
+    expect_result("const f = function () {}; const mx = Math.max; delete f.name; delete mx.name;"
+                  "[String(f), String(mx), JSON.stringify(mx.name)].join('|');",
+                  "function () {}|function max() { [native code] }|\"\"");
+    /* a message that shows a function shows its text */
+    expect_error("(x => x) in 1;", RUN_RUNTIME_ERR,
+                 "TypeError: Cannot use 'in' operator to search for 'x => x' in 1");
 }
 
 int main(void) {
@@ -1312,6 +1354,7 @@ int main(void) {
     test_functions();
     test_function_names();
     test_function_lengths();
+    test_function_source();
     test_new();
     test_real_prototypes();
     test_closures();
