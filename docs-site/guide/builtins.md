@@ -194,6 +194,23 @@ signature and `Error.prototype` in their chain.
 - **`Error.prototype`**: `name` (`"Error"`; each subclass prototype
   overrides it), `message` (`""`), `toString` → `"name: message"`, dropping
   either half when it is empty.
+- **`stack`**, as V8 gives it: `"TypeError: x\n    at f (main.js:3:9)\n    at main.js:7:1"`.
+  The frames are taken when the error is made and the text is built the first time `stack` is
+  read, so the first line shows the name and message the error has by then. A frame reads
+  `at name (module:line:column)`, or just the location for an anonymous function or a module
+  body, with V8's details: `Object.m` / `F.m` for a method (the receiver's type; an inferred
+  `x.y` for `x.y = function () {}`), ` [as k]` when it was called under another key, `new C`,
+  `async f` for an async function waiting on the one above it, and builtins as
+  `at Array.map (<anonymous>)` (no frames for `call`, `apply` or a bound function, nor for a
+  host's natives). The column is where V8 puts it: a call at its callee's name (or its `(`), a
+  property read at the property, `new` and `await` at the keyword. A function compiled outside
+  the module pipeline is in `<anonymous>`. `stack` is an own property that is not enumerated
+  (`Object.keys`, `JSON.stringify` and spread do not see it); it can be assigned, even on a
+  frozen error, and deleted.
+- **`Error.stackTraceLimit`** (10): the frames kept. Anything but a number gives a `stack` that
+  reads `undefined`.
+- **`Error.captureStackTrace(object, fn?)`** gives `object` a `stack` of the frames running now,
+  leaving out `fn`'s call and those above it.
 - String conversion (`String(e)`, `'' + e`, template literals) uses the
   same `"name: message"` form, so an error renders identically whether it
   came from `throw new TypeError('x')` or from the engine.

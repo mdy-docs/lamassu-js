@@ -253,6 +253,9 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->fuel_left = 0;
     ctx->error_pos = 0;
     ctx->running_native = NULL;
+    ctx->native_act = NULL;
+    ctx->error_ctor = NULL;
+    ctx->builtins_ready = false;
     ctx->error_trace_count = 0;
     ctx->error_trace_value = js_undefined();
     ctx->reentry_depth = 0;
@@ -284,6 +287,7 @@ JsContext *js_context_new(JsVm *vm) {
         js_context_free(ctx);
         return NULL;
     }
+    ctx->builtins_ready = true; /* natives made from here on are the host's (or bind's) */
     /* globalThis is ctx->globals itself, created above before
      * ctx->object_proto existed (js_builtins_init creates it) — real JS has
      * it inherit Object.prototype like any other ordinary object, so wire

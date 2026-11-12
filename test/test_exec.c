@@ -1334,6 +1334,66 @@ static void test_function_source(void) {
                  "TypeError: Cannot use 'in' operator to search for 'x => x' in 1");
 }
 
+/* e.stack as V8 gives it (each expectation is Node's output for the same source, as an unnamed
+ * script): frames taken when the error is made, the text built when `stack` is first read; a
+ * method's type and alias, `new`, builtins as `at Array.map (<anonymous>)`, V8's positions,
+ * inferred names, Error.stackTraceLimit and Error.captureStackTrace; `stack` own and not
+ * enumerable, assignable and deletable. */
+static void test_error_stack(void) {
+    expect_result("function f() { return new Error('m'); } const g = () => f(); let $ = g().stack; $;",
+                  "Error: m\n    at f (<anonymous>:1:23)\n    at g (<anonymous>:1:57)\n    at <anonymous>:1:70");
+    expect_result("const o = { m() { return new TypeError('t'); } }; let $ = o.m().stack; $;",
+                  "TypeError: t\n    at Object.m (<anonymous>:1:26)\n    at <anonymous>:1:61");
+    expect_result("function C() { this.e = new Error(); } let $ = new C().e.stack; $;",
+                  "Error\n    at new C (<anonymous>:1:25)\n    at <anonymous>:1:48");
+    expect_result("const r = [1].map(() => new Error('cb')); let $ = r[0].stack; $;",
+                  "Error: cb\n    at <anonymous>:1:25\n    at Array.map (<anonymous>)\n    at <anonymous>:1:15");
+    expect_result("const r = [1].map(function cb() { return new Error(); }); let $ = r[0].stack; $;",
+                  "Error\n    at cb (<anonymous>:1:42)\n    at Array.map (<anonymous>)\n    at <anonymous>:1:15");
+    expect_result("function f() { return new Error(); } let $ = f.call({}).stack; $;",
+                  "Error\n    at Object.f (<anonymous>:1:23)\n    at <anonymous>:1:48");
+    expect_result("let s; try { const o = null; o.x; } catch (e) { s = e.stack; } let $ = s; $;",
+                  "TypeError: Cannot read properties of null (reading 'x')\n    at <anonymous>:1:32");
+    expect_result("let s; try { [].reduce((a) => a); } catch (e) { s = e.stack; } let $ = s; $;",
+                  "TypeError: Reduce of empty array with no initial value\n    at Array.reduce (<anonymous>)\n    at <anonymous>:1:17");
+    expect_result("let s; try { new Map([1]); } catch (e) { s = e.stack; } let $ = s; $;",
+                  "TypeError: Iterator value 1 is not an entry object\n    at new Map (<anonymous>)\n    at <anonymous>:1:14");
+    expect_result("let s; try { JSON.parse('{'); } catch (e) { s = e.stack; } let $ = s; $;",
+                  "SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)\n    at JSON.parse (<anonymous>)\n    at <anonymous>:1:19");
+    expect_result("const x = {}; x.y = function () { return new Error(); }; let $ = x.y().stack; $;",
+                  "Error\n    at x.y (<anonymous>:1:42)\n    at <anonymous>:1:68");
+    expect_result("function F() {} F.prototype.m = function () { return new Error(); }; let $ = new F().m().stack; $;",
+                  "Error\n    at F.m (<anonymous>:1:54)\n    at <anonymous>:1:86");
+    expect_result("const z = { a: function foo() { return new Error(); } }; let $ = z.a().stack; $;",
+                  "Error\n    at Object.foo [as a] (<anonymous>:1:40)\n    at <anonymous>:1:68");
+    expect_result("function K() {} K.make = () => new Error(); let $ = K.make().stack; $;",
+                  "Error\n    at K.make (<anonymous>:1:32)\n    at <anonymous>:1:55");
+    expect_result("const e = new Error('before'); e.message = 'after'; e.name = 'Custom'; let $ = e.stack; $;",
+                  "Custom: after\n    at <anonymous>:1:11");
+    expect_result("const d = (n) => n ? d(n - 1) : new Error('deep'); let $ = d(20).stack.split('\\n').length; $;",
+                  "11");
+    expect_result("Error.stackTraceLimit = 2; const d = (n) => n ? d(n - 1) : new Error(); let $ = d(5).stack.split('\\n').length; $;",
+                  "3");
+    expect_result("Error.stackTraceLimit = 'x'; const e = new Error(); let $ = [typeof e.stack, 'stack' in e].join(); $;",
+                  "undefined,true");
+    expect_result("function outer() { return inner(); } function inner() { const o = {}; Error.captureStackTrace(o, inner); return o.stack; } let $ = outer(); $;",
+                  "Error\n    at outer (<anonymous>:1:27)\n    at <anonymous>:1:132");
+    expect_result("function mk(m) { const e = new Error(m); Error.captureStackTrace(e, mk); return e; } function caller() { return mk('q'); } let $ = caller().stack; $;",
+                  "Error: q\n    at caller (<anonymous>:1:113)\n    at <anonymous>:1:132");
+    expect_result("const e = new Error('x'); let $ = [Object.keys(e).includes('stack'), e.hasOwnProperty('stack'), 'stack' in e].join(); $;",
+                  "false,true,true");
+    expect_result("const e = new Error('x'); e.stack = 'mine'; const a = e.stack; delete e.stack; let $ = [a, e.stack, 'stack' in e].join(); $;",
+                  "mine,,false");
+    expect_result("const e = new Error(); Object.freeze(e); e.stack = 'ok'; let $ = e.stack; $;",
+                  "ok");
+    expect_result("let s; try { Error.captureStackTrace(1); } catch (e) { s = e.message; } let $ = s; $;",
+                  "invalid_argument");
+    expect_result("let s; try { (function () { null.f(); })(); } catch (e) { s = e.stack; } let $ = s; $;",
+                  "TypeError: Cannot read properties of null (reading 'f')\n    at <anonymous>:1:34\n    at <anonymous>:1:41");
+    expect_result("let s; try { const f = () => 0; f()(); } catch (e) { s = e.stack; } let $ = s; $;",
+                  "TypeError: f(...) is not a function\n    at <anonymous>:1:36");
+}
+
 int main(void) {
     test_heap_limit_is_a_hard_cap();
     test_regex_memory_is_capped();
@@ -1355,6 +1415,7 @@ int main(void) {
     test_function_names();
     test_function_lengths();
     test_function_source();
+    test_error_stack();
     test_new();
     test_real_prototypes();
     test_closures();

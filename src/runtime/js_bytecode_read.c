@@ -355,6 +355,22 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
         fn->source = b->source;
         fn->src_start = src_start;
         fn->src_end = src_end;
+    } else if (depth > 0) {
+        fn->source = b->source; /* no text of its own, but its frames' lines and columns */
+    }
+    uint8_t has_debug = in_u8(b);
+    if (b->bad || has_debug > 1) {
+        *err = "SyntaxError: bad bytecode debug name";
+        goto done;
+    }
+    if (has_debug) {
+        const char *serr = NULL;
+        JsValue dn = load_string_const(ctx, b, &serr);
+        if (!js_is_string(dn)) {
+            *err = serr ? serr : "SyntaxError: bad function debug name";
+            goto done;
+        }
+        fn->debug_name = js_value_string(dn);
     }
 
     /* code */

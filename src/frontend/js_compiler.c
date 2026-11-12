@@ -119,6 +119,11 @@ typedef struct JsCompiler {
     const uint16_t *src;
     uint32_t src_len;
     JsFunctionCell *root;
+    /* the name V8 infers for the anonymous function INFER_NODE (a member assignment's target,
+     * `x.y`), which a stack trace shows when its `name` is "" */
+    const JsAstNode *infer_node;
+    const uint16_t *infer_units;
+    uint32_t infer_len;
 } JsCompiler;
 
 #define FN (cx->cur->fn)
@@ -990,7 +995,7 @@ static bool compile_member_chain(JsCompiler *cx, const JsAstNode *n,
         return compile_expr(cx, n);
     if (!compile_member_chain(cx, n->a, opt))
         return false;
-    note_pos(cx, n->pos);
+    note_pos(cx, n->pos2 ? n->pos2 : n->pos); /* V8's: the property */
     if (n->flags & JS_F_OPTIONAL) {
         uint32_t patch;
         if (!emit_jump(cx, JS_OP_OPT_CHAIN, 0, &patch) ||
@@ -1262,6 +1267,56 @@ static JsOp logical_peek_op(uint8_t op) {
     return JS_OP_JNN_PEEK;
 }
 
+/* The name V8's FuncNameInferrer gives an anonymous function assigned to T: its chain of names
+ * (`a.b.c`, a string key as a name, `this` and `prototype` left out); false when T is not such
+ * a chain. The units are in the compiler's arena. */
+static bool inferred_member_name(JsCompiler *cx, const JsAstNode *t, const uint16_t **out, uint32_t *len) {
+    const JsAstNode *segs[32];
+    uint32_t n = 0, total = 0;
+    for (const JsAstNode *c = t;; c = c->a) {
+        if (n == 32)
+            return false;
+        if (c->kind == JS_AST_THIS)
+            break;
+        if (c->kind == JS_AST_IDENT) {
+            segs[n++] = c;
+            break;
+        }
+        if (c->kind != JS_AST_MEMBER)
+            return false;
+        const JsAstNode *k = (c->flags & JS_F_COMPUTED) ? c->b : c;
+        if ((c->flags & JS_F_COMPUTED) && (!k || k->kind != JS_AST_STRING))
+            return false;
+        static const uint16_t proto[] = {'p', 'r', 'o', 't', 'o', 't', 'y', 'p', 'e'};
+        if (!(k->len == 9 && memcmp(k->units, proto, sizeof proto) == 0))
+            segs[n++] = k;
+    }
+    for (uint32_t i = 0; i < n; i++)
+        total += segs[i]->len + (i ? 1 : 0);
+    if (!n || !total)
+        return false;
+    uint16_t *u = js_arena_alloc(&cx->arena, (size_t)total * sizeof *u);
+    if (!u)
+        return false;
+    uint32_t at = 0;
+    for (uint32_t i = n; i-- > 0;) {
+        memcpy(u + at, segs[i]->units, segs[i]->len * sizeof *u);
+        at += segs[i]->len;
+        if (i)
+            u[at++] = '.';
+    }
+    *out = u;
+    *len = total;
+    return true;
+}
+
+/* VALUE, assigned to the member T: an anonymous function takes V8's inferred name */
+static bool compile_member_value(JsCompiler *cx, const JsAstNode *value, const JsAstNode *t) {
+    if (is_anonymous_function(value) && inferred_member_name(cx, t, &cx->infer_units, &cx->infer_len))
+        cx->infer_node = value;
+    return compile_expr(cx, value);
+}
+
 static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
     const JsAstNode *t = n->a;
     note_pos(cx, n->pos);
@@ -1270,7 +1325,7 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
         if (t->kind == JS_AST_IDENT)
             return compile_named_value(cx, n->b, t->units, t->len) && compile_ident_store(cx, t);
         if (t->kind == JS_AST_MEMBER) {
-            if (!compile_member_target_base(cx, t) || !compile_expr(cx, n->b))
+            if (!compile_member_target_base(cx, t) || !compile_member_value(cx, n->b, t))
                 return false;
             if (t->flags & JS_F_COMPUTED)
                 return emit_op(cx, JS_OP_SET_PROP, -2);
@@ -1560,6 +1615,8 @@ static bool compile_call(JsCompiler *cx, const JsAstNode *n) {
         }
         if (!emit_op(cx, JS_OP_DUP, +1)) /* [recv recv] */
             return false;
+        if (callee->pos2)
+            note_pos(cx, callee->pos2);
         if (callee->flags & JS_F_COMPUTED) {
             if (!compile_expr(cx, callee->b) || !emit_op(cx, JS_OP_GET_PROP, -1))
                 return false;
@@ -1591,6 +1648,7 @@ static bool compile_call(JsCompiler *cx, const JsAstNode *n) {
     if (!compile_args(cx, n->items, n->count, &varargs))
         return false;
     note_callee(cx, callee);
+    note_pos(cx, n->pos2 ? n->pos2 : n->pos); /* the call itself, where V8 places it */
     if (varargs) {
         if (!emit_op(cx, JS_OP_CALL_VARARGS, -2)) /* [callee this arr] -> [res] */
             return false;
@@ -1628,6 +1686,7 @@ static bool compile_new(JsCompiler *cx, const JsAstNode *n) {
     if (!compile_args(cx, n->items, n->count, &varargs))
         return false;
     note_callee(cx, n->a);
+    note_pos(cx, n->pos); /* `new` */
     if (varargs) {
         if (!emit_op(cx, JS_OP_NEW_VARARGS, -2)) /* [callee this arr] -> [res] */
             return false;
@@ -1799,7 +1858,10 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
     case JS_AST_AWAIT:
         note_pos(cx, n->pos);
         /* operand in, result out: net stack effect 0 */
-        return compile_expr(cx, n->a) && emit_op(cx, JS_OP_AWAIT, 0);
+        if (!compile_expr(cx, n->a))
+            return false;
+        note_pos(cx, n->pos); /* `await`: where an async frame shows it waits */
+        return emit_op(cx, JS_OP_AWAIT, 0);
     case JS_AST_IMPORT_CALL:
         note_pos(cx, n->pos);
         if (!compile_expr(cx, n->a))
@@ -2015,6 +2077,12 @@ static bool compile_function_as(JsCompiler *cx, const JsAstNode *fnode, const ui
     cx->cur = &fs;
 
     bool ok = true;
+    if (cx->infer_node == fnode) { /* V8's inferred name, for stack traces */
+        cx->infer_node = NULL;
+        JsValue dn = js_atom(cx->vm, cx->infer_units, cx->infer_len);
+        if (js_is_string(dn))
+            fn->debug_name = js_value_string(dn);
+    }
     /* its text, for Function.prototype.toString: a slice of the one copy of the source */
     if (cx->src && fnode->src_end > fnode->src_start && fnode->src_end <= cx->src_len) {
         if (!cx->root->source) /* the root is rooted; so, through it, is the copy */
@@ -2653,6 +2721,9 @@ JsFunctionCell *js_compile_ast(JsContext *ctx, const JsAstNode *module, bool rep
     fs.slot_max = 1;
     cx.cur = &fs;
     js_gc_protect(vm, &fs.fn_value);
+    /* the unit's source: its functions' text, and every frame's line and column in a trace */
+    if (cx.src && cx.src_len)
+        fn->source = js_string_cell_new(vm, cx.src, cx.src_len);
 
     bool ok = compile_block_stmts(&cx, module->items, module->count);
     if (ok)
@@ -3014,6 +3085,9 @@ JsFunctionCell *js_compile_module_body(JsContext *ctx, const JsAstNode *module,
     fs.slot_max = 1;
     cx.cur = &fs;
     js_gc_protect(vm, &fs.fn_value);
+    /* the unit's source: its functions' text, and every frame's line and column in a trace */
+    if (cx.src && cx.src_len)
+        fn->source = js_string_cell_new(vm, cx.src, cx.src_len);
 
     bool ok = analyze_module(&cx, module, mod) && exports_start_in_tdz(&cx, module, mod);
     if (ok) {

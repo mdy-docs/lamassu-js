@@ -136,6 +136,30 @@ typedef struct JsObject {
 /* A host object (js_host_object_new): an ordinary object in every way guest code can see, whose
  * cell also carries a host pointer. The class's finalizer runs when the collector frees the cell
  * or the VM is freed; external_bytes counts toward collection pacing (JsVm.external_bytes). */
+/* An error (obj_kind JS_OBJ_ERROR): an ordinary object plus its `stack`, V8's own property,
+ * kept out of the property map so that it is not enumerable. The frames are taken when the
+ * error is made (js_error_capture) and turned into text the first time `stack` is read, as V8
+ * does: the first line uses the name and message the error has by then. */
+typedef struct JsErrorFrame {
+    JsValue fn;       /* the closure or native running in the frame */
+    JsValue receiver; /* `this` it was called with: names a method's type, as V8 does */
+    uint32_t pos;     /* source offset of the instruction executing in the frame */
+    uint8_t flags;    /* JS_EF_* */
+} JsErrorFrame;
+#define JS_EF_CONSTRUCT 1u /* entered through `new` */
+#define JS_EF_ASYNC 2u     /* an async function waiting on the one above it */
+
+enum { JS_STACK_NONE, JS_STACK_PENDING, JS_STACK_FRAMES, JS_STACK_VALUE };
+
+typedef struct JsErrorObject {
+    JsObject obj;
+    JsValue stack;         /* JS_STACK_VALUE: the text, or whatever a script assigned */
+    JsErrorFrame *frames;  /* JS_STACK_FRAMES: raw allocation, frame_count entries */
+    uint32_t frame_count;
+    uint8_t stack_state;   /* JS_STACK_*: PENDING = made by the interpreter for a raise,
+                            * captured when the raise unwinds */
+} JsErrorObject;
+
 typedef struct JsHostObject {
     JsObject obj; /* obj_kind == JS_OBJ_HOST */
     const JsHostClass *cls;
@@ -214,6 +238,9 @@ typedef struct JsFunctionCell {
      * the unit has text. Cold: last. */
     JsString *source;
     uint32_t src_start, src_end;
+    /* For a stack trace: the name V8 infers for an anonymous function from where it is put
+     * (`x.y` for `x.y = function () {}`, `F.m` for `F.prototype.m = ...`), when `name` is "". */
+    JsString *debug_name;
 } JsFunctionCell;
 
 /* JsFunctionCell.insn_boundary bits. */
@@ -221,6 +248,19 @@ typedef struct JsFunctionCell {
 #define JSBC_B_GOSUB_RET 2u /* a GOSUB resumes here — the only legal RET_SUB target */
 
 typedef struct JsFiber JsFiber;
+
+/* One native call in progress, on the C stack of whoever called it: where it was called from,
+ * so a stack trace can put it between the frames of the fibers around it (V8's
+ * `at Array.map (<anonymous>)`). */
+typedef struct JsNativeAct JsNativeAct;
+struct JsNativeAct {
+    JsNativeAct *outer;
+    struct JsNative *nf;
+    JsValue this_val;
+    JsFiber *fiber;       /* the fiber whose top frame called it, or NULL (the host) */
+    uint32_t frame_count; /* that fiber's frame count at the call */
+    bool is_new;
+};
 
 /*
  * Captured variable. While open it aliases fiber->stack[slot] (offset, not
@@ -273,6 +313,7 @@ typedef struct JsNative {
     JsValue bound;       /* captured value for bound natives */
     JsObject *props;     /* properties a script gives it (like JsClosure.props); NULL until written */
     bool is_bound;
+    bool builtin;        /* made by the engine (js_builtins_init): shown in a stack trace */
     bool name_deleted;   /* `delete f.name`: reads "", while toString still gives the name */
     uint8_t length;      /* `length`: V8's for a builtin (js_builtin_lengths_apply), else 0 */
 } JsNative;
@@ -554,6 +595,9 @@ struct JsContext {
     uint32_t reentry_depth; /* nested interpreter entries (native re-entry);
                              * bounds C-stack recursion the per-fiber frame
                              * limit can't see */
+    JsNativeAct *native_act;  /* the natives running now, innermost first (on the C stack) */
+    JsNative *error_ctor;     /* `Error`, for Error.stackTraceLimit; GC root */
+    bool builtins_ready;      /* natives made from here on are the host's, not builtins */
 };
 
 struct JsVm {

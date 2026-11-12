@@ -1,4 +1,5 @@
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "js_error.h"
@@ -42,29 +43,6 @@ static bool chain_get(JsContext *ctx, JsObject *o, const char *k, JsValue *out, 
         cur = js_is_object(cur->proto) ? js_value_object(cur->proto) : NULL;
     }
     return true;
-}
-
-JsValue js_error_new(JsContext *ctx, JsErrorKind kind, JsString *message) {
-    JsVm *vm = ctx->vm;
-    JsValue mv = message ? js_value_from_cell(&message->gc) : js_undefined();
-    js_gc_protect(vm, &mv);
-    JsValue ev = js_object_new(ctx);
-    bool ok = js_is_object(ev);
-    if (ok) {
-        JsObject *e = js_value_object(ev);
-        e->obj_kind = JS_OBJ_ERROR;
-        e->error_cause = JS_CAUSE_GUEST;
-        JsObject *proto = ctx->error_protos[kind];
-        if (proto)
-            e->proto = js_value_from_cell(&proto->gc);
-        if (message) {
-            js_gc_protect(vm, &ev);
-            ok = js_object_set_ascii(ctx, e, "message", mv);
-            js_gc_unprotect(vm, &ev);
-        }
-    }
-    js_gc_unprotect(vm, &mv);
-    return ok ? ev : js_undefined();
 }
 
 /* "TypeError: x" -> (JS_ERROR_TYPE, "x"); anything else -> (PLAIN, whole). */
@@ -432,6 +410,424 @@ done:
     return out;
 }
 
+/* ---- e.stack ---- */
+
+static bool key_is(JsValue key, const char *a) {
+    if (!js_is_string(key))
+        return false;
+    const JsString *s = js_value_string(key);
+    size_t n = strlen(a);
+    if (s->length != n)
+        return false;
+    for (size_t i = 0; i < n; i++)
+        if (s->units[i] != (uint16_t)(unsigned char)a[i])
+            return false;
+    return true;
+}
+
+/* Error.stackTraceLimit as V8 reads it: false when it is not a number (no stack at all) */
+static bool stack_trace_limit(JsContext *ctx, uint32_t *limit) {
+    *limit = 10;
+    if (!ctx->error_ctor)
+        return true;
+    JsObject *own = js_function_props(ctx, js_value_from_cell(&ctx->error_ctor->gc), false);
+    JsValue v;
+    bool found = false;
+    if (own && !chain_get(ctx, own, "stackTraceLimit", &v, &found))
+        return false;
+    if (!found || !js_is_number(v))
+        return false;
+    double d = js_get_number(v);
+    *limit = !(d > 0) ? 0 : d >= 100000 ? 100000 : (uint32_t)d;
+    return true;
+}
+
+static void drop_frames(JsContext *ctx, JsErrorObject *e) {
+    js_realloc_raw(ctx->vm, e->frames, (size_t)e->frame_count * sizeof *e->frames, 0);
+    e->frames = NULL;
+    e->frame_count = 0;
+}
+
+/* Takes the frames running now into E (rooted by the caller), as V8 does when an error is made:
+ * at most Error.stackTraceLimit, leaving out those up to and including SKIP's call. False on
+ * OOM. */
+bool js_error_capture(JsContext *ctx, JsObject *o, JsValue skip) {
+    JsErrorObject *e = (JsErrorObject *)o;
+    drop_frames(ctx, e);
+    e->stack = js_undefined();
+    uint32_t limit;
+    if (!stack_trace_limit(ctx, &limit)) {
+        e->stack_state = JS_STACK_VALUE; /* V8: a `stack` that reads undefined */
+        return true;
+    }
+    e->stack_state = JS_STACK_FRAMES;
+    if (!limit)
+        return true;
+    uint32_t cap = limit < 256 ? limit : 256;
+    for (;;) {
+        JsErrorFrame *buf = js_realloc_raw(ctx->vm, NULL, 0, (size_t)cap * sizeof *buf);
+        if (!buf)
+            return false;
+        uint32_t n = js_capture_frames(ctx, buf, cap, skip);
+        if (n == cap && cap < limit) { /* a deep stack and a high limit: room for all of it */
+            js_realloc_raw(ctx->vm, buf, (size_t)cap * sizeof *buf, 0);
+            cap = cap * 4 < limit ? cap * 4 : limit;
+            continue;
+        }
+        if (n < cap) {
+            JsErrorFrame *t = n ? js_realloc_raw(ctx->vm, buf, (size_t)cap * sizeof *buf, (size_t)n * sizeof *buf)
+                                : (js_realloc_raw(ctx->vm, buf, (size_t)cap * sizeof *buf, 0), NULL);
+            buf = t;
+            if (n && !buf)
+                return false;
+        }
+        e->frames = buf;
+        e->frame_count = n;
+        return true;
+    }
+}
+
+/* An error made by the interpreter for a raise is captured when the raise unwinds, once the
+ * instruction's position is known (js_interp.c, on_error) */
+bool js_error_capture_pending(JsContext *ctx, JsValue v) {
+    if (!js_is_object(v) || js_value_object(v)->obj_kind != JS_OBJ_ERROR ||
+        ((JsErrorObject *)js_value_object(v))->stack_state != JS_STACK_PENDING)
+        return true;
+    return js_error_capture(ctx, js_value_object(v), js_undefined());
+}
+
+/* ---- the text, as V8's CallSite serializes a frame ---- */
+
+static void fb_cell_str(FmtBuf *b, const JsString *s) {
+    if (s)
+        fb_units(b, s->units, s->length);
+}
+
+static void fb_uint(FmtBuf *b, uint32_t n) {
+    char t[16];
+    int k = snprintf(t, sizeof t, "%u", n);
+    fb_ascii(b, t, (size_t)k);
+}
+
+static bool str_prefix(const JsString *s, const JsString *p) {
+    if (p->length > s->length)
+        return false;
+    return memcmp(s->units, p->units, p->length * sizeof(uint16_t)) == 0;
+}
+
+/* V8's StringEndsWithMethodName: S is M, or ends with "." M */
+static bool ends_with_method(const JsString *s, const JsString *m) {
+    if (s->length == m->length && memcmp(s->units, m->units, s->length * sizeof(uint16_t)) == 0)
+        return true;
+    if (s->length < m->length + 1)
+        return false;
+    uint32_t off = s->length - m->length;
+    return s->units[off - 1] == '.' &&
+           memcmp(s->units + off, m->units, m->length * sizeof(uint16_t)) == 0;
+}
+
+/* The name a frame shows for its function: its own (`name` as it was made, computed keys
+ * included), else the one inferred from where it was defined (`F.m` for F.prototype.m = ...) */
+static const JsString *frame_function_name(JsValue fn) {
+    JsGcCell *c = js_value_cell(fn);
+    const JsString *n = NULL;
+    if (c->kind == JS_KIND_CLOSURE) {
+        const JsClosure *cl = (const JsClosure *)c;
+        n = cl->name && cl->name->length ? cl->name : cl->fn->name;
+        if ((!n || !n->length) && cl->fn->debug_name)
+            n = cl->fn->debug_name;
+    } else if (c->kind == JS_KIND_NATIVE) {
+        n = ((const JsNative *)c)->name;
+    }
+    return n && n->length ? n : NULL;
+}
+
+static JsObject *global_object(JsContext *ctx, const char *name) {
+    JsString *k = key(ctx, name);
+    if (!k)
+        return NULL;
+    bool found;
+    JsValue v = js_map_get(&ctx->globals->props, k, &found);
+    return found && js_is_object(v) ? js_value_object(v) : NULL;
+}
+
+/* V8's GetTypeName for a method call's receiver: a function's own name, else the receiver's
+ * constructor's (a primitive's wrapper's; JSON and Math by their tags); NULL for an object with
+ * no prototype. Allocates (the global lookups). */
+static const JsString *type_name(JsContext *ctx, JsValue recv, JsString **tmp) {
+    const char *fixed = NULL;
+    if (js_is_function(recv)) {
+        const JsString *n = frame_function_name(recv);
+        if (n)
+            return n;
+        fixed = "Function";
+    } else if (js_is_string(recv)) {
+        fixed = "String";
+    } else if (js_is_number(recv)) {
+        fixed = "Number";
+    } else if (js_is_bool(recv)) {
+        fixed = "Boolean";
+    } else if (js_is_promise(recv)) {
+        fixed = "Promise";
+    } else if (js_is_object(recv)) {
+        JsObject *o = js_value_object(recv);
+        if (o->obj_flags & JS_OBJ_NAMESPACE)
+            fixed = "Module";
+        else if (o->obj_kind == JS_OBJ_ARRAY)
+            fixed = "Array";
+        else if (o == global_object(ctx, "JSON"))
+            fixed = "JSON";
+        else if (o == global_object(ctx, "Math"))
+            fixed = "Math";
+        else {
+            JsValue cv;
+            bool found;
+            if (chain_get(ctx, o, "constructor", &cv, &found) && found && js_is_function(cv)) {
+                const JsString *n = frame_function_name(cv);
+                if (n)
+                    return n;
+            }
+            if (!js_is_object(o->proto))
+                return NULL;
+            fixed = o->obj_kind == JS_OBJ_MAP ? "Map" : o->obj_kind == JS_OBJ_SET ? "Set"
+                    : o->obj_kind == JS_OBJ_DATE ? "Date" : o->obj_kind == JS_OBJ_REGEXP ? "RegExp"
+                    : "Object";
+        }
+    }
+    if (!fixed)
+        return NULL;
+    *tmp = js_ascii_cell(ctx->vm, fixed);
+    return *tmp;
+}
+
+/* V8's GetMethodName: the key the receiver (or its prototype chain) holds the function under;
+ * the function's own name first, else the one enumerable key with it (none if two) */
+static const JsString *method_name(JsContext *ctx, JsValue recv, JsValue fn) {
+    JsObject *o = js_is_object(recv) ? js_value_object(recv)
+                  : js_is_function(recv) ? js_function_props(ctx, recv, false) : NULL;
+    if (!o)
+        return NULL;
+    JsGcCell *c = js_value_cell(fn);
+    const JsString *own = c->kind == JS_KIND_CLOSURE
+        ? (((JsClosure *)c)->name && ((JsClosure *)c)->name->length ? ((JsClosure *)c)->name
+                                                                    : ((JsClosure *)c)->fn->name)
+        : c->kind == JS_KIND_NATIVE ? ((JsNative *)c)->name : NULL;
+    if (own && own->length && own->interned) {
+        for (JsObject *cur = o; cur;) {
+            bool found;
+            JsValue v = js_map_get(&cur->props, own, &found);
+            if (found) {
+                if (js_same_value(v, fn))
+                    return own;
+                break;
+            }
+            cur = js_is_object(cur->proto) ? js_value_object(cur->proto) : NULL;
+        }
+    }
+    const JsString *result = NULL;
+    for (JsObject *cur = o; cur; cur = js_is_object(cur->proto) ? js_value_object(cur->proto) : NULL) {
+        for (uint32_t i = 0; i < cur->props.used; i++) {
+            const JsMapEntry *en = &cur->props.entries[i];
+            if (!en->key || en->key == JS_MAP_TOMBSTONE || !js_same_value(en->value, fn))
+                continue;
+            if (result)
+                return NULL; /* two keys: V8 names neither */
+            result = en->key;
+        }
+    }
+    return result;
+}
+
+static void frame_location(FmtBuf *b, JsValue fn, uint32_t pos) {
+    JsGcCell *c = js_value_cell(fn);
+    if (c->kind != JS_KIND_CLOSURE) {
+        fb_ascii(b, "<anonymous>", 11);
+        return;
+    }
+    const JsFunctionCell *f = ((const JsClosure *)c)->fn;
+    if (f->module && f->module->specifier && f->module->specifier->length)
+        fb_cell_str(b, f->module->specifier);
+    else
+        fb_ascii(b, "<anonymous>", 11);
+    if (f->source) {
+        uint32_t line, col;
+        js_source_line_col(f->source->units, f->source->length, pos, &line, &col);
+        fb_ascii(b, ":", 1);
+        fb_uint(b, line);
+        fb_ascii(b, ":", 1);
+        fb_uint(b, col);
+    }
+}
+
+static void frame_text(JsContext *ctx, FmtBuf *b, const JsErrorFrame *fr) {
+    JsVm *vm = ctx->vm;
+    const JsString *name = frame_function_name(fr->fn);
+    bool top_level = js_is_undefined(fr->receiver) || js_is_null(fr->receiver);
+    bool construct = (fr->flags & JS_EF_CONSTRUCT) != 0;
+    if (fr->flags & JS_EF_ASYNC)
+        fb_ascii(b, "async ", 6);
+    if (!top_level && !construct) {
+        JsString *tmp = NULL;
+        JsValue tv = js_undefined();
+        const JsString *type = type_name(ctx, fr->receiver, &tmp);
+        if (tmp) {
+            tv = js_value_from_cell(&tmp->gc);
+            js_gc_protect(vm, &tv);
+        }
+        const JsString *method = method_name(ctx, fr->receiver, fr->fn);
+        if (name) {
+            /* V8 adds the type to a plain name, not to an inferred `x.y` */
+            bool dotted = false;
+            for (uint32_t i = 0; i < name->length && !dotted; i++)
+                dotted = name->units[i] == '.';
+            if (type && type->length && !dotted && !str_prefix(name, type)) {
+                fb_cell_str(b, type);
+                fb_ascii(b, ".", 1);
+            }
+            fb_cell_str(b, name);
+            if (method && method->length && !ends_with_method(name, method)) {
+                fb_ascii(b, " [as ", 5);
+                fb_cell_str(b, method);
+                fb_ascii(b, "]", 1);
+            }
+        } else {
+            if (type && type->length) {
+                fb_cell_str(b, type);
+                fb_ascii(b, ".", 1);
+            }
+            if (method && method->length)
+                fb_cell_str(b, method);
+            else
+                fb_ascii(b, "<anonymous>", 11);
+        }
+        if (tmp)
+            js_gc_unprotect(vm, &tv);
+    } else if (construct) {
+        fb_ascii(b, "new ", 4);
+        if (name)
+            fb_cell_str(b, name);
+        else
+            fb_ascii(b, "<anonymous>", 11);
+    } else if (name) {
+        fb_cell_str(b, name);
+    } else {
+        frame_location(b, fr->fn, fr->pos);
+        return;
+    }
+    fb_ascii(b, " (", 2);
+    frame_location(b, fr->fn, fr->pos);
+    fb_ascii(b, ")", 1);
+}
+
+/* "Name: message" and a line per frame, as V8's default Error.prepareStackTrace gives it. O and
+ * its frames are rooted by the caller. NULL on OOM. */
+static JsString *stack_text(JsContext *ctx, JsObject *o, const JsErrorFrame *frames, uint32_t n) {
+    JsString *head = js_error_repr(ctx, o, 0);
+    if (!head)
+        return NULL;
+    JsValue hv = js_value_from_cell(&head->gc);
+    js_gc_protect(ctx->vm, &hv);
+    FmtBuf b = {0};
+    fb_cell_str(&b, head);
+    for (uint32_t i = 0; i < n; i++) {
+        fb_ascii(&b, "\n    at ", 8);
+        frame_text(ctx, &b, &frames[i]);
+    }
+    js_gc_unprotect(ctx->vm, &hv);
+    JsString *s = b.oom ? NULL : js_string_cell_new(ctx->vm, b.u, b.n);
+    free(b.u);
+    return s;
+}
+
+/* `stack` on an error: an own property, not enumerable, that a script may assign or delete.
+ * Each sets *handled when KEY is `stack` and the error has one; false only on OOM. */
+bool js_error_stack_get(JsContext *ctx, JsObject *o, JsValue key, JsValue *out, bool *handled) {
+    *handled = false;
+    JsErrorObject *e = (JsErrorObject *)o;
+    if (e->stack_state == JS_STACK_NONE || !key_is(key, "stack"))
+        return true;
+    *handled = true;
+    if (e->stack_state != JS_STACK_VALUE) {
+        JsValue ov = js_value_from_cell(&o->gc);
+        js_gc_protect(ctx->vm, &ov);
+        JsString *s = stack_text(ctx, o, e->frames, e->stack_state == JS_STACK_FRAMES ? e->frame_count : 0);
+        js_gc_unprotect(ctx->vm, &ov);
+        if (!s)
+            return false;
+        drop_frames(ctx, e);
+        e->stack = js_value_from_cell(&s->gc);
+        e->stack_state = JS_STACK_VALUE;
+    }
+    *out = e->stack;
+    return true;
+}
+
+bool js_error_stack_set(JsContext *ctx, JsObject *o, JsValue key, JsValue val) {
+    if (!key_is(key, "stack"))
+        return false;
+    JsErrorObject *e = (JsErrorObject *)o;
+    drop_frames(ctx, e);
+    e->stack = val;
+    e->stack_state = JS_STACK_VALUE;
+    return true;
+}
+
+bool js_error_stack_has(JsObject *o, JsValue key) {
+    return ((JsErrorObject *)o)->stack_state != JS_STACK_NONE && key_is(key, "stack");
+}
+
+bool js_error_stack_delete(JsContext *ctx, JsObject *o, JsValue key) {
+    if (!key_is(key, "stack"))
+        return false;
+    JsErrorObject *e = (JsErrorObject *)o;
+    drop_frames(ctx, e);
+    e->stack = js_undefined();
+    e->stack_state = JS_STACK_NONE;
+    return true;
+}
+
+/* A new error object. SKIP as for js_error_capture; the frames are taken now when a native is
+ * running (`new Error()`, a builtin's own error), else when the interpreter's raise unwinds. */
+static JsValue error_object_new(JsContext *ctx, JsErrorKind kind, JsString *message, JsValue skip) {
+    JsVm *vm = ctx->vm;
+    JsValue mv = message ? js_value_from_cell(&message->gc) : js_undefined();
+    js_gc_protect(vm, &mv);
+    js_gc_protect(vm, &skip);
+    JsGcCell *c = js_gc_new_cell(vm, JS_KIND_OBJECT, sizeof(JsErrorObject));
+    JsValue ev = js_undefined();
+    bool ok = c != NULL;
+    if (ok) {
+        JsErrorObject *eo = (JsErrorObject *)c;
+        JsObject *e = &eo->obj;
+        e->obj_kind = JS_OBJ_ERROR;
+        e->obj_flags = 0;
+        js_map_init(&e->props);
+        e->elems = NULL;
+        e->elem_count = e->elem_cap = 0;
+        e->error_cause = JS_CAUSE_GUEST;
+        JsObject *proto = ctx->error_protos[kind];
+        e->proto = proto ? js_value_from_cell(&proto->gc) : js_undefined();
+        eo->stack = js_undefined();
+        eo->frames = NULL;
+        eo->frame_count = 0;
+        eo->stack_state = JS_STACK_PENDING;
+        ev = js_value_from_cell(c);
+        js_gc_protect(vm, &ev);
+        if (message)
+            ok = js_object_set_ascii(ctx, e, "message", mv);
+        if (ok && js_in_native(ctx))
+            ok = js_error_capture(ctx, e, skip);
+        js_gc_unprotect(vm, &ev);
+    }
+    js_gc_unprotect(vm, &skip);
+    js_gc_unprotect(vm, &mv);
+    return ok ? ev : js_undefined();
+}
+
+JsValue js_error_new(JsContext *ctx, JsErrorKind kind, JsString *message) {
+    return error_object_new(ctx, kind, message, js_undefined());
+}
+
 /* ---- constructors ---- */
 
 static bool error_ctor(JsContext *ctx, JsErrorKind kind, const JsValue *args, int argc,
@@ -444,7 +840,9 @@ static bool error_ctor(JsContext *ctx, JsErrorKind kind, const JsValue *args, in
         if (!msg)
             return nthrow(ctx, r, "out of memory");
     }
-    JsValue ev = js_error_new(ctx, kind, msg);
+    /* the frames below the constructor's own, as V8 leaves it out */
+    JsValue self = ctx->running_native ? js_value_from_cell(&ctx->running_native->gc) : js_undefined();
+    JsValue ev = error_object_new(ctx, kind, msg, self);
     if (!js_is_object(ev))
         return nthrow(ctx, r, "out of memory");
     JsValue opts = ARG(1);
@@ -492,6 +890,41 @@ static bool errp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int a
     return true;
 }
 
+/* Error.captureStackTrace(object, fn?): gives OBJECT a `stack` of the frames running now, below
+ * FN's call when it is given, as V8 does. On an error it is the error's own, unenumerated
+ * `stack`; on any other object an ordinary property (there are no property attributes). */
+static bool err_captureStackTrace(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    JsValue target = ARG(0);
+    if (!js_is_object(target))
+        return nthrow(ctx, r, "TypeError: invalid_argument"); /* V8's text, as it stands */
+    JsValue skip = js_is_function(ARG(1)) ? ARG(1)
+                   : ctx->running_native ? js_value_from_cell(&ctx->running_native->gc) : js_undefined();
+    JsObject *o = js_value_object(target);
+    *r = js_undefined();
+    if (o->obj_kind == JS_OBJ_ERROR) {
+        if (!js_error_capture(ctx, o, skip))
+            return nthrow(ctx, r, "out of memory");
+        return true;
+    }
+    if (o->obj_flags)
+        return (*r = js_error_fmt(ctx, "TypeError: Cannot define property stack, object is not extensible")), false;
+    uint32_t limit;
+    if (!stack_trace_limit(ctx, &limit))
+        return true;
+    uint32_t cap = limit < 1024 ? limit : 1024;
+    JsErrorFrame *buf = cap ? js_realloc_raw(ctx->vm, NULL, 0, (size_t)cap * sizeof *buf) : NULL;
+    if (cap && !buf)
+        return nthrow(ctx, r, "out of memory");
+    uint32_t n = cap ? js_capture_frames(ctx, buf, cap, skip) : 0;
+    /* the frames' values stay on the stacks they came from while the text is built */
+    JsString *s = stack_text(ctx, o, buf, n);
+    js_realloc_raw(ctx->vm, buf, (size_t)cap * sizeof *buf, 0);
+    if (!s || !js_object_set_ascii(ctx, o, "stack", js_value_from_cell(&s->gc)))
+        return nthrow(ctx, r, "out of memory");
+    return true;
+}
+
 /* ---- registration ---- */
 
 bool js_error_builtins_init(JsContext *ctx) {
@@ -527,6 +960,16 @@ bool js_error_builtins_init(JsContext *ctx) {
         if (!js_object_set_ascii(ctx, proto, "constructor", ctor) ||
             !js_object_set_ascii(ctx, ctx->globals, kind_names[k], ctor))
             return false;
+        if (k == JS_ERROR_PLAIN) {
+            /* Error.stackTraceLimit and Error.captureStackTrace, as in V8 */
+            ctx->error_ctor = (JsNative *)js_value_cell(ctor);
+            JsObject *own = js_function_props(ctx, ctor, true);
+            if (!own || !js_object_set_ascii(ctx, own, "stackTraceLimit", js_number(10)))
+                return false;
+            JsValue cst = js_native_new(ctx, "captureStackTrace", err_captureStackTrace, NULL);
+            if (!js_is_function(cst) || !js_object_set_ascii(ctx, own, "captureStackTrace", cst))
+                return false;
+        }
     }
     return true;
 }

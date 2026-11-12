@@ -2618,6 +2618,10 @@ static bool obj_fromEntries(JsContext *ctx, JsValue tv, const JsValue *args, int
  * returns true; false means OOM (caller throws). */
 static bool object_has_own_key(JsContext *ctx, JsObject *ob, JsValue key, bool *out) {
     uint32_t idx;
+    if (ob->obj_kind == JS_OBJ_ERROR && js_error_stack_has(ob, key)) {
+        *out = true;
+        return true;
+    }
     JsString *ks = js_to_string_cell(ctx, key, 0);
     if (!ks)
         return false;
@@ -3299,6 +3303,15 @@ bool js_builtins_init(JsContext *ctx) {
         !install_methods(ctx, ctx->number_methods, number_methods) ||
         !install_methods(ctx, ctx->function_methods, function_methods))
         return false;
+    /* call and apply have no frame of their own in a stack trace, as in V8 */
+    for (const char *const *m = (const char *const[]){"call", "apply", NULL}; *m; m++) {
+        JsString *k = js_ascii_cell(ctx->vm, *m);
+        k = k ? js_intern_cell(ctx->vm, k) : NULL;
+        bool found = false;
+        JsValue v = k ? js_map_get(&ctx->function_methods->props, k, &found) : js_undefined();
+        if (found && js_is_function(v) && js_value_cell(v)->kind == JS_KIND_NATIVE)
+            ((JsNative *)js_value_cell(v))->builtin = false;
+    }
 
     /* Math */
     JsValue mathv = js_object_new(ctx);

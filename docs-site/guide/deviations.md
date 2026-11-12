@@ -81,7 +81,12 @@ iterator (`for...of` over the result behaves the same either way).
 - **No `instanceof`**, so `e instanceof TypeError` is a syntax error;
   test `e.name` or compare `Object.getPrototypeOf(e)` against the
   constructor's `.prototype`.
-- **No `stack`**, and no `EvalError`/`URIError`/`AggregateError`.
+- **No `EvalError`/`URIError`/`AggregateError`.**
+- **`stack` is V8's**, with these differences: no `Error.prepareStackTrace` hook;
+  `Error.captureStackTrace` on an object that is not an error makes an ordinary (enumerable)
+  `stack` property; an anonymous function's inferred name comes only from a member assignment
+  (`x.y = function () {}` is `x.y`, `F.prototype.m = ...` is `F.m`), where V8 also infers from
+  other places (`const a = [function () {}]` is `a` there); a host's natives have no frame.
 - **`message` and `cause` are ordinary enumerable own properties** (the
   engine has no property attributes), so `JSON.stringify(new Error('x'))`
   is `{"message":"x"}` rather than `{}`, and `Object.keys` lists them.

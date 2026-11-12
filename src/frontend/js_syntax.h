@@ -172,6 +172,9 @@ struct JsAstNode {
     JsAstNode *a, *b, *c, *d;
     JsAstNode **items; uint32_t count;
     uint32_t src_start, src_end; /* FUNC_*: the source text Function.prototype.toString gives */
+    /* Where V8 places the operation, for errors and stack frames: MEMBER the property (its name,
+     * or `[`); CALL the callee's name when it is a name or a member's name, else the `(`. */
+    uint32_t pos2;
 };
 
 /* ---- parser ---- */

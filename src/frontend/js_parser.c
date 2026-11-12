@@ -684,12 +684,26 @@ static JsAstNode *parse_paren_cover(JsParser *p, uint8_t extra_flags) {
     return cover;
 }
 
+/* V8's position for a call: the callee's own name when the token before `(` is one (`f(`,
+ * `o.m(`), else the `(` itself (`a[0](`, `f()(`, `(function () {})(`) */
+static uint32_t call_pos(const JsAstNode *callee, uint32_t lparen) {
+    if (callee->flags & JS_F_PAREN)
+        return lparen;
+    if (callee->kind == JS_AST_IDENT)
+        return callee->pos;
+    if (callee->kind == JS_AST_MEMBER && !(callee->flags & JS_F_COMPUTED) && callee->pos2)
+        return callee->pos2;
+    return lparen;
+}
+
 /* A cover that is not followed by `=>`: must be a plain parenthesized expr. */
 static JsAstNode *collapse_cover(JsParser *p, JsAstNode *cover) {
     if (cover->flags & JS_F_COVER_ASYNC) {
         /* `async (...)` not followed by => is a call to an `async` binding */
         JsAstNode *callee = new_node(p, JS_AST_IDENT, cover->pos);
         JsAstNode *call = new_node(p, JS_AST_CALL, cover->pos);
+        if (call)
+            call->pos2 = cover->src_start; /* `async` */
         static const uint16_t async_name[] = {'a', 's', 'y', 'n', 'c'};
         if (!callee || !call)
             return NULL;
@@ -1254,10 +1268,14 @@ static JsAstNode *parse_new_callee(JsParser *p) {
             m->a = base;
             m->units = name->units;
             m->len = name->len;
+            m->pos2 = name->pos;
             base = m;
         } else if (k == JS_T_LBRACK) {
             JsAstNode *m = new_node(p, JS_AST_MEMBER, base->pos);
-            if (!m || !advance(p))
+            if (!m)
+                return NULL;
+            m->pos2 = TOK(p).pos;
+            if (!advance(p))
                 return NULL;
             m->flags |= JS_F_COMPUTED;
             m->a = base;
@@ -1287,6 +1305,7 @@ static JsAstNode *parse_new_expr(JsParser *p) {
     if (!n)
         return NULL;
     n->a = callee;
+    n->pos2 = pos; /* `new` */
     if (TOK(p).kind == JS_T_LPAREN) {
         JsNodeVec args = {0};
         if (!parse_arguments(p, &args))
@@ -1320,6 +1339,7 @@ static JsAstNode *parse_call_member(JsParser *p) {
                 JsAstNode *call = new_node(p, JS_AST_CALL, base->pos);
                 if (!call)
                     return NULL;
+                call->pos2 = TOK(p).pos;
                 call->flags |= JS_F_OPTIONAL;
                 call->a = base;
                 JsNodeVec args = {0};
@@ -1332,7 +1352,10 @@ static JsAstNode *parse_call_member(JsParser *p) {
             }
             if (optional && TOK(p).kind == JS_T_LBRACK) {
                 JsAstNode *m = new_node(p, JS_AST_MEMBER, base->pos);
-                if (!m || !advance(p))
+                if (!m)
+                    return NULL;
+                m->pos2 = TOK(p).pos;
+                if (!advance(p))
                     return NULL;
                 m->flags |= JS_F_COMPUTED | JS_F_OPTIONAL;
                 m->a = base;
@@ -1353,10 +1376,14 @@ static JsAstNode *parse_call_member(JsParser *p) {
             m->a = base;
             m->units = name->units;
             m->len = name->len;
+            m->pos2 = name->pos;
             base = m;
         } else if (k == JS_T_LBRACK) {
             JsAstNode *m = new_node(p, JS_AST_MEMBER, base->pos);
-            if (!m || !advance(p))
+            if (!m)
+                return NULL;
+            m->pos2 = TOK(p).pos;
+            if (!advance(p))
                 return NULL;
             m->flags |= JS_F_COMPUTED;
             m->a = base;
@@ -1368,6 +1395,7 @@ static JsAstNode *parse_call_member(JsParser *p) {
             JsAstNode *call = new_node(p, JS_AST_CALL, base->pos);
             if (!call)
                 return NULL;
+            call->pos2 = call_pos(base, TOK(p).pos);
             call->a = base;
             JsNodeVec args = {0};
             if (!parse_arguments(p, &args))

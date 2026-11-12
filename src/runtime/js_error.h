@@ -31,6 +31,16 @@
 #define JS_MSG_INTERRUPT "Error: execution interrupted"
 #define JS_MSG_OOM "out of memory"
 
+/* e.stack (js_error.c over js_interp.c's frames) */
+bool js_in_native(const JsContext *ctx);
+uint32_t js_capture_frames(JsContext *ctx, JsErrorFrame *out, uint32_t limit, JsValue skip);
+bool js_error_capture(JsContext *ctx, JsObject *o, JsValue skip);
+bool js_error_capture_pending(JsContext *ctx, JsValue v);
+bool js_error_stack_get(JsContext *ctx, JsObject *o, JsValue key, JsValue *out, bool *handled);
+bool js_error_stack_set(JsContext *ctx, JsObject *o, JsValue key, JsValue val);
+bool js_error_stack_has(JsObject *o, JsValue key);
+bool js_error_stack_delete(JsContext *ctx, JsObject *o, JsValue key);
+
 /* New error object of `kind`; `message` may be NULL (inherits ""). Roots
  * `message` itself. undefined on OOM. */
 JsValue js_error_new(JsContext *ctx, JsErrorKind kind, JsString *message);

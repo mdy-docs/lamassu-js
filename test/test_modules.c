@@ -1120,6 +1120,25 @@ static void test_functions_at_instantiation(void) {
     mods_reset();
 }
 
+/* e.stack in a module graph (Node's output for the same files, the importer's columns shifted for
+ * its './lib.mjs'): an engine error raised in a callback a builtin made, frames kept by errors
+ * while garbage is made, an async frame; under the collector at every safe point too */
+static void test_error_stack(void) {
+    mods_reset();
+    mod_add("lib", "export function thrower(o) { return o.missing.x; }\n"
+                   "export const each = (a, f) => a.map(f);\n");
+    eq_export("import { thrower, each } from 'lib'; let s1; try { each([{}], thrower); } catch (e) { s1 = e.stack; }"
+              " const kept = []; for (let i = 0; i < 50; i++) kept.push(new Error('e' + i));"
+              " const junk = kept.map((e) => ({ big: 'x'.repeat(100) }));"
+              " async function a1() { await null; return new Error('late'); } const late = await a1();"
+              " export const r = [s1, kept[49].stack, late.stack].map((s) => s.split('\\n')"
+              ".filter((l) => !l.includes('node:')).join('\\n')).join('|');",
+              "r",
+              "TypeError: Cannot read properties of undefined (reading 'x')\n    at thrower (lib:1:47)\n"
+              "    at Array.map (<anonymous>)\n    at each (lib:2:33)\n    at main:1:52|Error: e49\n"
+              "    at main:1:159|Error: late\n    at a1 (main:1:279)\n    at async main:1:313");
+}
+
 int main(void) {
     test_basic_exports();
     test_imports();
@@ -1146,6 +1165,7 @@ int main(void) {
     test_check_module();
     test_declaration_rules();
     test_functions_at_instantiation();
+    test_error_stack();
     /* parked bodies, cycles and top-level await again with the collector running at every
      * safe point: the rooting of a fiber between instantiation and evaluation */
     g_gc_stress = true;
@@ -1153,6 +1173,7 @@ int main(void) {
     test_async_module();
     test_tla_dep_cross_turn();
     test_functions_at_instantiation();
+    test_error_stack();
     g_gc_stress = false;
     mods_reset();
     if (checks_failed) {

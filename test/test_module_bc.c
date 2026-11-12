@@ -259,6 +259,17 @@ static void test_graphs(void) {
     mod_add("main", "import d, { g, ar } from 'srcs'; export const r = [d, g, ar].join('|');");
     expect("main", "r", "function () { return 1 }|async function g(a) { return a }|(x) => x * 2");
 
+    /* e.stack across modules, from source and from the cache alike: each frame's module, async
+     * frames (V8's `at async`), an inferred name (Node gives these, the importer's columns
+     * shifted for its './stk.mjs') */
+    mod_add("stk", "export async function af() { await null; return new Error('a'); }\n"
+                   "export async function outer() { return await af(); }\n"
+                   "export const x = {}; x.y = function () { return new Error(); };");
+    mod_add("main", "import { outer, x } from 'stk'; const e = await outer();"
+                    " export const r = e.stack + '|' + x.y().stack;");
+    expect("main", "r", "Error: a\n    at af (stk:1:49)\n    at async outer (stk:2:40)\n    at async main:1:43"
+                        "|Error\n    at x.y (stk:3:49)\n    at main:1:93");
+
     /* basic import/export */
     mod_add("util", "export const g = 'hi'; export function up(s){ return s.toUpperCase(); }");
     mod_add("main", "import { g, up } from 'util'; export const r = up(g);");

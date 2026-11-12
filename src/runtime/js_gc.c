@@ -97,6 +97,14 @@ static void js_gc_trace(JsVm *vm) {
                 js_mapobj_mark(vm, o);
             if (o->obj_kind == JS_OBJ_SET)
                 js_setobj_mark(vm, o);
+            if (o->obj_kind == JS_OBJ_ERROR) {
+                JsErrorObject *e = (JsErrorObject *)o;
+                js_gc_mark_value(vm, e->stack);
+                for (uint32_t i = 0; i < e->frame_count; i++) {
+                    js_gc_mark_value(vm, e->frames[i].fn);
+                    js_gc_mark_value(vm, e->frames[i].receiver);
+                }
+            }
             break;
         }
         case JS_KIND_FUNCTION: {
@@ -107,6 +115,8 @@ static void js_gc_trace(JsVm *vm) {
                 js_gc_mark_cell(vm, &f->name->gc);
             if (f->source)
                 js_gc_mark_cell(vm, &f->source->gc);
+            if (f->debug_name)
+                js_gc_mark_cell(vm, &f->debug_name->gc);
             if (f->module)
                 js_gc_mark_cell(vm, &f->module->gc);
             break;
@@ -218,6 +228,11 @@ void js_gc_free_cell(JsVm *vm, JsGcCell *c, bool remove_atoms) {
             size = js_setobj_release(vm, o);
         if (o->obj_kind == JS_OBJ_HOST)
             size = js_host_object_release(vm, o);
+        if (o->obj_kind == JS_OBJ_ERROR) {
+            JsErrorObject *e = (JsErrorObject *)o;
+            js_realloc_raw(vm, e->frames, (size_t)e->frame_count * sizeof *e->frames, 0);
+            size = sizeof *e;
+        }
         break;
     }
     case JS_KIND_FUNCTION: {
@@ -328,6 +343,14 @@ void js_gc_collect(JsVm *vm) {
             js_gc_mark_value(vm, ctx->error_trace[i].function);
         }
         js_gc_mark_value(vm, ctx->error_trace_value);
+        if (ctx->error_ctor)
+            js_gc_mark_cell(vm, &ctx->error_ctor->gc);
+        /* the natives running now: their receivers (the callee is on its caller's stack, or
+         * held by the host) */
+        for (const JsNativeAct *a = ctx->native_act; a; a = a->outer) {
+            js_gc_mark_cell(vm, (JsGcCell *)&a->nf->gc);
+            js_gc_mark_value(vm, a->this_val);
+        }
     }
     js_gc_mark_jobs(vm);
     js_gc_trace(vm);

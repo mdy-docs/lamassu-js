@@ -520,6 +520,30 @@ JS_COLD static int delete_function_prop(JsContext *ctx, JsValue fn, JsValue key,
 
 /* A module namespace's let/const export reads as JS_SPECIAL_TDZ until its declaration has run
  * (also through a prototype chain): every caller that hands the value to a script checks it. */
+/* The properties some kinds of object make up (RegExp's source/flags/lastIndex, Map and Set's
+ * size, an error's stack), which shadow everything else. True when KEY is one: *ST says how
+ * the read went. Out of line, so the inlined get_property stays small. */
+__attribute__((noinline)) static bool special_prop_get(JsContext *ctx, JsObject *o, JsValue key,
+                                                       JsValue *out, JsPropStatus *st) {
+    bool handled = false;
+    *st = JS_PROP_OK;
+#ifdef LAMASSU_HAS_REGEX
+    if (o->obj_kind == JS_OBJ_REGEXP && !js_regexp_prop_get(ctx, o, key, out, &handled)) {
+        *st = JS_PROP_OOM;
+        return true;
+    }
+#endif
+    if (o->obj_kind == JS_OBJ_ERROR && !js_error_stack_get(ctx, o, key, out, &handled)) {
+        *st = JS_PROP_OOM;
+        return true;
+    }
+    if (o->obj_kind == JS_OBJ_MAP)
+        js_mapobj_prop_get(o, key, out, &handled);
+    else if (o->obj_kind == JS_OBJ_SET)
+        js_setobj_prop_get(o, key, out, &handled);
+    return handled;
+}
+
 static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
                                  JsValue *out) {
     JsVm *vm = ctx->vm;
@@ -547,28 +571,10 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
     }
     if (js_is_object(base)) {
         JsObject *o = js_value_object(base);
-#ifdef LAMASSU_HAS_REGEX
-        if (o->obj_kind == JS_OBJ_REGEXP) {
-            /* synthesized props (source, lastIndex, ...) shadow everything */
-            bool handled = false;
-            if (!js_regexp_prop_get(ctx, o, key, out, &handled))
-                return JS_PROP_OOM;
-            if (handled)
-                return JS_PROP_OK;
-        }
-#endif
-        if (o->obj_kind == JS_OBJ_MAP) {
-            /* synthesized `size` shadows everything, like RegExp's props */
-            bool handled = false;
-            js_mapobj_prop_get(o, key, out, &handled);
-            if (handled)
-                return JS_PROP_OK;
-        }
-        if (o->obj_kind == JS_OBJ_SET) {
-            bool handled = false;
-            js_setobj_prop_get(o, key, out, &handled);
-            if (handled)
-                return JS_PROP_OK;
+        if (JS_UNLIKELY(o->obj_kind > JS_OBJ_ARRAY)) { /* one test for plain objects and arrays */
+            JsPropStatus st;
+            if (special_prop_get(ctx, o, key, out, &st))
+                return st;
         }
         if (o->obj_kind == JS_OBJ_ARRAY) {
             uint32_t idx;
@@ -669,6 +675,8 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
  */
 static bool own_prop_present(JsContext *ctx, JsObject *o, JsValue key) {
     uint32_t idx;
+    if (o->obj_kind == JS_OBJ_ERROR && js_error_stack_has(o, key))
+        return true;
     if (o->obj_kind == JS_OBJ_ARRAY && key_to_index(key, &idx))
         return idx < o->elem_count;
     if (o->obj_kind == JS_OBJ_ARRAY && js_is_string(key) && units_is_ascii_str(js_value_string(key), "length"))
@@ -771,6 +779,11 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
         return JS_PROP_TYPE_ERROR;
     }
     JsObject *o = js_value_object(base);
+    /* an error's `stack` is V8's accessor: a frozen error still takes the write (once deleted,
+     * a write makes an ordinary property, as in V8) */
+    if (JS_UNLIKELY(o->obj_kind == JS_OBJ_ERROR) && js_error_stack_has(o, key) &&
+        js_error_stack_set(ctx, o, key, val))
+        return JS_PROP_OK;
     const char *blocked = write_blocked(ctx, o, key);
     if (blocked) {
         *errmsg = blocked;
@@ -862,6 +875,8 @@ static JsPropStatus has_property(JsContext *ctx, JsValue base, JsValue key,
             js_mapobj_prop_get(o, key, &tmp, &handled);
         else if (o->obj_kind == JS_OBJ_SET)
             js_setobj_prop_get(o, key, &tmp, &handled);
+        else if (o->obj_kind == JS_OBJ_ERROR)
+            handled = js_error_stack_has(o, key);
         if (handled) {
             *out = true;
             return JS_PROP_OK;
@@ -1008,6 +1023,137 @@ static uint32_t capture_trace(const JsFiber *fb, JsStackFrame *out, uint32_t max
             frame_record(&out[n++], fr, fr->ip > 0 ? fr->ip - 1 : 0);
         }
     return n;
+}
+
+/* Calls the native NF from FIBER's top frame (or from the host when FIBER is NULL), recording
+ * the call for js_native_userdata and for a stack trace's builtin frames. Out of line: its
+ * record on the C stack would otherwise sit in the interpreter loop's frame. */
+__attribute__((noinline)) static bool call_native(JsContext *ctx, JsFiber *fiber, JsNative *nf,
+                                                  JsValue this_val, const JsValue *args, int argc,
+                                                  bool is_new, JsValue *res) {
+    JsNative *outer_native = ctx->running_native;
+    ctx->running_native = nf;
+    JsNativeAct act = {ctx->native_act, nf, is_new ? js_undefined() : this_val, fiber,
+                       fiber ? fiber->frame_count : 0, is_new};
+    ctx->native_act = &act;
+    bool ok = nf->is_bound ? nf->bound_fn(ctx, nf->bound, this_val, args, argc, res)
+                           : nf->fn(ctx, this_val, args, argc, res);
+    ctx->native_act = act.outer;
+    ctx->running_native = outer_native;
+    return ok;
+}
+
+/* A raise, before any frame is popped: where it was raised (js_context_error_stack), and the
+ * frames of an error the interpreter made for it, now that the instruction's position is
+ * recorded. Out of line, to keep the interpreter loop small. */
+__attribute__((noinline)) static void record_raise(JsContext *ctx, JsFiber *fb) {
+    fb->trace_count = capture_trace(fb, fb->trace, JS_TRACE_MAX);
+    if (!js_error_capture_pending(ctx, fb->error))
+        fb->error = js_oom_value(ctx->vm);
+}
+
+/* `delete o[key]` on an object neither sealed nor frozen. False on OOM. */
+__attribute__((noinline)) static bool delete_object_prop(JsContext *ctx, JsObject *o, JsValue key) {
+    uint32_t idx;
+    if (o->obj_kind == JS_OBJ_ARRAY && value_to_index(key, &idx)) {
+        if (idx < o->elem_count)
+            o->elems[idx] = js_undefined();
+        return true;
+    }
+    if (o->obj_kind == JS_OBJ_ERROR && js_error_stack_delete(ctx, o, key))
+        return true; /* the error's `stack` */
+    JsString *k = to_prop_key(ctx, key);
+    if (!k)
+        return false;
+    js_map_delete(&o->props, k);
+    return true;
+}
+
+/* ---- e.stack: the frames an error is made in (js_error.c turns them into text) ---- */
+
+
+/* Whether the code running now is a native (rather than the interpreter, which raises its own
+ * errors before it has recorded the instruction's position): the innermost native call was made
+ * from the frame the current fiber is on. */
+bool js_in_native(const JsContext *ctx) {
+    const JsNativeAct *a = ctx->native_act;
+    return a && a->fiber == ctx->fiber && a->frame_count == (ctx->fiber ? ctx->fiber->frame_count : 0);
+}
+
+typedef struct {
+    JsErrorFrame *out;
+    uint32_t n, limit;
+    JsValue skip; /* a function: frames up to and including its call are left out */
+    bool skipping;
+} FrameSink;
+
+static void sink_add(FrameSink *k, JsValue fn, JsValue receiver, uint32_t pos, uint8_t flags) {
+    if (k->skipping) {
+        if (js_same_value(fn, k->skip))
+            k->skipping = false;
+        return;
+    }
+    if (k->n < k->limit)
+        k->out[k->n++] = (JsErrorFrame){fn, receiver, pos, flags};
+}
+
+static void sink_frame(FrameSink *k, const JsFiber *f, const JsFrame *fr, uint8_t flags) {
+    const JsFunctionCell *fn = fr->closure->fn;
+    JsValue receiver = fr->base >= 1 ? f->stack[fr->base - 1] : js_undefined();
+    sink_add(k, js_value_from_cell(&fr->closure->gc), receiver,
+             lookup_pos(fn, fr->ip > 0 ? fr->ip - 1 : 0),
+             (uint8_t)(flags | (fr->is_construct ? JS_EF_CONSTRUCT : 0)));
+}
+
+/* A native's frame, as V8 shows a builtin's (`at Array.map (<anonymous>)`): the engine's own
+ * natives only, not a bound function's trampoline nor a host's natives. */
+static void sink_native(FrameSink *k, const JsNativeAct *a) {
+    const JsNative *nf = a->nf;
+    if (!nf->builtin || (nf->is_bound && nf->bound_fn == js_bind_call)) {
+        if (k->skipping && js_same_value(js_value_from_cell((JsGcCell *)&nf->gc), k->skip))
+            k->skipping = false;
+        return;
+    }
+    sink_add(k, js_value_from_cell((JsGcCell *)&nf->gc), a->this_val, 0,
+             a->is_new ? JS_EF_CONSTRUCT : 0);
+}
+
+/*
+ * The frames running now, innermost first: each fiber's frames with the natives called from
+ * them in between, out through the fibers natives re-entered from; then, as V8 does, the async
+ * functions waiting on the outermost one (an `await` of its promise), and on them in turn.
+ * Returns how many were written to OUT (at most LIMIT).
+ */
+uint32_t js_capture_frames(JsContext *ctx, JsErrorFrame *out, uint32_t limit, JsValue skip) {
+    FrameSink k = {out, 0, limit, skip, js_is_function(skip)};
+    const JsNativeAct *a = ctx->native_act;
+    const JsFiber *last = NULL;
+    for (const JsFiber *f = ctx->fiber; f; f = f->caller) {
+        for (uint32_t i = f->frame_count; i > 0; i--) {
+            while (a && a->fiber == f && a->frame_count >= i) {
+                sink_native(&k, a);
+                a = a->outer;
+            }
+            sink_frame(&k, f, &f->frames[i - 1], 0);
+        }
+        last = f;
+    }
+    for (; a; a = a->outer) /* natives the host called */
+        sink_native(&k, a);
+    /* async callers: the fiber awaiting this one's promise, then the one awaiting that */
+    for (uint32_t guard = 0; last && last->result_promise && guard < 1000; guard++) {
+        const JsFiber *waiting = NULL;
+        for (const JsReaction *r = last->result_promise->reactions; r; r = r->next)
+            if (r->kind == 1 && r->fiber && r->fiber->frame_count) {
+                waiting = r->fiber;
+                break;
+            }
+        if (!waiting)
+            break;
+        sink_frame(&k, waiting, &waiting->frames[waiting->frame_count - 1], JS_EF_ASYNC);
+        last = waiting;
+    }
+    return k.n;
 }
 
 size_t js_context_stack(JsContext *ctx, JsStackFrame *out, size_t max) {
@@ -1270,6 +1416,7 @@ JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *ud)
     nf->bound = js_undefined();
     nf->is_bound = false;
     nf->name_deleted = false;
+    nf->builtin = !ctx->builtins_ready;
     nf->length = 0;
     return js_value_from_cell(c);
 }
@@ -1293,6 +1440,7 @@ JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound) {
     nf->bound = bound;
     nf->is_bound = true;
     nf->name_deleted = false;
+    nf->builtin = !ctx->builtins_ready;
     nf->length = 0;
     return js_value_from_cell(c);
 }
@@ -1338,6 +1486,7 @@ bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
     nf->bound = js_undefined();
     nf->is_bound = false;
     nf->name_deleted = false;
+    nf->builtin = !ctx->builtins_ready;
     nf->length = 0;
     return js_map_set(vm, &ctx->globals->props, js_value_string(key),
                       js_value_from_cell(c));
@@ -2133,16 +2282,8 @@ run:; /* (re)load the top frame */
                         fiber_throw_value(fb, js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of %v", key, b));
                         RT_RAISE();
                     }
-                    uint32_t idx;
-                    if (o->obj_kind == JS_OBJ_ARRAY && value_to_index(key, &idx)) {
-                        if (idx < o->elem_count)
-                            o->elems[idx] = js_undefined();
-                    } else {
-                        JsString *k = to_prop_key(ctx, key);
-                        if (!k)
-                            RT_THROW("out of memory");
-                        js_map_delete(&o->props, k);
-                    }
+                    if (!delete_object_prop(ctx, o, key))
+                        RT_THROW("out of memory");
                 } else if (js_is_function(b)) {
                     JsValue derr;
                     int dst = delete_function_prop(ctx, b, key, &derr);
@@ -2284,12 +2425,7 @@ run:; /* (re)load the top frame */
                         JsNative *nf = (JsNative *)cc;
                         fr->ip = ip;
                         JsValue res;
-                        JsNative *outer_native = ctx->running_native;
-                        ctx->running_native = nf;
-                        bool ok = nf->is_bound
-                            ? nf->bound_fn(ctx, nf->bound, S[nb - 1], &S[nb], (int)argc, &res)
-                            : nf->fn(ctx, S[nb - 1], &S[nb], (int)argc, &res);
-                        ctx->running_native = outer_native;
+                        bool ok = call_native(ctx, fb, nf, S[nb - 1], &S[nb], (int)argc, false, &res);
                         fb->sp = nb - 2;
                         if (!ok) {
                             fb->error = res;
@@ -2378,12 +2514,7 @@ run:; /* (re)load the top frame */
                     JsNative *nf = (JsNative *)cc;
                     fr->ip = ip;
                     JsValue res;
-                    JsNative *outer_native = ctx->running_native;
-                    ctx->running_native = nf;
-                    bool ok = nf->is_bound
-                        ? nf->bound_fn(ctx, nf->bound, S[nb - 1], &S[nb], (int)argc, &res)
-                        : nf->fn(ctx, S[nb - 1], &S[nb], (int)argc, &res);
-                    ctx->running_native = outer_native;
+                    bool ok = call_native(ctx, fb, nf, S[nb - 1], &S[nb], (int)argc, true, &res);
                     fb->sp = nb - 2;
                     if (!ok) {
                         fb->error = res;
@@ -2626,7 +2757,7 @@ on_error:
     /* Before any frame is popped: where the exception was raised, for
      * js_context_error_stack. A resume-with-rejection arrives here with the
      * top frame's ip just past its AWAIT, which reads the same way. */
-    fb->trace_count = capture_trace(fb, fb->trace, JS_TRACE_MAX);
+    record_raise(ctx, fb);
     while (fb->try_count > 0) {
         JsTryEntry t = fb->trys[fb->try_count - 1];
         while (fb->frame_count > t.frame_count) {
@@ -2865,13 +2996,7 @@ bool js_call(JsContext *ctx, JsValue fn, JsValue this_val, const JsValue *args,
     JsGcCell *c = js_value_cell(fn);
     if (c->kind == JS_KIND_NATIVE) {
         JsNative *nf = (JsNative *)c;
-        JsNative *outer_native = ctx->running_native;
-        ctx->running_native = nf;
-        bool ok_ = nf->is_bound
-            ? nf->bound_fn(ctx, nf->bound, this_val, args, argc, result)
-            : nf->fn(ctx, this_val, args, argc, result);
-        ctx->running_native = outer_native;
-        return ok_;
+        return call_native(ctx, ctx->fiber, nf, this_val, args, argc, false, result);
     }
     JsClosure *cl;
     if (c->kind == JS_KIND_CLOSURE) {

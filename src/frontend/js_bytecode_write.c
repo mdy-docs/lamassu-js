@@ -135,6 +135,13 @@ static bool serialize_fn(OutBuf *b, JsFunctionCell *fn, uint32_t depth) {
         if (n)
             out_units(b, fn->source->units, n);
     }
+    if (fn->debug_name) {
+        out_u8(b, 1);
+        out_u32(b, fn->debug_name->length);
+        out_units(b, fn->debug_name->units, fn->debug_name->length);
+    } else {
+        out_u8(b, 0);
+    }
     out_u32(b, fn->code_len);
     out_bytes(b, fn->code, fn->code_len);
     out_u32(b, fn->const_count);
