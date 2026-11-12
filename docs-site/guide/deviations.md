@@ -32,7 +32,8 @@ that's known to differ, so you're not surprised by one in production.
 
 ## Functions
 
-- **There is no `Function` global** (the constructor is left out, as `eval` is), so
+- **There is no `Function` global.** The constructor is left out, as `eval` is, so that
+  untrusted code cannot compile code at run time and a runtime-only build needs no compiler.
   `Function.prototype.toString.call(x)` is written `(() => {}).toString.call(x)`.
 - **After `delete f.name` or `delete f.length`**, it reads `""` or `0` as in V8, but
   `f.hasOwnProperty(...)` still says `true`.
