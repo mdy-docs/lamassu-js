@@ -125,6 +125,9 @@ const JsOpInfo js_op_info[JS_OP__COUNT] = {
     OP(JS_OP_NEW_REGEXP, OPF_REGEXP, CF_NEXT, +1, 0, 4),
     OP(JS_OP_DYNAMIC_IMPORT, OPF_NONE, CF_NEXT, 0, 1, 0),
     OP(JS_OP_THROW_CONST_ASSIGN, OPF_NONE, CF_NEXT, 0, 1, 0),
+    OP(JS_OP_SET_LOCAL_CHECKED, OPF_LOCAL, CF_NEXT, 0, 1, 2),
+    OP(JS_OP_SET_UPVAL_CHECKED, OPF_UPVAL, CF_NEXT, 0, 1, 2),
+    OP(JS_OP_INIT_EXPORT, OPF_CONST_STR, CF_NEXT, 0, 1, 2),
 };
 #undef OP
 
@@ -517,9 +520,9 @@ static bool const_is_function(JsFunctionCell *fn, uint16_t idx) {
  * therefore never depth-checked. Only a real GOSUB resume point is a legal
  * target, and pass 2 proves the depth at each of those.
  */
-/* True for the four opcodes that dereference fn->module. */
+/* True for the opcodes that dereference fn->module. */
 static bool is_module_opcode(uint8_t opb) {
-    return opb == JS_OP_GET_EXPORT || opb == JS_OP_SET_EXPORT ||
+    return opb == JS_OP_GET_EXPORT || opb == JS_OP_SET_EXPORT || opb == JS_OP_INIT_EXPORT ||
            opb == JS_OP_GET_IMPORT || opb == JS_OP_IMPORT_NS;
 }
 
@@ -1200,8 +1203,29 @@ bool js_bc_load_module(JsContext *ctx, JsModule *m, const uint8_t *buf, size_t l
         goto done;
     }
     js_value_object(exports)->proto = js_undefined();
+    js_value_object(exports)->obj_flags = JS_OBJ_SEALED | JS_OBJ_NAMESPACE;
+    js_value_object(exports)->props.by_name = true;
     ((JsModule *)js_value_cell(mv))->exports = js_value_object(exports);
     m = (JsModule *)js_value_cell(mv);
+
+    /* let/const exports: in the TDZ until their declarations run, so that another module of a
+     * cycle (or a hoisted function) reading one first throws, as in V8 */
+    uint32_t tdz_count = in_u32(&b);
+    if (b.bad || tdz_count > JSBC_MAX_CONSTS) {
+        *err = "SyntaxError: bad module export count";
+        goto done;
+    }
+    for (uint32_t i = 0; i < tdz_count; i++) {
+        JsString *name = load_req_str(ctx, &b, err);
+        if (!name)
+            goto done;
+        JsValue tdz;
+        tdz.bits = JS_SPECIAL_TDZ;
+        if (!js_map_set(vm, &m->exports->props, name, tdz)) {
+            *err = "out of memory";
+            goto done;
+        }
+    }
 
     /* body function */
     JsFunctionCell *body = load_fn(ctx, &b, 0, err);

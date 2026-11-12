@@ -233,6 +233,21 @@ bool js_bc_serialize_module(JsContext *ctx, JsModule *m, uint8_t **out, size_t *
     for (uint32_t i = 0; i < m->dep_spec_count; i++)
         out_str(&b, m->dep_specs[i]);
 
+    /* the let/const exports, which the compiler left in the TDZ in the (unevaluated) exports
+     * object; the loader puts them back there */
+    JsMap *ex = &m->exports->props;
+    js_map_sort_keys(ex);
+    uint32_t tdz_count = 0;
+    for (uint32_t i = 0; i < ex->capacity; i++)
+        if (ex->entries[i].key && ex->entries[i].key != JS_MAP_TOMBSTONE &&
+            ex->entries[i].value.bits == JS_SPECIAL_TDZ)
+            tdz_count++;
+    out_u32(&b, tdz_count);
+    for (uint32_t i = 0; i < ex->capacity; i++)
+        if (ex->entries[i].key && ex->entries[i].key != JS_MAP_TOMBSTONE &&
+            ex->entries[i].value.bits == JS_SPECIAL_TDZ)
+            out_str(&b, ex->entries[i].key);
+
     if (!serialize_fn(&b, m->body, 0) || b.oom) {
         js_realloc_raw(ctx->vm, b.data, b.cap, 0);
         return false;

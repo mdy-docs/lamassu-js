@@ -57,6 +57,8 @@ typedef struct JsLocalVar {
     bool is_const;
     bool captured;             /* an inner function closes over it */
     bool pending;              /* let/const not yet initialized here: a read may hit the TDZ */
+    bool tdz_anywhere;         /* let/const of a switch body: a later case can run without its
+                                  declaration, so any access may hit the TDZ */
 } JsLocalVar;
 
 typedef struct JsUpName {
@@ -536,6 +538,7 @@ static bool declare_local(JsCompiler *cx, const uint16_t *name, uint32_t len,
     v->is_const = is_const;
     v->captured = false;
     v->pending = false;
+    v->tdz_anywhere = false;
     if (fs->slot_count > fs->slot_max)
         fs->slot_max = fs->slot_count;
     if (slot_out)
@@ -804,28 +807,60 @@ static int emit_module_load(JsCompiler *cx, const JsAstNode *n) {
     JsModBinding *b = resolve_module_binding(cx, n->units, n->len);
     if (!b)
         return 0;
+    /* A TDZ error names the binding as the source does: the export's own name serves unless
+     * the local name differs (`export { a as b }`); an import is always named by its local
+     * name, since linking may rename what it reads. */
     if (b->kind == JS_MB_EXPORT) {
         uint16_t c;
         if (!atom_const(cx, b->export_name, b->export_len, n->pos, &c))
             return -1;
+        if (!units_equal(b->name, b->len, b->export_name, b->export_len))
+            note_units(cx, n->units, n->len);
         return emit_op_u16(cx, JS_OP_GET_EXPORT, c, +1) ? 1 : -1;
     }
     if (b->kind == JS_MB_IMPORT_NS)
         return emit_op_u16(cx, JS_OP_IMPORT_NS, b->import_index, +1) ? 1 : -1;
+    note_units(cx, n->units, n->len);
     return emit_op_u16(cx, JS_OP_GET_IMPORT, b->import_index, +1) ? 1 : -1;
+}
+
+/* Writes the value on the stack to every name a local is exported as (`export let a` and
+ * `export { a as b }` are two names of one binding); `op` is INIT_EXPORT for the declaration's
+ * own write, SET_EXPORT for an assignment. Returns 0 if `name` is not an exported binding. */
+static int emit_export_writes(JsCompiler *cx, const uint16_t *name, uint32_t len, uint32_t pos,
+                              uint8_t op) {
+    int n = 0;
+    for (uint32_t i = 0; i < cx->mbind_count; i++) {
+        JsModBinding *b = &cx->mbind[i];
+        if (b->kind != JS_MB_EXPORT || !units_equal(b->name, b->len, name, len))
+            continue;
+        uint16_t c;
+        if (!atom_const(cx, b->export_name, b->export_len, pos, &c))
+            return -1;
+        if (op == JS_OP_SET_EXPORT && !units_equal(b->name, b->len, b->export_name, b->export_len))
+            note_units(cx, name, len);
+        if (!emit_op_u16(cx, op, c, 0))
+            return -1;
+        n = 1;
+    }
+    return n;
 }
 
 static int emit_module_store(JsCompiler *cx, const JsAstNode *target) {
     JsModBinding *b = resolve_module_binding(cx, target->units, target->len);
     if (!b)
         return 0;
-    /* an import or a const: a TypeError when the assignment runs, as in V8 */
-    if (b->kind != JS_MB_EXPORT || b->is_const)
+    /* an import: a TypeError when the assignment runs, as in V8 */
+    if (b->kind != JS_MB_EXPORT)
         return emit_op(cx, JS_OP_THROW_CONST_ASSIGN, 0) ? 1 : -1;
-    uint16_t c;
-    if (!atom_const(cx, b->export_name, b->export_len, target->pos, &c))
-        return -1;
-    return emit_op_u16(cx, JS_OP_SET_EXPORT, c, 0) ? 1 : -1;
+    /* a const: the same, after the TDZ check that comes first */
+    if (b->is_const) {
+        int m = emit_module_load(cx, target);
+        if (m <= 0)
+            return m;
+        return emit_op(cx, JS_OP_POP, -1) && emit_op(cx, JS_OP_THROW_CONST_ASSIGN, 0) ? 1 : -1;
+    }
+    return emit_export_writes(cx, target->units, target->len, target->pos, JS_OP_SET_EXPORT);
 }
 
 /* Whether the binding NAME resolves to is a let/const whose declaration has not been compiled
@@ -836,7 +871,7 @@ static bool binding_pending(JsFuncState *fs, const uint16_t *name, uint32_t len)
     for (; fs; fs = fs->parent) {
         int i = resolve_local_in(fs, name, len);
         if (i >= 0)
-            return fs->locals[i].pending;
+            return fs->locals[i].pending || fs->locals[i].tdz_anywhere;
     }
     return false;
 }
@@ -845,7 +880,7 @@ static bool compile_ident_load(JsCompiler *cx, const JsAstNode *n) {
     note_pos(cx, n->pos);
     int idx = resolve_local_in(cx->cur, n->units, n->len);
     if (idx >= 0) {
-        if (cx->cur->locals[idx].pending)
+        if (cx->cur->locals[idx].pending || cx->cur->locals[idx].tdz_anywhere)
             note_units(cx, n->units, n->len);
         return emit_op_u16(cx, JS_OP_GET_LOCAL, cx->cur->locals[idx].slot, +1);
     }
@@ -872,20 +907,34 @@ static bool compile_ident_load(JsCompiler *cx, const JsAstNode *n) {
 
 static bool compile_ident_store(JsCompiler *cx, const JsAstNode *target) {
     note_pos(cx, target->pos);
+    /* A write that may come before the declaration has run (see binding_pending) is checked:
+     * in the TDZ it is a ReferenceError, which V8 reports before a const's TypeError. */
     int idx = resolve_local_in(cx->cur, target->units, target->len);
     if (idx >= 0) {
-        if (cx->cur->locals[idx].is_const)
-            return emit_op(cx, JS_OP_THROW_CONST_ASSIGN, 0);
-        return emit_op_u16(cx, JS_OP_SET_LOCAL, cx->cur->locals[idx].slot, 0);
+        JsLocalVar *v = &cx->cur->locals[idx];
+        bool maybe_tdz = v->pending || v->tdz_anywhere;
+        if (maybe_tdz)
+            note_units(cx, target->units, target->len);
+        if (v->is_const)
+            return (!maybe_tdz || (emit_op_u16(cx, JS_OP_GET_LOCAL, v->slot, +1) &&
+                                   emit_op(cx, JS_OP_POP, -1))) &&
+                   emit_op(cx, JS_OP_THROW_CONST_ASSIGN, 0);
+        return emit_op_u16(cx, maybe_tdz ? JS_OP_SET_LOCAL_CHECKED : JS_OP_SET_LOCAL, v->slot, 0);
     }
     bool is_const;
     int up = resolve_upvalue(cx, cx->cur, target->units, target->len, &is_const);
     if (cx->err_msg)
         return false;
     if (up >= 0) {
+        bool maybe_tdz = binding_pending(cx->cur->parent, target->units, target->len);
+        if (maybe_tdz)
+            note_units(cx, target->units, target->len);
         if (is_const)
-            return emit_op(cx, JS_OP_THROW_CONST_ASSIGN, 0);
-        return emit_op_u16(cx, JS_OP_SET_UPVAL, (uint16_t)up, 0);
+            return (!maybe_tdz || (emit_op_u16(cx, JS_OP_GET_UPVAL, (uint16_t)up, +1) &&
+                                   emit_op(cx, JS_OP_POP, -1))) &&
+                   emit_op(cx, JS_OP_THROW_CONST_ASSIGN, 0);
+        return emit_op_u16(cx, maybe_tdz ? JS_OP_SET_UPVAL_CHECKED : JS_OP_SET_UPVAL,
+                           (uint16_t)up, 0);
     }
     if (cx->module) {
         int m = emit_module_store(cx, target);
@@ -963,10 +1012,7 @@ static int emit_module_init(JsCompiler *cx, const JsAstNode *tgt) {
     JsModBinding *b = resolve_module_binding(cx, tgt->units, tgt->len);
     if (!b || b->kind != JS_MB_EXPORT)
         return 0;
-    uint16_t c;
-    if (!atom_const(cx, b->export_name, b->export_len, tgt->pos, &c))
-        return -1;
-    return emit_op_u16(cx, JS_OP_SET_EXPORT, c, 0) ? 1 : -1;
+    return emit_export_writes(cx, tgt->units, tgt->len, tgt->pos, JS_OP_INIT_EXPORT);
 }
 
 static bool store_target(JsCompiler *cx, const JsAstNode *tgt, bool declaring) {
@@ -1970,14 +2016,10 @@ static bool hoist_functions(JsCompiler *cx, JsAstNode *const *stmts, uint32_t co
         if (exported ||
             (cx->module && cx->cur->is_module && resolve_module_binding(cx, s->units, s->len) &&
              resolve_module_binding(cx, s->units, s->len)->kind == JS_MB_EXPORT)) {
-            /* exported function: initialize the export binding */
-            uint16_t c;
-            JsModBinding *b = resolve_module_binding(cx, s->units, s->len);
-            const uint16_t *ename = b ? b->export_name : s->units;
-            uint32_t elen = b ? b->export_len : s->len;
-            if (!atom_const(cx, ename, elen, s->pos, &c) ||
-                !emit_op_u16(cx, JS_OP_SET_EXPORT, c, 0) || !emit_op(cx, JS_OP_POP, -1))
-                return false;
+            /* exported function: initialize the export binding (under every name) */
+            if (emit_export_writes(cx, s->units, s->len, s->pos, JS_OP_INIT_EXPORT) <= 0 ||
+                !emit_op(cx, JS_OP_POP, -1))
+                return cx->err_msg ? false : cerr(cx, s->pos, "internal: export not bound");
             continue;
         }
         int idx = resolve_local_in(cx->cur, s->units, s->len);
@@ -2139,6 +2181,10 @@ static bool compile_switch(JsCompiler *cx, const JsAstNode *n) {
         if (!prescan_declarations(cx, n->items[i]->items, n->items[i]->count, m.local_count))
             return false;
     }
+    /* one scope for every case: jumping to a later case skips the declarations before it */
+    for (uint32_t i = m.local_count; i < cx->cur->local_count; i++)
+        if (cx->cur->locals[i].pending)
+            cx->cur->locals[i].tdz_anywhere = true;
     for (uint32_t i = 0; i < n->count; i++) {
         if (!hoist_functions(cx, n->items[i]->items, n->items[i]->count))
             return false;
@@ -2437,7 +2483,7 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
         static const uint16_t def_name[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
         if (!atom_const(cx, def_name, 7, n->pos, &c))
             return false;
-        return emit_op_u16(cx, JS_OP_SET_EXPORT, c, 0) && emit_op(cx, JS_OP_POP, -1);
+        return emit_op_u16(cx, JS_OP_INIT_EXPORT, c, 0) && emit_op(cx, JS_OP_POP, -1);
     }
     default:
         return cerr(cx, n->pos, "unsupported statement");
@@ -2573,12 +2619,13 @@ static bool mbind_add(JsCompiler *cx, uint32_t *cap, JsModBinding b) {
 /* Adds exported names from a declaration (let/const/function) to mbind. */
 static bool mbind_add_export(JsCompiler *cx, uint32_t *cap, const uint16_t *local,
                              uint32_t local_len, const uint16_t *exp, uint32_t exp_len,
-                             bool is_const) {
+                             bool is_const, bool lexical) {
     JsModBinding b;
     b.name = local;
     b.len = local_len;
     b.kind = JS_MB_EXPORT;
     b.is_const = is_const;
+    b.lexical = lexical;
     b.import_index = 0;
     b.export_name = exp ? exp : local;
     b.export_len = exp ? exp_len : local_len;
@@ -2590,7 +2637,7 @@ static bool export_pattern_names(JsCompiler *cx, uint32_t *cap, const JsAstNode 
                                  bool is_const) {
     switch ((JsAstKind)pat->kind) {
     case JS_AST_IDENT:
-        return mbind_add_export(cx, cap, pat->units, pat->len, NULL, 0, is_const);
+        return mbind_add_export(cx, cap, pat->units, pat->len, NULL, 0, is_const, true);
     case JS_AST_DEFAULT:
         return export_pattern_names(cx, cap, pat->a, is_const);
     case JS_AST_ARRAY_PATTERN:
@@ -2613,6 +2660,96 @@ static bool export_pattern_names(JsCompiler *cx, uint32_t *cap, const JsAstNode 
     default:
         return true;
     }
+}
+
+/* True if the declaration pattern binds `name`. */
+static bool pattern_binds(const JsAstNode *pat, const uint16_t *name, uint32_t len) {
+    switch ((JsAstKind)pat->kind) {
+    case JS_AST_IDENT:
+        return units_equal(pat->units, pat->len, name, len);
+    case JS_AST_DEFAULT:
+        return pattern_binds(pat->a, name, len);
+    case JS_AST_ARRAY_PATTERN:
+        for (uint32_t i = 0; i < pat->count; i++) {
+            const JsAstNode *el = pat->items[i];
+            if (el->kind != JS_AST_HOLE && pattern_binds(el->kind == JS_AST_REST ? el->a : el, name, len))
+                return true;
+        }
+        return false;
+    case JS_AST_OBJECT_PATTERN:
+        for (uint32_t i = 0; i < pat->count; i++) {
+            const JsAstNode *prop = pat->items[i];
+            if (pattern_binds(prop->kind == JS_AST_REST ? prop->a : prop->b, name, len))
+                return true;
+        }
+        return false;
+    default:
+        return false;
+    }
+}
+
+/*
+ * One name of `export { a, b as c }`, resolved as V8 does: an imported name is re-exported
+ * (an indirect export, which importers follow to the defining module), a top-level let/const
+ * or function becomes an export binding with that declaration's rules, anything else is a
+ * SyntaxError.
+ */
+static bool list_export(JsCompiler *cx, uint32_t *cap, const JsAstNode *module, JsModule *mod,
+                        const JsAstNode *sp) {
+    const uint16_t *name = sp->units, *exp = sp->units2;
+    uint32_t len = sp->len, exp_len = sp->len2;
+    for (uint32_t i = 0; i < cx->mbind_count; i++) {
+        JsModBinding *b = &cx->mbind[i];
+        if (b->kind == JS_MB_EXPORT || !units_equal(b->name, b->len, name, len))
+            continue;
+        JsModuleImport *imp = &mod->imports[b->import_index];
+        JsString *ex = intern_atom(cx, exp, exp_len);
+        if (!ex || !mod_add_star(cx, mod, imp->specifier,
+                                 b->kind == JS_MB_IMPORT_NS ? JS_REEXP_NS : JS_REEXP_NAMED,
+                                 b->kind == JS_MB_IMPORT_NS ? NULL : imp->imported_name, ex))
+            return cerr(cx, sp->pos, "out of memory");
+        return true;
+    }
+    for (uint32_t i = 0; i < module->count; i++) {
+        const JsAstNode *d = module->items[i];
+        if (d->kind == JS_AST_EXPORT_NAMED && d->a)
+            d = d->a;
+        if (d->kind == JS_AST_LET_DECL) {
+            for (uint32_t k = 0; k < d->count; k++)
+                if (pattern_binds(d->items[k]->a, name, len))
+                    return mbind_add_export(cx, cap, name, len, exp, exp_len,
+                                            (d->flags & JS_F_CONST) != 0, true);
+        } else if (d->kind == JS_AST_FUNC_DECL && units_equal(d->units, d->len, name, len)) {
+            return mbind_add_export(cx, cap, name, len, exp, exp_len, false, false);
+        }
+    }
+    return cerr(cx, sp->pos, js_compile_error_fmt(cx->vm, "Export '%U' is not defined in module",
+                                                  name, len));
+}
+
+/* Puts every let/const export (and an `export default` expression) in the TDZ in the exports
+ * object before anything runs, so that a read ahead of the declaration throws as in V8. */
+static bool exports_start_in_tdz(JsCompiler *cx, const JsAstNode *module, JsModule *mod) {
+    JsValue tdz;
+    tdz.bits = JS_SPECIAL_TDZ;
+    for (uint32_t i = 0; i < cx->mbind_count; i++) {
+        JsModBinding *b = &cx->mbind[i];
+        if (b->kind != JS_MB_EXPORT || !b->lexical)
+            continue;
+        JsString *k = intern_atom(cx, b->export_name, b->export_len);
+        if (!k || !js_map_set(cx->vm, &mod->exports->props, k, tdz))
+            return cerr(cx, 0, "out of memory");
+    }
+    for (uint32_t i = 0; i < module->count; i++) {
+        const JsAstNode *n = module->items[i];
+        if (n->kind != JS_AST_EXPORT_DEFAULT || (n->flags & JS_F_DEFAULT_DECL))
+            continue;
+        static const uint16_t d[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
+        JsString *k = intern_atom(cx, d, 7);
+        if (!k || !js_map_set(cx->vm, &mod->exports->props, k, tdz))
+            return cerr(cx, 0, "out of memory");
+    }
+    return true;
 }
 
 static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mod) {
@@ -2678,7 +2815,7 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
                         if (!export_pattern_names(cx, &cap, d->items[k]->a, is_const))
                             return false;
                 } else if (d->kind == JS_AST_FUNC_DECL) {
-                    if (!mbind_add_export(cx, &cap, d->units, d->len, NULL, 0, false))
+                    if (!mbind_add_export(cx, &cap, d->units, d->len, NULL, 0, false, false))
                         return false;
                 }
             } else if (n->len) { /* export { x as y } from 'm' (re-export) */
@@ -2693,18 +2830,19 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
                         !mod_add_star(cx, mod, spec, JS_REEXP_NAMED, imp, exp))
                         return cerr(cx, n->pos, "out of memory");
                 }
-            } else { /* export { a, b as c } (local) */
-                for (uint32_t s = 0; s < n->count; s++) {
-                    const JsAstNode *sp = n->items[s];
-                    if (!mbind_add_export(cx, &cap, sp->units, sp->len, sp->units2, sp->len2,
-                                          false))
-                        return false;
-                }
-            }
+            } /* export { a, b as c } (local): resolved below, once every binding is known */
             break;
         default:
             break;
         }
+    }
+    for (uint32_t i = 0; i < module->count; i++) {
+        const JsAstNode *n = module->items[i];
+        if (n->kind != JS_AST_EXPORT_NAMED || n->a || n->len)
+            continue;
+        for (uint32_t s = 0; s < n->count; s++)
+            if (!list_export(cx, &cap, module, mod, n->items[s]))
+                return false;
     }
     return true;
 }
@@ -2740,7 +2878,7 @@ JsFunctionCell *js_compile_module_body(JsContext *ctx, const JsAstNode *module,
     cx.cur = &fs;
     js_gc_protect(vm, &fs.fn_value);
 
-    bool ok = analyze_module(&cx, module, mod);
+    bool ok = analyze_module(&cx, module, mod) && exports_start_in_tdz(&cx, module, mod);
     if (ok)
         ok = compile_block_stmts(&cx, module->items, module->count);
     /* an entry that runs off its end returned undefined, not its last expression */

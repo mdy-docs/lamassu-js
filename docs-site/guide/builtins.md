@@ -34,7 +34,9 @@ re-added key moves to the end. An array lists its elements, then any named
 properties.
 
 `freeze` and `seal` are enforced, not advisory: writing to a frozen object,
-or adding to or deleting from a sealed one, throws a `TypeError`. Sealing
+or adding to or deleting from a sealed one, throws a `TypeError`, and so does
+giving either a different prototype with `setPrototypeOf` (`#<Object> is not
+extensible`). Sealing
 fixes the shape while leaving existing properties writable, so
 `reverse`/`fill`/`sort` still work on a sealed array while
 `push`/`pop`/`shift`/`unshift` don't. Both return their argument, and both

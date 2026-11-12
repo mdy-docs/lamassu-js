@@ -1,3 +1,4 @@
+#include "js_bytecode.h"
 #include "lamassu_internal.h"
 
 JsValue js_object_new(JsContext *ctx) {
@@ -159,7 +160,10 @@ JsValue js_object_get(JsVm *vm, JsValue obj, JsValue key) {
     if (!k)
         return js_undefined();
     bool found;
-    return js_map_get(&js_value_object(obj)->props, k, &found);
+    JsValue v = js_map_get(&js_value_object(obj)->props, k, &found);
+    /* a namespace's let/const export before its declaration has run: the TDZ marker never
+     * leaves the engine, so the host sees it as not there yet */
+    return v.bits == JS_SPECIAL_TDZ ? js_undefined() : v;
 }
 
 bool js_object_set(JsVm *vm, JsValue obj, JsValue key, JsValue value) {
@@ -169,7 +173,7 @@ bool js_object_set(JsVm *vm, JsValue obj, JsValue key, JsValue value) {
      * keep guest code out would otherwise be able to defeat its own guarantee
      * by accident, and natives share this entry point with guest writes. */
     JsObject *o = js_value_object(obj);
-    if (o->obj_flags & JS_OBJ_FROZEN)
+    if (o->obj_flags & (JS_OBJ_FROZEN | JS_OBJ_NAMESPACE))
         return false;
     if (o->obj_flags & JS_OBJ_SEALED) {
         bool found = false;

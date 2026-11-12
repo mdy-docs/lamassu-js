@@ -2330,6 +2330,7 @@ static JsAstNode *parse_export(JsParser *p) {
         if (TOK(p).kind == JS_T_FUNCTION) {
             if (!advance(p))
                 return NULL;
+            n->flags |= JS_F_DEFAULT_DECL;
             n->a = parse_func_common(p, 0, false, pos, JS_AST_FUNC_EXPR);
             return n->a ? n : NULL;
         }
@@ -2337,6 +2338,7 @@ static JsAstNode *parse_export(JsParser *p) {
             !peek(p).newline_before) {
             if (!advance(p) || !advance(p))
                 return NULL;
+            n->flags |= JS_F_DEFAULT_DECL;
             n->a = parse_func_common(p, JS_F_ASYNC, false, pos, JS_AST_FUNC_EXPR);
             return n->a ? n : NULL;
         }

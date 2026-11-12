@@ -90,9 +90,7 @@ iterator (`for...of` over the result behaves the same either way).
   disallowed as a lexically bound name`, `Invalid or unexpected token` and
   `o is not iterable`); a callee with no readable name shows its value
   (`undefined is not a function` for `(void 0)()`, where V8 prints the
-  expression); a `let`/`const` read too early after a fall-through between
-  `switch` cases says `Cannot access a variable before initialization`
-  without the name; and a duplicate label is not an error.
+  expression); and a duplicate label is not an error.
 - **Out-of-memory errors may still be bare strings**: when the engine
   cannot allocate an Error object, it throws the message text instead so
   the failure is never lost.
@@ -110,19 +108,24 @@ iterator (`for...of` over the result behaves the same either way).
 
 ## Modules
 
-- **An exported `let`/`const` read before its declaration runs is
-  `undefined`**, rather than a TDZ error (`Cannot access 'x' before
-  initialization`, which a binding that is not exported does throw). Exports
-  live in the module's exports object, which has no uninitialized state. It
-  happens in a cross-module cycle, and in the exporting module itself when a
-  hoisted function reads the export before its declaration. Hoisted `export
-  function` declarations are available throughout, so mutually recursive
-  function modules work fine.
+- **An exported function exists once its own module starts running**, not
+  before any module of the graph runs as in V8. In a cycle, the module that
+  runs first cannot call, from its top-level code, a function exported by a
+  module that runs after it (`f is not a function`). Calls made later (from a
+  function, once both modules have run) work, which covers mutually recursive
+  function modules. `export default function` behaves the same way. (Exported
+  `let`/`const` and `export default` expressions follow V8: read or written
+  before their declaration runs, they throw `Cannot access 'x' before
+  initialization`.)
 - **Named and `export *` re-exports are snapshots**, taken once the source
   module finishes evaluating (dependency order guarantees this has already
   happened). A later mutation of a re-exported *mutable* binding isn't
   observed through the re-export. `export * as ns from` is live by
-  reference instead (it aliases the source's namespace object). For a
+  reference instead (it aliases the source's namespace object). A module that
+  *imports* a re-exported name reads the defining module's live binding, as
+  in V8 (this includes `import { x } from 'm'; export { x }`); only the
+  re-exporting module's own namespace object holds the snapshot, which is
+  `undefined` for a binding whose module, in a cycle, had not run yet. For a
   templating workload this is exact in practice, since re-exports are
   almost always functions or constants.
 - **Module evaluation drains the whole microtask queue** after each module

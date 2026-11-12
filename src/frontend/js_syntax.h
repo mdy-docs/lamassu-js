@@ -147,6 +147,7 @@ typedef enum JsAstKind {
 #define JS_F_PREFIX      0x01 /* UPDATE */
 #define JS_F_TRUE        0x01 /* BOOL_LIT */
 #define JS_F_HAS_TLA     0x01 /* MODULE: uses top-level await */
+#define JS_F_DEFAULT_DECL 0x01 /* EXPORT_DEFAULT: `export default function ...` (not an expression) */
 #define JS_F_SPEC_DEFAULT 0x01 /* IMPORT_SPEC */
 #define JS_F_SPEC_NS      0x02 /* IMPORT_SPEC */
 #define JS_F_COVER_SPREAD 0x01 /* COVER */

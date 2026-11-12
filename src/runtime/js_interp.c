@@ -414,6 +414,8 @@ JsObject *js_function_props(JsContext *ctx, JsValue fn, bool create) {
     return *slot;
 }
 
+/* A module namespace's let/const export reads as JS_SPECIAL_TDZ until its declaration has run
+ * (also through a prototype chain): every caller that hands the value to a script checks it. */
 static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
                                  JsValue *out) {
     JsVm *vm = ctx->vm;
@@ -574,13 +576,14 @@ static const char SET_NULLISH[] = "TypeError: Cannot set properties of %v (setti
 static const char SET_READ_ONLY[] = "TypeError: Cannot assign to read only property '%v' of %s '%v'";
 static const char SET_NOT_EXTENSIBLE[] = "TypeError: Cannot add property %v, object is not extensible";
 static const char SET_PRIMITIVE[] = "TypeError: Cannot create property '%v' on %s '%v'";
+static const char SET_NAMESPACE[] = "TypeError: Cannot assign to property '%v' of [object Module]";
 
 static JsValue set_error(JsContext *ctx, const char *msg, JsValue base, JsValue key) {
     if (msg == SET_NULLISH)
         return js_error_fmt(ctx, msg, base, key);
     if (msg == SET_READ_ONLY)
         return js_error_fmt(ctx, msg, key, js_is_function(base) ? "function" : "object", base);
-    if (msg == SET_NOT_EXTENSIBLE)
+    if (msg == SET_NOT_EXTENSIBLE || msg == SET_NAMESPACE)
         return js_error_fmt(ctx, msg, key);
 #ifdef LAMASSU_HAS_REGEX
     if (strcmp(msg, JS_REGEXP_GETTER_ONLY) == 0)
@@ -595,6 +598,8 @@ static JsValue set_error(JsContext *ctx, const char *msg, JsValue base, JsValue 
 static const char *write_blocked(JsContext *ctx, JsObject *o, JsValue key) {
     if (!o->obj_flags)
         return NULL; /* the overwhelmingly common case: one predictable branch */
+    if (o->obj_flags & JS_OBJ_NAMESPACE)
+        return SET_NAMESPACE; /* a module's exports change only through its own bindings */
     if (!own_prop_present(ctx, o, key))
         return SET_NOT_EXTENSIBLE; /* sealed or frozen: no new properties */
     if (o->obj_flags & JS_OBJ_FROZEN)
@@ -773,8 +778,9 @@ static JsPropStatus has_property(JsContext *ctx, JsValue base, JsValue key,
     return JS_PROP_OK;
 }
 
-bool js_spread_into_object(JsContext *ctx, JsObject *dst, JsValue src) {
+bool js_spread_into_object(JsContext *ctx, JsObject *dst, JsValue src, JsString **uninit) {
     JsVm *vm = ctx->vm;
+    *uninit = NULL;
     if (!js_is_object(src) && !js_is_string(src))
         return true; /* primitives spread to nothing */
     if (js_is_string(src)) {
@@ -808,6 +814,10 @@ bool js_spread_into_object(JsContext *ctx, JsObject *dst, JsValue src) {
     for (uint32_t i = 0; i < o->props.capacity; i++) {
         JsMapEntry *e = &o->props.entries[i];
         if (e->key && e->key != JS_MAP_TOMBSTONE) {
+            if (e->value.bits == JS_SPECIAL_TDZ) { /* a namespace's uninitialized export */
+                *uninit = e->key;
+                return false;
+            }
             if (!js_map_set(vm, &dst->props, e->key, e->value))
                 return false;
         }
@@ -955,8 +965,9 @@ static bool find_note(const JsFunctionCell *fn, uint32_t ip, const uint16_t **un
         if (fn->callees[mid].off < ip) lo = mid + 1; else hi = mid;
     }
     if (lo < fn->callee_count && fn->callees[lo].off == ip) {
-        *units = fn->callee_text + fn->callees[lo].start;
         *len = fn->callees[lo].len;
+        /* an empty text (the only kind a function may have) has no buffer behind it */
+        *units = *len ? fn->callee_text + fn->callees[lo].start : NULL;
         return true;
     }
     return false;
@@ -988,13 +999,30 @@ static void fiber_throw_callee(JsContext *ctx, JsFiber *fb, const JsFunctionCell
 
 /* V8's ReferenceError for a let/const read before its declaration ran, named when the compiler
  * recorded the name for this read. */
-static void fiber_throw_tdz(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip) {
+JS_COLD static void fiber_throw_tdz(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip) {
     const uint16_t *u;
     uint32_t len;
     if (find_note(fn, ip, &u, &len) && len)
         fiber_throw_units(ctx, fb, "ReferenceError: Cannot access '", u, len, "' before initialization");
     else
         fiber_throw(ctx, fb, "ReferenceError: Cannot access a variable before initialization");
+}
+
+/* A read of a namespace's export (or a module binding) still in the TDZ, named by `name`. */
+JS_COLD static void fiber_throw_uninit(JsContext *ctx, JsFiber *fb, JsValue name) {
+    fiber_throw_value(fb, js_error_fmt(ctx, "ReferenceError: Cannot access '%v' before initialization", name));
+}
+
+/* A module binding in the TDZ: named by the compiler's note (the local name, which is what
+ * the source says) or else by the export's own name. */
+JS_COLD static void fiber_throw_tdz_binding(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn,
+                                    uint32_t ip, JsString *name) {
+    const uint16_t *u;
+    uint32_t len;
+    if (find_note(fn, ip, &u, &len) && len)
+        fiber_throw_units(ctx, fb, "ReferenceError: Cannot access '", u, len, "' before initialization");
+    else
+        fiber_throw_uninit(ctx, fb, js_value_from_cell(&name->gc));
 }
 
 /* A property read from null or undefined: "Cannot read properties of null (reading 'x')", or
@@ -1395,6 +1423,15 @@ run:; /* (re)load the top frame */
             case JS_OP_SET_LOCAL:
                 S[base + READ_U16()] = PEEK(0);
                 break;
+            case JS_OP_SET_LOCAL_CHECKED: {
+                uint16_t slot = READ_U16();
+                if (S[base + slot].bits == JS_SPECIAL_TDZ) {
+                    fiber_throw_tdz(ctx, fb, fn, op_ip);
+                    RT_RAISE();
+                }
+                S[base + slot] = PEEK(0);
+                break;
+            }
             case JS_OP_TDZ:
                 S[base + READ_U16()].bits = JS_SPECIAL_TDZ;
                 break;
@@ -1416,6 +1453,16 @@ run:; /* (re)load the top frame */
                     uv->fiber->stack[uv->slot] = PEEK(0);
                 else
                     uv->closed = PEEK(0);
+                break;
+            }
+            case JS_OP_SET_UPVAL_CHECKED: {
+                JsUpvalue *uv = cl->upvals[READ_U16()];
+                JsValue *cell = uv->open ? &uv->fiber->stack[uv->slot] : &uv->closed;
+                if (cell->bits == JS_SPECIAL_TDZ) {
+                    fiber_throw_tdz(ctx, fb, fn, op_ip);
+                    RT_RAISE();
+                }
+                *cell = PEEK(0);
                 break;
             }
             case JS_OP_CLOSE_UPVALS:
@@ -1860,8 +1907,13 @@ run:; /* (re)load the top frame */
                 if (!js_is_object(PEEK(1)))
                     RT_THROW("internal error: object builder on non-object");
                 JsObject *dst = js_value_object(PEEK(1));
-                if (!js_spread_into_object(ctx, dst, PEEK(0)))
-                    RT_THROW("out of memory");
+                JsString *uninit;
+                if (!js_spread_into_object(ctx, dst, PEEK(0), &uninit)) {
+                    if (!uninit)
+                        RT_THROW("out of memory");
+                    fiber_throw_value(fb, js_error_fmt(ctx, "ReferenceError: %S is not defined", uninit));
+                    RT_RAISE();
+                }
                 fb->sp--;
                 break;
             }
@@ -1882,6 +1934,10 @@ run:; /* (re)load the top frame */
                 JsPropStatus st = get_property(ctx, PEEK(1), PEEK(0), &out);
                 if (st == JS_PROP_OOM)
                     RT_THROW("out of memory");
+                if (JS_UNLIKELY(out.bits == JS_SPECIAL_TDZ)) {
+                    fiber_throw_uninit(ctx, fb, PEEK(0));
+                    RT_RAISE();
+                }
                 if (st == JS_PROP_TYPE_ERROR) {
                     fiber_throw_read(ctx, fb, fn, op_ip, PEEK(1), PEEK(0));
                     RT_RAISE();
@@ -1896,6 +1952,10 @@ run:; /* (re)load the top frame */
                 JsPropStatus st = get_property(ctx, PEEK(0), key, &out);
                 if (st == JS_PROP_OOM)
                     RT_THROW("out of memory");
+                if (JS_UNLIKELY(out.bits == JS_SPECIAL_TDZ)) {
+                    fiber_throw_uninit(ctx, fb, key);
+                    RT_RAISE();
+                }
                 if (st == JS_PROP_TYPE_ERROR) {
                     fiber_throw_read(ctx, fb, fn, op_ip, PEEK(0), key);
                     RT_RAISE();
@@ -2334,11 +2394,24 @@ run:; /* (re)load the top frame */
                 JsString *name = js_value_string(K[READ_U16()]);
                 bool found;
                 JsValue v = js_map_get(&fn->module->exports->props, name, &found);
+                if (v.bits == JS_SPECIAL_TDZ) {
+                    fiber_throw_tdz_binding(ctx, fb, fn, op_ip, name);
+                    RT_RAISE();
+                }
                 PUSH(found ? v : js_undefined());
                 break;
             }
-            case JS_OP_SET_EXPORT: {
+            case JS_OP_SET_EXPORT:
+            case JS_OP_INIT_EXPORT: {
                 JsString *name = js_value_string(K[READ_U16()]);
+                if (op == JS_OP_SET_EXPORT) {
+                    bool found;
+                    JsValue old = js_map_get(&fn->module->exports->props, name, &found);
+                    if (old.bits == JS_SPECIAL_TDZ) {
+                        fiber_throw_tdz_binding(ctx, fb, fn, op_ip, name);
+                        RT_RAISE();
+                    }
+                }
                 if (!js_map_set(vm, &fn->module->exports->props, name, PEEK(0)))
                     RT_THROW("out of memory");
                 break;
@@ -2355,6 +2428,10 @@ run:; /* (re)load the top frame */
                 bool found;
                 JsValue v = js_map_get(&imp->source->exports->props, imp->imported_name,
                                        &found);
+                if (v.bits == JS_SPECIAL_TDZ) {
+                    fiber_throw_tdz_binding(ctx, fb, fn, op_ip, imp->imported_name);
+                    RT_RAISE();
+                }
                 PUSH(found ? v : js_undefined());
                 break;
             }

@@ -95,6 +95,7 @@ typedef struct {
     uint32_t len, cap;
     bool oom;
     bool circular; /* set by JSON.stringify on a cyclic structure */
+    JsString *uninit; /* set by JSON.stringify on a namespace's export still in the TDZ */
 } StrBuf;
 
 static void sb_init(StrBuf *sb, JsVm *vm) {
@@ -103,6 +104,7 @@ static void sb_init(StrBuf *sb, JsVm *vm) {
     sb->len = sb->cap = 0;
     sb->oom = false;
     sb->circular = false;
+    sb->uninit = NULL;
 }
 
 static bool sb_reserve(StrBuf *sb, uint32_t extra) {
@@ -1854,6 +1856,10 @@ static bool json_str(JsContext *ctx, StrBuf *sb, JsValue v, const uint16_t *inde
         sb_unit(sb, ':');
         if (indent_len)
             sb_unit(sb, ' ');
+        if (e->value.bits == JS_SPECIAL_TDZ) {
+            sb->uninit = e->key;
+            return false;
+        }
         bool em;
         if (!json_str(ctx, sb, e->value, indent, indent_len, depth + 1, &node, &em))
             return false;
@@ -1890,9 +1896,12 @@ static bool json_stringify(JsContext *ctx, JsValue tv, const JsValue *args, int 
     bool em;
     if (!json_str(ctx, &sb, ARG(0), indent, indent_len, 0, NULL, &em)) {
         bool circular = sb.circular;
+        JsString *uninit = sb.uninit;
         sb_free(&sb);
         if (circular)
             return native_throw(ctx, r, "TypeError: Converting circular structure to JSON");
+        if (uninit)
+            return native_throw_fmt(ctx, r, "ReferenceError: Cannot access '%S' before initialization", uninit);
         return oom(ctx, r);
     }
     if (!em) {
@@ -2360,6 +2369,12 @@ static bool obj_keys_impl(JsContext *ctx, JsValue tv, const JsValue *args, int a
                 JsMapEntry *e = &o->props.entries[i];
                 if (!e->key || e->key == JS_MAP_TOMBSTONE)
                     continue;
+                if (e->value.bits == JS_SPECIAL_TDZ) { /* a namespace's uninitialized export */
+                    js_gc_unprotect(ctx->vm, &outv);
+                    return mode == 0
+                        ? native_throw_fmt(ctx, r, "ReferenceError: Cannot access '%S' before initialization", e->key)
+                        : native_throw_fmt(ctx, r, "ReferenceError: %S is not defined", e->key);
+                }
                 JsValue entry;
                 if (mode == 0) {
                     entry = js_value_from_cell(&e->key->gc);
@@ -2409,8 +2424,22 @@ static bool obj_assign(JsContext *ctx, JsValue tv, const JsValue *args, int argc
         return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
     if (js_value_object(dst)->obj_flags & JS_OBJ_FROZEN)
         return native_throw(ctx, r, "TypeError: cannot assign to a property of a frozen object");
+    if (js_value_object(dst)->obj_flags & JS_OBJ_NAMESPACE) {
+        /* nothing to copy is fine; any property is a write V8 refuses */
+        for (int i = 1; i < argc; i++) {
+            if (!js_is_object(args[i]))
+                continue;
+            JsObject *so = js_value_object(args[i]);
+            if (so->obj_kind == JS_OBJ_ARRAY && so->elem_count)
+                return native_throw(ctx, r, "TypeError: Cannot assign to read only property '0' of object '[object Module]'");
+            if (js_object_size(args[i]) > 0)
+                return native_throw_fmt(ctx, r, "TypeError: Cannot assign to read only property '%v' of object '[object Module]'",
+                                        js_object_key_at(args[i], 0));
+        }
+    }
     js_gc_protect(ctx->vm, &target);
     bool ok = true;
+    JsString *uninit = NULL;
     for (int i = 1; i < argc && ok; i++) {
         JsValue src = args[i];
         if (js_is_function(src)) {
@@ -2418,9 +2447,11 @@ static bool obj_assign(JsContext *ctx, JsValue tv, const JsValue *args, int argc
             src = own ? js_value_from_cell(&own->gc) : js_undefined();
         }
         if (js_is_object(src))
-            ok = js_spread_into_object(ctx, js_value_object(dst), src);
+            ok = js_spread_into_object(ctx, js_value_object(dst), src, &uninit);
     }
     js_gc_unprotect(ctx->vm, &target);
+    if (!ok && uninit)
+        return native_throw_fmt(ctx, r, "ReferenceError: %S is not defined", uninit);
     if (!ok)
         return oom(ctx, r);
     *r = target;
@@ -2436,8 +2467,13 @@ static bool obj_set_integrity(JsContext *ctx, const JsValue *args, int argc,
                               JsValue *r, uint8_t flags) {
     (void)argc;
     JsValue v = ARG(0);
-    if (js_is_object(v))
-        js_value_object(v)->obj_flags |= flags;
+    if (js_is_object(v)) {
+        JsObject *o = js_value_object(v);
+        /* a namespace's exports stay writable by their module: V8 refuses to freeze one */
+        if ((o->obj_flags & JS_OBJ_NAMESPACE) && (flags & JS_OBJ_FROZEN) && js_object_size(v) > 0)
+            return native_throw_fmt(ctx, r, "TypeError: Cannot redefine property: %v", js_object_key_at(v, 0));
+        o->obj_flags |= flags;
+    }
     if (js_is_function(v)) { /* freezes the function's own properties (made now, so it sticks) */
         JsObject *own = js_function_props(ctx, v, true);
         if (!own)
@@ -2646,8 +2682,14 @@ static bool obj_setPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, 
         return native_throw(ctx, r, "TypeError: Object.setPrototypeOf called on null or undefined");
     if (!js_is_object(proto) && !js_is_null(proto))
         return native_throw_fmt(ctx, r, "TypeError: Object prototype may only be an Object or null: %v", proto);
-    if (js_is_object(v))
-        js_value_object(v)->proto = js_is_object(proto) ? proto : js_undefined();
+    if (js_is_object(v)) {
+        JsObject *o = js_value_object(v);
+        JsValue np = js_is_object(proto) ? proto : js_undefined();
+        /* a sealed or frozen object (a namespace too) is not extensible: its prototype stays */
+        if ((o->obj_flags & (JS_OBJ_SEALED | JS_OBJ_FROZEN)) && np.bits != o->proto.bits)
+            return native_throw_fmt(ctx, r, "TypeError: %v is not extensible", v);
+        o->proto = np;
+    }
     *r = v;
     return true;
 }

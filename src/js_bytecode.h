@@ -80,9 +80,9 @@ typedef enum JsOp {
     /* phase 6 */
     JS_OP_AWAIT,           /* peeks operand; suspends fiber until it settles */
     /* phase 7: module bindings (via the running frame's fn->module) */
-    JS_OP_GET_EXPORT,      /* u16 name-atom const idx -> push module.exports[name] */
-    JS_OP_SET_EXPORT,      /* u16 name; peeks; module.exports[name] = value */
-    JS_OP_GET_IMPORT,      /* u16 import idx -> push source.exports[importedName] */
+    JS_OP_GET_EXPORT,      /* u16 name-atom const idx -> push module.exports[name]; TDZ-checked */
+    JS_OP_SET_EXPORT,      /* u16 name; peeks; module.exports[name] = value; TDZ-checked */
+    JS_OP_GET_IMPORT,      /* u16 import idx -> push source.exports[importedName]; TDZ-checked */
     JS_OP_IMPORT_NS,       /* u16 import idx -> push source's namespace object */
     /* phase 10: regex (LAMASSU_HAS_REGEX builds; literals are rejected at
      * compile time elsewhere, so the opcode never reaches other builds) */
@@ -93,9 +93,18 @@ typedef enum JsOp {
     /* an assignment to a const or an import: throws "TypeError: Assignment to constant
      * variable." when it runs, as V8 does (the value stays, for the validator's sake) */
     JS_OP_THROW_CONST_ASSIGN,
+    /* an assignment that may reach a let/const before its declaration has run (written before
+     * it in the source, from a closure made before it, or in a switch body): throws
+     * "ReferenceError: Cannot access 'x' before initialization" if the slot is still in the
+     * TDZ, else stores like SET_LOCAL / SET_UPVAL */
+    JS_OP_SET_LOCAL_CHECKED, /* u16 slot; peeks */
+    JS_OP_SET_UPVAL_CHECKED, /* u16 upvalue; peeks */
+    /* the declaration's own write of an exported binding (SET_EXPORT is an assignment, which
+     * throws while the export is still in the TDZ) */
+    JS_OP_INIT_EXPORT,       /* u16 name; peeks; module.exports[name] = value */
 } JsOp;
 
-#define JS_OP__COUNT (JS_OP_THROW_CONST_ASSIGN + 1)
+#define JS_OP__COUNT (JS_OP_INIT_EXPORT + 1)
 
 /*
  * Per-opcode metadata, the single source of truth the bytecode verifier
@@ -170,7 +179,9 @@ JsString *js_ascii_cell(JsVm *vm, const char *s); /* <=128 chars */
  * fail. Returns undefined only if the VM could not be fully initialized. */
 JsValue js_oom_value(JsVm *vm);
 JsString *js_concat_cells(JsVm *vm, const JsString *a, const JsString *b);
-bool      js_spread_into_object(JsContext *ctx, JsObject *dst, JsValue src);
+/* Copies src's own properties into dst. False on OOM, or with *uninit set when src is a module
+ * namespace with an export still in the TDZ (V8: "ReferenceError: x is not defined"). */
+bool      js_spread_into_object(JsContext *ctx, JsObject *dst, JsValue src, JsString **uninit);
 
 /* js_builtins.c: installs the standard library into a fresh context. */
 bool js_builtins_init(JsContext *ctx);
@@ -208,6 +219,7 @@ typedef struct JsModBinding {
     uint32_t len;
     uint8_t kind;
     bool is_const;
+    bool lexical;         /* JS_MB_EXPORT of a let/const: in the TDZ until its declaration runs */
     uint16_t import_index; /* JS_MB_IMPORT/NS: index into module->imports */
     const uint16_t *export_name; /* JS_MB_EXPORT: exported-as name */
     uint32_t export_len;

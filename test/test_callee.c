@@ -85,6 +85,21 @@ static const struct { const char *body; const char *message; } CASES[] = {
     { "const g = () => K2; g(); const K2 = 1;", "ReferenceError: Cannot access 'K2' before initialization" },
     { "const q = q + 1;", "ReferenceError: Cannot access 'q' before initialization" },
     { "{ h(); let v = 1; function h() { return v; } }", "ReferenceError: Cannot access 'v' before initialization" },
+    /* writes before the declaration has run: direct, compound, destructuring, from a closure */
+    { "x = 1; let x;", "ReferenceError: Cannot access 'x' before initialization" },
+    { "x2++; let x2 = 0;", "ReferenceError: Cannot access 'x2' before initialization" },
+    { "{ [d] = [1]; let d; }", "ReferenceError: Cannot access 'd' before initialization" },
+    { "{ ({ d2 } = { d2: 1 }); let d2; }", "ReferenceError: Cannot access 'd2' before initialization" },
+    { "for (d3 of [1]); let d3;", "ReferenceError: Cannot access 'd3' before initialization" },
+    { "function g() { n = 5; } g(); let n = 0;", "ReferenceError: Cannot access 'n' before initialization" },
+    { "const s = () => { m = 1; }; s(); let m;", "ReferenceError: Cannot access 'm' before initialization" },
+    /* a const in the TDZ: the ReferenceError comes before the TypeError */
+    { "c = 1; const c = 2;", "ReferenceError: Cannot access 'c' before initialization" },
+    { "function f() { c2 = 1; } f(); const c2 = 2;", "ReferenceError: Cannot access 'c2' before initialization" },
+    /* a later case of a switch skips the declaration in an earlier one */
+    { "switch (1) { case 0: let a = 1; break; case 1: a = 2; }", "ReferenceError: Cannot access 'a' before initialization" },
+    { "switch (1) { case 0: let b = 1; break; case 1: b; }", "ReferenceError: Cannot access 'b' before initialization" },
+    { "switch (1) { case 0: let e = 1; break; case 1: (() => { e = 2; })(); }", "ReferenceError: Cannot access 'e' before initialization" },
 };
 
 static bool message_of(JsContext *ctx, JsValue fn, char *msg, size_t cap) {

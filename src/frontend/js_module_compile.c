@@ -39,6 +39,8 @@ static bool module_compile_source(JsContext *ctx, JsModule *m, const uint16_t *s
         return false;
     }
     js_value_object(exports)->proto = js_undefined();
+    js_value_object(exports)->obj_flags = JS_OBJ_SEALED | JS_OBJ_NAMESPACE;
+    js_value_object(exports)->props.by_name = true;
     value_module(mv)->exports = js_value_object(exports);
 
     JsArena arena;

@@ -20,6 +20,7 @@ void js_map_init(JsMap *m) {
     m->capacity = 0;
     m->index_cap = 0;
     m->unsorted = false;
+    m->by_name = false;
 }
 
 void js_map_free(JsVm *vm, JsMap *m) {
@@ -102,6 +103,14 @@ static bool key_index(const JsString *k, uint32_t *out) {
 /* Enumeration order of the entries at positions a and b: index keys first, by value; the rest by
  * position (insertion order). Total, since keys are distinct. */
 static bool order_before(const JsMap *m, uint32_t a, uint32_t b) {
+    if (m->by_name) { /* a module namespace: export names in code-unit order */
+        const JsString *ka = m->entries[a].key, *kb = m->entries[b].key;
+        uint32_t n = ka->length < kb->length ? ka->length : kb->length;
+        for (uint32_t i = 0; i < n; i++)
+            if (ka->units[i] != kb->units[i])
+                return ka->units[i] < kb->units[i];
+        return ka->length < kb->length;
+    }
     uint32_t va, vb;
     bool ia = key_index(m->entries[a].key, &va), ib = key_index(m->entries[b].key, &vb);
     if (ia != ib)
@@ -198,6 +207,8 @@ bool js_map_set(JsVm *vm, JsMap *m, JsString *key, JsValue value) {
     /* In order, the last entry is the greatest: an index key stays in order only behind a smaller
      * one. (A tombstone there could hide anything, so it counts as out of order.) */
     uint32_t v, last;
+    if (m->by_name && m->used)
+        m->unsorted = true; /* rare (a namespace gains names once); sorted when next enumerated */
     if (!m->unsorted && m->used && key_index(key, &v)) {
         const JsString *lk = m->entries[m->used - 1].key;
         if (lk == JS_MAP_TOMBSTONE || !key_index(lk, &last) || last > v)

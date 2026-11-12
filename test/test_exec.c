@@ -242,6 +242,14 @@ static void test_scoping(void) {
     expect_error("let d = 1; let d = 2;", RUN_COMPILE_ERR, "already been declared");
     expect_error("x_undeclared = 1;", RUN_RUNTIME_ERR, "is not defined");
     expect_error("missing_global + 1;", RUN_RUNTIME_ERR, "missing_global is not defined");
+    /* checked writes (a closure made before the declaration, a switch body) still write once
+     * the binding is initialized, and code that never runs early is unaffected */
+    expect_result("function g() { n = n + 5; } let n = 1; g(); g(); n;", "11");
+    expect_result("let r = 0; function inc() { r++; } for (let i = 0; i < 4; i++) inc(); r;", "4");
+    expect_result("let out; switch (0) { case 0: let a = 1; a = a + 2; out = a; } out;", "3");
+    expect_result("let out; switch (1) { case 0: break; case 1: let b = 7; out = (() => { b = b * 2; return b; })(); } out;", "14");
+    expect_result("if (false) { y = 1; } let y = 2; y;", "2");
+    expect_result("let k = 0; for (const v of [1, 2, 3]) { const f = () => { k += v; }; f(); } k;", "6");
 }
 
 static void test_control_flow(void) {

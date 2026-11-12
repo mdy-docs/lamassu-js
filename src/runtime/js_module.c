@@ -741,14 +741,19 @@ static bool apply_reexport(JsContext *ctx, JsModule *dst, const JsStarExport *re
     if (re->kind == JS_REEXP_NAMED) {
         bool found;
         JsValue v = js_map_get(&src->exports->props, re->imported, &found);
-        return js_map_set(ctx->vm, &doo->props, re->exported, found ? v : js_undefined());
+        /* a source in a cycle that has not run yet: the snapshot (a known deviation) is
+         * undefined, never the TDZ marker, which would stay in this namespace for good */
+        if (!found || v.bits == JS_SPECIAL_TDZ)
+            v = js_undefined();
+        return js_map_set(ctx->vm, &doo->props, re->exported, v);
     }
     /* export * from: copy all named exports (excluding default) */
     JsObject *so = src->exports;
     js_map_sort_keys(&so->props);
     for (uint32_t i = 0; i < so->props.capacity; i++) {
         JsMapEntry *e = &so->props.entries[i];
-        if (!e->key || e->key == JS_MAP_TOMBSTONE || str_is_default(e->key))
+        if (!e->key || e->key == JS_MAP_TOMBSTONE || str_is_default(e->key) ||
+            e->value.bits == JS_SPECIAL_TDZ)
             continue;
         if (!js_map_set(ctx->vm, &doo->props, e->key, e->value))
             return false;

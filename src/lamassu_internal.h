@@ -77,6 +77,7 @@ typedef struct JsMap {
     uint32_t capacity;   /* length of `entries`, or 0 */
     uint32_t index_cap;  /* length of `index`: power of two, or 0 */
     bool unsorted;       /* entries are not in enumeration order (see above) */
+    bool by_name;        /* a module namespace's: enumerated by name (code units), as V8 does */
 } JsMap;
 
 #define JS_MAP_EMPTY UINT32_MAX
@@ -100,8 +101,22 @@ typedef enum JsObjKind {
  * observably do to an ordinary object, which is all guest code can test. */
 #define JS_OBJ_SEALED 1u /* no adding, no deleting; existing props writable */
 #define JS_OBJ_FROZEN 2u /* sealed, and no writes either */
+/* A module namespace (a compiled module's exports object): sealed, and its properties
+ * read-only to scripts (only the module's own export writes change them). A let/const export
+ * holds JS_SPECIAL_TDZ until its declaration runs; every read of the object checks for it. */
+#define JS_OBJ_NAMESPACE 4u
 
 /* JsErrorKind (lamassu.h) indexes JsContext.error_protos (js_error.c). */
+
+/* An error path the interpreter loop calls rarely: kept out of line, so that it does not take
+ * registers or code space from the hot cases around it. */
+#if defined(__GNUC__) || defined(__clang__)
+#define JS_COLD __attribute__((noinline, cold))
+#define JS_UNLIKELY(c) __builtin_expect(!!(c), 0)
+#else
+#define JS_COLD
+#define JS_UNLIKELY(c) (c)
+#endif
 
 typedef struct JsObject {
     JsGcCell gc;

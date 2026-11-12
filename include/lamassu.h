@@ -200,8 +200,11 @@ bool    js_string_equals(JsValue a, JsValue b);                     /* content e
  * walk), so they need no realm context.
  */
 JsValue js_object_new(JsContext *ctx);                              /* undefined on OOM */
-JsValue js_object_get(JsVm *vm, JsValue obj, JsValue key);          /* undefined if absent */
-bool    js_object_set(JsVm *vm, JsValue obj, JsValue key, JsValue value); /* false on OOM/bad args */
+JsValue js_object_get(JsVm *vm, JsValue obj, JsValue key);          /* undefined if absent, or a module
+                                                                       namespace's export still in the TDZ */
+bool    js_object_set(JsVm *vm, JsValue obj, JsValue key, JsValue value); /* false on OOM/bad args, or when
+                                                                       refused: frozen, sealed (a new key),
+                                                                       a module namespace */
 bool    js_object_delete(JsVm *vm, JsValue obj, JsValue key);       /* true if a property was removed */
 size_t  js_object_size(JsValue obj);
 
@@ -214,7 +217,8 @@ size_t  js_object_size(JsValue obj);
  *
  * That is the language's order: array-index names ("0", "12") first in
  * ascending numeric order, then the other names in the order they were first
- * set — so `{ body, lid }` walks as body, lid.
+ * set — so `{ body, lid }` walks as body, lid. A module namespace lists its
+ * export names in code-unit order, as V8 does.
  */
 JsValue js_object_key_at(JsValue obj, size_t index);
 

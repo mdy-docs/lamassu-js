@@ -31,6 +31,10 @@ static bool chain_get(JsContext *ctx, JsObject *o, const char *k, JsValue *out, 
         return false;
     for (JsObject *cur = o; cur;) {
         JsValue v = js_map_get(&cur->props, ik, found);
+        if (*found && v.bits == JS_SPECIAL_TDZ) { /* a namespace's uninitialized export */
+            *found = false;
+            return true;
+        }
         if (*found) {
             *out = v;
             return true;
@@ -302,6 +306,8 @@ JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
         } else if (js_is_object(v)) {
             if (js_value_object(v)->obj_kind == JS_OBJ_ARRAY)
                 fb_ascii(b, "[object Array]", 14);
+            else if (js_value_object(v)->obj_flags & JS_OBJ_NAMESPACE)
+                fb_ascii(b, "[object Module]", 15);
             else
                 fb_ascii(b, "#<Object>", 9);
         } else if (js_is_promise(v)) {

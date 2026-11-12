@@ -972,6 +972,91 @@ static void test_check_module(void) {
     tv_close(&tv, "check");
 }
 
+
+/* ---- declaration rules: the TDZ of exports, export lists, namespaces ---- */
+
+/* A module that records what each thunk returns or throws, as "value|" or "Name: message|". */
+#define TRY_ALL "const t = (fs) => fs.map(f => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }).join('|');"
+
+static void test_declaration_rules(void) {
+    /* a cycle: b reads a's exports before a has run its declarations */
+    mod_add("a",
+            "import { early } from 'b';"
+            "export const r = early;"
+            "export let y = 1; export const z = 2; let w = 3; export { w as ww };");
+    mod_add("b",
+            "import * as ns from 'a'; import { y as yy, z, ww } from 'a';" TRY_ALL
+            "export const early = t([() => yy, () => z, () => ww, () => ns.y, () => 'y' in ns,"
+            "  () => Object.keys(ns), () => JSON.stringify(ns), () => Object.values(ns),"
+            "  () => Object.entries(ns), () => ({ ...ns }), () => Object.assign({}, ns)]);");
+    eq_export("import { r } from 'a'; export const out = r;", "out",
+              "ReferenceError: Cannot access 'yy' before initialization|"
+              "ReferenceError: Cannot access 'z' before initialization|"
+              "ReferenceError: Cannot access 'ww' before initialization|"
+              "ReferenceError: Cannot access 'y' before initialization|true|"
+              "ReferenceError: Cannot access 'r' before initialization|"
+              "ReferenceError: Cannot access 'r' before initialization|"
+              "ReferenceError: r is not defined|ReferenceError: r is not defined|"
+              "ReferenceError: r is not defined|ReferenceError: r is not defined");
+    /* and once a has run, the same reads see the values */
+    mod_add("a", "export let y = 1; export const z = 2;");
+    eq_export("import * as ns from 'a'; import { y } from 'a';"
+              "export const out = [y, ns.z, Object.keys(ns), JSON.stringify(ns)].join(' ');",
+              "out", "1 2 y,z {\"y\":1,\"z\":2}");
+
+    /* the exporting module itself: a hoisted function, an assignment, a const */
+    eq_export(TRY_ALL "function h() { return e; }"
+              "export const out = t([h, () => { e = 2; }, () => { c = 2; }]);"
+              "export let e = 1; export const c = 1;",
+              "out", "ReferenceError: Cannot access 'e' before initialization|"
+                     "ReferenceError: Cannot access 'e' before initialization|"
+                     "ReferenceError: Cannot access 'c' before initialization");
+    eq_export("let w = 1; export { w as v }; function f() { return w; }"
+              TRY_ALL "export const out = t([() => { k = 1; }]) + ' ' + f(); const k = 0;",
+              "out", "ReferenceError: Cannot access 'k' before initialization 1");
+    /* an export default expression is in the TDZ too; a default function is not */
+    mod_add("da", "import { early } from 'db'; export const r = early; export default 5;");
+    mod_add("db", "import d from 'da';" TRY_ALL "export const early = t([() => d]);");
+    eq_export("import { r } from 'da'; export const out = r;", "out",
+              "ReferenceError: Cannot access 'd' before initialization");
+
+    /* export lists: every name of a binding, const rules, imports re-exported, unknown names */
+    eq_export("export let a = 1; export { a as b }; a = 2;"
+              "export function f() {} export { f as g }; let c = 3; export { c, c as c2 };"
+              "import * as me from 'main'; export let out;" /* out itself is in the TDZ until declared */
+              "out = JSON.stringify(me) + ' ' + typeof me.g;",
+              "out", "{\"a\":2,\"b\":2,\"c\":3,\"c2\":3} function");
+    mod_add("k", "export const k = 1;");
+    eq_export("import { k } from 'k'; import * as kn from 'k'; export { k, k as k2, kn };"
+              "import * as me from 'main'; export const out = '' + me.k + me.k2 + me.kn.k;",
+              "out", "111");
+    eq_export("const w = 1; export { w };" TRY_ALL "export const out = t([() => { w = 2; }]);",
+              "out", "TypeError: Assignment to constant variable.");
+    mod_add("main", "export { nope };");
+    {
+        bool ok;
+        char *msg = eval_export_spec("main", "x", &ok);
+        check(!ok && strstr(msg, "SyntaxError: Export 'nope' is not defined in module"),
+              "export of an undeclared name is a SyntaxError");
+        free(msg);
+    }
+    mods_reset();
+
+    /* a namespace is sealed, its exports read-only, its keys in name order */
+    eq_export("export let q = 4; export const fz = 1; import * as ns from 'main';" TRY_ALL
+              "export let out; out = t([() => { ns.zz = 1; }, () => { ns.q = 1; }, () => { delete ns.q; },"
+              "  () => Object.isSealed(ns) + ' ' + Object.isFrozen(ns), () => Object.freeze(ns),"
+              "  () => Object.setPrototypeOf(ns, {}), () => Object.assign(ns, { q: 1 }),"
+              "  () => Object.keys(ns)]);",
+              "out", "TypeError: Cannot assign to property 'zz' of [object Module]|"
+                     "TypeError: Cannot assign to property 'q' of [object Module]|"
+                     "TypeError: Cannot delete property 'q' of [object Module]|true false|"
+                     "TypeError: Cannot redefine property: fz|"
+                     "TypeError: [object Module] is not extensible|"
+                     "TypeError: Cannot assign to read only property 'q' of object '[object Module]'|"
+                     "fz,out,q");
+}
+
 int main(void) {
     test_basic_exports();
     test_imports();
@@ -996,6 +1081,7 @@ int main(void) {
     test_source_modules_gated();
     test_entry_return();
     test_check_module();
+    test_declaration_rules();
     mods_reset();
     if (checks_failed) {
         fprintf(stderr, "%d/%d module checks FAILED\n", checks_failed, checks_run);

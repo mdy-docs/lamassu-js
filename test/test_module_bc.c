@@ -305,6 +305,20 @@ static void test_graphs(void) {
             "const f = make(); f(); f();"
             "export const r = fmt([1,2,3]) + '|' + f();");
     expect("main", "r", "1,4,9|3");
+
+    /* a cached module keeps its let/const exports in the TDZ until they run (a cycle reads
+     * them early), its export lists, and its namespace's name order */
+    mod_add("a", "import { early } from 'b'; export const r = early; export let y = 1; let w = 2; export { w as ww };");
+    mod_add("b", "import * as ns from 'a'; import { y } from 'a';"
+                 "const t = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } };"
+                 "export const early = t(() => y) + '|' + t(() => Object.keys(ns));");
+    mod_add("main", "import { r } from 'a'; import * as a from 'a'; export const r2 = r + '|' + Object.keys(a) + '|' + a.ww;");
+    expect("main", "r2", "ReferenceError: Cannot access 'y' before initialization|"
+                         "ReferenceError: Cannot access 'r' before initialization|r,ww,y|2");
+    mod_add("k", "export const k = 1;");
+    mod_add("main", "import { k } from 'k'; export { k as k2 }; import * as me from 'main'; export function r() { return me.k2; }");
+    mod_add("root", "import { r } from 'main'; export const out = r();");
+    expect("root", "out", "1");
 }
 
 /* ---- kind confusion + tamper resistance ---- */

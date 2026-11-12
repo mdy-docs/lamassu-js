@@ -184,7 +184,7 @@ bool    js_string_equals(JsValue a, JsValue b);                     // content e
 ```c
 JsValue js_object_new(JsContext *ctx);                                    // undefined on OOM
 JsValue js_object_get(JsVm *vm, JsValue obj, JsValue key);                // undefined if absent
-bool    js_object_set(JsVm *vm, JsValue obj, JsValue key, JsValue value); // false on OOM/bad args
+bool    js_object_set(JsVm *vm, JsValue obj, JsValue key, JsValue value); // false on OOM/bad args, or refused
 bool    js_object_delete(JsVm *vm, JsValue obj, JsValue key);             // true if removed
 size_t  js_object_size(JsValue obj);
 ```
@@ -527,7 +527,10 @@ always returns a live promise: protect it, drive outstanding loads with
 `js_promise_state` / `js_promise_result`. It fulfils with the module's
 namespace (exports) object and rejects with the load/compile/link/evaluate
 error. `js_module_get_export` is a host convenience for reading a named export
-back out.
+back out. A namespace is read-only to the host too (`js_object_set` refuses it), and
+an export still in the TDZ (a `let`/`const` whose declaration has not run, seen
+mid-cycle) reads as `undefined`: the engine's uninitialized marker never reaches
+the host.
 
 `js_eval_entry` is the same for a program's entry point, where the host wants a
 result rather than exports. The root module — only the root — may `return` at
