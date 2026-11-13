@@ -93,6 +93,10 @@ boxed `String` object — this engine has no boxed-primitive type at all).
   `replace`, `replaceAll`, `split`, `concat`, `toString`, `valueOf`, and,
   when regex support is compiled in (the default): `match`, `matchAll`
   (returns an array, not a lazy iterator), `search`.
+- **`replace`/`replaceAll` with a string pattern** take a replacement string
+  (`$$`, `$&`, `` $` `` and `$'` expand; `$1` and `$<name>` stay literal, as
+  there are no groups) or a function, called as `fn(match, position, string)`
+  for each match, whose result is converted to a string.
 
 ## `Number`
 

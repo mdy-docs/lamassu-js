@@ -624,9 +624,10 @@ static bool sm_padEnd(JsContext *ctx, JsValue tv, const JsValue *a, int c, JsVal
     return sm_pad(ctx, tv, a, c, r, false);
 }
 
-/* replacement with $$ and $& expansion */
-static void append_replacement(StrBuf *sb, JsString *rep, const uint16_t *match,
-                               uint32_t mlen) {
+/* GetSubstitution for a string pattern: $$ $& $` $'; with no captures, $n and
+ * $<name> stay literal, as does anything else after a $ */
+static void append_replacement(StrBuf *sb, const JsString *rep, const JsString *s,
+                               uint32_t pos, uint32_t mlen) {
     for (uint32_t i = 0; i < rep->length; i++) {
         if (rep->units[i] == '$' && i + 1 < rep->length) {
             uint16_t n = rep->units[i + 1];
@@ -636,7 +637,17 @@ static void append_replacement(StrBuf *sb, JsString *rep, const uint16_t *match,
                 continue;
             }
             if (n == '&') {
-                sb_units(sb, match, mlen);
+                sb_units(sb, s->units + pos, mlen);
+                i++;
+                continue;
+            }
+            if (n == '`') {
+                sb_units(sb, s->units, pos);
+                i++;
+                continue;
+            }
+            if (n == '\'') {
+                sb_units(sb, s->units + pos + mlen, s->length - pos - mlen);
                 i++;
                 continue;
             }
@@ -645,44 +656,90 @@ static void append_replacement(StrBuf *sb, JsString *rep, const uint16_t *match,
     }
 }
 
+/* String.prototype.replace/replaceAll with a string pattern. The replacement is
+ * a string (with GetSubstitution) or a function called as fn(match, position,
+ * string) for each match, its result converted to a string. replaceAll finds
+ * every match first, advancing by the pattern's length (1 for ""). */
 static bool sm_replace_impl(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                             JsValue *r, bool all) {
 #ifdef LAMASSU_HAS_REGEX
     if (js_regexp_is(ARG(0)))
         return js_re_str_replace(ctx, tv, args, argc, r, all);
 #endif
+    JsVm *vm = ctx->vm;
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
+    JsValue sv = js_value_from_cell(&s->gc);
+    js_gc_protect(vm, &sv);
     JsString *pat = arg_string(ctx, ARG(0));
-    if (!pat)
+    if (!pat) {
+        js_gc_unprotect(vm, &sv);
         return oom(ctx, r);
-    JsString *rep = arg_string(ctx, ARG(1));
-    if (!rep)
-        return oom(ctx, r);
-    StrBuf sb;
-    sb_init(&sb, ctx->vm);
-    uint32_t pos = 0;
-    for (;;) {
-        long f = units_find(s->units, s->length, pat->units, pat->length, pos);
-        if (f < 0) {
-            sb_units(&sb, s->units + pos, s->length - pos);
-            break;
-        }
-        sb_units(&sb, s->units + pos, (uint32_t)f - pos);
-        append_replacement(&sb, rep, pat->units, pat->length);
-        uint32_t adv = pat->length ? pat->length : 1;
-        if (pat->length == 0 && (uint32_t)f < s->length)
-            sb_unit(&sb, s->units[f]);
-        pos = (uint32_t)f + adv;
-        if (!all || pos > s->length) {
-            if (pos <= s->length)
-                sb_units(&sb, s->units + pos, s->length - pos);
-            break;
-        }
     }
-    *r = sb_finish(&sb);
-    return js_is_undefined(*r) ? oom(ctx, r) : true;
+    JsValue patv = js_value_from_cell(&pat->gc);
+    js_gc_protect(vm, &patv);
+    JsValue fn = ARG(1);
+    bool is_fn = js_is_function(fn);
+    JsValue repv = js_undefined();
+    js_gc_protect(vm, &repv);
+    bool ok = true, thrown = false;
+    if (is_fn) {
+        repv = fn;
+    } else {
+        JsString *rep = arg_string(ctx, fn);
+        if (rep)
+            repv = js_value_from_cell(&rep->gc);
+        else
+            ok = false;
+    }
+    StrBuf sb;
+    sb_init(&sb, vm);
+    uint32_t pos = 0, cursor = 0;
+    while (ok) {
+        long f = units_find(s->units, s->length, pat->units, pat->length, pos);
+        if (f < 0)
+            break;
+        uint32_t at = (uint32_t)f;
+        sb_units(&sb, s->units + cursor, at - cursor);
+        if (is_fn) {
+            JsValue argv[3] = {patv, js_number(at), sv};
+            JsValue res;
+            if (!js_call(ctx, repv, js_undefined(), argv, 3, &res)) {
+                *r = res;
+                ok = false;
+                thrown = true;
+                break;
+            }
+            js_gc_protect(vm, &res);
+            JsString *rs = js_to_string_cell(ctx, res, 0);
+            js_gc_unprotect(vm, &res);
+            if (!rs) {
+                ok = false;
+                break;
+            }
+            sb_units(&sb, rs->units, rs->length);
+        } else {
+            append_replacement(&sb, js_value_string(repv), s, at, pat->length);
+        }
+        cursor = at + pat->length;
+        pos = at + (pat->length ? pat->length : 1);
+        if (!all || pos > s->length)
+            break;
+    }
+    if (ok) {
+        sb_units(&sb, s->units + cursor, s->length - cursor);
+        *r = sb_finish(&sb);
+        ok = !js_is_undefined(*r);
+    } else {
+        sb_free(&sb);
+    }
+    js_gc_unprotect(vm, &repv);
+    js_gc_unprotect(vm, &patv);
+    js_gc_unprotect(vm, &sv);
+    if (thrown)
+        return false;
+    return ok ? true : oom(ctx, r);
 }
 
 static bool sm_replace(JsContext *ctx, JsValue tv, const JsValue *a, int c, JsValue *r) {

@@ -228,6 +228,18 @@ static void test_string(void) {
     eq("'hello'.replace('l', 'L');", "heLlo");
     eq("'hello'.replaceAll('l', 'L');", "heLLo");
     eq("'a1b2'.replaceAll('1', '$&$&');", "a11b2");
+    /* a function replacer gets (match, position, string); its result is converted */
+    eq("'aXbXc'.replace('X', (m, i, s) => '[' + m + i + s + ']');", "a[X1aXbXc]bXc");
+    eq("'aXbXc'.replaceAll('X', (m, i) => '<' + i + '>');", "a<1>b<3>c");
+    eq("'abc'.replaceAll('', (m, i) => i);", "0a1b2c3");
+    eq("['abc'.replace('b', () => 5), 'abc'.replace('b', () => undefined), 'abc'.replace('z', () => 'Q'), 'abc'.replace('b')].join('|');",
+       "a5c|aundefinedc|abc|aundefinedc");
+    eq("let n = 0; 'aaaa'.replaceAll('aa', () => { n++; return ''; }); n;", "2");
+    eq("let m; try { 'abc'.replace('b', () => { throw new Error('boom'); }); } catch (e) { m = e.message; } m;", "boom");
+    /* GetSubstitution with a string pattern: $` $' too; $n and $<name> stay literal */
+    eq("'abcabc'.replace('b', '[$`|$\\'|$$|$1|$<x>]');", "a[a|cabc|$|$1|$<x>]cabc");
+    eq("['a.b.c'.replaceAll('.', '$`'), 'xyxy'.replaceAll('xy', \"$'\"), 'ab'.replaceAll('', \"$`$'|\")].join(' ');",
+       "aaba.bc xy ab|aab|bab|");
     eq("'foo'.concat('bar', 'baz');", "foobarbaz");
     eq("String.fromCharCode(72, 105);", "Hi");
     eq("String.fromCharCode(65 + 65536);", "A"); /* ToUint16 wraps mod 2**16 */
