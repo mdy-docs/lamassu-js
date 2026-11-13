@@ -584,11 +584,24 @@ static bool ps_reject(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
 }
 
 /*
- * Promise.all / race / allSettled share a per-call state object bound into
- * each element's reaction: { results, remaining, promise, mode }.
+ * Promise.all / allSettled / any share a per-call state object bound into
+ * each element's reaction: { results, remaining, promise, mode }. For any,
+ * `results` collects the rejection reasons.
  */
 #define ALL_MODE_ALL 0
 #define ALL_MODE_SETTLED 1
+#define ALL_MODE_ANY 2
+
+static bool race_resolve(JsContext *ctx, JsValue bound, JsValue tv, const JsValue *args, int argc, JsValue *r);
+
+/* Promise.any's rejection when every input rejected (or there were none) */
+static void reject_all_rejected(JsContext *ctx, JsPromise *rp, JsObject *reasons) {
+    JsValue rpv = js_value_from_cell(&rp->gc);
+    js_gc_protect(ctx->vm, &rpv);
+    JsValue e = js_aggregate_error_new(ctx, reasons, "All promises were rejected");
+    js_promise_reject(ctx, js_value_promise(rpv), js_is_object(e) ? e : js_oom_value(ctx->vm));
+    js_gc_unprotect(ctx->vm, &rpv);
+}
 
 /* read/write state fields by ascii key */
 static JsValue state_get(JsContext *ctx, JsObject *st, const char *k) {
@@ -670,6 +683,13 @@ static bool all_element_reject(JsContext *ctx, JsValue bound, JsValue tv,
             JsPromise *rp = js_value_promise(state_get(ctx, state, "promise"));
             js_promise_fulfill(ctx, rp, js_value_from_cell(&results->gc));
         }
+    } else if (mode == ALL_MODE_ANY) {
+        JsObject *reasons = js_value_object(state_get(ctx, state, "results"));
+        reasons->elems[idx] = ARG(0);
+        double rem = js_to_number_value(ctx, state_get(ctx, state, "remaining")) - 1;
+        state_set(ctx, state, "remaining", js_number(rem));
+        if (rem == 0)
+            reject_all_rejected(ctx, js_value_promise(state_get(ctx, state, "promise")), reasons);
     } else {
         JsPromise *rp = js_value_promise(state_get(ctx, state, "promise"));
         js_promise_reject(ctx, rp, ARG(0));
@@ -678,15 +698,32 @@ static bool all_element_reject(JsContext *ctx, JsValue bound, JsValue tv,
     return true;
 }
 
+/* A combinator's answer when its argument cannot be listed: a promise rejected with ERR, as V8
+ * gives (it does not throw) */
+static bool reject_with(JsContext *ctx, JsValue err, JsValue *r) {
+    if (err.bits == js_oom_value(ctx->vm).bits) /* out of memory still stops the script */
+        return (*r = err), false;
+    js_gc_protect(ctx->vm, &err);
+    JsValue pv = js_promise_new(ctx);
+    if (js_is_promise(pv))
+        js_promise_reject(ctx, js_value_promise(pv), err);
+    js_gc_unprotect(ctx->vm, &err);
+    if (!js_is_promise(pv))
+        return nthrow(ctx, r, "out of memory");
+    *r = pv;
+    return true;
+}
+
 static bool all_impl(JsContext *ctx, const JsValue *args, int argc, JsValue *r, int mode) {
-    JsValue iterable = ARG(0);
-    if (!js_is_object(iterable) || js_value_object(iterable)->obj_kind != JS_OBJ_ARRAY)
-        return (*r = js_error_fmt(ctx, "TypeError: %t is not iterable (cannot read property Symbol(Symbol.iterator))",
-                                  iterable)), false;
-    JsObject *input = js_value_object(iterable);
+    JsObject *input = js_iterable_to_array(ctx, ARG(0), r);
+    if (!input)
+        return reject_with(ctx, *r, r);
+    JsValue iterable = js_value_from_cell(&input->gc); /* a new array: rooted below */
     uint32_t n = input->elem_count;
 
+    js_gc_protect(ctx->vm, &iterable);
     JsValue rpv = js_promise_new(ctx);
+    js_gc_unprotect(ctx->vm, &iterable);
     if (!js_is_promise(rpv))
         return nthrow(ctx, r, "out of memory");
     js_gc_protect(ctx->vm, &rpv);
@@ -709,9 +746,10 @@ static bool all_impl(JsContext *ctx, const JsValue *args, int argc, JsValue *r, 
         state_set(ctx, state, "promise", rpv);
         state_set(ctx, state, "mode", js_number(mode));
 
-        if (n == 0) {
+        if (n == 0 && mode == ALL_MODE_ANY)
+            reject_all_rejected(ctx, js_value_promise(rpv), results);
+        else if (n == 0)
             js_promise_fulfill(ctx, js_value_promise(rpv), resultsv);
-        }
         for (uint32_t i = 0; i < n && ok; i++) {
             JsPromise *ep = coerce_promise(ctx, input->elems[i]);
             if (!ep) {
@@ -728,7 +766,8 @@ static bool all_impl(JsContext *ctx, const JsValue *args, int argc, JsValue *r, 
                 pair->elem_count = 2;
                 JsValue pairv = js_value_from_cell(&pair->gc);
                 js_gc_protect(ctx->vm, &pairv);
-                JsValue onf = js_bound_native_new(ctx, all_element_resolve, pairv);
+                JsValue onf = mode == ALL_MODE_ANY ? js_bound_native_new(ctx, race_resolve, rpv)
+                                                   : js_bound_native_new(ctx, all_element_resolve, pairv);
                 js_gc_protect(ctx->vm, &onf);
                 JsValue onr = js_bound_native_new(ctx, all_element_reject, pairv);
                 js_gc_protect(ctx->vm, &onr);
@@ -766,6 +805,11 @@ static bool ps_allSettled(JsContext *ctx, JsValue tv, const JsValue *args, int a
     return all_impl(ctx, args, argc, r, ALL_MODE_SETTLED);
 }
 
+static bool ps_any(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    return all_impl(ctx, args, argc, r, ALL_MODE_ANY);
+}
+
 static bool race_resolve(JsContext *ctx, JsValue bound, JsValue tv,
                          const JsValue *args, int argc, JsValue *r) {
     (void)tv;
@@ -784,12 +828,13 @@ static bool race_reject(JsContext *ctx, JsValue bound, JsValue tv,
 
 static bool ps_race(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
-    JsValue iterable = ARG(0);
-    if (!js_is_object(iterable) || js_value_object(iterable)->obj_kind != JS_OBJ_ARRAY)
-        return (*r = js_error_fmt(ctx, "TypeError: %t is not iterable (cannot read property Symbol(Symbol.iterator))",
-                                  iterable)), false;
-    JsObject *input = js_value_object(iterable);
+    JsObject *input = js_iterable_to_array(ctx, ARG(0), r);
+    if (!input)
+        return reject_with(ctx, *r, r);
+    JsValue iterable = js_value_from_cell(&input->gc);
+    js_gc_protect(ctx->vm, &iterable);
     JsValue rpv = js_promise_new(ctx);
+    js_gc_unprotect(ctx->vm, &iterable);
     if (!js_is_promise(rpv))
         return nthrow(ctx, r, "out of memory");
     js_gc_protect(ctx->vm, &rpv);
@@ -893,14 +938,15 @@ bool js_promise_builtins_init(JsContext *ctx) {
     JsNative *native = (JsNative *)js_value_cell(ctor);
     native->statics = statics;
     native->prototype = ctx->promise_methods; /* Promise.prototype: then, catch, finally */
-    bool ok = js_object_set_ascii(ctx, ctx->globals, "Promise", ctor);
+    bool ok = js_object_set_ascii(ctx, ctx->promise_methods, "constructor", ctor) &&
+              js_object_set_ascii(ctx, ctx->globals, "Promise", ctor);
     js_gc_unprotect(vm, &ctor);
     if (!ok)
         return false;
     JsObject *st = native->statics;
     if (!def_fn(ctx, st, "resolve", ps_resolve) || !def_fn(ctx, st, "reject", ps_reject) ||
         !def_fn(ctx, st, "all", ps_all) || !def_fn(ctx, st, "race", ps_race) ||
-        !def_fn(ctx, st, "allSettled", ps_allSettled))
+        !def_fn(ctx, st, "allSettled", ps_allSettled) || !def_fn(ctx, st, "any", ps_any))
         return false;
     return true;
 }

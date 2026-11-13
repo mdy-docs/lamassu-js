@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const globals = ['Math', 'JSON', 'Object', 'Array', 'Number', 'String', 'Boolean', 'Error', 'TypeError',
   'RangeError', 'ReferenceError', 'SyntaxError', 'Promise', 'RegExp', 'Date', 'Map', 'Set', 'parseInt',
-  'parseFloat', 'isNaN', 'isFinite'];
+  'parseFloat', 'isNaN', 'isFinite', 'EvalError', 'URIError', 'AggregateError'];
 const functionsOf = (o, owner, out) => {
   for (const k of Object.getOwnPropertyNames(o)) {
     const d = Object.getOwnPropertyDescriptor(o, k);
@@ -32,7 +32,7 @@ functionsOf(Function.prototype, 'Function.prototype', cand);
 const instance = { Array: '[]', String: "''", Number: '0', Boolean: 'true', Promise: 'Promise.resolve()',
   RegExp: '/a/', Date: 'new Date(0)', Map: 'new Map()', Set: 'new Set()', Object: '({})',
   Error: "new Error('')", TypeError: "new TypeError('')", RangeError: "new RangeError('')",
-  ReferenceError: "new ReferenceError('')", SyntaxError: "new SyntaxError('')", Function: '(function () {})' };
+  ReferenceError: "new ReferenceError('')", SyntaxError: "new SyntaxError('')", EvalError: "new EvalError('')", URIError: "new URIError('')", AggregateError: 'new AggregateError([])', Function: '(function () {})' };
 let probe = 'const r = [];\nconst t = (i, f) => { try { if (typeof f() === "function") r.push(i); } catch (e) {} };\n';
 cand.forEach((e, i) => {
   const base = e.owner === '' ? 'globalThis'

@@ -1007,6 +1007,43 @@ static void test_object_create_instanceof(void) {
     err("({}) instanceof {};", "TypeError: Right-hand side of 'instanceof' is not callable");
 }
 
+/* EvalError, URIError and AggregateError; constructors inheriting Error's statics; V8's
+ * Object.prototype.toString tags. Expected values are Node's. */
+static void test_error_types(void) {
+    eq("[typeof EvalError, typeof URIError, typeof AggregateError, EvalError.length, URIError.length, AggregateError.length].join();",
+       "function,function,function,1,1,2");
+    eq("[String(new EvalError('a')), String(URIError('b')), new EvalError('a') instanceof Error, new URIError() instanceof TypeError].join('|');",
+       "EvalError: a|URIError: b|true|false");
+    eq("['EvalError', 'URIError', 'AggregateError'].map(n => Object.getPrototypeOf(globalThis[n].prototype) === Error.prototype && globalThis[n].prototype.name === n && globalThis[n].prototype.constructor === globalThis[n]).join();",
+       "true,true,true");
+    eq("const a = [1, 2]; const e = new AggregateError(a, 'm', { cause: 3 }); [e.name, e.message, e.errors.join('+'), e.errors !== a, e.cause, String(e), e instanceof Error].join('|');",
+       "AggregateError|m|1+2|true|3|AggregateError: m|true");
+    eq("const e = new AggregateError([1], 'm', { cause: 2 }); [JSON.stringify(e), Object.keys(e).length, JSON.stringify({ ...e }), e.hasOwnProperty('errors')].join('|');",
+       "{}|0|{}|true");
+    eq("const e = new AggregateError([]); e.errors = 5; const k = Object.keys(e).length; delete e.errors; e.errors = 6; [k, Object.keys(e).join()].join('|');",
+       "0|errors");
+    eq("[new AggregateError('ab').errors.join(), new AggregateError(new Set([3, 4])).errors.join(), new AggregateError(new Map([[1, 2]])).errors[0].join(':')].join('|');",
+       "a,b|3,4|1:2");
+    eq("const e = new AggregateError([]); [e.message, e.hasOwnProperty('message'), AggregateError([7]).errors[0]].join('|');",
+       "|false|7");
+    eq("let m; try { new AggregateError(); } catch (e) { m = String(e); } m;",
+       "TypeError: undefined is not iterable (cannot read property Symbol(Symbol.iterator))");
+    eq("let m; try { new AggregateError(5); } catch (e) { m = String(e); } m;",
+       "TypeError: number 5 is not iterable (cannot read property Symbol(Symbol.iterator))");
+    eq("[Object.getPrototypeOf(TypeError) === Error, Object.getPrototypeOf(AggregateError) === Error, Object.getPrototypeOf(Error) === Object.getPrototypeOf(() => 0)].join();",
+       "true,true,true");
+    eq("[typeof TypeError.captureStackTrace, URIError.stackTraceLimit, 'captureStackTrace' in RangeError, TypeError.hasOwnProperty('captureStackTrace')].join();",
+       "function,10,true,false");
+    eq("TypeError.stackTraceLimit = 3; const r = [TypeError.stackTraceLimit, Error.stackTraceLimit]; delete TypeError.stackTraceLimit; r.push(TypeError.stackTraceLimit); r.join();",
+       "3,10,10");
+    eq("const t = v => Object.prototype.toString.call(v); [t(new Error('x')), t(new AggregateError([])), t([]), t(null), t(undefined), t(1), t('s'), t(true), t(() => 1), t(new Date(0)), t(/a/), t(new Map()), t(new Set()), t(Promise.resolve()), t(Math), t(JSON), t({}), t(Object.create(Error.prototype))].join(' ');",
+       "[object Error] [object Error] [object Array] [object Null] [object Undefined] [object Number] [object String] [object Boolean] [object Function] [object Date] [object RegExp] [object Map] [object Set] [object Promise] [object Math] [object JSON] [object Object] [object Object]");
+    eq("[String(Math), `${JSON}`, ({}).toString()].join(' ');",
+       "[object Math] [object JSON] [object Object]");
+    eq("[Object.getPrototypeOf(5) === Number.prototype, Object.getPrototypeOf('s') === String.prototype, Object.getPrototypeOf(Promise.resolve()) === Promise.prototype, (5).constructor === Number, 's'.constructor === String, Promise.resolve().constructor === Promise, typeof Number.prototype.toFixed, typeof String.prototype.slice].join();",
+       "true,true,true,true,true,true,function,function");
+}
+
 int main(void) {
     test_freeze_seal();
     test_string();
@@ -1022,6 +1059,7 @@ int main(void) {
     test_map();
     test_set();
     test_error();
+    test_error_types();
     test_stress();
     test_integration();
     if (checks_failed) {

@@ -3,7 +3,8 @@
 
 /*
  * Error objects: the `Error` global and its standard subclasses
- * (TypeError, RangeError, ReferenceError, SyntaxError).
+ * (TypeError, RangeError, ReferenceError, SyntaxError, EvalError, URIError,
+ * AggregateError).
  *
  * An error is an ordinary JsObject with obj_kind JS_OBJ_ERROR, an own
  * `message` string, and [[Prototype]] = the kind's prototype object (which
@@ -44,6 +45,9 @@ bool js_error_stack_delete(JsContext *ctx, JsObject *o, JsValue key);
 /* New error object of `kind`; `message` may be NULL (inherits ""). Roots
  * `message` itself. undefined on OOM. */
 JsValue js_error_new(JsContext *ctx, JsErrorKind kind, JsString *message);
+/* An AggregateError with MESSAGE and ERRORS (an array) as its `errors`, as Promise.any rejects
+ * with. Roots ERRORS itself. undefined on OOM. */
+JsValue js_aggregate_error_new(JsContext *ctx, JsObject *errors, const char *message);
 
 /* Engine-raised error from "Name: message" text: a leading standard error
  * name selects the kind (else JS_ERROR_PLAIN) and the remainder becomes the

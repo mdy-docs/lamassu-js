@@ -10,6 +10,7 @@
 
 static const char *const kind_names[JS_ERROR_KIND_COUNT] = {
     "Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError",
+    "EvalError", "URIError", "AggregateError",
 };
 
 static bool nthrow(JsContext *ctx, JsValue *r, const char *msg) {
@@ -827,15 +828,56 @@ static JsValue error_object_new(JsContext *ctx, JsErrorKind kind, JsString *mess
     return ok ? ev : js_undefined();
 }
 
+/* An AggregateError's own `errors`: LIST, made non-enumerable as V8 makes it */
+static bool set_errors(JsContext *ctx, JsValue ev, JsObject *list) {
+    if (!js_object_set_ascii(ctx, js_value_object(ev), "errors", js_value_from_cell(&list->gc)))
+        return false;
+    ((JsErrorObject *)js_value_object(ev))->hidden |= JS_ERR_HIDE_ERRORS;
+    return true;
+}
+
 JsValue js_error_new(JsContext *ctx, JsErrorKind kind, JsString *message) {
-    return error_object_new(ctx, kind, message, js_undefined());
+    JsValue ev = error_object_new(ctx, kind, message, js_undefined());
+    if (kind != JS_ERROR_AGGREGATE || !js_is_object(ev))
+        return ev;
+    js_gc_protect(ctx->vm, &ev);
+    JsObject *list = js_array_new_cell(ctx, 0);
+    bool ok = list && set_errors(ctx, ev, list);
+    js_gc_unprotect(ctx->vm, &ev);
+    return ok ? ev : js_undefined();
+}
+
+JsValue js_aggregate_error_new(JsContext *ctx, JsObject *errors, const char *message) {
+    JsVm *vm = ctx->vm;
+    JsValue lv = js_value_from_cell(&errors->gc);
+    js_gc_protect(vm, &lv);
+    JsString *m = js_ascii_cell(vm, message);
+    JsValue ev = m ? error_object_new(ctx, JS_ERROR_AGGREGATE, m, js_undefined()) : js_undefined();
+    js_gc_protect(vm, &ev);
+    bool ok = js_is_object(ev) && set_errors(ctx, ev, js_value_object(lv));
+    if (ok) { /* V8 makes it with no frames: its stack is the first line alone */
+        JsErrorObject *e = (JsErrorObject *)js_value_object(ev);
+        drop_frames(ctx, e);
+        e->stack_state = JS_STACK_FRAMES;
+    }
+    js_gc_unprotect(vm, &ev);
+    js_gc_unprotect(vm, &lv);
+    return ok ? ev : js_undefined();
 }
 
 /* ---- constructors ---- */
 
+/* new X(message, options), and new AggregateError(errors, message, options): the message, then
+ * the cause, then (an AggregateError's) the errors listed from their iterable, in V8's order */
 static bool error_ctor(JsContext *ctx, JsErrorKind kind, const JsValue *args, int argc,
                        JsValue *r) {
     JsVm *vm = ctx->vm;
+    JsValue errors = js_undefined(); /* the caller's argument: rooted */
+    if (kind == JS_ERROR_AGGREGATE && argc > 0) {
+        errors = args[0];
+        args++;
+        argc--;
+    }
     JsValue mv = ARG(0);
     JsString *msg = NULL;
     if (!js_is_undefined(mv)) {
@@ -861,6 +903,17 @@ static bool error_ctor(JsContext *ctx, JsErrorKind kind, const JsValue *args, in
         if (!ok)
             return nthrow(ctx, r, "out of memory");
     }
+    if (kind == JS_ERROR_AGGREGATE) {
+        js_gc_protect(vm, &ev);
+        JsValue err = js_undefined();
+        JsObject *list = js_iterable_to_array(ctx, errors, &err);
+        bool ok = list && set_errors(ctx, ev, list);
+        js_gc_unprotect(vm, &ev);
+        if (!list)
+            return (*r = err), false;
+        if (!ok)
+            return nthrow(ctx, r, "out of memory");
+    }
     *r = ev;
     return true;
 }
@@ -876,10 +929,14 @@ DEF_CTOR(g_TypeError, JS_ERROR_TYPE)
 DEF_CTOR(g_RangeError, JS_ERROR_RANGE)
 DEF_CTOR(g_ReferenceError, JS_ERROR_REFERENCE)
 DEF_CTOR(g_SyntaxError, JS_ERROR_SYNTAX)
+DEF_CTOR(g_EvalError, JS_ERROR_EVAL)
+DEF_CTOR(g_URIError, JS_ERROR_URI)
+DEF_CTOR(g_AggregateError, JS_ERROR_AGGREGATE)
 #undef DEF_CTOR
 
 static const JsNativeFn kind_ctors[JS_ERROR_KIND_COUNT] = {
     g_Error, g_TypeError, g_RangeError, g_ReferenceError, g_SyntaxError,
+    g_EvalError, g_URIError, g_AggregateError,
 };
 
 /* Error.prototype.toString: "name: message" for any object receiver. */
@@ -962,6 +1019,8 @@ bool js_error_builtins_init(JsContext *ctx) {
         if (!js_is_function(ctor))
             return false;
         ((JsNative *)js_value_cell(ctor))->prototype = proto;
+        if (k != JS_ERROR_PLAIN) /* TypeError's [[Prototype]] is Error: it inherits its statics */
+            ((JsNative *)js_value_cell(ctor))->parent = ctx->error_ctor;
         if (!js_object_set_ascii(ctx, proto, "constructor", ctor) ||
             !js_object_set_ascii(ctx, ctx->globals, kind_names[k], ctor))
             return false;

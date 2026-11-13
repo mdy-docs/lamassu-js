@@ -348,6 +348,9 @@ typedef enum JsErrorKind {
     JS_ERROR_RANGE,         /* RangeError */
     JS_ERROR_REFERENCE,     /* ReferenceError */
     JS_ERROR_SYNTAX,        /* SyntaxError */
+    JS_ERROR_EVAL,          /* EvalError */
+    JS_ERROR_URI,           /* URIError */
+    JS_ERROR_AGGREGATE,     /* AggregateError (its `errors` is an empty array) */
     JS_ERROR_KIND_COUNT
 } JsErrorKind;
 

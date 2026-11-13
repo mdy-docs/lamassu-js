@@ -163,6 +163,7 @@ typedef struct JsErrorObject {
 } JsErrorObject;
 #define JS_ERR_HIDE_MESSAGE 1u
 #define JS_ERR_HIDE_CAUSE 2u
+#define JS_ERR_HIDE_ERRORS 4u /* an AggregateError's `errors` */
 
 static inline bool js_units_are(const JsString *s, const char *a, uint32_t n) {
     if (s->length != n)
@@ -176,10 +177,12 @@ static inline bool js_units_are(const JsString *s, const char *a, uint32_t n) {
 /* The JS_ERR_HIDE_* bit KEY names on an error, or 0 */
 static inline uint8_t js_error_hide_bit(const JsString *key) {
     return js_units_are(key, "message", 7) ? JS_ERR_HIDE_MESSAGE
-           : js_units_are(key, "cause", 5) ? JS_ERR_HIDE_CAUSE : 0;
+           : js_units_are(key, "cause", 5)   ? JS_ERR_HIDE_CAUSE
+           : js_units_are(key, "errors", 6)  ? JS_ERR_HIDE_ERRORS : 0;
 }
 
-/* Whether enumerating O's own properties leaves KEY out: an error's `message` and `cause`, as
+/* Whether enumerating O's own properties leaves KEY out: an error's `message`, `cause` and
+ * `errors`, as
  * V8 makes them non-enumerable (Object.keys, JSON.stringify, spread, Object.assign) */
 static inline bool js_prop_hidden(const JsObject *o, const JsString *key) {
     return o->obj_kind == JS_OBJ_ERROR && ((const JsErrorObject *)o)->hidden &&
@@ -342,6 +345,8 @@ typedef struct JsNative {
     bool builtin;        /* made by the engine (js_builtins_init): shown in a stack trace */
     bool name_deleted;   /* `delete f.name`: reads "", while toString still gives the name */
     uint8_t length;      /* `length`: V8's for a builtin (js_builtin_lengths_apply), else 0 */
+    struct JsNative *parent; /* its [[Prototype]] when that is another constructor (TypeError's
+                              * is Error), whose statics it inherits; NULL: Function.prototype */
 } JsNative;
 
 /* ---- promises & microtasks ---- */
@@ -624,6 +629,7 @@ struct JsContext {
     JsNativeAct *native_act;  /* the natives running now, innermost first (on the C stack) */
     JsNative *error_ctor;     /* `Error`, for Error.stackTraceLimit; GC root */
     bool builtins_ready;      /* natives made from here on are the host's, not builtins */
+    JsObject *math_obj, *json_obj; /* Math and JSON, whose toString tags are theirs; GC roots */
 };
 
 struct JsVm {
@@ -737,6 +743,11 @@ static inline JsPromise *js_value_promise(JsValue v) { return (JsPromise *)js_va
  * bare vm-only allocator would leave them with. */
 JsObject *js_array_new_cell(JsContext *ctx, uint32_t reserve);
 bool js_array_append(JsVm *vm, JsObject *arr, JsValue v);
+/* A new array of what `for (const x of V)` visits (an array's elements, a string's code points,
+ * a Map's entries, a Set's values); NULL with *ERR set (V8's TypeError, or out of memory). */
+JsObject *js_iterable_to_array(JsContext *ctx, JsValue v, JsValue *err);
+/* The tag Object.prototype.toString gives V ("Array" for "[object Array]"), as V8's */
+const char *js_to_string_tag(const JsContext *ctx, JsValue v);
 bool js_array_set_index(JsVm *vm, JsObject *arr, uint32_t idx, JsValue v);
 
 /* ---- allocator (js_vm.c) ---- */

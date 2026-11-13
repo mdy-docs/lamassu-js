@@ -9,11 +9,11 @@ that's known to differ, so you're not surprised by one in production.
 - **`Object.prototype` only has three methods** — `hasOwnProperty`,
   `toString`, `valueOf`. Real JS also has `isPrototypeOf`,
   `propertyIsEnumerable`, `toLocaleString`, and the legacy `__proto__`
-  accessor; none of those are implemented. `toString` always returns
-  `"[object Object]"` — there's no per-kind `Symbol.toStringTag`-style
-  internal class tag, though in practice this is only reachable for plain
-  objects, since `Array`/`Map`/`Set`/`Date`/`RegExp` all define their own
-  `toString` that shadows it.
+  accessor; none of those are implemented. `toString` gives V8's tags
+  (`Object.prototype.toString.call(x)` is `[object Array]`, `[object Error]`,
+  `[object Null]`, `[object Math]`, …), with no `Symbol.toStringTag` to change
+  one (there are no symbols). `Array.prototype` is a plain object here, not an
+  array, so its tag is `[object Object]` (V8: `[object Array]`).
 - **`Object(primitiveValue)` returns the primitive unchanged** rather than
   boxing it into a wrapper object — this engine has no boxed-primitive type
   at all. `Object()`/`Object(null)`/`Object(undefined)` (a new empty
@@ -78,13 +78,14 @@ iterator (`for...of` over the result behaves the same either way).
 
 ## Errors
 
-- **No `EvalError`/`URIError`/`AggregateError`.**
+- **Nothing raises `EvalError` or `URIError`**: there is no `eval`, and no
+  `encodeURI`/`decodeURI`/`encodeURIComponent`/`decodeURIComponent`. The
+  constructors are there, as in V8.
 - **`stack` is V8's**, with these differences: no `Error.prepareStackTrace` hook;
   `Error.captureStackTrace` on an object that is not an error makes an ordinary (enumerable)
   `stack` property; an anonymous function's inferred name comes only from a member assignment
   (`x.y = function () {}` is `x.y`, `F.prototype.m = ...` is `F.m`), where V8 also infers from
   other places (`const a = [function () {}]` is `a` there); a host's natives have no frame.
-- **`Object.prototype.toString` reports `[object Object]`** for errors.
 - **Subclassing is not possible** (no classes); set `name` on an instance
   for a custom discriminator.
 - **Messages follow V8's wording**, with these differences: an error about

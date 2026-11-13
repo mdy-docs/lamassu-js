@@ -2712,11 +2712,94 @@ static bool objp_hasOwnProperty(JsContext *ctx, JsValue tv, const JsValue *args,
     return true;
 }
 
+const char *js_to_string_tag(const JsContext *ctx, JsValue v) {
+    if (js_is_undefined(v))
+        return "Undefined";
+    if (js_is_null(v))
+        return "Null";
+    if (js_is_number(v))
+        return "Number";
+    if (js_is_string(v))
+        return "String";
+    if (js_is_bool(v))
+        return "Boolean";
+    if (js_is_function(v))
+        return "Function";
+    if (js_is_promise(v))
+        return "Promise";
+    if (!js_is_object(v))
+        return "Object";
+    const JsObject *o = js_value_object(v);
+    switch (o->obj_kind) {
+    case JS_OBJ_ARRAY: return "Array";
+    case JS_OBJ_ERROR: return "Error";
+    case JS_OBJ_DATE: return "Date";
+    case JS_OBJ_MAP: return "Map";
+    case JS_OBJ_SET: return "Set";
+#ifdef LAMASSU_HAS_REGEX
+    case JS_OBJ_REGEXP: return "RegExp";
+#endif
+    default: break;
+    }
+    if (o->obj_flags & JS_OBJ_NAMESPACE)
+        return "Module";
+    if (o == ctx->math_obj)
+        return "Math";
+    if (o == ctx->json_obj)
+        return "JSON";
+    return "Object";
+}
+
+JsObject *js_iterable_to_array(JsContext *ctx, JsValue v, JsValue *err) {
+    JsVm *vm = ctx->vm;
+    if (js_mapobj_is(v) || js_setobj_is(v)) {
+        JsObject *a = js_mapobj_is(v) ? js_mapobj_entries_array(ctx, js_value_object(v))
+                                      : js_setobj_values_array(ctx, js_value_object(v));
+        if (!a)
+            *err = js_oom_value(vm);
+        return a;
+    }
+    bool str = js_is_string(v);
+    if (!str && !(js_is_object(v) && js_value_object(v)->obj_kind == JS_OBJ_ARRAY)) {
+        *err = js_error_fmt(ctx, "TypeError: %t is not iterable (cannot read property Symbol(Symbol.iterator))", v);
+        return NULL;
+    }
+    js_gc_protect(vm, &v);
+    JsObject *a = js_array_new_cell(ctx, str ? 0 : js_value_object(v)->elem_count);
+    JsValue av = a ? js_value_from_cell(&a->gc) : js_undefined();
+    js_gc_protect(vm, &av);
+    bool ok = a != NULL;
+    if (ok && str) {
+        for (uint32_t i = 0; ok && i < js_value_string(v)->length;) {
+            JsString *s = js_value_string(v);
+            uint32_t n = 1;
+            if (s->units[i] >= 0xD800 && s->units[i] <= 0xDBFF && i + 1 < s->length &&
+                s->units[i + 1] >= 0xDC00 && s->units[i + 1] <= 0xDFFF)
+                n = 2;
+            JsString *c = js_string_cell_new(vm, s->units + i, n);
+            ok = c && js_array_append(vm, a, js_value_from_cell(&c->gc));
+            i += n;
+        }
+    } else if (ok) {
+        for (uint32_t i = 0; ok && i < js_value_object(v)->elem_count; i++)
+            ok = js_array_append(vm, a, js_value_object(v)->elems[i]);
+    }
+    js_gc_unprotect(vm, &av);
+    js_gc_unprotect(vm, &v);
+    if (!ok) {
+        *err = js_oom_value(vm);
+        return NULL;
+    }
+    return a;
+}
+
+/* Object.prototype.toString: "[object Tag]", V8's tag for the receiver */
 static bool objp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    (void)tv;
     (void)args;
     (void)argc;
-    JsString *s = js_ascii_cell(ctx->vm, "[object Object]");
+    char buf[32];
+    snprintf(buf, sizeof buf, "[object %s]", js_to_string_tag(ctx, tv));
+    JsString *s = js_ascii_cell(ctx->vm, buf);
     if (!s)
         return oom(ctx, r);
     *r = js_value_from_cell(&s->gc);
@@ -2746,7 +2829,18 @@ static bool obj_getPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, 
         *r = js_is_object(proto) ? proto : js_null();
         return true;
     }
-    *r = js_null();
+    /* a function's is Function.prototype, or the constructor it inherits from (TypeError's is
+     * Error); a promise's, number's and string's their constructor's prototype. A boolean's is
+     * null: there is no Boolean.prototype object. */
+    JsObject *p = js_is_function(v)  ? ctx->function_methods
+                  : js_is_promise(v) ? ctx->promise_methods
+                  : js_is_number(v)  ? ctx->number_methods
+                  : js_is_string(v)  ? ctx->string_methods : NULL;
+    if (js_is_function(v) && js_value_cell(v)->kind == JS_KIND_NATIVE && ((JsNative *)js_value_cell(v))->parent) {
+        *r = js_value_from_cell(&((JsNative *)js_value_cell(v))->parent->gc);
+        return true;
+    }
+    *r = p ? js_value_from_cell(&p->gc) : js_null();
     return true;
 }
 
@@ -3219,6 +3313,21 @@ static bool def_fn(JsContext *ctx, JsObject *o, const char *k, JsNativeFn fn) {
     return js_is_function(nf) && js_object_set_ascii(ctx, o, k, nf);
 }
 
+/* Makes TABLE (a primitive's method table) the prototype of the global constructor NAME, linked
+ * both ways as V8's are: Number.prototype.toFixed, (5).constructor === Number */
+static bool link_prototype(JsContext *ctx, const char *name, JsObject *table) {
+    JsString *k = js_ascii_cell(ctx->vm, name);
+    JsString *ik = k ? js_intern_cell(ctx->vm, k) : NULL;
+    if (!ik)
+        return false;
+    bool found;
+    JsValue ctor = js_map_get(&ctx->globals->props, ik, &found);
+    if (!found || !js_is_function(ctor) || js_value_cell(ctor)->kind != JS_KIND_NATIVE)
+        return false;
+    ((JsNative *)js_value_cell(ctor))->prototype = table;
+    return js_object_set_ascii(ctx, table, "constructor", ctor);
+}
+
 /* Creates a callable global (native) with an attached statics object. */
 static JsObject *def_ctor(JsContext *ctx, const char *name, JsNativeFn fn) {
     JsValue nf = js_native_new(ctx, name, fn, NULL);
@@ -3336,6 +3445,7 @@ bool js_builtins_init(JsContext *ctx) {
     if (!js_is_object(mathv) || !js_object_set_ascii(ctx, ctx->globals, "Math", mathv))
         return false;
     JsObject *math = js_value_object(mathv);
+    ctx->math_obj = math;
     if (!def_fn(ctx, math, "abs", math_abs) || !def_fn(ctx, math, "floor", math_floor) ||
         !def_fn(ctx, math, "ceil", math_ceil) || !def_fn(ctx, math, "round", math_round) ||
         !def_fn(ctx, math, "trunc", math_trunc) || !def_fn(ctx, math, "sign", math_sign) ||
@@ -3364,6 +3474,7 @@ bool js_builtins_init(JsContext *ctx) {
     if (!js_is_object(jsonv) || !js_object_set_ascii(ctx, ctx->globals, "JSON", jsonv))
         return false;
     JsObject *json = js_value_object(jsonv);
+    ctx->json_obj = json;
     if (!def_fn(ctx, json, "stringify", json_stringify) ||
         !def_fn(ctx, json, "parse", json_parse))
         return false;
@@ -3448,6 +3559,9 @@ bool js_builtins_init(JsContext *ctx) {
         return false;
     if (!def_fn(ctx, stro, "fromCharCode", str_fromCharCode) ||
         !def_fn(ctx, stro, "fromCodePoint", str_fromCodePoint))
+        return false;
+    if (!link_prototype(ctx, "Number", ctx->number_methods) ||
+        !link_prototype(ctx, "String", ctx->string_methods))
         return false;
 
     /* Boolean: callable conversion */

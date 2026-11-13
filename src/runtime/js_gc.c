@@ -190,6 +190,8 @@ static void js_gc_trace(JsVm *vm) {
                 js_gc_mark_cell(vm, &nf->props->gc);
             if (nf->prototype)
                 js_gc_mark_cell(vm, &nf->prototype->gc);
+            if (nf->parent)
+                js_gc_mark_cell(vm, &nf->parent->gc);
             if (nf->is_bound)
                 js_gc_mark_value(vm, nf->bound);
             break;
@@ -345,6 +347,10 @@ void js_gc_collect(JsVm *vm) {
         js_gc_mark_value(vm, ctx->error_trace_value);
         if (ctx->error_ctor)
             js_gc_mark_cell(vm, &ctx->error_ctor->gc);
+        if (ctx->math_obj)
+            js_gc_mark_cell(vm, &ctx->math_obj->gc);
+        if (ctx->json_obj)
+            js_gc_mark_cell(vm, &ctx->json_obj->gc);
         /* the natives running now: their receivers (the callee is on its caller's stack, or
          * held by the host) */
         for (const JsNativeAct *a = ctx->native_act; a; a = a->outer) {

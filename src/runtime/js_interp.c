@@ -96,6 +96,8 @@ JsString *js_to_string_cell(JsContext *ctx, JsValue v, int depth) {
             return js_ascii_cell(vm, "[object Set]");
         if (o->obj_kind == JS_OBJ_ERROR)
             return js_error_repr(ctx, o, depth);
+        if (o == ctx->math_obj || o == ctx->json_obj)
+            return js_ascii_cell(vm, o == ctx->math_obj ? "[object Math]" : "[object JSON]");
         if (o->obj_kind != JS_OBJ_ARRAY)
             return js_ascii_cell(vm, "[object Object]");
         if (depth >= JS_TOSTRING_MAX_DEPTH)
@@ -544,6 +546,9 @@ __attribute__((noinline)) static bool special_prop_get(JsContext *ctx, JsObject 
     return handled;
 }
 
+__attribute__((noinline)) static JsPropStatus parent_ctor_lookup(JsContext *ctx, JsNative *p, JsValue key,
+                                                               JsValue *out);
+
 static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
                                  JsValue *out) {
     JsVm *vm = ctx->vm;
@@ -660,6 +665,8 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
             if (st != JS_PROP_OK || !js_is_undefined(*out))
                 return st;
         }
+        if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->parent)
+            return parent_ctor_lookup(ctx, ((JsNative *)c)->parent, key, out);
         /* Function.prototype methods (call), shared by closures and natives */
         return method_lookup(ctx, ctx->function_methods, key, out);
     }
@@ -1465,6 +1472,7 @@ JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *ud)
     nf->name_deleted = false;
     nf->builtin = !ctx->builtins_ready;
     nf->length = 0;
+    nf->parent = NULL;
     return js_value_from_cell(c);
 }
 
@@ -1489,6 +1497,7 @@ JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound) {
     nf->name_deleted = false;
     nf->builtin = !ctx->builtins_ready;
     nf->length = 0;
+    nf->parent = NULL;
     return js_value_from_cell(c);
 }
 
@@ -1535,6 +1544,7 @@ bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
     nf->name_deleted = false;
     nf->builtin = !ctx->builtins_ready;
     nf->length = 0;
+    nf->parent = NULL;
     return js_map_set(vm, &ctx->globals->props, js_value_string(key),
                       js_value_from_cell(c));
 }
@@ -3288,4 +3298,24 @@ bool js_builtin_lengths_apply(JsContext *ctx) {
             ((JsNative *)js_value_cell(f))->length = e->length;
     }
     return true;
+}
+
+/* What a constructor inherits from the one that is its [[Prototype]] (TypeError from Error): that
+ * one's own properties and statics, up its chain, then Function.prototype's. Out of line: it is
+ * the cold end of a function property read. */
+__attribute__((noinline)) static JsPropStatus parent_ctor_lookup(JsContext *ctx, JsNative *p, JsValue key,
+                                                               JsValue *out) {
+    for (int depth = 0; p && depth < JS_PROTO_CHAIN_LIMIT; p = p->parent, depth++) {
+        if (p->props) {
+            JsPropStatus st = method_lookup(ctx, p->props, key, out);
+            if (st != JS_PROP_OK || !js_is_undefined(*out))
+                return st;
+        }
+        if (p->statics) {
+            JsPropStatus st = method_lookup(ctx, p->statics, key, out);
+            if (st != JS_PROP_OK || !js_is_undefined(*out))
+                return st;
+        }
+    }
+    return method_lookup(ctx, ctx->function_methods, key, out);
 }

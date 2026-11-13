@@ -491,9 +491,12 @@ static void test_real_prototypes(void) {
     expect_result("function Base() {} let o = {};"
                   " Object.setPrototypeOf(o, Base.prototype);"
                   " Object.getPrototypeOf(o) === Base.prototype;", "true");
-    /* getPrototypeOf on values with no [[Prototype]] slot: null, not a crash */
-    expect_result("Object.getPrototypeOf(5);", "null");
-    expect_result("Object.getPrototypeOf(function(){});", "null");
+    /* getPrototypeOf on values with no [[Prototype]] slot: what V8 gives, not a crash */
+    expect_result("Object.getPrototypeOf(5) === Number.prototype;", "true");
+    expect_result("Object.getPrototypeOf('s') === String.prototype;", "true");
+    expect_result("Object.getPrototypeOf(true);", "null");
+    expect_result("Object.getPrototypeOf(function(){}) === Object.getPrototypeOf(Math.max);", "true");
+    expect_result("Object.getPrototypeOf(Object.getPrototypeOf(function(){})) === Object.prototype;", "true");
     /* user-defined `new` prototype chains are unaffected by any of this */
     expect_result("function Animal(n) { this.name = n; }"
                   " Animal.prototype.speak = function() { return this.name + ' speaks'; };"

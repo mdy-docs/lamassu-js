@@ -49,7 +49,9 @@ are no-ops on a primitive (which `isFrozen`/`isSealed` therefore report as
 frozen and sealed). Integrity is whole-object — there are no per-property
 attributes; see [Deviations](/guide/deviations).
 
-**`Object.prototype`**: `hasOwnProperty`, `toString` (`"[object Object]"`),
+**`Object.prototype`**: `hasOwnProperty`, `toString` (`"[object Object]"`, and V8's tag for
+anything else: `Object.prototype.toString.call([])` is `"[object Array]"`, an error's
+`"[object Error]"`, `null`'s `"[object Null]"`),
 `valueOf` (returns the object itself). This is the root of *every*
 `[[Prototype]]` chain in the engine — a plain object literal's own
 `[[Prototype]]` is `Object.prototype`, and `Array.prototype`/
@@ -57,7 +59,9 @@ attributes; see [Deviations](/guide/deviations).
 user-defined constructor's `.prototype`, and even `globalThis` itself all
 chain up to it in turn (`Object.getPrototypeOf(Array.prototype) ===
 Object.prototype`). `Object.prototype`'s own `[[Prototype]]` is `null`,
-matching spec.
+matching spec. `Object.getPrototypeOf` of a function is `Function.prototype` (of `TypeError` and
+the other error constructors, `Error`), of a number `Number.prototype`, of a string
+`String.prototype` and of a promise `Promise.prototype`.
 
 ## `Array`
 
@@ -98,7 +102,8 @@ boxed `String` object — this engine has no boxed-primitive type at all).
   `parseInt`, `parseFloat`.
 - **Constants**: `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`,
   `MIN_VALUE`, `EPSILON`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`, `NaN`.
-- **`Number.prototype`**: `toFixed`, `toString`, `valueOf`.
+- **`Number.prototype`**: `toFixed`, `toString`, `valueOf` (the same object `(5).constructor`
+  and `Object.getPrototypeOf(5)` lead to; likewise `String.prototype`).
 
 `toString()`/number-to-string prints what V8 prints: the shortest digits that
 read back as the same double, and of those the nearest to its value (ties to
@@ -190,12 +195,16 @@ not the full parser for arbitrary date strings).
 ## `Error`
 
 `new Error(message?, { cause }?)` (callable without `new` too), plus
-`TypeError`, `RangeError`, `ReferenceError`, and `SyntaxError` with the same
-signature and `Error.prototype` in their chain.
+`TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`, `EvalError` and `URIError` with the
+same signature and `Error.prototype` in their chain, and
+`new AggregateError(errors, message?, { cause }?)`, whose own `errors` is a new array of what
+`errors` iterates (an array, a string, a `Map` or a `Set`; anything else is V8's `TypeError`).
+Each subclass constructor's `[[Prototype]]` is `Error`, so `TypeError.captureStackTrace` is
+`Error.captureStackTrace`.
 
 - **Instances**: own `message` (ToString of the argument; absent when the
   argument is `undefined`, inheriting `""`), own `cause` when the options
-  object has one. As in V8 neither is enumerated: `JSON.stringify(new Error('x'))` is `{}`, and
+  object has one, and an `AggregateError`'s own `errors`. As in V8 none is enumerated: `JSON.stringify(new Error('x'))` is `{}`, and
   `Object.keys`, spread and `Object.assign` leave them out (one deleted and made again, or
   assigned to an error that had none, is ordinary).
 - **`Error.prototype`**: `name` (`"Error"`; each subclass prototype
@@ -242,8 +251,11 @@ regular own property; it shadows a same-named data property the way
 `new Promise(executor)` — and, as a deliberate accommodation for this
 engine's subset, callable **without** `new` too.
 
-- **Statics**: `resolve`, `reject`, `all`, `race`, `allSettled`.
-  `Promise.any` is not implemented.
+- **Statics**: `resolve`, `reject`, `all`, `race`, `allSettled`, `any`. The four combinators take
+  any iterable (an array, a string, a `Map` or a `Set`); given something else they return a
+  promise rejected with V8's `TypeError`, as V8 does, rather than throwing. `Promise.any` rejects
+  with an `AggregateError` (`All promises were rejected`) whose `errors` are the reasons in
+  input order.
 - **`Promise.prototype`**: `then`, `catch`, `finally`.
 
 See [Async & host calls](/guide/async) for how promises connect to

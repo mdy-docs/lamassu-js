@@ -274,6 +274,25 @@ static void test_promise_combinators(void) {
     eq("await Promise.allSettled([Promise.resolve(1), Promise.reject('e')])"
        ".then(rs => rs.map(x => x.status).join(','));", "fulfilled,rejected");
     eq("await Promise.allSettled([Promise.resolve(5)]).then(rs => rs[0].value);", "5");
+    /* Promise.any: the first fulfilment, else an AggregateError of the reasons in input order */
+    eq("await Promise.any([Promise.reject(1), defer(2), Promise.resolve(3)]);", "3");
+    eq("OUT = await Promise.any([Promise.reject(1), defer(2)]);", "2");
+    eq("OUT = await Promise.any([rejectLater('a'), Promise.reject('b')]).catch(e =>"
+       " [e.name, e.message, e.errors.join(), e instanceof AggregateError, e.stack].join('|'));",
+       "AggregateError|All promises were rejected|a,b|true|AggregateError: All promises were rejected");
+    eq("await Promise.any([]).catch(e => e.errors.length + '|' + e.stack);",
+       "0|AggregateError: All promises were rejected");
+    /* any iterable, and a non-iterable rejects (it does not throw), as V8 */
+    eq("OUT = await Promise.all(new Set([1, defer(2)])).then(a => a.join());", "1,2");
+    eq("await Promise.race('xy');", "x");
+    eq("await Promise.any(new Map([[1, 2]])).then(p => p.join());", "1,2");
+    eq("const p = Promise.all(5); await p.catch(e => String(e));",
+       "TypeError: number 5 is not iterable (cannot read property Symbol(Symbol.iterator))");
+    eq("await Promise.allSettled().catch(e => e.message);",
+       "undefined is not iterable (cannot read property Symbol(Symbol.iterator))");
+    eq("await Promise.race(null).catch(e => e.message);",
+       "object null is not iterable (cannot read property Symbol(Symbol.iterator))");
+    eq("await Promise.any({}).catch(e => e.stack.split('\\n')[1]);", "    at Promise.any (<anonymous>)");
 }
 
 static void test_ctor_executor(void) {

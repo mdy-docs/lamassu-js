@@ -256,6 +256,7 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->native_act = NULL;
     ctx->error_ctor = NULL;
     ctx->builtins_ready = false;
+    ctx->math_obj = ctx->json_obj = NULL;
     ctx->error_trace_count = 0;
     ctx->error_trace_value = js_undefined();
     ctx->reentry_depth = 0;

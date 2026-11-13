@@ -138,6 +138,14 @@ static void test_native_values(void) {
     static const uint16_t wide[] = { 0x00e9, 0x0074, 0x00e9 }; /* été */
     JsValue e2 = js_error_new_utf16(ctx, JS_ERROR_PLAIN, wide, 3);
     CHECK(js_is_object(e2) && js_string_length(js_object_get(vm, e2, atom(vm, "message"))) == 3, "utf16 message");
+    JsValue e3 = js_error_new_ascii(ctx, JS_ERROR_AGGREGATE, "all");
+    js_gc_protect(vm, &e3);
+    JsValue errs = js_is_object(e3) ? js_object_get(vm, e3, atom(vm, "errors")) : js_undefined();
+    CHECK(str_is(js_to_string(ctx, e3), "AggregateError: all") && js_is_array(errs) && js_array_length(errs) == 0,
+          "a host AggregateError has an empty errors array");
+    JsValue e4 = js_error_new_ascii(ctx, JS_ERROR_URI, "u");
+    CHECK(js_is_object(e4) && str_is(js_to_string(ctx, e4), "URIError: u"), "URIError name via ToString");
+    js_gc_unprotect(vm, &e3);
     js_gc_unprotect(vm, &e);
     js_gc_unprotect(vm, &fn);
     js_gc_unprotect(vm, &obj);
