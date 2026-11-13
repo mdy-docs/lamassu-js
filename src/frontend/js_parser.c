@@ -1571,8 +1571,6 @@ static JsAstNode *parse_binary(JsParser *p, int min_prec) {
             if (!left)
                 return NULL;
         }
-        if (k == JS_T_INSTANCEOF)
-            return perr_here(p, "'instanceof' is not supported");
         uint32_t pos = left->pos;
         if (!advance(p))
             return NULL;

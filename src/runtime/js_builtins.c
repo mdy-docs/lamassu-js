@@ -2750,6 +2750,24 @@ static bool obj_getPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, 
     return true;
 }
 
+/* Object.create(proto): a new plain object whose prototype is PROTO (an object) or none (null).
+ * A second argument (property descriptors) is refused: there are no property attributes here
+ * to give the properties it describes, so there is nothing faithful to do with it. */
+static bool obj_create(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    JsValue proto = ARG(0);
+    if (!js_is_object(proto) && !js_is_null(proto))
+        return native_throw_fmt(ctx, r, "TypeError: Object prototype may only be an Object or null: %v", proto);
+    if (!js_is_undefined(ARG(1)))
+        return native_throw(ctx, r, "TypeError: Object.create with property descriptors is not supported");
+    JsValue o = js_object_new(ctx); /* proto is the caller's argument: rooted */
+    if (!js_is_object(o))
+        return oom(ctx, r);
+    js_value_object(o)->proto = js_is_object(proto) ? proto : js_undefined();
+    *r = o;
+    return true;
+}
+
 static bool obj_setPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                                JsValue *r) {
     (void)tv;
@@ -3377,7 +3395,8 @@ bool js_builtins_init(JsContext *ctx) {
         !def_fn(ctx, object, "fromEntries", obj_fromEntries) ||
         !def_fn(ctx, object, "hasOwn", obj_hasOwn) ||
         !def_fn(ctx, object, "getPrototypeOf", obj_getPrototypeOf) ||
-        !def_fn(ctx, object, "setPrototypeOf", obj_setPrototypeOf))
+        !def_fn(ctx, object, "setPrototypeOf", obj_setPrototypeOf) ||
+        !def_fn(ctx, object, "create", obj_create))
         return false;
 
     /* Array: a callable native (Array(n) / new Array(n) behave identically —

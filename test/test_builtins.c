@@ -977,6 +977,36 @@ static void test_freeze_seal(void) {
        "2,4");
 }
 
+/* Object.create and instanceof, as V8 gives them (Node's results) */
+static void test_object_create_instanceof(void) {
+    eq("const base = { greet() { return 'hi ' + this.n; } }; const o = Object.create(base); o.n = 'x';"
+       " [o.greet(), Object.getPrototypeOf(o) === base, Object.keys(o).join(), o.hasOwnProperty('greet'),"
+       " 'greet' in o, Object.create.length].join();",
+       "hi x,true,n,false,true,2");
+    eq("const n = Object.create(null); n.k = 1; [Object.getPrototypeOf(n), JSON.stringify(n)].join();",
+       ",{\"k\":1}");
+    err("Object.create(1);", "TypeError: Object prototype may only be an Object or null: 1");
+    err("Object.create();", "TypeError: Object prototype may only be an Object or null: undefined");
+    err("Object.create({}, { a: { value: 1 } });",
+        "TypeError: Object.create with property descriptors is not supported");
+    eq("let c; try { null.x; } catch (e) { c = e; }"
+       " [new TypeError() instanceof TypeError, new TypeError() instanceof Error, new Error() instanceof TypeError,"
+       " c instanceof TypeError, c instanceof RangeError].join();",
+       "true,true,false,true,false");
+    eq("[[] instanceof Array, [] instanceof Object, ({}) instanceof Array, new Map() instanceof Map,"
+       " new Set() instanceof Map, new Date(0) instanceof Date].join();",
+       "true,true,false,true,false,true");
+    eq("function P() {} function Q() {} Q.prototype = Object.create(P.prototype);"
+       " [new P() instanceof P, new Q() instanceof P, new P() instanceof Q,"
+       " Object.create(null) instanceof Object, new P() instanceof P.bind(null)].join();",
+       "true,true,false,false,true");
+    eq("[(() => 0) instanceof Object, Promise.resolve() instanceof Promise, Promise.resolve() instanceof Object,"
+       " 1 instanceof Object, 'x' instanceof Object, null instanceof Object, typeof Promise.prototype.then].join();",
+       "true,true,true,false,false,false,function");
+    err("({}) instanceof 1;", "TypeError: Right-hand side of 'instanceof' is not an object");
+    err("({}) instanceof {};", "TypeError: Right-hand side of 'instanceof' is not callable");
+}
+
 int main(void) {
     test_freeze_seal();
     test_string();
@@ -987,6 +1017,7 @@ int main(void) {
     test_math();
     test_json();
     test_object();
+    test_object_create_instanceof();
     test_date();
     test_map();
     test_set();

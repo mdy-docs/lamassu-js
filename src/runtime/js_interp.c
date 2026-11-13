@@ -1070,6 +1070,52 @@ __attribute__((noinline)) static bool delete_object_prop(JsContext *ctx, JsObjec
     return true;
 }
 
+/* `V instanceof C`, as V8 runs it (there is no Symbol.hasInstance): C must be a function; a bound
+ * one stands for its target; true when C.prototype is on V's prototype chain. A function's chain
+ * starts at the function methods (Function.prototype), a promise's at Promise.prototype; both go
+ * on to Object.prototype. 1 or 0, or -1 with *ERR the TypeError. */
+__attribute__((noinline)) static int instance_of(JsContext *ctx, JsValue v, JsValue c, JsValue *err) {
+    if (!js_is_object(c) && !js_is_function(c) && !js_is_promise(c)) {
+        *err = js_error_from_ascii(ctx, "TypeError: Right-hand side of 'instanceof' is not an object");
+        return -1;
+    }
+    if (!js_is_function(c)) {
+        *err = js_error_from_ascii(ctx, "TypeError: Right-hand side of 'instanceof' is not callable");
+        return -1;
+    }
+    while (js_value_cell(c)->kind == JS_KIND_NATIVE && ((JsNative *)js_value_cell(c))->is_bound &&
+           ((JsNative *)js_value_cell(c))->bound_fn == js_bind_call)
+        c = js_value_object(((JsNative *)js_value_cell(c))->bound)->elems[0];
+    JsObject *start;
+    if (js_is_object(v))
+        start = js_is_object(js_value_object(v)->proto) ? js_value_object(js_value_object(v)->proto) : NULL;
+    else if (js_is_function(v))
+        start = ctx->function_methods;
+    else if (js_is_promise(v))
+        start = ctx->promise_methods;
+    else
+        return 0; /* a primitive is no instance */
+    static const uint16_t kp[] = {'p', 'r', 'o', 't', 'o', 't', 'y', 'p', 'e'};
+    js_gc_protect(ctx->vm, &c);
+    JsValue key = js_atom(ctx->vm, kp, 9);
+    JsValue proto = js_undefined();
+    JsPropStatus st = js_is_string(key) ? get_property(ctx, c, key, &proto) : JS_PROP_OOM;
+    js_gc_unprotect(ctx->vm, &c);
+    if (st == JS_PROP_OOM) {
+        *err = js_oom_value(ctx->vm);
+        return -1;
+    }
+    if (!js_is_object(proto)) {
+        *err = js_error_fmt(ctx, "TypeError: Function has non-object prototype '%v' in instanceof check", proto);
+        return -1;
+    }
+    const JsObject *target = js_value_object(proto);
+    for (const JsObject *p = start; p; p = js_is_object(p->proto) ? js_value_object(p->proto) : NULL)
+        if (p == target)
+            return 1;
+    return 0;
+}
+
 /* ---- e.stack: the frames an error is made in (js_error.c turns them into text) ---- */
 
 
@@ -1983,6 +2029,17 @@ run:; /* (re)load the top frame */
                     RT_THROW("out of memory");
                 fb->sp--;
                 PEEK(0) = js_bool(has);
+                break;
+            }
+            case JS_OP_INSTANCEOF: {
+                JsValue ierr;
+                int is = instance_of(ctx, PEEK(1), PEEK(0), &ierr);
+                if (is < 0) {
+                    fiber_throw_value(fb, ierr);
+                    RT_RAISE();
+                }
+                fb->sp--;
+                PEEK(0) = js_bool(is == 1);
                 break;
             }
             case JS_OP_TYPEOF: {

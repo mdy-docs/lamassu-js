@@ -78,9 +78,6 @@ iterator (`for...of` over the result behaves the same either way).
 
 ## Errors
 
-- **No `instanceof`**, so `e instanceof TypeError` is a syntax error;
-  test `e.name` or compare `Object.getPrototypeOf(e)` against the
-  constructor's `.prototype`.
 - **No `EvalError`/`URIError`/`AggregateError`.**
 - **`stack` is V8's**, with these differences: no `Error.prepareStackTrace` hook;
   `Error.captureStackTrace` on an object that is not an error makes an ordinary (enumerable)

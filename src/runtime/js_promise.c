@@ -892,6 +892,7 @@ bool js_promise_builtins_init(JsContext *ctx) {
     JsObject *statics = js_value_object(staticsv);
     JsNative *native = (JsNative *)js_value_cell(ctor);
     native->statics = statics;
+    native->prototype = ctx->promise_methods; /* Promise.prototype: then, catch, finally */
     bool ok = js_object_set_ascii(ctx, ctx->globals, "Promise", ctor);
     js_gc_unprotect(vm, &ctor);
     if (!ok)

@@ -24,7 +24,12 @@ nothing to box it into.
 
 **Statics**: `keys`, `values`, `entries`, `assign`, `freeze`, `isFrozen`,
 `seal`, `isSealed`, `fromEntries`, `hasOwn`, `getPrototypeOf`,
-`setPrototypeOf`.
+`setPrototypeOf`, `create`.
+
+`Object.create(proto)` makes a plain object whose prototype is `proto` (an object) or none
+(`null`); anything else is V8's `TypeError: Object prototype may only be an Object or null`. A
+second argument (property descriptors) is a `TypeError`: there are no property attributes to give
+the properties it describes.
 
 Own keys come out in the language's order everywhere — `keys`/`values`/
 `entries`, spread, `assign` and `JSON.stringify`: array-index names (`"0"`,

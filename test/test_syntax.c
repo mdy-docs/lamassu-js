@@ -753,7 +753,8 @@ static void test_errors(void) {
     check_err("for (let k in o) {}", "for-in is not supported", -1);
     check_err("for (k in o) {}", "for-in is not supported", -1);
     check_err("new.target;", "'new.target' is not supported", -1);
-    check_err("x instanceof y;", "'instanceof' is not supported", -1);
+    check_parses("x instanceof y;"); /* V8's operator, at the relational level */
+    check_parses("a instanceof B === c in d;");
     check_err("function f() { await g(); }", "Unexpected reserved word", -1);
     check_err("a ?? b || c;", "Unexpected token '?\?'", -1);
     check_err("const x;", "Missing initializer in const declaration", -1);

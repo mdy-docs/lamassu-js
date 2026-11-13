@@ -107,8 +107,10 @@ the script compiles), and for a script that does not compile `Unexpected token
 `SyntaxError` object. [Deviations](./deviations.md#errors) lists where they
 still differ.
 
-There is no `instanceof` (see [Deviations](./deviations.md)); discriminate
-on `e.name` or `Object.getPrototypeOf(e) === RangeError.prototype`.
+`instanceof` is V8's (without `Symbol.hasInstance`): `e instanceof TypeError`, `[] instanceof
+Array`, an object made by `new F` or `Object.create(F.prototype)` is an instance of `F`; a bound
+function stands for its target; a function is an instance of `Object`, a promise of `Promise` and
+`Object`. The right side must be a function (`Right-hand side of 'instanceof' is not callable`).
 
 ## Async
 

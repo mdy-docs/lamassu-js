@@ -110,9 +110,11 @@ typedef enum JsOp {
     /* stack [key, fn]: an anonymous function defined under a computed (or number) key takes the
      * key, as a string, as its name; peeks both */
     JS_OP_SET_FUNCTION_NAME,
+    /* stack [v, C] -> [v instanceof C] */
+    JS_OP_INSTANCEOF,
 } JsOp;
 
-#define JS_OP__COUNT (JS_OP_SET_FUNCTION_NAME + 1)
+#define JS_OP__COUNT (JS_OP_INSTANCEOF + 1)
 
 /*
  * Per-opcode metadata, the single source of truth the bytecode verifier

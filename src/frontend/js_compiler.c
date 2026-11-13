@@ -1235,6 +1235,7 @@ static JsOp binop_opcode(uint8_t op) {
     case JS_T_LE: return JS_OP_LE;
     case JS_T_GE: return JS_OP_GE;
     case JS_T_IN: return JS_OP_IN;
+    case JS_T_INSTANCEOF: return JS_OP_INSTANCEOF;
     default: return JS_OP_NOP;
     }
 }
