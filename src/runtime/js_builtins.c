@@ -3098,6 +3098,166 @@ static bool g_parseInt(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     return true;
 }
 
+/* ---- encodeURI / decodeURI and their component forms, as the spec's Encode and Decode ---- */
+
+static bool uri_in(uint16_t c, const char *set) {
+    return c < 128 && c && strchr(set, (char)c) != NULL;
+}
+#define URI_UNRESERVED "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()"
+#define URI_RESERVED ";/?:@&=+$,#"
+
+static int hex_val(uint16_t c) {
+    return c >= '0' && c <= '9' ? c - '0'
+           : c >= 'a' && c <= 'f' ? c - 'a' + 10
+           : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+static bool uri_finish(JsContext *ctx, StrBuf *sb, JsValue *r) {
+    if (!sb->oom && sb->len > JS_MAX_STRING_UNITS) {
+        sb_free(sb);
+        return native_throw(ctx, r, "RangeError: Invalid string length");
+    }
+    JsValue v = sb_finish(sb);
+    if (js_is_undefined(v))
+        return oom(ctx, r);
+    *r = v;
+    return true;
+}
+
+/* Encode: what is not in KEEP becomes %XX of its UTF-8; a lone surrogate is V8's URIError */
+static bool uri_encode(JsContext *ctx, const JsValue *args, int argc, JsValue *r, bool component) {
+    JsString *s = arg_string(ctx, ARG(0));
+    if (!s)
+        return oom(ctx, r);
+    static const char hex[] = "0123456789ABCDEF";
+    StrBuf sb;
+    sb_init(&sb, ctx->vm);
+    for (uint32_t i = 0; i < s->length; i++) {
+        uint16_t c = s->units[i];
+        if (uri_in(c, URI_UNRESERVED) || (!component && uri_in(c, URI_RESERVED))) {
+            sb_unit(&sb, c);
+            continue;
+        }
+        uint32_t cp = c;
+        if (c >= 0xDC00 && c <= 0xDFFF) {
+            sb_free(&sb);
+            return native_throw(ctx, r, "URIError: URI malformed");
+        }
+        if (c >= 0xD800 && c <= 0xDBFF) {
+            if (i + 1 >= s->length || s->units[i + 1] < 0xDC00 || s->units[i + 1] > 0xDFFF) {
+                sb_free(&sb);
+                return native_throw(ctx, r, "URIError: URI malformed");
+            }
+            cp = 0x10000 + (((uint32_t)c - 0xD800) << 10) + (s->units[++i] - 0xDC00);
+        }
+        uint8_t oct[4];
+        int n;
+        if (cp < 0x80) {
+            oct[0] = (uint8_t)cp;
+            n = 1;
+        } else if (cp < 0x800) {
+            oct[0] = (uint8_t)(0xC0 | cp >> 6);
+            oct[1] = (uint8_t)(0x80 | (cp & 0x3F));
+            n = 2;
+        } else if (cp < 0x10000) {
+            oct[0] = (uint8_t)(0xE0 | cp >> 12);
+            oct[1] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+            oct[2] = (uint8_t)(0x80 | (cp & 0x3F));
+            n = 3;
+        } else {
+            oct[0] = (uint8_t)(0xF0 | cp >> 18);
+            oct[1] = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+            oct[2] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+            oct[3] = (uint8_t)(0x80 | (cp & 0x3F));
+            n = 4;
+        }
+        for (int k = 0; k < n; k++) {
+            uint16_t esc[3] = {'%', (uint16_t)hex[oct[k] >> 4], (uint16_t)hex[oct[k] & 15]};
+            sb_units(&sb, esc, 3);
+        }
+    }
+    return uri_finish(ctx, &sb, r);
+}
+
+/* The byte %XX at I, or -1 */
+static int uri_byte(const JsString *s, uint32_t i) {
+    if (i + 2 >= s->length || s->units[i] != '%')
+        return -1;
+    int hi = hex_val(s->units[i + 1]), lo = hex_val(s->units[i + 2]);
+    return hi < 0 || lo < 0 ? -1 : hi << 4 | lo;
+}
+
+/* Decode: %XX sequences of UTF-8 become their characters, except (decodeURI) an escaped
+ * reserved character, which stays escaped; anything malformed is V8's URIError */
+static bool uri_decode(JsContext *ctx, const JsValue *args, int argc, JsValue *r, bool component) {
+    JsString *s = arg_string(ctx, ARG(0));
+    if (!s)
+        return oom(ctx, r);
+    StrBuf sb;
+    sb_init(&sb, ctx->vm);
+    for (uint32_t i = 0; i < s->length; i++) {
+        uint16_t c = s->units[i];
+        if (c != '%') {
+            sb_unit(&sb, c);
+            continue;
+        }
+        int b = uri_byte(s, i);
+        if (b < 0)
+            goto malformed;
+        if (b < 0x80) {
+            if (!component && uri_in((uint16_t)b, URI_RESERVED))
+                sb_units(&sb, s->units + i, 3);
+            else
+                sb_unit(&sb, (uint16_t)b);
+            i += 2;
+            continue;
+        }
+        int n = (b & 0xE0) == 0xC0 ? 2 : (b & 0xF0) == 0xE0 ? 3 : (b & 0xF8) == 0xF0 ? 4 : 0;
+        if (!n)
+            goto malformed;
+        uint32_t cp = (uint32_t)b & (0xFF >> (n + 1));
+        for (int k = 1; k < n; k++) {
+            uint32_t at = i + 3 * (uint32_t)k;
+            int cb = uri_byte(s, at);
+            if (cb < 0 || (cb & 0xC0) != 0x80)
+                goto malformed;
+            cp = cp << 6 | ((uint32_t)cb & 0x3F);
+        }
+        static const uint32_t min_cp[5] = {0, 0, 0x80, 0x800, 0x10000};
+        if (cp < min_cp[n] || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+            goto malformed;
+        if (cp < 0x10000) {
+            sb_unit(&sb, (uint16_t)cp);
+        } else {
+            cp -= 0x10000;
+            sb_unit(&sb, (uint16_t)(0xD800 + (cp >> 10)));
+            sb_unit(&sb, (uint16_t)(0xDC00 + (cp & 0x3FF)));
+        }
+        i += 3 * (uint32_t)n - 1;
+    }
+    return uri_finish(ctx, &sb, r);
+malformed:
+    sb_free(&sb);
+    return native_throw(ctx, r, "URIError: URI malformed");
+}
+
+static bool g_encodeURI(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    return uri_encode(ctx, args, argc, r, false);
+}
+static bool g_encodeURIComponent(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    return uri_encode(ctx, args, argc, r, true);
+}
+static bool g_decodeURI(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    return uri_decode(ctx, args, argc, r, false);
+}
+static bool g_decodeURIComponent(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    return uri_decode(ctx, args, argc, r, true);
+}
+
 static bool g_parseFloat(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     (void)argc;
@@ -3602,7 +3762,11 @@ bool js_builtins_init(JsContext *ctx) {
     if (!js_register_native(ctx, n_parseInt, 8, g_parseInt, NULL) ||
         !js_register_native(ctx, n_parseFloat, 10, g_parseFloat, NULL) ||
         !js_register_native(ctx, n_isNaN, 5, g_isNaN, NULL) ||
-        !js_register_native(ctx, n_isFinite, 8, g_isFinite, NULL))
+        !js_register_native(ctx, n_isFinite, 8, g_isFinite, NULL) ||
+        !def_fn(ctx, ctx->globals, "encodeURI", g_encodeURI) ||
+        !def_fn(ctx, ctx->globals, "encodeURIComponent", g_encodeURIComponent) ||
+        !def_fn(ctx, ctx->globals, "decodeURI", g_decodeURI) ||
+        !def_fn(ctx, ctx->globals, "decodeURIComponent", g_decodeURIComponent))
         return false;
     return true;
 }

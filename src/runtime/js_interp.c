@@ -1655,7 +1655,10 @@ static int frame_setup(JsContext *ctx, JsFiber *fb, JsClosure *cl, uint32_t base
 static bool call_async(JsContext *ctx, JsClosure *cl, JsValue this_val,
                        const JsValue *args, int argc, JsValue *out);
 
-static JsRunStatus run_fiber(JsContext *ctx, JsFiber *fb, JsValue *result) {
+/* Aligned so its speed does not depend on code elsewhere: the loop's branch targets sit at fixed
+ * offsets from here, and when its start fell on a 16-byte rather than a 64-byte boundary, because
+ * an unrelated file grew, the benchmarks lost up to 22%. */
+__attribute__((aligned(64))) static JsRunStatus run_fiber(JsContext *ctx, JsFiber *fb, JsValue *result) {
     JsVm *vm = ctx->vm;
 
 #define S (fb->stack)

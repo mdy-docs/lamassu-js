@@ -78,9 +78,8 @@ iterator (`for...of` over the result behaves the same either way).
 
 ## Errors
 
-- **Nothing raises `EvalError` or `URIError`**: there is no `eval`, and no
-  `encodeURI`/`decodeURI`/`encodeURIComponent`/`decodeURIComponent`. The
-  constructors are there, as in V8.
+- **Nothing raises `EvalError`**: there is no `eval`. The constructor is
+  there, as in V8.
 - **`stack` is V8's**, with these differences: no `Error.prepareStackTrace` hook;
   `Error.captureStackTrace` on an object that is not an error makes an ordinary (enumerable)
   `stack` property; an anonymous function's inferred name comes only from a member assignment

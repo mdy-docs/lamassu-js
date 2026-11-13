@@ -1044,6 +1044,22 @@ static void test_error_types(void) {
        "true,true,true,true,true,true,function,function");
 }
 
+/* encodeURI / decodeURI and their component forms. Expected values are Node's. */
+static void test_uri(void) {
+    eq("[encodeURIComponent(\"a b&c=d/e?f#g;-_.!~*'()\"), encodeURI(\"a b&c=d/e?f#g;-_.!~*'()\")].join('|');",
+       "a%20b%26c%3Dd%2Fe%3Ff%23g%3B-_.!~*'()|a%20b&c=d/e?f#g;-_.!~*'()");
+    eq("[encodeURIComponent('\xc3\xa9""\xe2\x82\xac""\xf0\x9f\x98\x80""'), encodeURI('\xc3\xa9""\xe2\x82\xac""\xf0\x9f\x98\x80""')].join('|');",
+       "%C3%A9%E2%82%AC%F0%9F%98%80|%C3%A9%E2%82%AC%F0%9F%98%80");
+    eq("[decodeURIComponent('%C3%A9%E2%82%AC%F0%9F%98%80') === '\xc3\xa9""\xe2\x82\xac""\xf0\x9f\x98\x80""', decodeURIComponent('a%2Fb%23c%2bd'), decodeURI('a%2Fb%23c%2bd%41%20')].join('|');",
+       "true|a/b#c+d|a%2Fb%23c%2bdA ");
+    eq("[encodeURIComponent(null), encodeURI(12), decodeURIComponent(undefined), encodeURI.length, decodeURIComponent.name].join('|');",
+       "null|12|undefined|1|decodeURIComponent");
+    eq("const bad = ['%', '%2', '%G0', '%C3', '%C3%2', '%C3A9', '%80', '%FF', '%C0%80', '%E0%80%80', '%ED%A0%80', '%F4%90%80%80', '%E2%82%2C']; bad.map(x => { try { decodeURIComponent(x); return 'ok'; } catch (e) { return e instanceof URIError ? 'U' : String(e); } }).join('');",
+       "UUUUUUUUUUUUU");
+    eq("const r = []; for (const x of ['\\uD800', '\\uDC00', 'a\\uD800b']) { try { encodeURIComponent(x); r.push('ok'); } catch (e) { r.push(String(e)); } } r.push(encodeURIComponent('\\uDBFF\\uDFFF')); r.join('|');",
+       "URIError: URI malformed|URIError: URI malformed|URIError: URI malformed|%F4%8F%BF%BF");
+}
+
 int main(void) {
     test_freeze_seal();
     test_string();
@@ -1060,6 +1076,7 @@ int main(void) {
     test_set();
     test_error();
     test_error_types();
+    test_uri();
     test_stress();
     test_integration();
     if (checks_failed) {

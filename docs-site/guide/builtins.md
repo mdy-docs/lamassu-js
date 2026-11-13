@@ -277,7 +277,10 @@ protocol, named capture groups, and `/d` (indices) all work.
 
 ## Global functions
 
-`parseInt`, `parseFloat`, `isNaN`, `isFinite`.
+`parseInt`, `parseFloat`, `isNaN`, `isFinite`, and `encodeURI`, `encodeURIComponent`,
+`decodeURI`, `decodeURIComponent` as V8 has them: UTF-8 percent-escapes, `decodeURI` leaving an
+escaped reserved character (`%2F`, `%23`, …) escaped, and a lone surrogate or a malformed or
+non-UTF-8 escape a `URIError: URI malformed`.
 
 `print(...)` is **not** a language built-in — it's a host-provided native,
 registered by the CLI (`tools/lamassu.c`) and the npm package's WASM glue

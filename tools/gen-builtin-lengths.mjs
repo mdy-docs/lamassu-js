@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const globals = ['Math', 'JSON', 'Object', 'Array', 'Number', 'String', 'Boolean', 'Error', 'TypeError',
   'RangeError', 'ReferenceError', 'SyntaxError', 'Promise', 'RegExp', 'Date', 'Map', 'Set', 'parseInt',
-  'parseFloat', 'isNaN', 'isFinite', 'EvalError', 'URIError', 'AggregateError'];
+  'parseFloat', 'isNaN', 'isFinite', 'EvalError', 'URIError', 'AggregateError', 'encodeURI', 'encodeURIComponent', 'decodeURI', 'decodeURIComponent'];
 const functionsOf = (o, owner, out) => {
   for (const k of Object.getOwnPropertyNames(o)) {
     const d = Object.getOwnPropertyDescriptor(o, k);
