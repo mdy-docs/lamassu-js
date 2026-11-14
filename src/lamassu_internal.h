@@ -113,6 +113,7 @@ typedef enum JsObjKind {
  * read-only to scripts (only the module's own export writes change them). A let/const export
  * holds JS_SPECIAL_TDZ until its declaration runs; every read of the object checks for it. */
 #define JS_OBJ_NAMESPACE 4u
+#define JS_OBJ_RAW_JSON 8u /* made by JSON.rawJSON (always frozen too): JSON.stringify writes its rawJSON */
 
 /* JsErrorKind (lamassu.h) indexes JsContext.error_protos (js_error.c). */
 

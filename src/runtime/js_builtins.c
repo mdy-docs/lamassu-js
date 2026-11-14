@@ -94,8 +94,6 @@ typedef struct {
     uint16_t *u;
     uint32_t len, cap;
     bool oom;
-    bool circular; /* set by JSON.stringify on a cyclic structure */
-    JsString *uninit; /* set by JSON.stringify on a namespace's export still in the TDZ */
 } StrBuf;
 
 static void sb_init(StrBuf *sb, JsVm *vm) {
@@ -103,8 +101,6 @@ static void sb_init(StrBuf *sb, JsVm *vm) {
     sb->u = NULL;
     sb->len = sb->cap = 0;
     sb->oom = false;
-    sb->circular = false;
-    sb->uninit = NULL;
 }
 
 static bool sb_reserve(StrBuf *sb, uint32_t extra) {
@@ -2025,10 +2021,18 @@ static void json_quote(StrBuf *sb, const uint16_t *u, uint32_t n) {
         case '\b': sb_ascii(sb, "\\b"); break;
         case '\f': sb_ascii(sb, "\\f"); break;
         default:
-            if (c < 0x20) {
+            if (c >= 0xD800 && c <= 0xDFFF) { /* well-formed JSON.stringify: a lone surrogate is escaped */
+                bool paired = c <= 0xDBFF ? (i + 1 < n && u[i + 1] >= 0xDC00 && u[i + 1] <= 0xDFFF)
+                                          : (i > 0 && u[i - 1] >= 0xD800 && u[i - 1] <= 0xDBFF);
+                if (paired) {
+                    sb_unit(sb, c);
+                    break;
+                }
+            }
+            if (c < 0x20 || (c >= 0xD800 && c <= 0xDFFF)) {
                 char h[7];
                 static const char *hex = "0123456789abcdef";
-                h[0] = '\\'; h[1] = 'u'; h[2] = '0'; h[3] = '0';
+                h[0] = '\\'; h[1] = 'u'; h[2] = hex[(c >> 12) & 0xF]; h[3] = hex[(c >> 8) & 0xF];
                 h[4] = hex[(c >> 4) & 0xF]; h[5] = hex[c & 0xF]; h[6] = 0;
                 sb_ascii(sb, h);
             } else {
@@ -2039,17 +2043,6 @@ static void json_quote(StrBuf *sb, const uint16_t *u, uint32_t n) {
     sb_unit(sb, '"');
 }
 
-/* Ancestor chain of objects/arrays currently being serialized, threaded on the
- * C stack so JSON.stringify can detect a cycle and throw instead of recursing. */
-typedef struct JsonSeen {
-    const JsObject *o;
-    const struct JsonSeen *prev;
-} JsonSeen;
-
-static bool json_str(JsContext *ctx, StrBuf *sb, JsValue v, const uint16_t *indent,
-                     uint32_t indent_len, uint32_t depth, const JsonSeen *seen,
-                     bool *emitted);
-
 static void json_newline_indent(StrBuf *sb, const uint16_t *indent, uint32_t indent_len,
                                 uint32_t depth) {
     if (indent_len == 0)
@@ -2059,158 +2052,432 @@ static void json_newline_indent(StrBuf *sb, const uint16_t *indent, uint32_t ind
         sb_units(sb, indent, indent_len);
 }
 
-static bool json_str(JsContext *ctx, StrBuf *sb, JsValue v, const uint16_t *indent,
-                     uint32_t indent_len, uint32_t depth, const JsonSeen *seen,
-                     bool *emitted) {
-    *emitted = true;
-    if (depth > 200) {
-        sb->oom = true;
+/* JSON.stringify (25.5.2) as V8 has it: toJSON, a replacer function (called with the holder as
+ * `this`, the wrapper {"": value} at the top) or property list, the gap, raw JSON
+ * (JSON.rawJSON), and V8's circular-structure message. Values are read with [[Get]] in the
+ * spec's order, so a toJSON or replacer that changes what is still to come is seen, and every
+ * value held across a call is rooted. Errors are left pending (or the buffer marks OOM). */
+
+/* Nesting bound: it guards the C stack, as the limit on nested interpreter entries does. */
+#define JSON_MAX_DEPTH 200
+
+typedef struct {
+    JsContext *ctx;
+    StrBuf sb;
+    JsValue replacer; /* a function, or undefined */
+    JsValue plist;    /* the property list (an array of strings), or undefined */
+    JsValue stack;    /* the objects being serialized and the key each was reached by, in pairs */
+    JsValue keys;     /* each open object's key snapshot, one after another (no array per object) */
+    JsValue to_json;  /* the key "toJSON", looked up once */
+    const uint16_t *gap;
+    uint32_t gap_len;
+    uint32_t depth;
+} JsonS;
+
+static bool json_prop(JsonS *s, JsValue holder, JsValue key, JsValue value, bool *emitted);
+
+/* A key as the string toJSON and the replacer are given ("0" for an array's index). NULL on OOM. */
+static JsString *json_key_string(JsContext *ctx, JsValue key) {
+    return js_is_string(key) ? js_value_string(key) : js_number_to_string(ctx->vm, js_get_number(key));
+}
+
+static bool json_fail_pending(JsContext *ctx, JsValue err) {
+    js_set_error(ctx, err);
+    return false;
+}
+
+/* The name V8 gives an object in the circular-structure message: its constructor's, else Object */
+static JsString *json_ctor_name(JsContext *ctx, JsValue o) {
+    static const uint16_t kc[] = {'c', 'o', 'n', 's', 't', 'r', 'u', 'c', 't', 'o', 'r'};
+    JsValue key = js_atom(ctx->vm, kc, 11), c = js_undefined();
+    if (js_is_string(key) && js_get_property(ctx, o, key, &c) && js_is_function(c)) {
+        JsString *n = js_function_name(c);
+        if (n && n->length)
+            return n;
+    }
+    js_take_error(ctx); /* a failed read just means no name */
+    return js_ascii_cell(ctx->vm, "Object");
+}
+
+/* "property 'k'" or "index 3": how the message names the key an object was reached by */
+static void json_key_phrase(JsContext *ctx, StrBuf *m, JsValue key) {
+    if (js_is_number(key)) {
+        JsString *k = js_number_to_string(ctx->vm, js_get_number(key));
+        sb_ascii(m, "index ");
+        if (k)
+            sb_units(m, k->units, k->length);
+        else
+            m->oom = true;
+    } else {
+        JsString *k = js_value_string(key);
+        sb_ascii(m, "property '");
+        sb_units(m, k->units, k->length);
+        sb_unit(m, '\'');
+    }
+}
+
+static void json_ctor_phrase(JsContext *ctx, StrBuf *m, JsValue o) {
+    JsString *n = json_ctor_name(ctx, o);
+    sb_ascii(m, "object with constructor '");
+    if (n)
+        sb_units(m, n->units, n->length);
+    else
+        m->oom = true;
+    sb_unit(m, '\'');
+}
+
+/* V8's TypeError for a cycle (JsonStringifier::ConstructCircularStructureErrorMessage): the object
+ * it starts at, the first two steps and the last one of the path back to it, "..." for what lies
+ * between, and the key that closes it. START is that object's index in the stack. */
+static bool json_circular(JsonS *s, uint32_t start, JsValue closing_key) {
+    JsContext *ctx = s->ctx;
+    JsObject *st = js_value_object(s->stack);
+    uint32_t n = st->elem_count / 2;
+    StrBuf m;
+    sb_init(&m, ctx->vm);
+    sb_ascii(&m, "TypeError: Converting circular structure to JSON\n    --> starting at ");
+    json_ctor_phrase(ctx, &m, st->elems[2 * start]);
+    uint32_t i = start + 1, prefix_end = n < i + 2 ? n : i + 2;
+    for (; i < prefix_end; i++) {
+        sb_ascii(&m, "\n    |     ");
+        json_key_phrase(ctx, &m, st->elems[2 * i + 1]);
+        sb_ascii(&m, " -> ");
+        json_ctor_phrase(ctx, &m, st->elems[2 * i]);
+    }
+    if (n > i + 1)
+        sb_ascii(&m, "\n    |     ...");
+    if (i < n - 1)
+        i = n - 1;
+    for (; i < n; i++) {
+        sb_ascii(&m, "\n    |     ");
+        json_key_phrase(ctx, &m, st->elems[2 * i + 1]);
+        sb_ascii(&m, " -> ");
+        json_ctor_phrase(ctx, &m, st->elems[2 * i]);
+    }
+    sb_ascii(&m, "\n    --- ");
+    json_key_phrase(ctx, &m, closing_key);
+    sb_ascii(&m, " closes the circle");
+    JsValue msg = sb_finish(&m);
+    if (!js_is_string(msg))
         return false;
-    }
-    if (js_is_undefined(v) || js_is_function(v)) {
-        *emitted = false;
-        return true;
-    }
-    if (js_is_null(v)) {
-        sb_ascii(sb, "null");
-        return true;
-    }
-    if (js_is_bool(v)) {
-        sb_ascii(sb, js_get_bool(v) ? "true" : "false");
-        return true;
-    }
-    if (js_is_number(v)) {
-        double d = js_get_number(v);
-        if (d != d || d == __builtin_inf() || d == -__builtin_inf())
-            sb_ascii(sb, "null");
-        else {
-            JsString *s = js_number_to_string(ctx->vm, d);
-            if (!s) {
-                sb->oom = true;
-                return false;
-            }
-            sb_units(sb, s->units, s->length);
-        }
-        return true;
-    }
-    if (js_is_string(v)) {
-        JsString *s = js_value_string(v);
-        json_quote(sb, s->units, s->length);
-        return true;
-    }
-    if (js_is_promise(v)) { /* not a JsObject: what a script wrote onto it, as a plain object */
-        JsObject *own = js_cell_props(ctx, v, false);
-        if (!own) {
-            sb_ascii(sb, "{}");
-            return true;
-        }
-        v = js_value_from_cell(&own->gc);
-    }
-    if (!js_is_object(v)) { /* nothing else reaches here; never read a non-object as one */
-        *emitted = false;
-        return true;
-    }
-    JsObject *o = js_value_object(v);
-    /* Cycle detection: a container that is already an ancestor on the current
-     * serialization path makes the structure circular — throw, as real JS does,
-     * rather than recurse to the depth cap. */
-    for (const JsonSeen *s = seen; s; s = s->prev) {
-        if (s->o == o) {
-            sb->circular = true;
+    js_gc_protect(ctx->vm, &msg);
+    JsValue err = js_error_from_cell(ctx, js_value_string(msg)); /* whole: js_error_fmt shortens a piece */
+    js_gc_unprotect(ctx->vm, &msg);
+    return json_fail_pending(ctx, err);
+}
+
+/* Enters O (reached by KEY): the cycle check, the depth bound, then onto the stack. */
+static bool json_enter(JsonS *s, JsValue o, JsValue key) {
+    JsObject *st = js_value_object(s->stack);
+    for (uint32_t i = 0; i < st->elem_count; i += 2)
+        if (st->elems[i].bits == o.bits)
+            return json_circular(s, i / 2, key);
+    if (s->depth >= JSON_MAX_DEPTH)
+        return json_fail_pending(s->ctx, js_error_fmt(s->ctx, "RangeError: Maximum call stack size exceeded"));
+    s->depth++;
+    return js_array_append(s->ctx->vm, st, o) && js_array_append(s->ctx->vm, st, key);
+}
+
+static void json_leave(JsonS *s) {
+    JsObject *st = js_value_object(s->stack);
+    st->elem_count -= 2;
+    s->depth--;
+}
+
+/* SerializeJSONArray: its length read once, each element read as it comes */
+static bool json_array(JsonS *s, JsValue av, JsValue key) {
+    if (!json_enter(s, av, key))
+        return false;
+    JsObject *a = js_value_object(av);
+    uint32_t len = a->elem_count;
+    sb_unit(&s->sb, '[');
+    for (uint32_t i = 0; i < len; i++) {
+        if (i)
+            sb_unit(&s->sb, ',');
+        json_newline_indent(&s->sb, s->gap, s->gap_len, s->depth);
+        bool em;
+        JsValue v = i < a->elem_count ? a->elems[i] : js_undefined();
+        if (!json_prop(s, av, js_number(i), v, &em))
             return false;
-        }
+        if (!em)
+            sb_ascii(&s->sb, "null");
     }
-    JsonSeen node = {o, seen};
-    if (o->obj_kind == JS_OBJ_ARRAY) {
-        sb_unit(sb, '[');
-        for (uint32_t i = 0; i < o->elem_count; i++) {
-            if (i)
-                sb_unit(sb, ',');
-            json_newline_indent(sb, indent, indent_len, depth + 1);
-            bool em;
-            if (!json_str(ctx, sb, o->elems[i], indent, indent_len, depth + 1, &node, &em))
-                return false;
-            if (!em)
-                sb_ascii(sb, "null");
-        }
-        if (o->elem_count)
-            json_newline_indent(sb, indent, indent_len, depth);
-        sb_unit(sb, ']');
-        return true;
-    }
-    /* plain object: own string keys in enumeration order (index keys
-     * ascending, then insertion order). Values are written straight into `sb`; a property whose value emits
-     * nothing (undefined/function) is undone by rewinding sb->len, so no
-     * throwaway per-property buffer is needed. */
-    sb_unit(sb, '{');
-    bool first = true;
+    json_leave(s);
+    if (len)
+        json_newline_indent(&s->sb, s->gap, s->gap_len, s->depth);
+    sb_unit(&s->sb, ']');
+    return true;
+}
+
+/* The own enumerable string keys of O (a JsObject), in order, as an array. False on OOM. */
+static bool json_own_keys(JsContext *ctx, JsObject *o, JsValue *out) {
+    JsObject *keys = js_array_new_cell(ctx, 0);
+    if (!keys)
+        return false;
+    *out = js_value_from_cell(&keys->gc);
     js_map_sort_keys(&o->props);
     for (uint32_t i = 0; i < o->props.capacity; i++) {
         JsMapEntry *e = &o->props.entries[i];
         if (!e->key || e->key == JS_MAP_TOMBSTONE || js_prop_hidden_at(o, i))
             continue;
-        uint32_t mark = sb->len; /* rewind point if the value emits nothing */
-        if (!first)
-            sb_unit(sb, ',');
-        json_newline_indent(sb, indent, indent_len, depth + 1);
-        json_quote(sb, e->key->units, e->key->length);
-        sb_unit(sb, ':');
-        if (indent_len)
-            sb_unit(sb, ' ');
-        if (e->value.bits == JS_SPECIAL_TDZ) {
-            sb->uninit = e->key;
-            return false;
+        if (!js_array_append(ctx->vm, keys, js_value_from_cell(&e->key->gc)))
+            return false; /* keys is the caller's to root: nothing here collects before append */
+    }
+    return true;
+}
+
+/* SerializeJSONObject: the property list, or a snapshot of the own enumerable keys (on the
+ * shared key array, from FROM to its end while this object is open) */
+static bool json_object(JsonS *s, JsValue ov, JsValue key) {
+    JsContext *ctx = s->ctx;
+    JsObject *o = js_is_promise(ov) ? js_cell_props(ctx, ov, false) : js_value_object(ov);
+    if (!json_enter(s, ov, key))
+        return false;
+    JsObject *ka = js_value_object(js_is_undefined(s->plist) ? s->keys : s->plist);
+    uint32_t from = 0, to = ka->elem_count;
+    if (js_is_undefined(s->plist)) {
+        from = ka->elem_count;
+        if (o) {
+            js_map_sort_keys(&o->props);
+            for (uint32_t i = 0; i < o->props.capacity; i++) {
+                JsMapEntry *e = &o->props.entries[i];
+                if (!e->key || e->key == JS_MAP_TOMBSTONE || js_prop_hidden_at(o, i))
+                    continue;
+                if (!js_array_append(ctx->vm, ka, js_value_from_cell(&e->key->gc))) {
+                    s->sb.oom = true;
+                    return false;
+                }
+            }
         }
+        to = ka->elem_count;
+    }
+    sb_unit(&s->sb, '{');
+    bool first = true, ok = true;
+    for (uint32_t i = from; i < to && ok; i++) {
+        JsValue k = ka->elems[i];
+        JsValue v;
+        bool found = false;
+        if (o) { /* an own data property is what [[Get]] reads; else (deleted meanwhile) the chain */
+            v = js_map_get(&o->props, js_value_string(k), &found);
+        }
+        if (!found && !js_get_property(ctx, ov, k, &v)) {
+            ok = false;
+            break;
+        }
+        if (v.bits == JS_SPECIAL_TDZ) { /* a namespace's export not yet initialized */
+            ok = json_fail_pending(ctx, js_error_fmt(ctx, "ReferenceError: Cannot access '%v' before initialization", k));
+            break;
+        }
+        uint32_t mark = s->sb.len; /* rewind point if the value emits nothing */
+        if (!first)
+            sb_unit(&s->sb, ',');
+        json_newline_indent(&s->sb, s->gap, s->gap_len, s->depth);
+        json_quote(&s->sb, js_value_string(k)->units, js_value_string(k)->length);
+        sb_unit(&s->sb, ':');
+        if (s->gap_len)
+            sb_unit(&s->sb, ' ');
         bool em;
-        if (!json_str(ctx, sb, e->value, indent, indent_len, depth + 1, &node, &em))
-            return false;
+        if (!json_prop(s, ov, k, v, &em)) {
+            ok = false;
+            break;
+        }
         if (!em) {
-            sb->len = mark; /* drop the comma/key/colon we just wrote */
+            s->sb.len = mark;
             continue;
         }
         first = false;
     }
+    if (js_is_undefined(s->plist))
+        ka->elem_count = from; /* this object's snapshot is done */
+    if (!ok)
+        return false;
+    json_leave(s);
     if (!first)
-        json_newline_indent(sb, indent, indent_len, depth);
-    sb_unit(sb, '}');
+        json_newline_indent(&s->sb, s->gap, s->gap_len, s->depth);
+    sb_unit(&s->sb, '}');
+    return true;
+}
+
+/* Whether V is an object JSON.rawJSON made */
+static bool json_is_raw(JsValue v) {
+    return js_is_object(v) && (js_value_object(v)->obj_flags & JS_OBJ_RAW_JSON);
+}
+
+/* SerializeJSONProperty: VALUE is holder[key], already read. toJSON, then the replacer, then
+ * the value's own form. *emitted is false for undefined, a function, or what becomes one. */
+static bool json_prop(JsonS *s, JsValue holder, JsValue key, JsValue value, bool *emitted) {
+    JsContext *ctx = s->ctx;
+    *emitted = true;
+    JsValue v = value, ks = js_undefined();
+    js_gc_protect(ctx->vm, &v);
+    js_gc_protect(ctx->vm, &ks);
+    bool ok = true;
+    if (js_is_object(v) || js_is_function(v) || js_is_promise(v)) {
+        JsValue tj = js_undefined();
+        ok = js_get_property(ctx, v, s->to_json, &tj);
+        if (ok && js_is_function(tj)) {
+            JsString *k = json_key_string(ctx, key);
+            ok = k != NULL;
+            if (ok) {
+                ks = js_value_from_cell(&k->gc);
+                JsValue res;
+                ok = js_call(ctx, tj, v, &ks, 1, &res) || json_fail_pending(ctx, res);
+                if (ok)
+                    v = res;
+            }
+        }
+    }
+    if (ok && js_is_function(s->replacer)) {
+        if (js_is_undefined(ks)) {
+            JsString *k = json_key_string(ctx, key);
+            ok = k != NULL;
+            if (ok)
+                ks = js_value_from_cell(&k->gc);
+        }
+        if (ok) {
+            JsValue argv[2] = {ks, v}, res;
+            ok = js_call(ctx, s->replacer, holder, argv, 2, &res) || json_fail_pending(ctx, res);
+            if (ok)
+                v = res;
+        }
+    }
+    if (ok) {
+        if (js_is_null(v)) {
+            sb_ascii(&s->sb, "null");
+        } else if (js_is_bool(v)) {
+            sb_ascii(&s->sb, js_get_bool(v) ? "true" : "false");
+        } else if (js_is_string(v)) {
+            json_quote(&s->sb, js_value_string(v)->units, js_value_string(v)->length);
+        } else if (js_is_number(v)) {
+            double d = js_get_number(v);
+            if (d != d || d == __builtin_inf() || d == -__builtin_inf()) {
+                sb_ascii(&s->sb, "null");
+            } else {
+                JsString *str = js_number_to_string(ctx->vm, d);
+                if (str)
+                    sb_units(&s->sb, str->units, str->length);
+                else
+                    s->sb.oom = true;
+            }
+        } else if (json_is_raw(v)) {
+            static const uint16_t kr[] = {'r', 'a', 'w', 'J', 'S', 'O', 'N'};
+            JsValue rk = js_atom(ctx->vm, kr, 7), raw = js_undefined();
+            ok = js_is_string(rk) && js_get_property(ctx, v, rk, &raw);
+            if (ok && js_is_string(raw))
+                sb_units(&s->sb, js_value_string(raw)->units, js_value_string(raw)->length);
+        } else if (js_is_object(v) && js_value_object(v)->obj_kind == JS_OBJ_ARRAY) {
+            ok = json_array(s, v, key);
+        } else if (js_is_object(v) || js_is_promise(v)) {
+            ok = json_object(s, v, key);
+        } else {
+            *emitted = false; /* undefined, a function */
+        }
+    }
+    js_gc_unprotect(ctx->vm, &ks);
+    js_gc_unprotect(ctx->vm, &v);
+    return ok && !s->sb.oom;
+}
+
+/* A replacer array's property list: its strings and numbers as keys, in order, once each */
+static bool json_property_list(JsContext *ctx, JsObject *ra, JsValue *out) {
+    JsObject *list = js_array_new_cell(ctx, 0);
+    if (!list)
+        return false;
+    *out = js_value_from_cell(&list->gc); /* the caller roots *out */
+    for (uint32_t i = 0; i < ra->elem_count; i++) {
+        JsValue e = ra->elems[i];
+        JsString *k = js_is_string(e) ? js_value_string(e)
+                      : js_is_number(e) ? js_number_to_string(ctx->vm, js_get_number(e)) : NULL;
+        if (!k) {
+            if (js_is_number(e))
+                return false;
+            continue;
+        }
+        bool dup = false;
+        for (uint32_t j = 0; j < list->elem_count && !dup; j++) {
+            const JsString *o = js_value_string(list->elems[j]);
+            dup = o->length == k->length && memcmp(o->units, k->units, k->length * sizeof(uint16_t)) == 0;
+        }
+        if (!dup && !js_array_append(ctx->vm, list, js_value_from_cell(&k->gc)))
+            return false;
+    }
     return true;
 }
 
 static bool json_stringify(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
-    uint16_t indent[10];
-    uint32_t indent_len = 0;
+    uint16_t gap[10];
+    uint32_t gap_len = 0;
     JsValue space = ARG(2);
     if (js_is_number(space)) {
         /* space count is clamped to [0,10]; route through to_integer_clamped so
          * an Infinity/NaN/huge argument can't UB on the cast to int */
         int n = (int)to_integer_clamped(js_get_number(space), 0, 10);
         for (int i = 0; i < n; i++)
-            indent[indent_len++] = ' ';
+            gap[gap_len++] = ' ';
     } else if (js_is_string(space)) {
-        JsString *s = js_value_string(space);
-        for (uint32_t i = 0; i < s->length && i < 10; i++)
-            indent[indent_len++] = s->units[i];
+        JsString *sp = js_value_string(space);
+        for (uint32_t i = 0; i < sp->length && i < 10; i++)
+            gap[gap_len++] = sp->units[i];
     }
-    StrBuf sb;
-    sb_init(&sb, ctx->vm);
-    bool em;
-    if (!json_str(ctx, &sb, ARG(0), indent, indent_len, 0, NULL, &em)) {
-        bool circular = sb.circular;
-        JsString *uninit = sb.uninit;
-        sb_free(&sb);
-        if (circular)
-            return native_throw(ctx, r, "TypeError: Converting circular structure to JSON");
-        if (uninit)
-            return native_throw_fmt(ctx, r, "ReferenceError: Cannot access '%S' before initialization", uninit);
-        return oom(ctx, r);
+    JsonS s = {ctx, {0}, js_undefined(), js_undefined(), js_undefined(), js_undefined(),
+               js_undefined(), gap, gap_len, 0};
+    sb_init(&s.sb, ctx->vm);
+    JsValue rep = ARG(1), wrapper = js_undefined();
+    if (js_is_function(rep))
+        s.replacer = rep; /* an argument: rooted */
+    JsValue empty = js_undefined();
+    js_gc_protect(ctx->vm, &s.plist);
+    js_gc_protect(ctx->vm, &s.stack);
+    js_gc_protect(ctx->vm, &s.keys);
+    js_gc_protect(ctx->vm, &s.to_json);
+    js_gc_protect(ctx->vm, &wrapper);
+    js_gc_protect(ctx->vm, &empty);
+    bool ok = true;
+    if (js_is_object(rep) && js_value_object(rep)->obj_kind == JS_OBJ_ARRAY)
+        ok = json_property_list(ctx, js_value_object(rep), &s.plist);
+    JsObject *st = ok ? js_array_new_cell(ctx, 0) : NULL;
+    ok = st != NULL;
+    if (ok)
+        s.stack = js_value_from_cell(&st->gc);
+    JsObject *ka = ok ? js_array_new_cell(ctx, 0) : NULL;
+    ok = ka != NULL;
+    if (ok) {
+        static const uint16_t kt[] = {'t', 'o', 'J', 'S', 'O', 'N'};
+        s.keys = js_value_from_cell(&ka->gc);
+        s.to_json = js_atom(ctx->vm, kt, 6);
+        ok = js_is_string(s.to_json);
+    }
+    if (ok) {
+        JsString *e = js_ascii_cell(ctx->vm, "");
+        ok = e && (e = js_intern_cell(ctx->vm, e)) != NULL;
+        if (ok)
+            empty = js_value_from_cell(&e->gc);
+    }
+    if (ok && js_is_function(s.replacer)) { /* the replacer's first `this`: {"": value} */
+        wrapper = js_object_new(ctx);
+        ok = js_is_object(wrapper) &&
+             js_map_set(ctx->vm, &js_value_object(wrapper)->props, js_value_string(empty), ARG(0));
+    }
+    bool em = false;
+    if (ok)
+        ok = json_prop(&s, wrapper, empty, ARG(0), &em);
+    js_gc_unprotect(ctx->vm, &empty);
+    js_gc_unprotect(ctx->vm, &wrapper);
+    js_gc_unprotect(ctx->vm, &s.to_json);
+    js_gc_unprotect(ctx->vm, &s.keys);
+    js_gc_unprotect(ctx->vm, &s.stack);
+    js_gc_unprotect(ctx->vm, &s.plist);
+    if (!ok) {
+        sb_free(&s.sb);
+        return oom(ctx, r); /* the pending error, else out of memory */
     }
     if (!em) {
-        sb_free(&sb);
+        sb_free(&s.sb);
         *r = js_undefined();
         return true;
     }
-    *r = sb_finish(&sb);
+    *r = sb_finish(&s.sb);
     return js_is_undefined(*r) ? oom(ctx, r) : true;
 }
 
@@ -2262,8 +2529,35 @@ static void json_ws(JsonP *p) {
     }
 }
 
-static bool json_value(JsonP *p, JsValue *out);
-static bool json_value_body(JsonP *p, JsValue *out);
+static bool json_value(JsonP *p, JsValue *out, JsValue *snap);
+static bool json_value_body(JsonP *p, JsValue *out, JsValue *snap);
+
+/* With a reviver, JSON.parse keeps a snapshot of what it made, for the reviver's context argument
+ * (V8's source text access): a primitive's node is [value, its source text], an object's or
+ * array's [it, its members' nodes] (an object keyed as it is, an array in order). A and B are
+ * rooted by the caller. False on OOM. */
+static bool json_snap_node(JsonP *p, JsValue a, JsValue b, JsValue *snap) {
+    JsObject *n = js_array_new_cell(p->ctx, 2);
+    if (!n)
+        return json_oom(p);
+    n->elems[0] = a;
+    n->elems[1] = b;
+    n->elem_count = 2;
+    *snap = js_value_from_cell(&n->gc);
+    return true;
+}
+
+/* A primitive's node: VALUE and the source from START to the current position */
+static bool json_snap_primitive(JsonP *p, uint32_t start, JsValue value, JsValue *snap) {
+    js_gc_protect(p->ctx->vm, &value);
+    JsString *src = js_string_cell_new(p->ctx->vm, p->u + start, p->pos - start);
+    JsValue sv = src ? js_value_from_cell(&src->gc) : js_undefined();
+    js_gc_protect(p->ctx->vm, &sv);
+    bool ok = src ? json_snap_node(p, value, sv, snap) : json_oom(p);
+    js_gc_unprotect(p->ctx->vm, &sv);
+    js_gc_unprotect(p->ctx->vm, &value);
+    return ok;
+}
 
 static bool json_lit(JsonP *p, const char *word, JsValue v, JsValue *out) {
     for (uint32_t i = 0; word[i]; i++) {
@@ -2390,29 +2684,39 @@ static bool json_string_raw(JsonP *p, JsString **out) {
 
 /* Depth-guarded entry: bounds recursion before descending into json_value_body,
  * which recurses back through json_value for nested arrays/objects. */
-static bool json_value(JsonP *p, JsValue *out) {
+static bool json_value(JsonP *p, JsValue *out, JsValue *snap) {
     if (++p->depth > JSON_PARSE_MAX_DEPTH) {
         json_fail(p, JE_DEPTH, NULL, p->pos);
         p->depth--;
         return false;
     }
-    bool ok = json_value_body(p, out);
+    bool ok = json_value_body(p, out, snap);
     p->depth--;
     return ok;
 }
 
-static bool json_value_body(JsonP *p, JsValue *out) {
+static bool json_value_body(JsonP *p, JsValue *out, JsValue *snap) {
     json_ws(p);
     if (p->pos >= p->len)
         return json_end(p);
     uint16_t c = p->u[p->pos];
+    uint32_t start = p->pos;
     if (c == '{') {
         p->pos++;
-        JsValue ov = js_object_new(p->ctx);
+        JsValue ov = js_object_new(p->ctx), kids = js_undefined();
         if (!js_is_object(ov))
             return json_oom(p);
         JsObject *o = js_value_object(ov);
         js_gc_protect(p->ctx->vm, &ov);
+        js_gc_protect(p->ctx->vm, &kids);
+        if (snap) {
+            kids = js_object_new(p->ctx);
+            if (!js_is_object(kids)) {
+                js_gc_unprotect(p->ctx->vm, &kids);
+                js_gc_unprotect(p->ctx->vm, &ov);
+                return json_oom(p);
+            }
+        }
         json_ws(p);
         bool okc = true;
         if (p->pos < p->len && p->u[p->pos] == '}') {
@@ -2446,14 +2750,18 @@ static bool json_value_body(JsonP *p, JsValue *out) {
                     break;
                 }
                 p->pos++;
-                JsValue val;
-                if (!json_value(p, &val)) {
+                JsValue val, kid = js_undefined();
+                if (!json_value(p, &val, snap ? &kid : NULL)) {
                     js_gc_unprotect(p->ctx->vm, &keyv);
                     okc = false;
                     break;
                 }
+                js_gc_protect(p->ctx->vm, &kid);
                 bool set_ok = js_map_set(p->ctx->vm, &o->props,
-                                         js_value_string(keyv), val);
+                                         js_value_string(keyv), val) &&
+                              (!snap || js_map_set(p->ctx->vm, &js_value_object(kids)->props,
+                                                   js_value_string(keyv), kid));
+                js_gc_unprotect(p->ctx->vm, &kid);
                 js_gc_unprotect(p->ctx->vm, &keyv);
                 if (!set_ok) {
                     okc = json_oom(p);
@@ -2473,6 +2781,9 @@ static bool json_value_body(JsonP *p, JsValue *out) {
                 break;
             }
         }
+        if (okc && snap)
+            okc = json_snap_node(p, ov, kids, snap);
+        js_gc_unprotect(p->ctx->vm, &kids);
         js_gc_unprotect(p->ctx->vm, &ov);
         if (!okc)
             return false;
@@ -2484,20 +2795,34 @@ static bool json_value_body(JsonP *p, JsValue *out) {
         JsObject *a = js_array_new_cell(p->ctx, 0);
         if (!a)
             return json_oom(p);
-        JsValue av = js_value_from_cell(&a->gc);
+        JsValue av = js_value_from_cell(&a->gc), kids = js_undefined();
         js_gc_protect(p->ctx->vm, &av);
+        js_gc_protect(p->ctx->vm, &kids);
+        if (snap) {
+            JsObject *k = js_array_new_cell(p->ctx, 0);
+            if (!k) {
+                js_gc_unprotect(p->ctx->vm, &kids);
+                js_gc_unprotect(p->ctx->vm, &av);
+                return json_oom(p);
+            }
+            kids = js_value_from_cell(&k->gc);
+        }
         json_ws(p);
         bool okc = true;
         if (p->pos < p->len && p->u[p->pos] == ']') {
             p->pos++;
         } else {
             for (;;) {
-                JsValue el;
-                if (!json_value(p, &el)) {
+                JsValue el, kid = js_undefined();
+                if (!json_value(p, &el, snap ? &kid : NULL)) {
                     okc = false;
                     break;
                 }
-                if (!js_array_append(p->ctx->vm, a, el)) {
+                js_gc_protect(p->ctx->vm, &kid);
+                bool app = js_array_append(p->ctx->vm, a, el) &&
+                           (!snap || js_array_append(p->ctx->vm, js_value_object(kids), kid));
+                js_gc_unprotect(p->ctx->vm, &kid);
+                if (!app) {
                     okc = json_oom(p);
                     break;
                 }
@@ -2514,28 +2839,35 @@ static bool json_value_body(JsonP *p, JsValue *out) {
                 break;
             }
         }
+        if (okc && snap)
+            okc = json_snap_node(p, av, kids, snap);
+        js_gc_unprotect(p->ctx->vm, &kids);
         js_gc_unprotect(p->ctx->vm, &av);
         if (!okc)
             return false;
         *out = av;
         return true;
     }
+    bool ok;
     if (c == '"') {
         JsString *s;
-        if (!json_string_raw(p, &s))
-            return false;
-        *out = js_value_from_cell(&s->gc);
-        return true;
+        ok = json_string_raw(p, &s);
+        if (ok)
+            *out = js_value_from_cell(&s->gc);
+    } else if (c == 't') {
+        ok = json_lit(p, "true", js_bool(true), out);
+    } else if (c == 'f') {
+        ok = json_lit(p, "false", js_bool(false), out);
+    } else if (c == 'n') {
+        ok = json_lit(p, "null", js_null(), out);
+    } else if (c == '-' || (c >= '0' && c <= '9')) {
+        ok = json_number(p, out);
+    } else {
+        return json_token(p, p->pos);
     }
-    if (c == 't')
-        return json_lit(p, "true", js_bool(true), out);
-    if (c == 'f')
-        return json_lit(p, "false", js_bool(false), out);
-    if (c == 'n')
-        return json_lit(p, "null", js_null(), out);
-    if (c == '-' || (c >= '0' && c <= '9'))
-        return json_number(p, out);
-    return json_token(p, p->pos);
+    if (ok && snap)
+        ok = json_snap_primitive(p, start, *out, snap);
+    return ok;
 }
 
 /* V8's message for a failed parse: "Unexpected token 'x', "[1, x]" is not valid JSON" (the
@@ -2590,16 +2922,153 @@ static JsValue json_error(JsContext *ctx, const JsonP *p) {
     return e;
 }
 
+/* InternalizeJSONProperty with V8's source text access: VAL is holder[name]; SNAP is the node
+ * the parse made for what stood there, while the value is still that one (undefined once a
+ * reviver has replaced it). The reviver is called with (name, val, context), context.source the
+ * primitive's source text while it is unchanged. Each member is visited first, and replaced by
+ * what the reviver returns (deleted for undefined) as CreateDataProperty and [[Delete]] would,
+ * silently doing nothing on a frozen or sealed object. False with an error pending, or OOM. */
+#define JSON_REVIVE_MAX_DEPTH 200
+
+typedef struct {
+    JsContext *ctx;
+    JsValue reviver;
+    uint32_t depth;
+} JsonR;
+
+static bool json_revive(JsonR *rv, JsValue holder, JsValue name, JsValue snap, JsValue *out);
+
+/* CreateDataProperty(o, key, v) or, for undefined, [[Delete]](o, key), as internalize does them:
+ * a refused one is no error. KEY is an interned string; for an array, INDEX is its index. */
+static bool json_revive_put(JsContext *ctx, JsValue ov, JsValue key, int64_t index, JsValue v) {
+    JsObject *o = js_has_cell_props(ov) ? js_cell_props(ctx, ov, !js_is_undefined(v))
+                                        : js_value_object(ov);
+    if (!o)
+        return js_is_undefined(v); /* nothing to delete from; OOM making the props */
+    if (o->obj_flags & JS_OBJ_FROZEN)
+        return true;
+    if (index >= 0 && o->obj_kind == JS_OBJ_ARRAY) {
+        uint32_t i = (uint32_t)index;
+        if (js_is_undefined(v)) { /* a hole here reads as undefined */
+            if (i < o->elem_count && !(o->obj_flags & JS_OBJ_SEALED))
+                o->elems[i] = js_undefined();
+            return true;
+        }
+        if (i < o->elem_count) {
+            o->elems[i] = v;
+            return true;
+        }
+        if (o->obj_flags & JS_OBJ_SEALED)
+            return true;
+        js_gc_protect(ctx->vm, &v);
+        bool ok = true;
+        while (ok && o->elem_count < i)
+            ok = js_array_append(ctx->vm, o, js_undefined());
+        ok = ok && js_array_append(ctx->vm, o, v);
+        js_gc_unprotect(ctx->vm, &v);
+        return ok;
+    }
+    JsString *k = js_value_string(key);
+    if (js_is_undefined(v)) {
+        if (!(o->obj_flags & JS_OBJ_SEALED))
+            js_map_delete(&o->props, k);
+        return true;
+    }
+    if (o->obj_flags & JS_OBJ_SEALED) {
+        bool found;
+        js_map_get(&o->props, k, &found);
+        if (!found)
+            return true;
+    }
+    return js_map_set(ctx->vm, &o->props, k, v);
+}
+
+static bool json_revive(JsonR *rv, JsValue holder, JsValue name, JsValue snap, JsValue *out) {
+    JsContext *ctx = rv->ctx;
+    if (rv->depth >= JSON_REVIVE_MAX_DEPTH) {
+        js_set_error(ctx, js_error_fmt(ctx, "RangeError: Maximum call stack size exceeded"));
+        return false;
+    }
+    JsValue val, kids = js_undefined(), keys = js_undefined(), cx = js_undefined();
+    if (!js_get_property(ctx, holder, name, &val))
+        return false;
+    js_gc_protect(ctx->vm, &val);
+    js_gc_protect(ctx->vm, &kids);
+    js_gc_protect(ctx->vm, &keys);
+    js_gc_protect(ctx->vm, &cx);
+    JsObject *sn = js_is_object(snap) ? js_value_object(snap) : NULL;
+    bool same = sn && sn->elems[0].bits == val.bits; /* still what the parse made */
+    bool ok = true;
+    rv->depth++;
+    if (js_is_object(val) || js_is_function(val) || js_is_promise(val)) {
+        if (same)
+            kids = sn->elems[1];
+        if (js_is_object(val) && js_value_object(val)->obj_kind == JS_OBJ_ARRAY) {
+            uint32_t len = js_value_object(val)->elem_count;
+            for (uint32_t i = 0; i < len && ok; i++) {
+                JsString *k = js_number_to_string(ctx->vm, i);
+                k = k ? js_intern_cell(ctx->vm, k) : NULL;
+                ok = k != NULL;
+                if (!ok)
+                    break;
+                JsValue kv = js_value_from_cell(&k->gc), nv;
+                js_gc_protect(ctx->vm, &kv);
+                JsObject *ka = js_is_object(kids) ? js_value_object(kids) : NULL;
+                JsValue ks = ka && i < ka->elem_count ? ka->elems[i] : js_undefined();
+                ok = json_revive(rv, val, kv, ks, &nv) && json_revive_put(ctx, val, kv, i, nv);
+                js_gc_unprotect(ctx->vm, &kv);
+            }
+        } else {
+            JsObject *o = js_has_cell_props(val) ? js_cell_props(ctx, val, false) : js_value_object(val);
+            if (o)
+                ok = json_own_keys(ctx, o, &keys);
+            uint32_t n = ok && js_is_object(keys) ? js_value_object(keys)->elem_count : 0;
+            for (uint32_t i = 0; i < n && ok; i++) {
+                JsValue kv = js_value_object(keys)->elems[i], nv, ks = js_undefined();
+                if (js_is_object(kids)) {
+                    bool found;
+                    ks = js_map_get(&js_value_object(kids)->props, js_value_string(kv), &found);
+                    if (!found)
+                        ks = js_undefined();
+                }
+                ok = json_revive(rv, val, kv, ks, &nv) && json_revive_put(ctx, val, kv, -1, nv);
+            }
+        }
+    }
+    rv->depth--;
+    if (ok) { /* the context: { source } for a primitive still as parsed */
+        cx = js_object_new(ctx);
+        ok = js_is_object(cx);
+        if (ok && same && !(js_is_object(val) || js_is_function(val) || js_is_promise(val)))
+            ok = js_object_set_ascii(ctx, js_value_object(cx), "source", sn->elems[1]);
+    }
+    if (ok) {
+        JsValue argv[3] = {name, val, cx}, res;
+        ok = js_call(ctx, rv->reviver, holder, argv, 3, &res);
+        if (ok)
+            *out = res;
+        else
+            js_set_error(ctx, res);
+    }
+    js_gc_unprotect(ctx->vm, &cx);
+    js_gc_unprotect(ctx->vm, &keys);
+    js_gc_unprotect(ctx->vm, &kids);
+    js_gc_unprotect(ctx->vm, &val);
+    return ok;
+}
+
 static bool json_parse(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     JsString *s = arg_string(ctx, ARG(0));
     if (!s)
         return oom(ctx, r);
-    JsValue sv = js_value_from_cell(&s->gc);
+    JsValue sv = js_value_from_cell(&s->gc), snap = js_undefined();
     js_gc_protect(ctx->vm, &sv);
+    js_gc_protect(ctx->vm, &snap);
+    bool revive = js_is_function(ARG(1));
     JsonP p = {ctx, s->units, s->length, 0, false, 0, JE_NONE, NULL, 0};
     JsValue out;
-    bool ok = json_value(&p, &out);
+    bool ok = json_value(&p, &out, revive ? &snap : NULL);
     if (ok) {
         json_ws(&p);
         if (p.pos != p.len)
@@ -2607,11 +3076,85 @@ static bool json_parse(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     }
     if (!ok || p.error) {
         *r = json_error(ctx, &p); /* s is still rooted: the message quotes it */
+        js_gc_unprotect(ctx->vm, &snap);
         js_gc_unprotect(ctx->vm, &sv);
         return false;
     }
     js_gc_unprotect(ctx->vm, &sv);
-    *r = out;
+    if (!revive) {
+        js_gc_unprotect(ctx->vm, &snap);
+        *r = out;
+        return true;
+    }
+    /* the reviver starts at a wrapper {"": result} */
+    js_gc_protect(ctx->vm, &out);
+    JsValue root = js_object_new(ctx), empty = js_undefined();
+    js_gc_protect(ctx->vm, &root);
+    js_gc_protect(ctx->vm, &empty);
+    JsString *e = js_is_object(root) ? js_ascii_cell(ctx->vm, "") : NULL;
+    e = e ? js_intern_cell(ctx->vm, e) : NULL;
+    if (e)
+        empty = js_value_from_cell(&e->gc);
+    ok = e && js_map_set(ctx->vm, &js_value_object(root)->props, e, out);
+    JsonR rv = {ctx, ARG(1), 0};
+    JsValue res = js_undefined();
+    ok = ok && json_revive(&rv, root, empty, snap, &res);
+    js_gc_unprotect(ctx->vm, &empty);
+    js_gc_unprotect(ctx->vm, &root);
+    js_gc_unprotect(ctx->vm, &out);
+    js_gc_unprotect(ctx->vm, &snap);
+    if (!ok)
+        return oom(ctx, r);
+    *r = res;
+    return true;
+}
+
+/* JSON.rawJSON(text): a frozen, prototype-less object whose `rawJSON` is TEXT, which must be one
+ * JSON primitive with nothing around it; JSON.stringify writes it as it is. V8's errors: "Invalid
+ * value for JSON.rawJSON" when it is empty or something follows, else the parser's own. */
+static bool json_rawJSON(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    JsString *s = arg_string(ctx, ARG(0));
+    if (!s)
+        return oom(ctx, r);
+    JsValue sv = js_value_from_cell(&s->gc);
+    js_gc_protect(ctx->vm, &sv);
+    JsonP p = {ctx, s->units, s->length, 0, false, 0, JE_NONE, NULL, 0};
+    bool ok = s->length > 0, invalid = !ok;
+    if (ok) {
+        uint16_t c = s->units[0];
+        JsValue v;
+        if (c == '"' || c == 't' || c == 'f' || c == 'n' || c == '-' || (c >= '0' && c <= '9'))
+            ok = json_value_body(&p, &v, NULL);
+        else
+            ok = json_token(&p, 0);
+        if (ok && p.pos != p.len)
+            ok = false, invalid = true;
+    }
+    if (!ok) {
+        *r = invalid ? js_error_fmt(ctx, "SyntaxError: Invalid value for JSON.rawJSON")
+                     : json_error(ctx, &p);
+        js_gc_unprotect(ctx->vm, &sv);
+        return false;
+    }
+    JsValue o = js_object_new(ctx);
+    js_gc_protect(ctx->vm, &o); /* the key's allocation below may collect */
+    bool made = js_is_object(o) && js_object_set_ascii(ctx, js_value_object(o), "rawJSON", sv);
+    js_gc_unprotect(ctx->vm, &o);
+    js_gc_unprotect(ctx->vm, &sv);
+    if (!made)
+        return oom(ctx, r);
+    JsObject *ob = js_value_object(o);
+    ob->proto = js_undefined(); /* null prototype */
+    ob->obj_flags |= JS_OBJ_SEALED | JS_OBJ_FROZEN | JS_OBJ_RAW_JSON;
+    *r = o;
+    return true;
+}
+
+static bool json_isRawJSON(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)ctx;
+    (void)tv;
+    *r = js_bool(json_is_raw(ARG(0)));
     return true;
 }
 
@@ -4126,8 +4669,8 @@ bool js_builtins_init(JsContext *ctx) {
         return false;
     JsObject *json = js_value_object(jsonv);
     ctx->json_obj = json;
-    if (!def_fn(ctx, json, "stringify", json_stringify) ||
-        !def_fn(ctx, json, "parse", json_parse))
+    if (!def_fn(ctx, json, "parse", json_parse) || !def_fn(ctx, json, "stringify", json_stringify) ||
+        !def_fn(ctx, json, "rawJSON", json_rawJSON) || !def_fn(ctx, json, "isRawJSON", json_isRawJSON))
         return false;
 
     /* Object: a callable native (Object() / new Object() behave identically —

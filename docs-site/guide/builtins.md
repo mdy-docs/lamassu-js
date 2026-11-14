@@ -238,7 +238,26 @@ Constants: `PI`, `E`, `LN2`, `LN10`, `LOG2E`, `LOG10E`, `SQRT2`,
 
 ## `JSON`
 
-`stringify`, `parse`.
+`parse`, `stringify`, `rawJSON`, `isRawJSON`, as V8 has them.
+
+- `JSON.stringify(value, replacer, space)` calls a value's `toJSON(key)` (a `Date` gives its ISO
+  string), then a replacer function with the holder as `this` (`{"": value}` first) and
+  `(key, value)`, or keeps only the keys a replacer array lists (its strings and numbers, once
+  each). `space` indents by up to 10 spaces or the first 10 characters of a string. Values are
+  read as they are reached, so a `toJSON` or replacer that changes what is still to come is seen,
+  and keys are those the object had when it was reached. A lone surrogate is written as `\udXXX`.
+  A cycle throws V8's `TypeError`, naming the path: `Converting circular structure to JSON
+  --> starting at object with constructor 'Object' | property 'a' -> ... --- property 'c' closes
+  the circle`.
+- `JSON.parse(text, reviver)` calls the reviver for each member, innermost first, with the holder
+  as `this` and `(key, value, context)`; what it returns replaces the member, and `undefined`
+  deletes it. `context.source` is a primitive's source text (`"1.50"`, `"\"x\""`) while the
+  value is still the one parsed there, as V8 gives it; for an object, or a value a reviver has
+  changed, `context` is `{}`.
+- `JSON.rawJSON(text)` makes a frozen, prototype-less object with `rawJSON: text`, which
+  `JSON.stringify` writes as it is (`JSON.stringify({ n: JSON.rawJSON('1e1000') })` is
+  `{"n":1e1000}`); `text` must be one JSON primitive with nothing around it. `JSON.isRawJSON`
+  tells such an object.
 
 ## `Date`
 

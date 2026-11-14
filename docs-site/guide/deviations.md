@@ -134,11 +134,10 @@ iterator (`for...of` over the result behaves the same either way).
 
 ## JSON
 
-- **`JSON.stringify` takes no replacer and calls no `toJSON`**, and
-  **`JSON.parse` takes no reviver.** A replacer function or array is
-  ignored, so is an object's own `toJSON`, and a `Date` inside a value
-  serializes as `{}` where V8 gives its ISO string (`date.toJSON()` itself
-  works). The `space` argument is supported.
+- **`JSON.stringify` and `JSON.parse` nest at most 200 deep** (their C
+  recursion is bounded like the interpreter's nested entries): past that,
+  both throw `RangeError: Maximum call stack size exceeded`. V8 goes several
+  thousand levels deeper.
 
 ## Promises & async
 

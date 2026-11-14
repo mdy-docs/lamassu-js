@@ -856,6 +856,28 @@ static void test_audit_regressions(void) {
     CHECK(strcmp(out, "2|bc|abxyx|ab|6|true|true|t[object Object]|p-q-3-z-|,,|0,0,0|key|val|7|1|true|kept|Error: msg|/src/g|1|5|Hi|9|abc|c,|1,2,3,d|true|c") == 0);
     free(out);
 
+    /* JSON calls guest code mid-walk (toJSON, the replacer, the reviver): each allocates and
+     * drops garbage and some change what is still to be walked, so every value held across a
+     * call (the value, its key, the key list, the snapshot, the wrapper) must be rooted. */
+    st = run_src_opts(
+                      "const junk = () => { let a = []; for (let i = 0; i < 20; i++) a.push({ s: 'x' + i }); return a.length; };\n"
+                      "const r = [];\n"
+                      "const o = { a: { toJSON(k) { junk(); return { made: [k, 'v' + junk()] }; } }, b: [1, { toJSON() { junk(); return 'B'; } }], c: 3, d: 4 };\n"
+                      "r.push(JSON.stringify(o, function (k, v) { junk(); if (k === 'c') { delete this.d; this.e = { f: 'new' }; } return typeof v === 'number' ? v + 1 : v; }));\n"
+                      "const arr = [1, 2, 3, 4];\n"
+                      "r.push(JSON.stringify(arr, function (k, v) { junk(); if (k === '1') arr.length = 2; return v; }));\n"
+                      "r.push(JSON.stringify({ q: 1, w: 2 }, ['w', 'q', 'w']));\n"
+                      "r.push(JSON.stringify({ r: JSON.rawJSON('1e9' + junk()), p: Object.assign(Promise.resolve(), { z: 1 }) }));\n"
+                      "const cyc = { a: { b: {} } }; cyc.a.b.c = cyc;\n"
+                      "try { JSON.stringify(cyc, (k, v) => { junk(); return v; }); } catch (e) { r.push(e.message.split('\\n').length); }\n"
+                      "r.push(JSON.stringify(JSON.parse('{\"a\":[1,{\"b\":\"s\"}],\"c\":{\"d\":2.50},\"e\":1}', function (k, v, c) { junk(); if (k === 'a') { this.e = 'chg'; this.g = { h: 1 }; } return typeof v === 'number' ? c.source : v; })));\n"
+                      "r.push(JSON.stringify(JSON.parse('[1,2,3]', function (k, v) { junk(); if (k === '0') { this.length = 1; this.push({ n: junk() }); } return v; })));\n"
+                      "r.join('|');\n"
+                      , &gs, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "{\"a\":{\"made\":[\"a\",\"v20\"]},\"b\":[2,\"B\"],\"c\":4}|[1,2,null,null]|{\"w\":2,\"q\":1}|{\"r\":1e920,\"p\":{\"z\":1}}|5|{\"a\":[\"1\",{\"b\":\"s\"}],\"c\":{\"d\":\"2.50\"},\"e\":\"chg\",\"g\":{\"h\":1}}|[1,{\"n\":20}]") == 0);
+    free(out);
+
     /* A fiber is reachable from nothing between its allocation and the moment
      * the caller installs it as ctx->fiber, yet setting it up allocates: the
      * rest-parameter array is built while the fiber's own stack is half filled

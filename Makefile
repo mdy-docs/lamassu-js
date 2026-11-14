@@ -83,7 +83,7 @@ HDR := include/lamassu.h include/lamassu_compile.h src/lamassu_internal.h \
        src/js_bytecode.h src/js_bcformat.h src/js_valindex.h \
        src/frontend/js_syntax.h src/runtime/js_regexp.h src/runtime/js_date.h \
        src/runtime/js_mapobj.h src/runtime/js_setobj.h src/runtime/js_error.h \
-       src/runtime/fdlibm/libm.h
+       src/runtime/js_builtin_lengths.h src/runtime/fdlibm/libm.h
 INC := -Iinclude -Isrc -Isrc/runtime -Isrc/frontend
 
 ASAN := -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer

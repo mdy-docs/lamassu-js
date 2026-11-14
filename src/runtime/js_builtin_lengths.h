@@ -38,6 +38,8 @@ static const JsBuiltinLength js_builtin_lengths[] = {
     {"Math", "trunc", 1},
     {"JSON", "parse", 2},
     {"JSON", "stringify", 3},
+    {"JSON", "rawJSON", 1},
+    {"JSON", "isRawJSON", 1},
     {"", "Object", 1},
     {"Object", "assign", 2},
     {"Object", "hasOwn", 2},

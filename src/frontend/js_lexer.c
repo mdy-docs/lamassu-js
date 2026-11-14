@@ -355,7 +355,9 @@ static bool lex_string(JsLexer *lx) {
             if (scan >= lx->len)
                 return lex_fail(lx, start, "Invalid or unexpected token");
             scan++;
-        } else if (is_line_term(u)) {
+        } else if (u == '\n' || u == '\r') {
+            /* U+2028 and U+2029 may stand in a string literal (ES2019, so JSON text is a
+             * subset of the language); only CR and LF end one */
             return lex_fail(lx, start, "Invalid or unexpected token");
         } else {
             scan++;
