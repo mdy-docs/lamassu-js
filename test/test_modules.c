@@ -995,7 +995,9 @@ static void test_declaration_rules(void) {
             "import * as ns from 'a'; import { y as yy, z, ww } from 'a';" TRY_ALL
             "export const early = t([() => yy, () => z, () => ww, () => ns.y, () => 'y' in ns,"
             "  () => Object.keys(ns), () => JSON.stringify(ns), () => Object.values(ns),"
-            "  () => Object.entries(ns), () => ({ ...ns }), () => Object.assign({}, ns)]);");
+            "  () => Object.entries(ns), () => ({ ...ns }), () => Object.assign({}, ns),"
+            "  () => Object.getOwnPropertyNames(ns), () => Object.hasOwn(ns, 'y'),"
+            "  () => Object.prototype.hasOwnProperty.call(ns, 'z'), () => Object.hasOwn(ns, 'q')]);");
     eq_export("import { r } from 'a'; export const out = r;", "out",
               "ReferenceError: Cannot access 'yy' before initialization|"
               "ReferenceError: Cannot access 'z' before initialization|"
@@ -1004,7 +1006,8 @@ static void test_declaration_rules(void) {
               "ReferenceError: Cannot access 'r' before initialization|"
               "ReferenceError: Cannot access 'r' before initialization|"
               "ReferenceError: r is not defined|ReferenceError: r is not defined|"
-              "ReferenceError: r is not defined|ReferenceError: r is not defined");
+              "ReferenceError: r is not defined|ReferenceError: r is not defined|"
+              "r,ww,y,z|ReferenceError: y is not defined|ReferenceError: z is not defined|false");
     /* and once a has run, the same reads see the values */
     mod_add("a", "export let y = 1; export const z = 2;");
     eq_export("import * as ns from 'a'; import { y } from 'a';"

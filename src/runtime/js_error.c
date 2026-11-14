@@ -773,6 +773,10 @@ bool js_error_stack_set(JsContext *ctx, JsObject *o, JsValue key, JsValue val) {
     return true;
 }
 
+bool js_error_has_stack(const JsObject *o) {
+    return ((const JsErrorObject *)o)->stack_state != JS_STACK_NONE;
+}
+
 bool js_error_stack_has(JsObject *o, JsValue key) {
     return ((JsErrorObject *)o)->stack_state != JS_STACK_NONE && key_is(key, "stack");
 }
@@ -1021,10 +1025,11 @@ bool js_error_builtins_init(JsContext *ctx) {
             /* Error.stackTraceLimit and Error.captureStackTrace, as in V8 */
             ctx->error_ctor = (JsNative *)js_value_cell(ctor);
             JsObject *own = js_function_props(ctx, ctor, true);
-            if (!own || !js_object_set_ascii(ctx, own, "stackTraceLimit", js_number(10)))
+            if (!own)
                 return false;
             JsValue cst = js_native_new(ctx, "captureStackTrace", err_captureStackTrace, NULL);
-            if (!js_is_function(cst) || !js_object_set_hidden(ctx, own, "captureStackTrace", cst))
+            if (!js_is_function(cst) || !js_object_set_hidden(ctx, own, "captureStackTrace", cst) ||
+                !js_object_set_ascii(ctx, own, "stackTraceLimit", js_number(10)))
                 return false;
         }
     }

@@ -1077,6 +1077,14 @@ static void test_uri(void) {
  * `constructor` it starts with, like every builtin prototype's property, is not enumerable */
 /* ToPrimitive: an object's own (or inherited) valueOf/toString, by hint, through every operator and
  * builtin that converts; expectations generated from Node (vm.runInNewContext) */
+/* Object.getOwnPropertyNames, and Object.hasOwn/hasOwnProperty agreeing with it; outputs from Node */
+static void test_own_property_names(void) {
+    eq("const E = (f) => { try { return JSON.stringify(f()); } catch (e) { return e.name + ': ' + e.message; } }; const g = Object.getOwnPropertyNames; const a = [1, 2]; a.x = 1; const f = function h(p, q) {}; f.z = 1; const e = new RangeError('m', { cause: 1 }); const d = new Error('d'); delete d.stack; const r = /a/g; r.k = 1; [E(() => g({ b: 1, a: 2, 2: 0, 1: 0 })), E(() => g(a)), E(() => g('ab')), E(() => g(5)), E(() => g(true)), E(() => g(null)), E(() => g()), E(() => g(f)), E(() => g(() => 1)), E(() => g(async function () {})), E(() => g({ m() {} }.m)), E(() => g(f.bind(null))), E(() => g(Math.max)), E(() => g(f.prototype)), E(() => g(e)), E(() => g(d)), E(() => g(r)), E(() => g(new Map())), E(() => g(Promise.resolve())), E(() => g(Object.freeze({ q: 1 }))), E(() => g(Object.create({ i: 1 }))), E(() => g(Array).slice(0, 4)), E(() => g(Error).slice(0, 4)), g.length, g.name].join('|');",
+       "[\"1\",\"2\",\"b\",\"a\"]|[\"0\",\"1\",\"length\",\"x\"]|[\"0\",\"1\",\"length\"]|[]|[]|TypeError: Cannot convert undefined or null to object|TypeError: Cannot convert undefined or null to object|[\"length\",\"name\",\"prototype\",\"z\"]|[\"length\",\"name\"]|[\"length\",\"name\"]|[\"length\",\"name\"]|[\"length\",\"name\"]|[\"length\",\"name\"]|[\"constructor\"]|[\"stack\",\"message\",\"cause\"]|[\"message\"]|[\"lastIndex\",\"k\"]|[]|[]|[\"q\"]|[]|[\"length\",\"name\",\"prototype\",\"isArray\"]|[\"length\",\"name\",\"prototype\",\"captureStackTrace\"]|1|getOwnPropertyNames");
+    eq("const E = (f) => { try { return JSON.stringify(f()); } catch (e) { return e.name + ': ' + e.message; } }; const h = Object.hasOwn; const hp = (o, k) => Object.prototype.hasOwnProperty.call(o, k); [h([1, 2], 1), h([1, 2], '01'), h([1, 2], 2), h([], 'length'), hp([], 'length'), h('ab', 1), h('ab', '2'), h('ab', 'length'), h(5, 'x'), E(() => h(null, 'x')), E(() => h(undefined, { toString() { throw new Error('key'); } })), E(() => hp(null, { toString() { throw new Error('key'); } })), h(/a/, 'lastIndex'), h(Object, 'keys'), hp(Array, 'isArray'), h(TypeError, 'captureStackTrace'), h(Error, 'captureStackTrace'), h(() => 1, 'prototype'), h(function () {}, 'prototype'), h(new Error(), 'stack'), h(new Error('x'), 'message'), JSON.stringify(Object.keys('ab')), JSON.stringify(Object.values('ab')), JSON.stringify(Object.entries('ab')), E(() => Object.keys(null)), E(() => Object.values()), E(() => Object.entries(undefined)), JSON.stringify(Object.keys(Error))].join('|');",
+       "true|false|false|true|true|true|false|true|false|TypeError: Cannot convert undefined or null to object|TypeError: Cannot convert undefined or null to object|Error: key|true|true|true|false|true|false|true|true|true|[\"0\",\"1\"]|[\"a\",\"b\"]|[[\"0\",\"a\"],[\"1\",\"b\"]]|TypeError: Cannot convert undefined or null to object|TypeError: Cannot convert undefined or null to object|TypeError: Cannot convert undefined or null to object|[\"stackTraceLimit\"]");
+}
+
 static void test_to_primitive(void) {
     eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const log = []; const o = { toString() { log.push('t'); return 'S'; }, valueOf() { log.push('v'); return 42; } }; ['' + o, `${o}`, String(o), o + 1, o * 2, -o, +o, Number(o), o < 50, o == 42, o == 'S', log.join('')].join('|');",
        "42|S|S|43|84|-42|42|42|true|true|false|vttvvvvvvvv");
@@ -1178,6 +1186,7 @@ int main(void) {
     test_uri();
     test_prototype();
     test_to_primitive();
+    test_own_property_names();
     test_stress();
     test_integration();
     if (checks_failed) {

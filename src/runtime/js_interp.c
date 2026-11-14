@@ -3698,7 +3698,7 @@ bool js_builtin_lengths_apply(JsContext *ctx) {
 }
 
 /* What a constructor inherits from the one that is its [[Prototype]] (TypeError from Error): that
- * one's own properties and statics, up its chain, then Function.prototype's. Out of line: it is
+ * one's own properties and statics, up its chain, then Function.prototype's and Object.prototype's. Out of line: it is
  * the cold end of a function property read. */
 __attribute__((noinline)) static JsPropStatus parent_ctor_lookup(JsContext *ctx, JsNative *p, JsValue key,
                                                                JsValue *out) {
@@ -3714,5 +3714,5 @@ __attribute__((noinline)) static JsPropStatus parent_ctor_lookup(JsContext *ctx,
                 return st;
         }
     }
-    return method_lookup(ctx, ctx->function_methods, key, out);
+    return proto_table_lookup(ctx, ctx->function_methods, key, out);
 }

@@ -2607,10 +2607,61 @@ static bool json_parse(JsContext *ctx, JsValue tv, const JsValue *args, int argc
  * Object / Array / Number / String statics + globals
  * ===================================================================== */
 
+/* Object.keys/values/entries of a string primitive: its indices, its one-unit strings, or both */
+static bool string_keys(JsContext *ctx, JsString *str, JsValue *r, int mode) {
+    JsValue sv = js_value_from_cell(&str->gc);
+    js_gc_protect(ctx->vm, &sv);
+    JsObject *out = js_array_new_cell(ctx, 0);
+    JsValue outv = out ? js_value_from_cell(&out->gc) : js_undefined();
+    js_gc_protect(ctx->vm, &outv);
+    bool ok = out != NULL;
+    for (uint32_t i = 0; ok && i < str->length; i++) {
+        JsValue k = js_undefined(), c = js_undefined();
+        js_gc_protect(ctx->vm, &k);
+        if (mode != 1) {
+            JsString *ks = js_number_to_string(ctx->vm, i);
+            ok = ks != NULL;
+            if (ok)
+                k = js_value_from_cell(&ks->gc);
+        }
+        if (ok && mode != 0) {
+            JsString *cs = js_string_cell_new(ctx->vm, str->units + i, 1);
+            ok = cs != NULL;
+            if (ok)
+                c = js_value_from_cell(&cs->gc);
+        }
+        if (ok && mode == 2) {
+            js_gc_protect(ctx->vm, &c);
+            JsObject *pair = js_array_new_cell(ctx, 2);
+            js_gc_unprotect(ctx->vm, &c);
+            ok = pair != NULL;
+            if (ok) {
+                pair->elems[0] = k;
+                pair->elems[1] = c;
+                pair->elem_count = 2;
+                ok = js_array_append(ctx->vm, out, js_value_from_cell(&pair->gc));
+            }
+        } else if (ok) {
+            ok = js_array_append(ctx->vm, out, mode == 0 ? k : c);
+        }
+        js_gc_unprotect(ctx->vm, &k);
+    }
+    js_gc_unprotect(ctx->vm, &outv);
+    js_gc_unprotect(ctx->vm, &sv);
+    if (!ok)
+        return oom(ctx, r);
+    *r = outv;
+    return true;
+}
+
 static bool obj_keys_impl(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                           JsValue *r, int mode /*0 keys,1 values,2 entries*/) {
     (void)tv;
     JsValue v = ARG(0);
+    if (js_is_undefined(v) || js_is_null(v)) /* ToObject */
+        return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
+    if (js_is_string(v)) /* a string's own enumerable keys are its indices */
+        return string_keys(ctx, js_value_string(v), r, mode);
     if (js_is_function(v)) { /* a function's own properties (none until a script writes one) */
         JsObject *own = js_function_props(ctx, v, false);
         v = own ? js_value_from_cell(&own->gc) : js_undefined();
@@ -2696,6 +2747,87 @@ static bool obj_values(JsContext *ctx, JsValue tv, const JsValue *a, int c, JsVa
 }
 static bool obj_entries(JsContext *ctx, JsValue tv, const JsValue *a, int c, JsValue *r) {
     return obj_keys_impl(ctx, tv, a, c, r, 2);
+}
+
+/* Appends the key named by the ASCII string A to OUT (rooted). False on OOM. */
+static bool append_ascii_key(JsContext *ctx, JsObject *out, const char *a) {
+    JsString *k = js_ascii_cell(ctx->vm, a);
+    return k && js_array_append(ctx->vm, out, js_value_from_cell(&k->gc));
+}
+
+/* Appends the indices 0..N-1 to OUT (rooted) as strings. False on OOM. */
+static bool append_index_keys(JsContext *ctx, JsObject *out, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        JsString *k = js_number_to_string(ctx->vm, i);
+        if (!k || !js_array_append(ctx->vm, out, js_value_from_cell(&k->gc)))
+            return false;
+    }
+    return true;
+}
+
+/* Appends every key in O's property map, enumerable or not, in enumeration order (integer keys
+ * ascending, then insertion order), to OUT. O and OUT are rooted. False on OOM. */
+static bool append_map_keys(JsContext *ctx, JsObject *out, JsObject *o) {
+    js_map_sort_keys(&o->props);
+    for (uint32_t i = 0; i < o->props.capacity; i++) {
+        JsMapEntry *e = &o->props.entries[i];
+        if (!e->key || e->key == JS_MAP_TOMBSTONE)
+            continue;
+        if (!js_array_append(ctx->vm, out, js_value_from_cell(&e->key->gc)))
+            return false;
+    }
+    return true;
+}
+
+/* Object.getOwnPropertyNames(o): every own string key, enumerable or not, in V8's order. Its
+ * [[OwnPropertyKeys]] reads no values, so a namespace's uninitialized export is listed, not thrown.
+ *   string      its indices, then "length"; a number or boolean has none
+ *   array       its indices, then "length", then its named properties
+ *   function    "length", "name", "prototype" when it has one, then a builtin's statics and what
+ *               a script wrote onto it
+ *   error       "stack" while it has one, then "message", "cause" and the rest
+ *   regexp      "lastIndex", then the rest */
+static bool obj_getOwnPropertyNames(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
+                                    JsValue *r) {
+    (void)tv;
+    JsValue v = ARG(0);
+    if (js_is_undefined(v) || js_is_null(v)) /* ToObject */
+        return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
+    JsObject *out = js_array_new_cell(ctx, 0);
+    if (!out)
+        return oom(ctx, r);
+    JsValue outv = js_value_from_cell(&out->gc);
+    js_gc_protect(ctx->vm, &outv);
+    bool ok = true;
+    if (js_is_string(v)) {
+        ok = append_index_keys(ctx, out, js_value_string(v)->length) &&
+             append_ascii_key(ctx, out, "length");
+    } else if (js_is_function(v)) {
+        JsGcCell *c = js_value_cell(v);
+        ok = append_ascii_key(ctx, out, "length") && append_ascii_key(ctx, out, "name") &&
+             (!js_function_has_own_prototype(v) || append_ascii_key(ctx, out, "prototype"));
+        if (ok && c->kind == JS_KIND_NATIVE && ((JsNative *)c)->statics)
+            ok = append_map_keys(ctx, out, ((JsNative *)c)->statics);
+        JsObject *own = js_function_props(ctx, v, false);
+        if (ok && own)
+            ok = append_map_keys(ctx, out, own);
+    } else if (js_is_object(v)) {
+        JsObject *o = js_value_object(v);
+        if (o->obj_kind == JS_OBJ_ARRAY)
+            ok = append_index_keys(ctx, out, o->elem_count) && append_ascii_key(ctx, out, "length");
+        else if (o->obj_kind == JS_OBJ_ERROR && js_error_has_stack(o))
+            ok = append_ascii_key(ctx, out, "stack");
+#ifdef LAMASSU_HAS_REGEX
+        else if (o->obj_kind == JS_OBJ_REGEXP)
+            ok = append_ascii_key(ctx, out, "lastIndex");
+#endif
+        ok = ok && append_map_keys(ctx, out, o);
+    }
+    js_gc_unprotect(ctx->vm, &outv);
+    if (!ok)
+        return oom(ctx, r);
+    *r = outv;
+    return true;
 }
 
 static bool obj_assign(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
@@ -2875,37 +3007,6 @@ static bool obj_fromEntries(JsContext *ctx, JsValue tv, const JsValue *args, int
     return true;
 }
 
-/* Shared by Object.hasOwn(obj, key) and Object.prototype.hasOwnProperty
- * (this.hasOwnProperty(key)) below. *out is only meaningful when this
- * returns true; false means OOM (caller throws). */
-static bool object_has_own_key(JsContext *ctx, JsObject *ob, JsValue key, bool *out) {
-    uint32_t idx;
-    if (ob->obj_kind == JS_OBJ_ERROR && js_error_stack_has(ob, key)) {
-        *out = true;
-        return true;
-    }
-    JsString *ks = js_op_to_string(ctx, key); /* ToPropertyKey; false leaves its error pending */
-    if (!ks)
-        return false;
-    if (ob->obj_kind == JS_OBJ_ARRAY) {
-        /* index check; bounds-check before the cast: (uint32_t)d is UB for
-         * d outside [0, UINT32_MAX], e.g. Object.hasOwn(arr, "1e20") */
-        double d = js_units_to_number(ks->units, ks->length);
-        if (d >= 0 && d < 4294967296.0 && d == __builtin_floor(d)) {
-            idx = (uint32_t)d;
-            if (idx < ob->elem_count) {
-                *out = true;
-                return true;
-            }
-        }
-    }
-    JsString *ik = js_intern_cell(ctx->vm, ks);
-    if (!ik)
-        return false;
-    js_map_get(&ob->props, ik, out);
-    return true;
-}
-
 static bool str_is_ascii(JsValue key, const char *a) {
     if (!js_is_string(key))
         return false;
@@ -2919,30 +3020,82 @@ static bool str_is_ascii(JsValue key, const char *a) {
     return true;
 }
 
-/* Every function has `name` and `length` as own properties (read-only, not enumerable), and a
- * constructor `prototype`, as in V8. */
-static bool is_function_name_key(JsValue fn, JsValue key) {
-    return js_is_function(fn) && (str_is_ascii(key, "name") || str_is_ascii(key, "length") ||
-                                  (str_is_ascii(key, "prototype") && js_function_has_own_prototype(fn)));
+/* Whether S is an array index below LEN in canonical form: "1", not "01", "1.0" or "+1" */
+static bool is_index_below(const JsString *s, uint32_t len) {
+    if (s->length == 0 || s->length > 10 || (s->length > 1 && s->units[0] == '0'))
+        return false;
+    uint64_t n = 0;
+    for (uint32_t i = 0; i < s->length; i++) {
+        uint16_t c = s->units[i];
+        if (c < '0' || c > '9')
+            return false;
+        n = n * 10 + (uint64_t)(c - '0');
+    }
+    return n < len;
 }
 
+/* Whether V has the own property KS (a property key, rooted), for Object.hasOwn and
+ * hasOwnProperty: exactly the keys Object.getOwnPropertyNames lists. V is neither undefined nor
+ * null. *out is only meaningful when this returns true; false leaves an error pending (an
+ * uninitialized export of a module namespace) or means OOM. */
+static bool value_has_own(JsContext *ctx, JsValue v, JsString *ks, bool *out) {
+    JsValue kv = js_value_from_cell(&ks->gc);
+    JsObject *maps[2] = {NULL, NULL};
+    *out = false;
+    if (js_is_string(v)) {
+        *out = is_index_below(ks, js_value_string(v)->length) || str_is_ascii(kv, "length");
+        return true;
+    }
+    if (js_is_function(v)) {
+        if (str_is_ascii(kv, "name") || str_is_ascii(kv, "length") ||
+            (str_is_ascii(kv, "prototype") && js_function_has_own_prototype(v))) {
+            *out = true;
+            return true;
+        }
+        JsGcCell *c = js_value_cell(v);
+        maps[0] = js_function_props(ctx, v, false);
+        if (c->kind == JS_KIND_NATIVE)
+            maps[1] = ((JsNative *)c)->statics;
+    } else if (js_is_object(v)) {
+        JsObject *o = js_value_object(v);
+        bool special = (o->obj_kind == JS_OBJ_ARRAY &&
+                        (is_index_below(ks, o->elem_count) || str_is_ascii(kv, "length"))) ||
+                       (o->obj_kind == JS_OBJ_ERROR && js_error_stack_has(o, kv));
+#ifdef LAMASSU_HAS_REGEX
+        special = special || (o->obj_kind == JS_OBJ_REGEXP && str_is_ascii(kv, "lastIndex"));
+#endif
+        if (special) {
+            *out = true;
+            return true;
+        }
+        maps[0] = o;
+    }
+    if (!maps[0] && !maps[1])
+        return true; /* a number, boolean or promise: none */
+    JsString *ik = js_intern_cell(ctx->vm, ks);
+    if (!ik)
+        return false;
+    for (int i = 0; i < 2 && !*out; i++) {
+        if (!maps[i])
+            continue;
+        JsValue val = js_map_get(&maps[i]->props, ik, out);
+        if (*out && val.bits == JS_SPECIAL_TDZ) { /* a namespace's uninitialized export: V8 reads it */
+            js_set_error(ctx, js_error_fmt(ctx, "ReferenceError: %S is not defined", ik));
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Object.hasOwn(o, key): ToObject(o), then ToPropertyKey(key), as V8 */
 static bool obj_hasOwn(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     JsValue o = ARG(0);
-    if (is_function_name_key(o, ARG(1))) {
-        *r = js_bool(true);
-        return true;
-    }
-    if (js_is_function(o)) {
-        JsObject *own = js_function_props(ctx, o, false);
-        o = own ? js_value_from_cell(&own->gc) : js_undefined();
-    }
-    if (!js_is_object(o)) {
-        *r = js_bool(false);
-        return true;
-    }
+    if (js_is_undefined(o) || js_is_null(o))
+        return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
+    JsString *ks = js_native_string(ctx, ARG(1)); /* kept: interning it allocates */
     bool found;
-    if (!object_has_own_key(ctx, js_value_object(o), ARG(1), &found))
+    if (!ks || !value_has_own(ctx, o, ks, &found))
         return oom(ctx, r);
     *r = js_bool(found);
     return true;
@@ -2955,48 +3108,16 @@ static bool obj_hasOwn(JsContext *ctx, JsValue tv, const JsValue *args, int argc
  * own `toString`, so this generic one is only ever actually reached for
  * plain objects (and anything else that doesn't override it). */
 
-static inline bool is_object_type_value(JsValue v) {
-    return js_is_object(v) || js_is_function(v) || js_is_promise(v);
-}
-
+/* o.hasOwnProperty(key): ToPropertyKey(key) first, then ToObject(this), as V8 */
 static bool objp_hasOwnProperty(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                                 JsValue *r) {
-    if (is_function_name_key(tv, ARG(0))) {
-        *r = js_bool(true);
-        return true;
-    }
-    if (!is_object_type_value(tv)) {
-        /* ToPropertyKey first, then ToObject(this), as V8: a string's own keys are its indices and
-         * length; a number's and boolean's none */
-        JsString *k = js_native_string(ctx, ARG(0)); /* kept: the index check allocates */
-        if (!k)
-            return oom(ctx, r);
-        if (js_is_undefined(tv) || js_is_null(tv))
-            return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
-        bool own = false;
-        if (js_is_string(tv)) {
-            uint32_t len = js_value_string(tv)->length;
-            double d = js_units_to_number(k->units, k->length);
-            JsString *canon = NULL;
-            if (d >= 0 && d < len && d == __builtin_floor(d))
-                canon = js_number_to_string(ctx->vm, d); /* "1", not "01" or "1.0" */
-            own = (canon && canon->length == k->length &&
-                   memcmp(canon->units, k->units, k->length * sizeof(uint16_t)) == 0) ||
-                  (k->length == 6 && memcmp(k->units, (const uint16_t[]){'l', 'e', 'n', 'g', 't', 'h'}, 12) == 0);
-        }
-        *r = js_bool(own);
-        return true;
-    }
-    if (js_is_function(tv)) {
-        JsObject *own = js_function_props(ctx, tv, false);
-        tv = own ? js_value_from_cell(&own->gc) : js_undefined();
-    }
-    if (!js_is_object(tv)) {
-        *r = js_bool(false);
-        return true;
-    }
+    JsString *ks = js_native_string(ctx, ARG(0)); /* kept: interning it allocates */
+    if (!ks)
+        return oom(ctx, r);
+    if (js_is_undefined(tv) || js_is_null(tv))
+        return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
     bool found;
-    if (!object_has_own_key(ctx, js_value_object(tv), ARG(0), &found))
+    if (!value_has_own(ctx, tv, ks, &found))
         return oom(ctx, r);
     *r = js_bool(found);
     return true;
@@ -3933,8 +4054,7 @@ bool js_builtins_init(JsContext *ctx) {
         {"flat", am_flat}, {"toString", am_toString},
         {NULL, NULL}};
     static const MethodDef function_methods[] = {
-        {"apply", fm_apply}, {"bind", fm_bind}, {"call", fm_call},
-        {"hasOwnProperty", objp_hasOwnProperty}, {"toString", fm_toString},
+        {"apply", fm_apply}, {"bind", fm_bind}, {"call", fm_call}, {"toString", fm_toString},
         {NULL, NULL}};
     static const MethodDef number_methods[] = {
         {"toFixed", nm_toFixed}, {"toString", nm_toString}, {"valueOf", nm_valueOf},
@@ -4023,6 +4143,7 @@ bool js_builtins_init(JsContext *ctx) {
         !def_fn(ctx, object, "seal", obj_seal) || !def_fn(ctx, object, "isSealed", obj_isSealed) ||
         !def_fn(ctx, object, "fromEntries", obj_fromEntries) ||
         !def_fn(ctx, object, "hasOwn", obj_hasOwn) ||
+        !def_fn(ctx, object, "getOwnPropertyNames", obj_getOwnPropertyNames) ||
         !def_fn(ctx, object, "getPrototypeOf", obj_getPrototypeOf) ||
         !def_fn(ctx, object, "setPrototypeOf", obj_setPrototypeOf) ||
         !def_fn(ctx, object, "create", obj_create))

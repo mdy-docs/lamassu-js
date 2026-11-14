@@ -45,8 +45,18 @@ boxed-primitive type at all (see `String`/`Number` below), so there's
 nothing to box it into.
 
 **Statics**: `keys`, `values`, `entries`, `assign`, `freeze`, `isFrozen`,
-`seal`, `isSealed`, `fromEntries`, `hasOwn`, `getPrototypeOf`,
+`seal`, `isSealed`, `fromEntries`, `hasOwn`, `getOwnPropertyNames`, `getPrototypeOf`,
 `setPrototypeOf`, `create`.
+
+`Object.getOwnPropertyNames(o)` lists every own key, enumerable or not, in V8's order: a string's
+indices then `length` (a number or boolean has none); an array's indices, `length`, then its named
+properties; a function's `length`, `name`, `prototype` when it is a constructor, then a builtin's
+statics and what a script wrote onto it; an error's `stack`, `message`, `cause`; a regexp's
+`lastIndex`. `Object.hasOwn` and `hasOwnProperty` answer `true` for exactly those keys.
+`Object.keys`/`values`/`entries` list a string's indices and characters, and they, `hasOwn` and
+`getOwnPropertyNames` throw V8's `TypeError: Cannot convert undefined or null to object` for
+`undefined` or `null`. On a module namespace, `getOwnPropertyNames` lists an export that has not
+run yet, while `hasOwn` reads it and throws, as in V8.
 
 `Object.create(proto)` makes a plain object whose prototype is `proto` (an object) or none
 (`null`); anything else is V8's `TypeError: Object prototype may only be an Object or null`. A
@@ -187,7 +197,8 @@ A function can hold properties like any object, which is how a constructor gets 
 classes out of the language: `F.from = (v) => new F(v)`, `F.ORIGIN = new F(0)`, a cache on a helper.
 `in`, `delete`, `hasOwnProperty`, `Object.keys`/`values`/`entries`/`assign`/`hasOwn` and
 `freeze`/`seal` see them. A builtin constructor's own statics (`Object.keys`, `Array.isArray`) can be
-replaced but are not listed by `Object.keys(Object)`, as in other engines. `typeof` a function
+replaced but are not listed by `Object.keys(Object)`, as in other engines; `hasOwn` and
+`Object.getOwnPropertyNames(Object)` see them. `typeof` a function
 is still `"function"`.
 
 `prototype` is V8's. A constructor has it as its own property: a `function` declaration or

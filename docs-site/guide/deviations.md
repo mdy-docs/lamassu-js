@@ -31,8 +31,13 @@ that's known to differ, so you're not surprised by one in production.
   object; it only differs if you were reaching for a partially frozen one.
   Enumerability is per property, though: what V8 makes non-enumerable (a builtin
   prototype's methods, a function's `prototype.constructor`, an error's `message`)
-  is left out of `Object.keys`, JSON, spread and `Object.assign` here too. There is
-  no `Object.getOwnPropertyNames` to list those.
+  is left out of `Object.keys`, JSON, spread and `Object.assign` here too, and
+  `Object.getOwnPropertyNames` lists it. Since only part of each builtin is
+  implemented, `Object.getOwnPropertyNames(Math)` and the like list fewer names
+  than V8's. `Array.prototype` has no `length`, being a plain object, and
+  `arguments` (an array here) has no `callee`. `Function.prototype` is not
+  itself a function, so it has no `length`, `name`, `constructor`, `arguments`
+  or `caller`.
 
 ## Functions
 
@@ -40,7 +45,8 @@ that's known to differ, so you're not surprised by one in production.
   untrusted code cannot compile code at run time and a runtime-only build needs no compiler.
   `Function.prototype.toString.call(x)` is written `(() => {}).toString.call(x)`.
 - **After `delete f.name` or `delete f.length`**, it reads `""` or `0` as in V8, but
-  `f.hasOwnProperty(...)` still says `true`.
+  `f.hasOwnProperty(...)` still says `true` and `Object.getOwnPropertyNames(f)` still
+  lists it.
 
 ## Conversions
 

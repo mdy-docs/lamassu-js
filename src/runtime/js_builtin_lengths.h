@@ -44,6 +44,7 @@ static const JsBuiltinLength js_builtin_lengths[] = {
     {"Object", "seal", 1},
     {"Object", "create", 2},
     {"Object", "freeze", 1},
+    {"Object", "getOwnPropertyNames", 1},
     {"Object", "getPrototypeOf", 1},
     {"Object", "setPrototypeOf", 2},
     {"Object", "isFrozen", 1},

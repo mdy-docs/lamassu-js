@@ -40,6 +40,8 @@ bool js_error_capture_pending(JsContext *ctx, JsValue v);
 bool js_error_stack_get(JsContext *ctx, JsObject *o, JsValue key, JsValue *out, bool *handled);
 bool js_error_stack_set(JsContext *ctx, JsObject *o, JsValue key, JsValue val);
 bool js_error_stack_has(JsObject *o, JsValue key);
+/* Whether the error O has its own `stack` (not deleted) */
+bool js_error_has_stack(const JsObject *o);
 bool js_error_stack_delete(JsContext *ctx, JsObject *o, JsValue key);
 
 /* New error object of `kind`; `message` may be NULL (inherits ""). Roots
