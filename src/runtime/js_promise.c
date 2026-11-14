@@ -28,6 +28,7 @@ JsPromise *js_promise_alloc(JsContext *ctx) {
     p->state = JS_PROMISE_PENDING;
     p->value = js_undefined();
     p->reactions = NULL;
+    p->props = NULL;
     return p;
 }
 

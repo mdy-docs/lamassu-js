@@ -498,7 +498,7 @@ static bool prototype_read_only(JsContext *ctx, JsValue fn) {
     JsGcCell *c = js_value_cell(fn);
     if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->ctor == JS_CTOR_FACTORY)
         return true;
-    JsObject *own = js_function_props(ctx, fn, false);
+    JsObject *own = js_cell_props(ctx, fn, false);
     return own && (own->obj_flags & JS_OBJ_FROZEN);
 }
 
@@ -563,15 +563,18 @@ static JsPropStatus proto_table_lookup(JsContext *ctx, JsObject *table, JsValue 
     return st;
 }
 
-/* The own-property object of a function value (closure or native): what a script wrote onto it.
- * With create, made on first use (NULL then means out of memory); without, NULL if it has none. */
-JsObject *js_function_props(JsContext *ctx, JsValue fn, bool create) {
-    if (!js_is_function(fn))
+/* The own-property object of a function value (closure or native) or a promise: what a script
+ * wrote onto it. With create, made on first use (NULL then means out of memory); without, NULL if
+ * it has none. */
+JsObject *js_cell_props(JsContext *ctx, JsValue fn, bool create) {
+    if (!js_has_cell_props(fn))
         return NULL;
     JsGcCell *c = js_value_cell(fn);
-    if (c->kind != JS_KIND_CLOSURE && c->kind != JS_KIND_NATIVE)
+    JsObject **slot = c->kind == JS_KIND_CLOSURE ? &((JsClosure *)c)->props
+                      : c->kind == JS_KIND_NATIVE ? &((JsNative *)c)->props
+                      : c->kind == JS_KIND_PROMISE ? &((JsPromise *)c)->props : NULL;
+    if (!slot)
         return NULL;
-    JsObject **slot = c->kind == JS_KIND_CLOSURE ? &((JsClosure *)c)->props : &((JsNative *)c)->props;
     if (!*slot && create) {
         JsValue o = js_object_new(ctx); /* fn is the caller's (rooted) value; cells do not move */
         if (!js_is_object(o))
@@ -648,6 +651,56 @@ static bool is_length_key(JsValue key) {
     return js_is_string(key) && units_is_ascii_str(js_value_string(key), "length");
 }
 
+/* fn[k] or p[k] for a key that is not a string (f[0]): read with its canonical string key, as an
+ * object's own properties are keyed. The interned key stays alive in the intern table. */
+JS_COLD static JsPropStatus cell_get_key(JsContext *ctx, JsValue base, JsValue key, JsValue *out) {
+    JsString *k = to_prop_key(ctx, key);
+    if (!k)
+        return JS_PROP_OOM;
+    return get_property(ctx, base, js_value_from_cell(&k->gc), out);
+}
+
+/* A promise's property: what a script wrote onto it, then Promise.prototype's and
+ * Object.prototype's. Out of line: promises are rarely property bases. */
+JS_COLD static JsPropStatus promise_get(JsContext *ctx, JsValue p, JsValue key, JsValue *out) {
+    if (!js_is_string(key))
+        return cell_get_key(ctx, p, key, out);
+    JsObject *own = js_cell_props(ctx, p, false);
+    if (own) {
+        JsPropStatus st = method_lookup(ctx, own, key, out);
+        if (st != JS_PROP_OK || !js_is_undefined(*out))
+            return st;
+    }
+    return proto_table_lookup(ctx, ctx->promise_methods, key, out);
+}
+
+static const char *write_blocked(JsContext *ctx, JsObject *o, JsValue key);
+
+/* p[key] = val on a promise: its own-property object, made on first write, as a function's */
+JS_COLD static JsPropStatus promise_set(JsContext *ctx, JsValue p, JsValue key, JsValue val,
+                                        const char **errmsg) {
+    JsObject *own = js_cell_props(ctx, p, true);
+    if (!own)
+        return JS_PROP_OOM;
+    const char *blocked = write_blocked(ctx, own, key);
+    if (blocked) {
+        *errmsg = blocked;
+        return JS_PROP_TYPE_ERROR;
+    }
+    JsString *k = to_prop_key(ctx, key);
+    if (!k || !js_map_set(ctx->vm, &own->props, k, val))
+        return JS_PROP_OOM;
+    return JS_PROP_OK;
+}
+
+/* Removes the interned key K from a builtin's own statics, if it is one: they and the
+ * properties a script writes stay disjoint, so a static that is replaced or deleted is gone
+ * (Object.getOwnPropertyNames lists each name once, as V8). Allocates nothing. */
+JS_COLD static void drop_static(JsGcCell *c, JsString *k) {
+    if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->statics)
+        js_map_delete(&((JsNative *)c)->statics->props, k);
+}
+
 /* `delete fn[key]`, out of the dispatch loop: 0 done, 1 refused (*err the TypeError), 2 OOM.
  * name and length are configurable: deleting one leaves Function.prototype's, "" or 0. */
 JS_COLD static int delete_function_prop(JsContext *ctx, JsValue fn, JsValue key, JsValue *err) {
@@ -661,10 +714,23 @@ JS_COLD static int delete_function_prop(JsContext *ctx, JsValue fn, JsValue key,
         js_gc_unprotect(ctx->vm, &kv);
         return r;
     }
-    JsObject *own = js_function_props(ctx, fn, false);
-    bool special = is_name_key(key) || is_length_key(key);
-    if ((own && own->obj_flags) || (has_own_prototype(js_value_cell(fn)) && is_prototype_key(key))) {
-        /* `prototype` is not configurable */
+    JsObject *own = js_cell_props(ctx, fn, false);
+    bool isfn = js_is_function(fn); /* else a promise: only its own properties */
+    bool special = isfn && (is_name_key(key) || is_length_key(key));
+    JsGcCell *fc0 = js_value_cell(fn);
+    bool refused = isfn && has_own_prototype(fc0) && is_prototype_key(key); /* not configurable */
+    if (!refused && own && own->obj_flags) { /* sealed or frozen: only a property it has */
+        JsString *k = to_prop_key(ctx, key);
+        if (!k)
+            return 2;
+        bool found = special;
+        if (!found)
+            js_map_get(&own->props, k, &found);
+        if (!found && fc0->kind == JS_KIND_NATIVE && ((JsNative *)fc0)->statics)
+            js_map_get(&((JsNative *)fc0)->statics->props, k, &found);
+        refused = found;
+    }
+    if (refused) {
         *err = js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of %v", key, fn);
         return 1;
     }
@@ -686,11 +752,14 @@ JS_COLD static int delete_function_prop(JsContext *ctx, JsValue fn, JsValue key,
             ((JsNative *)fc)->name_deleted = true;
         return 0;
     }
-    if (own) {
+    JsNative *nf = fc->kind == JS_KIND_NATIVE ? (JsNative *)fc : NULL;
+    if (own || (nf && nf->statics)) {
         JsString *k = to_prop_key(ctx, key);
         if (!k)
             return 2;
-        js_map_delete(&own->props, k);
+        if (own)
+            js_map_delete(&own->props, k);
+        drop_static(fc, k);
     }
     return 0;
 }
@@ -854,8 +923,10 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
     if (js_is_number(base))
         return proto_table_lookup(ctx, ctx->number_methods, key, out);
     if (js_is_promise(base))
-        return proto_table_lookup(ctx, ctx->promise_methods, key, out);
+        return promise_get(ctx, base, key, out);
     if (js_is_function(base)) {
+        if (JS_UNLIKELY(!js_is_string(key)))
+            return cell_get_key(ctx, base, key, out);
         JsGcCell *c = js_value_cell(base);
         if (has_own_prototype(c) && is_prototype_key(key))
             return function_prototype(ctx, c, out) ? JS_PROP_OK : JS_PROP_OOM;
@@ -873,7 +944,7 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
             *out = js_number(js_function_length(base));
             return JS_PROP_OK;
         }
-        JsObject *own = js_function_props(ctx, base, false);
+        JsObject *own = js_cell_props(ctx, base, false);
         if (own) {
             JsPropStatus st = method_lookup(ctx, own, key, out);
             if (st != JS_PROP_OK || !js_is_undefined(*out))
@@ -990,7 +1061,7 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
             return JS_PROP_TYPE_ERROR;
         }
         /* any other key: the function's own properties (statics, constants, caches) */
-        JsObject *own = js_function_props(ctx, base, true);
+        JsObject *own = js_cell_props(ctx, base, true);
         if (!own)
             return JS_PROP_OOM;
         const char *blocked = write_blocked(ctx, own, key);
@@ -1003,9 +1074,12 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
             return JS_PROP_OOM;
         if (!js_map_set(vm, &own->props, k, val))
             return JS_PROP_OOM;
+        drop_static(js_value_cell(base), k); /* the write replaces a builtin's static */
         return JS_PROP_OK;
     }
     if (!js_is_object(base)) {
+        if (js_is_promise(base))
+            return promise_set(ctx, base, key, val, errmsg);
         *errmsg = SET_PRIMITIVE;
         return JS_PROP_TYPE_ERROR;
     }
@@ -1083,7 +1157,7 @@ static JsPropStatus has_property(JsContext *ctx, JsValue base, JsValue key,
     *out = false;
     if (JS_UNLIKELY(is_object_type(key)) && is_object_type(base))
         return has_property_object_key(ctx, base, key, out);
-    if (js_is_function(base)) {
+    if (js_has_cell_props(base)) {
         /* `k in fn`: what reading fn[k] would find (own properties, builtin statics, methods) */
         if (has_own_prototype(js_value_cell(base)) && is_prototype_key(key)) {
             *out = true;
@@ -1156,6 +1230,12 @@ static JsPropStatus has_property(JsContext *ctx, JsValue base, JsValue key,
 bool js_spread_into_object(JsContext *ctx, JsObject *dst, JsValue src, JsString **uninit) {
     JsVm *vm = ctx->vm;
     *uninit = NULL;
+    if (js_has_cell_props(src)) { /* a function's or promise's own properties */
+        JsObject *own = js_cell_props(ctx, src, false);
+        if (!own)
+            return true;
+        src = js_value_from_cell(&own->gc);
+    }
     if (!js_is_object(src) && !js_is_string(src))
         return true; /* primitives spread to nothing */
     if (js_is_string(src)) {
@@ -1408,16 +1488,26 @@ __attribute__((noinline)) static void record_raise(JsContext *ctx, JsFiber *fb) 
 }
 
 /* `delete o[key]` on an object neither sealed nor frozen. False on OOM. */
-__attribute__((noinline)) static bool delete_object_prop(JsContext *ctx, JsObject *o, JsValue key) {
+/* `delete o[key]` (O is the object B): false with an error pending when it is refused, or on OOM.
+ * Sealing exists to stop the shape changing, so a sealed or frozen object refuses to delete a
+ * property it has, and deleting one it lacks is true, as in V8; an array's `length` is never
+ * deletable. The refusal is raised here, so the dispatch loop's case keeps its one call. */
+__attribute__((noinline)) static bool delete_object_prop(JsContext *ctx, JsObject *o, JsValue b, JsValue key) {
     if (is_object_type(key)) { /* ToPropertyKey: its toString may run (o and key are rooted) */
         JsString *ks = js_op_to_string(ctx, key);
         if (!ks)
             return false;
         JsValue kv = js_value_from_cell(&ks->gc);
         js_gc_protect(ctx->vm, &kv);
-        bool r = delete_object_prop(ctx, o, kv);
+        bool r = delete_object_prop(ctx, o, b, kv);
         js_gc_unprotect(ctx->vm, &kv);
         return r;
+    }
+    if ((o->obj_kind == JS_OBJ_ARRAY && js_is_string(key) &&
+         units_is_ascii_str(js_value_string(key), "length")) ||
+        (o->obj_flags && own_prop_present(ctx, o, key))) {
+        js_set_error(ctx, js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of %v", key, b));
+        return false;
     }
     uint32_t idx;
     if (o->obj_kind == JS_OBJ_ARRAY && value_to_index(key, &idx)) {
@@ -2733,16 +2823,10 @@ run:; /* (re)load the top frame */
             case JS_OP_DELETE_PROP: {
                 JsValue key = PEEK(0), b = PEEK(1);
                 if (js_is_object(b)) {
-                    JsObject *o = js_value_object(b);
-                    /* Sealing exists precisely to stop the shape changing, so
-                     * delete is refused on both sealed and frozen objects. */
-                    if (o->obj_flags) {
-                        fiber_throw_value(fb, js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of %v", key, b));
-                        RT_RAISE();
-                    }
-                    if (!delete_object_prop(ctx, o, key))
+                    /* false: refused (sealed/frozen) or OOM, its error pending */
+                    if (!delete_object_prop(ctx, js_value_object(b), b, key))
                         RT_THROW("out of memory");
-                } else if (js_is_function(b)) {
+                } else if (js_has_cell_props(b)) {
                     JsValue derr;
                     int dst = delete_function_prop(ctx, b, key, &derr);
                     if (dst == 1) {

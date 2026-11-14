@@ -71,7 +71,8 @@ re-added key moves to the end. An array lists its elements, then any named
 properties.
 
 `freeze` and `seal` are enforced, not advisory: writing to a frozen object,
-or adding to or deleting from a sealed one, throws a `TypeError`, and so does
+or adding to or deleting from a sealed one, throws a `TypeError` (deleting a
+property it does not have is `true`, as in V8), and so does
 giving either a different prototype with `setPrototypeOf` (`#<Object> is not
 extensible`). Sealing
 fixes the shape while leaving existing properties writable, so
@@ -197,8 +198,8 @@ A function can hold properties like any object, which is how a constructor gets 
 classes out of the language: `F.from = (v) => new F(v)`, `F.ORIGIN = new F(0)`, a cache on a helper.
 `in`, `delete`, `hasOwnProperty`, `Object.keys`/`values`/`entries`/`assign`/`hasOwn` and
 `freeze`/`seal` see them. A builtin constructor's own statics (`Object.keys`, `Array.isArray`) can be
-replaced but are not listed by `Object.keys(Object)`, as in other engines; `hasOwn` and
-`Object.getOwnPropertyNames(Object)` see them. `typeof` a function
+replaced or deleted (then gone, as in V8) but are not listed by `Object.keys(Object)`, as in
+other engines; `hasOwn` and `Object.getOwnPropertyNames(Object)` see them. `typeof` a function
 is still `"function"`.
 
 `prototype` is V8's. A constructor has it as its own property: a `function` declaration or
@@ -320,6 +321,9 @@ engine's subset, callable **without** `new` too.
   with an `AggregateError` (`All promises were rejected`) whose `errors` are the reasons in
   input order.
 - **`Promise.prototype`**: `then`, `catch`, `finally`.
+- A promise holds properties as any object does (`p.label = 'load'`): reads, `in`, `delete`,
+  `Object.keys`, spread, `Object.assign`, `JSON.stringify` and `freeze`/`seal` see them, and one
+  can shadow `then`.
 
 See [Async & host calls](/guide/async) for how promises connect to
 native/host functions.

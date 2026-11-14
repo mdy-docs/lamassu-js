@@ -146,6 +146,8 @@ static void js_gc_trace(JsVm *vm) {
         case JS_KIND_PROMISE: {
             JsPromise *p = (JsPromise *)c;
             js_gc_mark_value(vm, p->value);
+            if (p->props)
+                js_gc_mark_cell(vm, &p->props->gc);
             for (JsReaction *rx = p->reactions; rx; rx = rx->next) {
                 js_gc_mark_value(vm, rx->on_fulfilled);
                 js_gc_mark_value(vm, rx->on_rejected);

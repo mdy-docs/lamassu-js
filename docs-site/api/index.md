@@ -46,6 +46,10 @@ lamassu --emit-bytecode SRC OUT         # compile SRC to a bytecode cache
 | `--heap-limit N` | Cap on the guest heap, with an optional `K`/`M`/`G` suffix (e.g. `64M`). |
 | `-h`, `--help` | The same summary, from the tool itself. |
 
+A script's `import` specifiers resolve against the directory of the file it
+runs, taken as written when the file name has an extension (`./m.mjs`,
+`./util.js`) and with `.js` added when it has none (`./util`).
+
 Options come before the subcommand or filename. Both limits are off by
 default, which is what you want for your own code and not what you want for
 anyone else's; the budget is armed per evaluation, so a REPL survives

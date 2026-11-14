@@ -2098,6 +2098,18 @@ static bool json_str(JsContext *ctx, StrBuf *sb, JsValue v, const uint16_t *inde
         json_quote(sb, s->units, s->length);
         return true;
     }
+    if (js_is_promise(v)) { /* not a JsObject: what a script wrote onto it, as a plain object */
+        JsObject *own = js_cell_props(ctx, v, false);
+        if (!own) {
+            sb_ascii(sb, "{}");
+            return true;
+        }
+        v = js_value_from_cell(&own->gc);
+    }
+    if (!js_is_object(v)) { /* nothing else reaches here; never read a non-object as one */
+        *emitted = false;
+        return true;
+    }
     JsObject *o = js_value_object(v);
     /* Cycle detection: a container that is already an ancestor on the current
      * serialization path makes the structure circular — throw, as real JS does,
@@ -2662,8 +2674,8 @@ static bool obj_keys_impl(JsContext *ctx, JsValue tv, const JsValue *args, int a
         return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
     if (js_is_string(v)) /* a string's own enumerable keys are its indices */
         return string_keys(ctx, js_value_string(v), r, mode);
-    if (js_is_function(v)) { /* a function's own properties (none until a script writes one) */
-        JsObject *own = js_function_props(ctx, v, false);
+    if (js_has_cell_props(v)) { /* a function's or promise's own properties (none until written) */
+        JsObject *own = js_cell_props(ctx, v, false);
         v = own ? js_value_from_cell(&own->gc) : js_undefined();
     }
     JsObject *out = js_array_new_cell(ctx, 0);
@@ -2808,8 +2820,12 @@ static bool obj_getOwnPropertyNames(JsContext *ctx, JsValue tv, const JsValue *a
              (!js_function_has_own_prototype(v) || append_ascii_key(ctx, out, "prototype"));
         if (ok && c->kind == JS_KIND_NATIVE && ((JsNative *)c)->statics)
             ok = append_map_keys(ctx, out, ((JsNative *)c)->statics);
-        JsObject *own = js_function_props(ctx, v, false);
+        JsObject *own = js_cell_props(ctx, v, false);
         if (ok && own)
+            ok = append_map_keys(ctx, out, own);
+    } else if (js_is_promise(v)) {
+        JsObject *own = js_cell_props(ctx, v, false);
+        if (own)
             ok = append_map_keys(ctx, out, own);
     } else if (js_is_object(v)) {
         JsObject *o = js_value_object(v);
@@ -2833,10 +2849,10 @@ static bool obj_getOwnPropertyNames(JsContext *ctx, JsValue tv, const JsValue *a
 static bool obj_assign(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     JsValue target = ARG(0);
-    /* a function as target or source: its own-property object */
+    /* a function or promise as target: its own-property object (as a source, spread takes it) */
     JsValue dst = target;
-    if (js_is_function(target)) {
-        JsObject *own = js_function_props(ctx, target, true);
+    if (js_has_cell_props(target)) {
+        JsObject *own = js_cell_props(ctx, target, true);
         if (!own)
             return oom(ctx, r);
         dst = js_value_from_cell(&own->gc);
@@ -2862,13 +2878,8 @@ static bool obj_assign(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     bool ok = true;
     JsString *uninit = NULL;
     for (int i = 1; i < argc && ok; i++) {
-        JsValue src = args[i];
-        if (js_is_function(src)) {
-            JsObject *own = js_function_props(ctx, src, false);
-            src = own ? js_value_from_cell(&own->gc) : js_undefined();
-        }
-        if (js_is_object(src))
-            ok = js_spread_into_object(ctx, js_value_object(dst), src, &uninit);
+        /* what spread copies: own enumerable properties, a string's characters */
+        ok = js_spread_into_object(ctx, js_value_object(dst), args[i], &uninit);
     }
     js_gc_unprotect(ctx->vm, &target);
     if (!ok && uninit)
@@ -2911,8 +2922,8 @@ static bool obj_set_integrity(JsContext *ctx, const JsValue *args, int argc,
             return native_throw_fmt(ctx, r, "TypeError: Cannot redefine property: %v", js_object_key_at(v, 0));
         o->obj_flags |= flags;
     }
-    if (js_is_function(v)) { /* freezes the function's own properties (made now, so it sticks) */
-        JsObject *own = js_function_props(ctx, v, true);
+    if (js_has_cell_props(v)) { /* freezes its own properties (made now, so it sticks) */
+        JsObject *own = js_cell_props(ctx, v, true);
         if (!own)
             return oom(ctx, r);
         own->obj_flags |= flags;
@@ -2938,8 +2949,8 @@ static bool obj_isFrozen(JsContext *ctx, JsValue tv, const JsValue *args, int ar
     (void)tv;
     (void)argc;
     JsValue v = ARG(0);
-    if (js_is_function(v)) {
-        JsObject *own = js_function_props(ctx, v, false);
+    if (js_has_cell_props(v)) {
+        JsObject *own = js_cell_props(ctx, v, false);
         *r = js_bool(own && (own->obj_flags & JS_OBJ_FROZEN) != 0);
         return true;
     }
@@ -2953,8 +2964,8 @@ static bool obj_isSealed(JsContext *ctx, JsValue tv, const JsValue *args, int ar
     (void)tv;
     (void)argc;
     JsValue v = ARG(0);
-    if (js_is_function(v)) {
-        JsObject *own = js_function_props(ctx, v, false);
+    if (js_has_cell_props(v)) {
+        JsObject *own = js_cell_props(ctx, v, false);
         *r = js_bool(own && (own->obj_flags & JS_OBJ_SEALED) != 0);
         return true;
     }
@@ -3053,9 +3064,11 @@ static bool value_has_own(JsContext *ctx, JsValue v, JsString *ks, bool *out) {
             return true;
         }
         JsGcCell *c = js_value_cell(v);
-        maps[0] = js_function_props(ctx, v, false);
+        maps[0] = js_cell_props(ctx, v, false);
         if (c->kind == JS_KIND_NATIVE)
             maps[1] = ((JsNative *)c)->statics;
+    } else if (js_is_promise(v)) {
+        maps[0] = js_cell_props(ctx, v, false);
     } else if (js_is_object(v)) {
         JsObject *o = js_value_object(v);
         bool special = (o->obj_kind == JS_OBJ_ARRAY &&

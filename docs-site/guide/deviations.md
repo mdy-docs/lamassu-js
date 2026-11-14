@@ -39,6 +39,13 @@ that's known to differ, so you're not surprised by one in production.
   itself a function, so it has no `length`, `name`, `constructor`, `arguments`
   or `caller`.
 
+- **`Object.setPrototypeOf` cannot change a function's or a promise's
+  prototype, nor make either one another object's prototype.** A function's
+  [[Prototype]] is fixed as `Function.prototype` (or the constructor it
+  extends) and a promise's as `Promise.prototype`; `setPrototypeOf(f, p)`
+  leaves it as it was and returns `f`, and `setPrototypeOf(o, f)` throws
+  V8's `TypeError: Object prototype may only be an Object or null`.
+
 ## Functions
 
 - **There is no `Function` global.** The constructor is left out, as `eval` is, so that
@@ -124,6 +131,14 @@ iterator (`for...of` over the result behaves the same either way).
 - **Out-of-memory errors may still be bare strings**: when the engine
   cannot allocate an Error object, it throws the message text instead so
   the failure is never lost.
+
+## JSON
+
+- **`JSON.stringify` takes no replacer and calls no `toJSON`**, and
+  **`JSON.parse` takes no reviver.** A replacer function or array is
+  ignored, so is an object's own `toJSON`, and a `Date` inside a value
+  serializes as `{}` where V8 gives its ISO string (`date.toJSON()` itself
+  works). The `space` argument is supported.
 
 ## Promises & async
 

@@ -382,6 +382,7 @@ typedef struct JsPromise {
     uint8_t state;
     JsValue value;     /* fulfillment value or rejection reason */
     JsReaction *reactions; /* non-empty only while PENDING */
+    JsObject *props;       /* properties a script gives it (like JsClosure.props); NULL until written */
 } JsPromise;
 
 /* A queued microtask. Raw allocation; the VM's queue is a GC root. */

@@ -312,9 +312,12 @@ JsValue js_module_dynamic_import(JsContext *ctx, JsModule *referrer, JsValue spe
 /* js_native_new: public, lamassu.h */
 /* Bound native carrying a captured value (js_interp.c). */
 JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound);
-/* A function value's own-property object (js_interp.c): with create, made on first use (NULL on
- * OOM); without, NULL when it has none. Object builtins use it to treat functions as objects. */
-JsObject *js_function_props(JsContext *ctx, JsValue fn, bool create);
+/* The own-property object of a function or promise (js_interp.c), which are not JsObjects: with
+ * create, made on first use (NULL on OOM); without, NULL when it has none. Object builtins use it
+ * to treat them as objects. */
+JsObject *js_cell_props(JsContext *ctx, JsValue v, bool create);
+/* Whether V is a function or promise: a value whose own properties are js_cell_props */
+static inline bool js_has_cell_props(JsValue v) { return js_is_function(v) || js_is_promise(v); }
 /* A function value's `name` (closure or native); NULL for none, which reads as "". */
 JsString *js_function_source(JsContext *ctx, JsValue fn); /* Function.prototype.toString */
 JsString *js_function_name(JsValue fn);

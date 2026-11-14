@@ -431,7 +431,7 @@ static bool stack_trace_limit(JsContext *ctx, uint32_t *limit) {
     *limit = 10;
     if (!ctx->error_ctor)
         return true;
-    JsObject *own = js_function_props(ctx, js_value_from_cell(&ctx->error_ctor->gc), false);
+    JsObject *own = js_cell_props(ctx, js_value_from_cell(&ctx->error_ctor->gc), false);
     JsValue v;
     bool found = false;
     if (own && !chain_get(ctx, own, "stackTraceLimit", &v, &found))
@@ -605,7 +605,7 @@ static const JsString *type_name(JsContext *ctx, JsValue recv, JsString **tmp) {
  * the function's own name first, else the one enumerable key with it (none if two) */
 static const JsString *method_name(JsContext *ctx, JsValue recv, JsValue fn) {
     JsObject *o = js_is_object(recv) ? js_value_object(recv)
-                  : js_is_function(recv) ? js_function_props(ctx, recv, false) : NULL;
+                  : js_is_function(recv) ? js_cell_props(ctx, recv, false) : NULL;
     if (!o)
         return NULL;
     JsGcCell *c = js_value_cell(fn);
@@ -1024,7 +1024,7 @@ bool js_error_builtins_init(JsContext *ctx) {
         if (k == JS_ERROR_PLAIN) {
             /* Error.stackTraceLimit and Error.captureStackTrace, as in V8 */
             ctx->error_ctor = (JsNative *)js_value_cell(ctor);
-            JsObject *own = js_function_props(ctx, ctor, true);
+            JsObject *own = js_cell_props(ctx, ctor, true);
             if (!own)
                 return false;
             JsValue cst = js_native_new(ctx, "captureStackTrace", err_captureStackTrace, NULL);

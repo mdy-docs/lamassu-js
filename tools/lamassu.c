@@ -186,10 +186,12 @@ static JsValue file_loader(void *ud, JsContext *ctx, const uint16_t *spec, size_
     if (rel[0] == '.' && rel[1] == '/')
         rel += 2;
     char path[2048];
-    /* Append ".js" only when the specifier doesn't already end in it — a proper
-     * suffix test, not strstr (which would also match "a.jsx" or "x.js.bak"). */
-    size_t rl = strlen(rel);
-    bool has_ext = rl >= 3 && strcmp(rel + rl - 3, ".js") == 0;
+    /* Append ".js" only when the file name has no extension of its own: "./m.mjs" and
+     * "./data.json" are taken as written, "./util" is "./util.js". */
+    const char *base = strrchr(rel, '/');
+    base = base ? base + 1 : rel;
+    const char *dot = strrchr(base, '.');
+    bool has_ext = dot && dot != base && dot[1];
     snprintf(path, sizeof path, "%s/%s%s", g_root_dir, rel, has_ext ? "" : ".js");
 
     size_t bl;
