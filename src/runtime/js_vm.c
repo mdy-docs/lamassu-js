@@ -227,6 +227,8 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->number_methods = NULL;
     ctx->boolean_methods = NULL;
     ctx->function_methods = NULL;
+    ctx->function_proto = NULL;
+    ctx->async_function_proto = NULL;
     ctx->promise_methods = NULL;
     ctx->object_proto = NULL;
     ctx->array_proto = NULL;

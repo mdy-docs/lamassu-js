@@ -586,6 +586,12 @@ struct JsContext {
     JsObject *number_methods;
     JsObject *boolean_methods; /* Boolean.prototype: toString, valueOf */
     JsObject *function_methods; /* call, for every function value (closures and natives) */
+    struct JsNative *function_proto; /* Function.prototype itself, as V8 has it: a builtin
+                                      * function (callable, returns undefined, not a constructor)
+                                      * whose own properties are function_methods and whose
+                                      * [[Prototype]] (own_proto) is Object.prototype */
+    JsObject *async_function_proto; /* AsyncFunction.prototype: an async function's [[Prototype]],
+                                     * a plain object inheriting from Function.prototype */
     JsObject *promise_methods;
     /* Real, script-visible prototype objects — Ctor.prototype is this same
      * object, and instances' [[Prototype]] is set to it at allocation, so

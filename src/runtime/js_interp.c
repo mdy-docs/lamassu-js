@@ -556,8 +556,16 @@ static JsPropStatus method_lookup(JsContext *ctx, JsObject *table, JsValue key,
 static JsPropStatus proto_table_lookup(JsContext *ctx, JsObject *table, JsValue key, JsValue *out) {
     JsValue v = js_undefined();
     JsPropStatus st = method_lookup(ctx, table, key, &v);
-    if (st == JS_PROP_OK && js_is_undefined(v) && table)
-        st = method_lookup(ctx, ctx->object_proto, key, &v);
+    if (st == JS_PROP_OK && js_is_undefined(v) && table) {
+        /* then the table's own [[Prototype]] (Object.prototype unless a script set another);
+         * Function.prototype keeps its own on the function it is */
+        JsValue next = table == ctx->function_methods && ctx->function_proto
+                           ? ctx->function_proto->own_proto : table->proto;
+        if (js_is_object(next) && js_value_object(next) == ctx->object_proto)
+            st = method_lookup(ctx, ctx->object_proto, key, &v);
+        else if (js_is_object(next) || js_is_function(next) || js_is_promise(next))
+            st = get_property(ctx, next, key, &v);
+    }
     if (st == JS_PROP_OK && !js_is_undefined(v))
         *out = v;
     return st;
@@ -595,7 +603,10 @@ JsValue js_get_proto(JsContext *ctx, JsValue v) {
             return js_value_from_cell(&ctx->promise_methods->gc);
         if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->parent)
             return js_value_from_cell(&((JsNative *)c)->parent->gc);
-        return js_value_from_cell(&ctx->function_methods->gc);
+        if (c->kind == JS_KIND_CLOSURE && (((JsClosure *)c)->fn->fn_flags & JS_FN_ASYNC) &&
+            ctx->async_function_proto)
+            return js_value_from_cell(&ctx->async_function_proto->gc);
+        return ctx->function_proto ? js_value_from_cell(&ctx->function_proto->gc) : js_null();
     }
     JsObject *t = js_is_number(v) ? ctx->number_methods : js_is_string(v) ? ctx->string_methods
                   : js_is_bool(v) ? ctx->boolean_methods : NULL;
@@ -1034,6 +1045,8 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
             return proto_value_get(ctx, c->kind == JS_KIND_CLOSURE ? ((JsClosure *)c)->own_proto
                                                                    : ((JsNative *)c)->own_proto,
                                    key, out);
+        if (JS_UNLIKELY(c->kind == JS_KIND_CLOSURE && (((JsClosure *)c)->fn->fn_flags & JS_FN_ASYNC)))
+            return proto_value_get(ctx, js_value_from_cell(&ctx->async_function_proto->gc), key, out);
         if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->parent)
             return parent_ctor_lookup(ctx, ((JsNative *)c)->parent, key, out);
         /* Function.prototype methods (call), shared by closures and natives */

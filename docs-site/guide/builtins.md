@@ -101,8 +101,12 @@ user-defined constructor's `.prototype`, and even `globalThis` itself all
 chain up to it in turn (`Object.getPrototypeOf(Array.prototype) ===
 Object.prototype`). `Object.prototype`'s own `[[Prototype]]` is `null`,
 matching spec. `Object.getPrototypeOf` of a function is `Function.prototype` (of `TypeError` and
-the other error constructors, `Error`), of a number `Number.prototype`, of a string
-`String.prototype` and of a promise `Promise.prototype`.
+the other error constructors, `Error`; of an async function `AsyncFunction.prototype`, a plain
+object that inherits from `Function.prototype`), of a number `Number.prototype`, of a string
+`String.prototype` and of a promise `Promise.prototype`. `Function.prototype` is itself a function,
+as in V8: callable with anything, returning `undefined`, not a constructor, with `length` 0 and
+`name` `""`, its own properties `apply`, `bind`, `call` and `toString`, and its prototype
+`Object.prototype`.
 
 ## `Array`
 

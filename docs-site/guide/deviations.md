@@ -11,8 +11,10 @@ that's known to differ, so you're not surprised by one in production.
   `propertyIsEnumerable`, `toLocaleString`, and the legacy `__proto__`
   accessor; none of those are implemented. `toString` gives V8's tags
   (`Object.prototype.toString.call(x)` is `[object Array]`, `[object Error]`,
-  `[object Null]`, `[object Math]`, …), with no `Symbol.toStringTag` to change
-  one (there are no symbols). `Array.prototype` is a plain object here, not an
+  `[object Null]`, `[object Math]`, `[object AsyncFunction]`, …), and what
+  inherits from `Math`, `JSON`, `Promise.prototype` or `AsyncFunction.prototype`
+  reports that tag, as V8's own `Symbol.toStringTag` makes it; there is no
+  symbol to set another (there are no symbols). `Array.prototype` is a plain object here, not an
   array, so its tag is `[object Object]` (V8: `[object Array]`).
 - **`Object(primitiveValue)` returns the primitive unchanged** rather than
   boxing it into a wrapper object — this engine has no boxed-primitive type
@@ -35,15 +37,17 @@ that's known to differ, so you're not surprised by one in production.
   `Object.getOwnPropertyNames` lists it. Since only part of each builtin is
   implemented, `Object.getOwnPropertyNames(Math)` and the like list fewer names
   than V8's. `Array.prototype` has no `length`, being a plain object, and
-  `arguments` (an array here) has no `callee`. `Function.prototype` is not
-  itself a function, so it has no `length`, `name`, `constructor`, `arguments`
-  or `caller`.
+  `arguments` (an array here) has no `callee`.
 
 ## Functions
 
 - **There is no `Function` global.** The constructor is left out, as `eval` is, so that
   untrusted code cannot compile code at run time and a runtime-only build needs no compiler.
-  `Function.prototype.toString.call(x)` is written `(() => {}).toString.call(x)`.
+  `Function.prototype.toString.call(x)` is written `(() => {}).toString.call(x)`, and
+  `Object.getPrototypeOf(() => {})` is `Function.prototype`. For the same reason
+  `Function.prototype` has no `constructor`, and `AsyncFunction.prototype`
+  (`Object.getPrototypeOf(async () => {})`) none either. `Function.prototype` has no
+  `arguments` or `caller` (in V8, accessors that only throw).
 - **After `delete f.name` or `delete f.length`**, it reads `""` or `0` as in V8, but
   `f.hasOwnProperty(...)` still says `true` and `Object.getOwnPropertyNames(f)` still
   lists it.

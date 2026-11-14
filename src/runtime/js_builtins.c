@@ -1724,7 +1724,7 @@ static bool fm_bind(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     ((JsNative *)js_value_cell(fn))->length = (uint8_t)(bl > 255 ? 255 : bl);
     /* its [[Prototype]] is the target's, as it is now (BoundFunctionCreate) */
     JsValue tp = js_get_proto(ctx, tv);
-    if (tp.bits != js_value_from_cell(&ctx->function_methods->gc).bits) {
+    if (tp.bits != js_value_from_cell(&ctx->function_proto->gc).bits) {
         ((JsNative *)js_value_cell(fn))->own_proto = js_is_null(tp) ? js_undefined() : tp;
         ((JsNative *)js_value_cell(fn))->proto_set = true;
     }
@@ -3157,6 +3157,16 @@ static bool json_rawJSON(JsContext *ctx, JsValue tv, const JsValue *args, int ar
     return true;
 }
 
+/* Function.prototype, called: it accepts any arguments and returns undefined */
+static bool fp_call(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)ctx;
+    (void)tv;
+    (void)args;
+    (void)argc;
+    *r = js_undefined();
+    return true;
+}
+
 static bool json_isRawJSON(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)ctx;
     (void)tv;
@@ -3685,7 +3695,29 @@ static bool objp_hasOwnProperty(JsContext *ctx, JsValue tv, const JsValue *args,
     return true;
 }
 
+/* The tag V8 keeps as an own Symbol.toStringTag on a few builtin objects, which whatever inherits
+ * from them reports too (there are no symbols here, so these are the only ones) */
+static const char *inherited_tag(const JsContext *ctx, JsValue p) {
+    if (!js_is_object(p))
+        return NULL;
+    const JsObject *o = js_value_object(p);
+    return o == ctx->async_function_proto ? "AsyncFunction"
+           : o == ctx->promise_methods    ? "Promise"
+           : o == ctx->math_obj           ? "Math"
+           : o == ctx->json_obj           ? "JSON" : NULL;
+}
+
 const char *js_to_string_tag(const JsContext *ctx, JsValue v) {
+    if (js_is_object(v) || js_is_function(v) || js_is_promise(v)) {
+        /* Get(O, @@toStringTag) first: it overrides the kind's own tag */
+        int depth = 0;
+        for (JsValue p = v; depth < 1000 && (js_is_object(p) || js_is_function(p) || js_is_promise(p));
+             p = js_get_proto((JsContext *)ctx, p), depth++) {
+            const char *t = inherited_tag(ctx, p);
+            if (t)
+                return t;
+        }
+    }
     if (js_is_undefined(v))
         return "Undefined";
     if (js_is_null(v))
@@ -4580,6 +4612,23 @@ bool js_builtins_init(JsContext *ctx) {
     if (!js_is_object(fnm))
         return false;
     ctx->function_methods = js_value_object(fnm);
+    /* Function.prototype: a function that takes anything and returns undefined, not a
+     * constructor, named "" with length 0; the method table is its own properties */
+    JsValue fpv = js_native_new(ctx, "", fp_call, NULL);
+    if (!js_is_function(fpv))
+        return false;
+    JsNative *fp = (JsNative *)js_value_cell(fpv);
+    fp->props = ctx->function_methods;
+    fp->own_proto = js_value_from_cell(&ctx->object_proto->gc);
+    fp->proto_set = true;
+    fp->ctor = JS_CTOR_NONE;
+    ctx->function_proto = fp;
+    /* AsyncFunction.prototype: what async functions inherit from, then Function.prototype */
+    JsValue afp = js_object_new(ctx);
+    if (!js_is_object(afp))
+        return false;
+    js_value_object(afp)->proto = fpv;
+    ctx->async_function_proto = js_value_object(afp);
 
     static const MethodDef string_methods[] = {
         {"charAt", sm_charAt}, {"charCodeAt", sm_charCodeAt},
