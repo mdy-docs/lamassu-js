@@ -1075,6 +1075,48 @@ static void test_uri(void) {
 /* A function's `prototype`, as V8 has it (expected values from Node): only constructors have one;
  * it takes any value; it is not deletable, read-only on builtins and frozen functions; the
  * `constructor` it starts with, like every builtin prototype's property, is not enumerable */
+/* ToPrimitive: an object's own (or inherited) valueOf/toString, by hint, through every operator and
+ * builtin that converts; expectations generated from Node (vm.runInNewContext) */
+static void test_to_primitive(void) {
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const log = []; const o = { toString() { log.push('t'); return 'S'; }, valueOf() { log.push('v'); return 42; } }; ['' + o, `${o}`, String(o), o + 1, o * 2, -o, +o, Number(o), o < 50, o == 42, o == 'S', log.join('')].join('|');",
+       "42|S|S|43|84|-42|42|42|true|true|false|vttvvvvvvvv");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const t = { toString() { return '7'; } }; const v = { valueOf() { return 5; } }; [t * 3, t + 1, v + 1, `${v}`, String(v), v > 4, t == 7].join('|');",
+       "21|71|6|[object Object]|[object Object]|true|true");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const n = { toString() { return {}; }, valueOf() { return {}; } }; const f = { valueOf() { return {}; }, toString() { return 'fall'; } }; const x = { toString: 5, valueOf: 6 }; [E(() => n + ''), E(() => String(n)), E(() => n * 1), f + 1, E(() => x + ''), E(() => Object.create(null) + '')].join('|');",
+       "TypeError: Cannot convert object to primitive value|TypeError: Cannot convert object to primitive value|TypeError: Cannot convert object to primitive value|fall1|TypeError: Cannot convert object to primitive value|TypeError: Cannot convert object to primitive value");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const th = { toString() { throw new Error('boom'); } }; [E(() => '' + th), E(() => th * 1), E(() => ({})[th]), E(() => `${th}`), E(() => th < 1), E(() => th == 1), E(() => [th].join()), E(() => 'a'.indexOf(th))].join('|');",
+       "Error: boom|Error: boom|Error: boom|Error: boom|Error: boom|Error: boom|Error: boom|Error: boom");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const d = new Date(0); d.toString = () => 'DATE'; d.valueOf = () => 99; [d + 1, d * 1, d < 100, `${d}`, new Date({ valueOf() { return 5; } }).getTime(), new Date({ toString() { return '1970-01-01T00:00:00.007Z'; }, valueOf: undefined }).getTime()].join('|');",
+       "DATE1|99|true|DATE|5|7");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const a = [1, [2, 3], { toString() { return 'x'; } }, null, undefined]; const c = [1, 2]; c.push(c); const j = [1, 2]; j.join = () => 'J'; const k = [1]; k.join = 5; ['' + a, a.join('-'), String(c), c.join('|'), String(j), String(k), Array.prototype.toString.call({ join() { return 'g'; } }), Array.prototype.toString.call({}), E(() => Array.prototype.toString.call(null))].join('|');",
+       "1,2,3,x,,|1-2,3-x--|1,2,|1|2||J|[object Array]|g|[object Object]|TypeError: Cannot convert undefined or null to object");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; function f() { return 1; } f.valueOf = () => 10; const g = function () {}; g.toString = () => 'G'; [f * 2, `${g}`, typeof f.valueOf, f.valueOf === Object.prototype.valueOf].join('|');",
+       "20|G|function|false");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const e = new Error('m'); e.toString = () => 'E!'; const e3 = new Error({ toString() { return 'objmsg'; } }); const e4 = new Error('x'); e4.name = { toString() { return 'NM'; } }; const e5 = new Error('q'); e5.name = e5; ['' + e, e3.message, String(e4), E(() => String(e5)), Error.prototype.toString.call({ name: 'N', message: 'M' }), Error.prototype.toString.call({})].join('|');",
+       "E!|objmsg|NM: x|RangeError: Maximum call stack size exceeded|N: M|Error");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; let c = 0; const k = { toString() { c++; return 'a'; } }; const o = { a: 1 }; const r = []; o[k] += 1; r.push(c, o.a); c = 0; o[k]++; r.push(c); c = 0; o[k] = 5; r.push(c); c = 0; r.push(o[k], c); c = 0; const lit = { [k]: 3 }; r.push(c, lit.a); c = 0; r.push(k in o, c); c = 0; delete o[k]; r.push(c, o.a); c = 0; r.push(o.hasOwnProperty(k), c); r.join();",
+       "2,2,2,1,5,1,1,3,true,1,1,,false,1");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const order = []; const o = {}; o[{ toString() { order.push('key'); return 'z'; } }] = (order.push('rhs'), 1); const arr = [5, 6, 7]; const m = { [{ toString() { return 'fn'; } }]: function () {} }; [order.join(), arr[{ toString() { return '1'; } }], m.fn.name, E(() => null[{ toString() { throw new Error('no'); } }]).slice(0, 37), E(() => ({ toString() { throw new Error('in'); } }) in 5).slice(0, 51)].join('|');",
+       "rhs,key|6|fn|TypeError: Cannot read properties of |TypeError: Cannot use 'in' operator to search for '");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; let c = 0; const ar = [1, 2, 3]; ar.length = { valueOf() { c++; return 1; } }; [c, ar.length].join();",
+       "2,1");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const s = (v) => ({ toString() { return v; } }); const n = (v) => ({ valueOf() { return v; } }); ['abc'.includes(s('b')), 'abcdef'.slice(n(2)), 'ab'.repeat(n(2)), Math.max(n(3), 1), parseInt(s('12')), String.prototype.charAt.call(s('xyz'), 1), 'a'.concat(s('S')), 'a'.padStart(3, s('-')), 'a,b'.split(s(',')).length, 'aXb'.replace(s('X'), '-'), String.fromCharCode(n(65)), isNaN(n(1)), [3, 4, 5].indexOf(4, n(1)), [1, 2, 3].slice(n(1)).join(), 'abc'.at(n(-1)), Math.pow(n(2), n(3)), (255).toString(n(16)), Number(s('0x10'))].join('|');",
+       "true|cdef|abab|3|12|y|aS|--a|2|a-b|A|false|1|2,3|c|8|ff|16");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const log = []; const n = (v) => ({ valueOf() { log.push(v); return v; } }); [Math.max(NaN, n(1), n(2)), Math.min(n(3), NaN), log.join()].join('|');",
+       "NaN|NaN|1,2,3");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; [[{ toString() { return 'b'; } }, { toString() { return 'a'; } }].sort().map(String).join(), [3, 1, 2].sort((x, y) => ({ valueOf() { return x - y; } })).join()].join('|');",
+       "a,b|1,2,3");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; [(5).valueOf() + 1, typeof (5).valueOf(), E(() => Number.prototype.toString.call({})), E(() => Number.prototype.valueOf.call('1')), E(() => String.prototype.toString.call({})), E(() => String.prototype.valueOf.call(5)), 'ab'.valueOf(), true.toString(), true.valueOf(), E(() => Boolean.prototype.toString.call(1)), String(Number.prototype), String(Boolean.prototype), String(String.prototype) === '', Object.getPrototypeOf(false) === Boolean.prototype].join('|');",
+       "6|number|TypeError: Number.prototype.toString requires that 'this' be a Number|TypeError: Number.prototype.valueOf requires that 'this' be a Number|TypeError: String.prototype.toString requires that 'this' be a String|TypeError: String.prototype.valueOf requires that 'this' be a String|ab|true|true|TypeError: Boolean.prototype.toString requires that 'this' be a Boolean|0|false|true|true");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; [E(() => Object.prototype.valueOf.call(null)), 'ab'.hasOwnProperty('length'), 'ab'.hasOwnProperty(1), 'ab'.hasOwnProperty('01'), 'ab'.hasOwnProperty(2), (5).hasOwnProperty('x'), E(() => Object.prototype.hasOwnProperty.call(null, 'x')), RegExp.prototype.toString.call({ source: { toString() { return 'S'; } }, flags: 'g' }), /a/gi.toString(), typeof (1).hasOwnProperty].join('|');",
+       "TypeError: Cannot convert undefined or null to object|true|true|false|false|false|TypeError: Cannot convert undefined or null to object|/S/g|/a/gi|function");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const p = Promise.resolve(1); [String(p), `${p}`, E(() => p * 1), JSON.stringify({ a: { toString() { return 'x'; } } }), Object.keys(Object.fromEntries([[{ toString() { return 'k'; } }, 1]])).join()].join('|');",
+       "[object Promise]|[object Promise]|NaN|{\"a\":{}}|k");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; [E(() => { const r = { toString() { return '' + r; } }; return '' + r; }), E(() => { let x = []; for (let i = 0; i < 100; i++) x = [x]; return String(x).length; })].join('|');",
+       "RangeError: Maximum call stack size exceeded|0");
+
+}
+
 static void test_prototype(void) {
     eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; function F() {} [F.hasOwnProperty('prototype'), typeof F.prototype, F.prototype.constructor === F, F.prototype === F.prototype, JSON.stringify(Object.keys(F.prototype)), JSON.stringify(F.prototype)].join();",
        "true,object,true,true,[],{}");
@@ -1135,6 +1177,7 @@ int main(void) {
     test_error_types();
     test_uri();
     test_prototype();
+    test_to_primitive();
     test_stress();
     test_integration();
     if (checks_failed) {

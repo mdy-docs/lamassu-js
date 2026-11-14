@@ -72,7 +72,7 @@ JsValue js_error_receiver(JsContext *ctx, const char *cls, JsValue receiver);
 
 /* "name: message" (either half omitted when empty). `depth` guards against
  * an error whose message/name refers back to itself. NULL on OOM. */
-JsString *js_error_repr(JsContext *ctx, JsObject *o, int depth);
+JsString *js_error_repr(JsContext *ctx, JsObject *o); /* NULL: failed, error pending */
 
 /* Installs Error/TypeError/RangeError/ReferenceError/SyntaxError and their
  * prototypes. Must run after ctx->object_proto exists. */

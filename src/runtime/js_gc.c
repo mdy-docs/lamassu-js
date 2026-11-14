@@ -311,6 +311,8 @@ void js_gc_collect(JsVm *vm) {
             js_gc_mark_cell(vm, &ctx->string_methods->gc);
         if (ctx->number_methods)
             js_gc_mark_cell(vm, &ctx->number_methods->gc);
+        if (ctx->boolean_methods)
+            js_gc_mark_cell(vm, &ctx->boolean_methods->gc);
         if (ctx->function_methods)
             js_gc_mark_cell(vm, &ctx->function_methods->gc);
         if (ctx->promise_methods)
@@ -343,6 +345,7 @@ void js_gc_collect(JsVm *vm) {
             js_gc_mark_value(vm, ctx->error_trace[i].function);
         }
         js_gc_mark_value(vm, ctx->error_trace_value);
+        js_gc_mark_value(vm, ctx->pending_error);
         if (ctx->error_ctor)
             js_gc_mark_cell(vm, &ctx->error_ctor->gc);
         if (ctx->math_obj)
@@ -354,6 +357,8 @@ void js_gc_collect(JsVm *vm) {
         for (const JsNativeAct *a = ctx->native_act; a; a = a->outer) {
             js_gc_mark_cell(vm, (JsGcCell *)&a->nf->gc);
             js_gc_mark_value(vm, a->this_val);
+            for (uint8_t i = 0; i < a->nkeep; i++)
+                js_gc_mark_value(vm, a->keep[i]);
         }
     }
     js_gc_mark_jobs(vm);

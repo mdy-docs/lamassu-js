@@ -190,14 +190,28 @@ static const char *type_phrase(JsValue v) {
     return "an object";
 }
 
+/* A failure's error: what a conversion threw (valueOf/toString can run guest code), else out of
+ * memory. Every path that gives up after a failed js_op_to_string/js_op_to_number reports this. */
 static bool oom(JsContext *ctx, JsValue *result) {
+    if (!js_is_undefined(ctx->pending_error)) {
+        *result = js_take_error(ctx);
+        return false;
+    }
     return native_throw(ctx, result, "out of memory");
 }
 
-/* ---- ToString of an argument (rooted) ---- */
+/* ToNumber of V into D, or the native returns what it threw. For natives whose result is r and
+ * which hold nothing to release. */
+#define TO_NUM(d, v)                                                            \
+    do {                                                                        \
+        if (!js_op_to_number(ctx, (v), &(d)))                                   \
+            return oom(ctx, r);                                                 \
+    } while (0)
+
+/* ---- ToString of an argument, kept rooted until the native returns ---- */
 
 static JsString *arg_string(JsContext *ctx, JsValue v) {
-    return js_to_string_cell(ctx, v, 0);
+    return js_native_string(ctx, v);
 }
 
 /* substring search: returns index in hay of first needle at/after `from`, or -1 */
@@ -222,7 +236,7 @@ static long units_find(const uint16_t *hay, uint32_t hlen, const uint16_t *ndl,
  * ===================================================================== */
 
 static bool str_this(JsContext *ctx, JsValue this_val, JsString **out, JsValue *result) {
-    JsString *s = js_to_string_cell(ctx, this_val, 0);
+    JsString *s = js_native_string(ctx, this_val);
     if (!s)
         return oom(ctx, result);
     *out = s;
@@ -233,7 +247,9 @@ static bool sm_charAt(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
-    double d = to_int(js_to_number_value(ctx, ARG(0)));
+    double d;
+    TO_NUM(d, ARG(0));
+    d = to_int(d);
     if (d < 0 || d >= s->length) {
         JsString *e = js_string_cell_new(ctx->vm, NULL, 0);
         if (!e)
@@ -252,7 +268,9 @@ static bool sm_charCodeAt(JsContext *ctx, JsValue tv, const JsValue *args, int a
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
-    double d = to_int(js_to_number_value(ctx, ARG(0)));
+    double d;
+    TO_NUM(d, ARG(0));
+    d = to_int(d);
     if (d < 0 || d >= s->length) {
         *r = js_number(__builtin_nan(""));
         return true;
@@ -265,7 +283,9 @@ static bool sm_codePointAt(JsContext *ctx, JsValue tv, const JsValue *args, int 
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
-    double d = to_int(js_to_number_value(ctx, ARG(0)));
+    double d;
+    TO_NUM(d, ARG(0));
+    d = to_int(d);
     if (d < 0 || d >= s->length) {
         *r = js_undefined();
         return true;
@@ -283,7 +303,9 @@ static bool sm_at(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsV
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
-    double d = to_int(js_to_number_value(ctx, ARG(0)));
+    double d;
+    TO_NUM(d, ARG(0));
+    d = to_int(d);
     if (d < 0)
         d += s->length;
     if (d < 0 || d >= s->length) {
@@ -304,7 +326,10 @@ static bool sm_indexOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     JsString *n = arg_string(ctx, ARG(0));
     if (!n)
         return oom(ctx, r);
-    uint32_t from = argc > 1 ? clamp_index(js_to_number_value(ctx, ARG(1)), s->length) : 0;
+    double fromd = 0;
+    if (argc > 1)
+        TO_NUM(fromd, ARG(1));
+    uint32_t from = clamp_index(fromd, s->length);
     *r = js_number((double)units_find(s->units, s->length, n->units, n->length, from));
     return true;
 }
@@ -318,7 +343,9 @@ static bool sm_lastIndexOf(JsContext *ctx, JsValue tv, const JsValue *args, int 
         return oom(ctx, r);
     /* fromIndex: the last match whose start index is <= fromIndex. Defaults to
      * +Infinity (whole string); NaN is also treated as +Infinity per spec. */
-    double posd = argc > 1 ? js_to_number_value(ctx, ARG(1)) : __builtin_inf();
+    double posd = __builtin_inf();
+    if (argc > 1)
+        TO_NUM(posd, ARG(1));
     uint32_t limit;
     if (posd != posd || posd >= (double)s->length)
         limit = s->length;
@@ -356,7 +383,10 @@ static bool sm_startsWith(JsContext *ctx, JsValue tv, const JsValue *args, int a
     JsString *n = arg_string(ctx, ARG(0));
     if (!n)
         return oom(ctx, r);
-    uint32_t from = argc > 1 ? clamp_index(js_to_number_value(ctx, ARG(1)), s->length) : 0;
+    double fromd = 0;
+    if (argc > 1)
+        TO_NUM(fromd, ARG(1));
+    uint32_t from = clamp_index(fromd, s->length);
     bool ok = from + n->length <= s->length;
     for (uint32_t j = 0; ok && j < n->length; j++)
         ok = s->units[from + j] == n->units[j];
@@ -371,7 +401,12 @@ static bool sm_endsWith(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     JsString *n = arg_string(ctx, ARG(0));
     if (!n)
         return oom(ctx, r);
-    uint32_t end = argc > 1 ? clamp_index(js_to_number_value(ctx, ARG(1)), s->length) : s->length;
+    uint32_t end = s->length;
+    if (argc > 1) {
+        double ed;
+        TO_NUM(ed, ARG(1));
+        end = clamp_index(ed, s->length);
+    }
     bool ok = n->length <= end;
     for (uint32_t j = 0; ok && j < n->length; j++)
         ok = s->units[end - n->length + j] == n->units[j];
@@ -393,10 +428,12 @@ static bool sm_slice(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
-    uint32_t start = clamp_index(js_to_number_value(ctx, ARG(0)), s->length);
-    uint32_t end = argc > 1 && !js_is_undefined(ARG(1))
-                       ? clamp_index(js_to_number_value(ctx, ARG(1)), s->length)
-                       : s->length;
+    double sd, ed = s->length;
+    TO_NUM(sd, ARG(0));
+    if (argc > 1 && !js_is_undefined(ARG(1)))
+        TO_NUM(ed, ARG(1));
+    uint32_t start = clamp_index(sd, s->length);
+    uint32_t end = clamp_index(ed, s->length);
     return make_substr(ctx, s, start, end, r);
 }
 
@@ -404,10 +441,12 @@ static bool sm_substring(JsContext *ctx, JsValue tv, const JsValue *args, int ar
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
-    uint32_t a = clamp_index(js_to_number_value(ctx, ARG(0)), s->length);
-    uint32_t b = argc > 1 && !js_is_undefined(ARG(1))
-                     ? clamp_index(js_to_number_value(ctx, ARG(1)), s->length)
-                     : s->length;
+    double ad, bd = s->length;
+    TO_NUM(ad, ARG(0));
+    if (argc > 1 && !js_is_undefined(ARG(1)))
+        TO_NUM(bd, ARG(1));
+    uint32_t a = clamp_index(ad, s->length);
+    uint32_t b = clamp_index(bd, s->length);
     if (a > b) {
         uint32_t t = a;
         a = b;
@@ -556,7 +595,9 @@ static bool sm_repeat(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
-    double d = to_int(js_to_number_value(ctx, ARG(0)));
+    double d;
+    TO_NUM(d, ARG(0));
+    d = to_int(d);
     if (d < 0 || d == __builtin_inf())
         return native_throw_fmt(ctx, r, "RangeError: Invalid count value: %v", ARG(0));
     /* bounds-check before the cast: (uint32_t)d is UB above UINT32_MAX,
@@ -582,7 +623,9 @@ static bool sm_pad(JsContext *ctx, JsValue tv, const JsValue *args, int argc, Js
     /* Clamp the target length into [0, UINT32_MAX] before the cast so an
      * Infinity/huge argument can't UB; an oversized target still means "pad a
      * lot" and is bounded by allocation limits downstream. */
-    uint32_t target = (uint32_t)to_integer_clamped(js_to_number_value(ctx, ARG(0)), 0, 4294967295.0);
+    double td;
+    TO_NUM(td, ARG(0));
+    uint32_t target = (uint32_t)to_integer_clamped(td, 0, 4294967295.0);
     if (target <= s->length)
         return make_substr(ctx, s, 0, s->length, r);
     JsString *pad;
@@ -712,7 +755,7 @@ static bool sm_replace_impl(JsContext *ctx, JsValue tv, const JsValue *args, int
                 break;
             }
             js_gc_protect(vm, &res);
-            JsString *rs = js_to_string_cell(ctx, res, 0);
+            JsString *rs = js_op_to_string(ctx, res);
             js_gc_unprotect(vm, &res);
             if (!rs) {
                 ok = false;
@@ -807,7 +850,7 @@ static bool sm_concat(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     sb_init(&sb, ctx->vm);
     sb_units(&sb, s->units, s->length);
     for (int i = 0; i < argc; i++) {
-        JsString *a = arg_string(ctx, args[i]);
+        JsString *a = js_op_to_string(ctx, args[i]); /* copied out before the next converts */
         if (!a) {
             sb_free(&sb);
             return oom(ctx, r);
@@ -818,13 +861,65 @@ static bool sm_concat(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     return js_is_undefined(*r) && sb.len ? oom(ctx, r) : true;
 }
 
+/* thisNumberValue / thisStringValue / thisBooleanValue: the receiver must be that primitive (there
+ * are no wrapper objects), or the prototype itself, which in V8 is a wrapper of 0, "" or false */
+static JsValue this_primitive(JsContext *ctx, JsValue tv) {
+    if (js_is_object(tv)) {
+        JsObject *o = js_value_object(tv);
+        if (o == ctx->number_methods)
+            return js_number(0);
+        if (o == ctx->boolean_methods)
+            return js_bool(false);
+        if (o == ctx->string_methods) {
+            JsString *e = js_string_cell_new(ctx->vm, NULL, 0);
+            return e ? js_value_from_cell(&e->gc) : js_undefined(); /* undefined: fails the check */
+        }
+    }
+    return tv;
+}
+
+/* thisStringValue: the receiver must be a string (there are no String objects) */
 static bool sm_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)args;
     (void)argc;
-    JsString *s;
-    if (!str_this(ctx, tv, &s, r))
-        return false;
+    tv = this_primitive(ctx, tv);
+    if (!js_is_string(tv))
+        return native_throw(ctx, r, "TypeError: String.prototype.toString requires that 'this' be a String");
+    *r = tv;
+    return true;
+}
+
+static bool sm_valueOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args;
+    (void)argc;
+    tv = this_primitive(ctx, tv);
+    if (!js_is_string(tv))
+        return native_throw(ctx, r, "TypeError: String.prototype.valueOf requires that 'this' be a String");
+    *r = tv;
+    return true;
+}
+
+/* Boolean.prototype: thisBooleanValue, as the others (no Boolean objects) */
+static bool bm_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args;
+    (void)argc;
+    tv = this_primitive(ctx, tv);
+    if (!js_is_bool(tv))
+        return native_throw(ctx, r, "TypeError: Boolean.prototype.toString requires that 'this' be a Boolean");
+    JsString *s = js_ascii_cell(ctx->vm, js_get_bool(tv) ? "true" : "false");
+    if (!s)
+        return oom(ctx, r);
     *r = js_value_from_cell(&s->gc);
+    return true;
+}
+
+static bool bm_valueOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args;
+    (void)argc;
+    tv = this_primitive(ctx, tv);
+    if (!js_is_bool(tv))
+        return native_throw(ctx, r, "TypeError: Boolean.prototype.valueOf requires that 'this' be a Boolean");
+    *r = tv;
     return true;
 }
 
@@ -956,7 +1051,9 @@ static bool am_at(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsV
     JsObject *a;
     if (!array_this(ctx, tv, &a, r))
         return false;
-    double d = to_int(js_to_number_value(ctx, ARG(0)));
+    double d;
+    TO_NUM(d, ARG(0));
+    d = to_int(d);
     if (d < 0)
         d += a->elem_count;
     if (d < 0 || d >= a->elem_count) {
@@ -971,8 +1068,13 @@ static bool am_indexOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     JsObject *a;
     if (!array_this(ctx, tv, &a, r))
         return false;
-    uint32_t from = argc > 1 ? clamp_index(js_to_number_value(ctx, ARG(1)), a->elem_count) : 0;
-    for (uint32_t i = from; i < a->elem_count; i++) {
+    /* the length first, then fromIndex, as V8: a valueOf that shrinks the array ends the search */
+    uint32_t len = a->elem_count;
+    double fd = 0;
+    if (argc > 1)
+        TO_NUM(fd, ARG(1));
+    uint32_t from = clamp_index(fd, len);
+    for (uint32_t i = from; i < len && i < a->elem_count; i++) {
         if (js_strict_equals(a->elems[i], ARG(0))) {
             *r = js_number(i);
             return true;
@@ -1014,55 +1116,90 @@ static bool am_slice(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
     JsObject *a;
     if (!array_this(ctx, tv, &a, r))
         return false;
-    uint32_t start = clamp_index(js_to_number_value(ctx, ARG(0)), a->elem_count);
-    uint32_t end = argc > 1 && !js_is_undefined(ARG(1))
-                       ? clamp_index(js_to_number_value(ctx, ARG(1)), a->elem_count)
-                       : a->elem_count;
+    /* the length first, then start and end, as V8; an element a valueOf removed reads undefined */
+    uint32_t len = a->elem_count;
+    double sd, ed = len;
+    TO_NUM(sd, ARG(0));
+    if (argc > 1 && !js_is_undefined(ARG(1)))
+        TO_NUM(ed, ARG(1));
+    uint32_t start = clamp_index(sd, len);
+    uint32_t end = clamp_index(ed, len);
     JsObject *out = js_array_new_cell(ctx, end > start ? end - start : 0);
     if (!out)
         return oom(ctx, r);
     for (uint32_t i = start; i < end; i++)
-        out->elems[out->elem_count++] = a->elems[i];
+        out->elems[out->elem_count++] = i < a->elem_count ? a->elems[i] : js_undefined();
     *r = js_value_from_cell(&out->gc);
     return true;
 }
 
+/* Array.prototype.join's cycle check, as V8's: an array already being joined further out joins as
+ * the empty string. False on OOM. */
+static bool join_enter(JsContext *ctx, JsObject *a, bool *cyclic) {
+    for (uint32_t i = 0; i < ctx->join_len; i++) {
+        if (ctx->join_stack[i] == a) {
+            *cyclic = true;
+            return true;
+        }
+    }
+    *cyclic = false;
+    if (ctx->join_len == ctx->join_cap) {
+        uint32_t ncap = ctx->join_cap ? ctx->join_cap * 2 : 8;
+        JsObject **ns = js_realloc_raw(ctx->vm, ctx->join_stack, ctx->join_cap * sizeof *ns,
+                                       ncap * sizeof *ns);
+        if (!ns)
+            return false;
+        ctx->join_stack = ns;
+        ctx->join_cap = ncap;
+    }
+    ctx->join_stack[ctx->join_len++] = a;
+    return true;
+}
+
+/* Array.prototype.join (23.1.3.18): the length, then the separator, then each element's ToString
+ * (an element's own toString may run, and may change the array: one it removed reads undefined). */
 static bool am_join(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsObject *a;
     if (!array_this(ctx, tv, &a, r))
         return false;
-    JsValue av = tv;
-    js_gc_protect(ctx->vm, &av);
-    const uint16_t comma[] = {','};
-    const uint16_t *su = comma;
-    uint32_t sn = 1;
-    JsString *sep = NULL;
-    if (argc > 0 && !js_is_undefined(ARG(0))) {
-        sep = arg_string(ctx, ARG(0));
-        if (!sep) {
-            js_gc_unprotect(ctx->vm, &av);
+    bool cyclic;
+    if (!join_enter(ctx, a, &cyclic))
+        return oom(ctx, r);
+    if (cyclic) {
+        JsString *e = js_string_cell_new(ctx->vm, NULL, 0);
+        if (!e)
             return oom(ctx, r);
-        }
-        su = sep->units;
-        sn = sep->length;
+        *r = js_value_from_cell(&e->gc);
+        return true;
     }
+    uint32_t len = a->elem_count;
+    const uint16_t comma[] = {','};
+    JsString *sep = NULL;
+    bool ok = true;
     StrBuf sb;
     sb_init(&sb, ctx->vm);
-    bool ok = true;
-    for (uint32_t i = 0; i < a->elem_count; i++) {
-        if (i)
-            sb_units(&sb, su, sn);
-        JsValue el = a->elems[i];
+    if (argc > 0 && !js_is_undefined(ARG(0))) {
+        sep = arg_string(ctx, ARG(0));
+        ok = sep != NULL;
+    }
+    for (uint32_t i = 0; ok && i < len; i++) {
+        if (i) {
+            if (sep)
+                sb_units(&sb, sep->units, sep->length);
+            else
+                sb_units(&sb, comma, 1);
+        }
+        JsValue el = i < a->elem_count ? a->elems[i] : js_undefined();
         if (js_is_undefined(el) || js_is_null(el))
             continue;
-        JsString *es = js_to_string_cell(ctx, el, 0);
+        JsString *es = js_op_to_string(ctx, el); /* copied out before the next converts */
         if (!es) {
             ok = false;
             break;
         }
         sb_units(&sb, es->units, es->length);
     }
-    js_gc_unprotect(ctx->vm, &av);
+    ctx->join_len--;
     if (!ok) {
         sb_free(&sb);
         return oom(ctx, r);
@@ -1091,12 +1228,23 @@ static bool am_fill(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     JsObject *a;
     if (!array_this_mut(ctx, tv, &a, r, MUT_WRITE))
         return false;
-    uint32_t start = argc > 1 ? clamp_index(js_to_number_value(ctx, ARG(1)), a->elem_count) : 0;
-    uint32_t end = argc > 2 && !js_is_undefined(ARG(2))
-                       ? clamp_index(js_to_number_value(ctx, ARG(2)), a->elem_count)
-                       : a->elem_count;
-    for (uint32_t i = start; i < end; i++)
-        a->elems[i] = ARG(0);
+    uint32_t len = a->elem_count;
+    double sd = 0, ed = len;
+    if (argc > 1)
+        TO_NUM(sd, ARG(1));
+    if (argc > 2 && !js_is_undefined(ARG(2)))
+        TO_NUM(ed, ARG(2));
+    /* a valueOf may have frozen or shortened it: check again, and write an index past the end as
+     * a property set would */
+    if (!array_this_mut(ctx, tv, &a, r, MUT_WRITE))
+        return false;
+    uint32_t start = clamp_index(sd, len), end = clamp_index(ed, len);
+    for (uint32_t i = start; i < end; i++) {
+        if (i < a->elem_count)
+            a->elems[i] = ARG(0);
+        else if (!js_array_set_index(ctx->vm, a, i, ARG(0)))
+            return oom(ctx, r);
+    }
     *r = tv;
     return true;
 }
@@ -1340,20 +1488,25 @@ static bool am_sort(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
                     failed = true;
                     break;
                 }
-                double d = js_to_number_value(ctx, res);
+                double d;
+                if (!js_op_to_number(ctx, res, &d)) {
+                    oom(ctx, r);
+                    failed = true;
+                    break;
+                }
                 c = d > 0 ? 1 : (d < 0 ? -1 : 0);
             } else {
                 /* Converting `key` allocates, which is a GC safe point — so
                  * `sa` must be rooted across it or the collector can reclaim
                  * the string this comparison is about to read. */
-                JsString *sa = js_to_string_cell(ctx, midv, 0);
+                JsString *sa = js_op_to_string(ctx, midv);
                 if (!sa) {
                     failed = true;
                     oom(ctx, r);
                     break;
                 }
                 midstr = js_value_from_cell(&sa->gc);
-                JsString *sk = js_to_string_cell(ctx, key, 0);
+                JsString *sk = js_op_to_string(ctx, key);
                 if (!sk) {
                     failed = true;
                     oom(ctx, r);
@@ -1398,7 +1551,11 @@ static bool am_flat(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     JsObject *a;
     if (!array_this(ctx, tv, &a, r))
         return false;
-    double depth = argc > 0 && !js_is_undefined(ARG(0)) ? to_int(js_to_number_value(ctx, ARG(0))) : 1;
+    double depth = 1;
+    if (argc > 0 && !js_is_undefined(ARG(0))) {
+        TO_NUM(depth, ARG(0));
+        depth = to_int(depth);
+    }
     JsObject *out = js_array_new_cell(ctx, 0);
     if (!out)
         return oom(ctx, r);
@@ -1438,17 +1595,21 @@ static bool am_flat(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     return true;
 }
 
+static bool objp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r);
+
+/* Array.prototype.toString (23.1.3.36), generic as V8's: this.join() when join is a function,
+ * else Object.prototype.toString. */
 static bool am_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    (void)args;
-    (void)argc;
-    JsObject *a;
-    if (!array_this(ctx, tv, &a, r))
-        return false;
-    JsString *s = js_to_string_cell(ctx, tv, 0);
-    if (!s)
+    if (js_is_undefined(tv) || js_is_null(tv))
+        return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
+    JsValue join = js_undefined();
+    static const uint16_t kj[] = {'j', 'o', 'i', 'n'};
+    JsValue key = js_atom(ctx->vm, kj, 4);
+    if (!js_is_string(key) || !js_get_property(ctx, tv, key, &join))
         return oom(ctx, r);
-    *r = js_value_from_cell(&s->gc);
-    return true;
+    if (!js_is_function(join))
+        return objp_toString(ctx, tv, args, argc, r);
+    return js_call(ctx, join, tv, NULL, 0, r);
 }
 
 /* =====================================================================
@@ -1569,9 +1730,29 @@ static bool fm_bind(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     return true;
 }
 
+/* thisNumberValue: a Number method's receiver must be a number (there are no Number objects) */
+#define NUMBER_THIS(name)                                                       \
+    do {                                                                        \
+        tv = this_primitive(ctx, tv);                                           \
+        if (!js_is_number(tv))                                                  \
+            return native_throw(ctx, r, "TypeError: Number.prototype." name     \
+                                " requires that 'this' be a Number");           \
+    } while (0)
+
+static bool nm_valueOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args;
+    (void)argc;
+    NUMBER_THIS("valueOf");
+    *r = tv;
+    return true;
+}
+
 static bool nm_toFixed(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    double x = js_to_number_value(ctx, tv);
-    double dd = to_int(js_to_number_value(ctx, ARG(0)));
+    NUMBER_THIS("toFixed");
+    double x = js_get_number(tv);
+    double dd;
+    TO_NUM(dd, ARG(0));
+    dd = to_int(dd);
     if (dd < 0 || dd > 100)
         return native_throw(ctx, r, "RangeError: toFixed() digits argument must be between 0 and 100");
     int d = (int)dd;
@@ -1630,12 +1811,16 @@ static bool nm_toFixed(JsContext *ctx, JsValue tv, const JsValue *args, int argc
 }
 
 static bool nm_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    double x = js_to_number_value(ctx, tv);
+    NUMBER_THIS("toString");
+    double x = js_get_number(tv);
     /* Clamp to [0,37] before the cast (avoids UB on Infinity/NaN/huge); an
      * out-of-range radix lands outside 2..36 and is rejected just below. */
-    int radix = argc > 0 && !js_is_undefined(ARG(0))
-                    ? (int)to_integer_clamped(js_to_number_value(ctx, ARG(0)), 0, 37)
-                    : 10;
+    int radix = 10;
+    if (argc > 0 && !js_is_undefined(ARG(0))) {
+        double rd;
+        TO_NUM(rd, ARG(0));
+        radix = (int)to_integer_clamped(rd, 0, 37);
+    }
     if (radix < 2 || radix > 36)
         return native_throw(ctx, r, "RangeError: toString() radix argument must be between 2 and 36");
     if (radix == 10 || x != x || x == __builtin_inf() || x == -__builtin_inf()) {
@@ -1698,32 +1883,38 @@ static double m_fround(double x) { return (double)(float)x; }
 static double m_sign(double x) { return x != x ? x : (x > 0 ? 1 : (x < 0 ? -1 : x)); }
 static bool math_min(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
+    /* every argument converts (a valueOf runs) even after a NaN, as V8 */
     double best = __builtin_inf();
+    bool nan = false;
     for (int i = 0; i < argc; i++) {
-        double v = js_to_number_value(ctx, args[i]);
-        if (v != v) {
-            *r = js_number(v);
-            return true;
-        }
-        if (v < best || (v == 0 && best == 0 && 1.0 / v < 0))
+        double v;
+        TO_NUM(v, args[i]);
+        if (v != v)
+            nan = true;
+        else if (v < best || (v == 0 && best == 0 && 1.0 / v < 0))
             best = v;
     }
+    if (nan)
+        best = __builtin_nan("");
     *r = js_number(best);
     return true;
 }
 
 static bool math_max(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
+    /* every argument converts (a valueOf runs) even after a NaN, as V8 */
     double best = -__builtin_inf();
+    bool nan = false;
     for (int i = 0; i < argc; i++) {
-        double v = js_to_number_value(ctx, args[i]);
-        if (v != v) {
-            *r = js_number(v);
-            return true;
-        }
-        if (v > best || (v == 0 && best == 0 && 1.0 / v > 0))
+        double v;
+        TO_NUM(v, args[i]);
+        if (v != v)
+            nan = true;
+        else if (v > best || (v == 0 && best == 0 && 1.0 / v > 0))
             best = v;
     }
+    if (nan)
+        best = __builtin_nan("");
     *r = js_number(best);
     return true;
 }
@@ -1746,7 +1937,12 @@ static bool math_hypot(JsContext *ctx, JsValue tv, const JsValue *args, int argc
             return oom(ctx, r);
     }
     for (int i = 0; i < argc; i++) {
-        double v = js_to_number_value(ctx, args[i]);
+        double v;
+        if (!js_op_to_number(ctx, args[i], &v)) {
+            if (vals != stackv)
+                js_realloc_raw(ctx->vm, vals, (size_t)argc * sizeof(double), 0);
+            return oom(ctx, r);
+        }
         vals[i] = v;
         if (v == inf || v == -inf)
             has_inf = true;
@@ -1783,13 +1979,19 @@ static bool math_hypot(JsContext *ctx, JsValue tv, const JsValue *args, int argc
 
 static bool math_pow(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
-    *r = js_number(js_k_pow(js_to_number_value(ctx, ARG(0)), js_to_number_value(ctx, ARG(1))));
+    double x, y;
+    TO_NUM(x, ARG(0));
+    TO_NUM(y, ARG(1));
+    *r = js_number(js_k_pow(x, y));
     return true;
 }
 
 static bool math_atan2(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
-    *r = js_number(js_k_atan2(js_to_number_value(ctx, ARG(0)), js_to_number_value(ctx, ARG(1))));
+    double y, x;
+    TO_NUM(y, ARG(0));
+    TO_NUM(x, ARG(1));
+    *r = js_number(js_k_atan2(y, x));
     return true;
 }
 
@@ -1970,7 +2172,7 @@ static bool json_stringify(JsContext *ctx, JsValue tv, const JsValue *args, int 
     if (js_is_number(space)) {
         /* space count is clamped to [0,10]; route through to_integer_clamped so
          * an Infinity/NaN/huge argument can't UB on the cast to int */
-        int n = (int)to_integer_clamped(js_to_number_value(ctx, space), 0, 10);
+        int n = (int)to_integer_clamped(js_get_number(space), 0, 10);
         for (int i = 0; i < n; i++)
             indent[indent_len++] = ' ';
     } else if (js_is_string(space)) {
@@ -2657,9 +2859,12 @@ static bool obj_fromEntries(JsContext *ctx, JsValue tv, const JsValue *args, int
         JsObject *pa = js_value_object(pair);
         JsValue k = pa->elem_count > 0 ? pa->elems[0] : js_undefined();
         JsValue val = pa->elem_count > 1 ? pa->elems[1] : js_undefined();
-        JsString *ks = js_to_string_cell(ctx, k, 0);
+        /* ToPropertyKey may run k's toString, which may drop val from the pair */
+        js_gc_protect(ctx->vm, &val);
+        JsString *ks = js_op_to_string(ctx, k);
         JsString *iks = ks ? js_intern_cell(ctx->vm, ks) : NULL;
         ok = iks && js_map_set(ctx->vm, &out->props, iks, val);
+        js_gc_unprotect(ctx->vm, &val);
     }
     js_gc_unprotect(ctx->vm, &outv);
     if (have_bad) /* bad is an element of src, which the caller holds */
@@ -2679,7 +2884,7 @@ static bool object_has_own_key(JsContext *ctx, JsObject *ob, JsValue key, bool *
         *out = true;
         return true;
     }
-    JsString *ks = js_to_string_cell(ctx, key, 0);
+    JsString *ks = js_op_to_string(ctx, key); /* ToPropertyKey; false leaves its error pending */
     if (!ks)
         return false;
     if (ob->obj_kind == JS_OBJ_ARRAY) {
@@ -2750,10 +2955,36 @@ static bool obj_hasOwn(JsContext *ctx, JsValue tv, const JsValue *args, int argc
  * own `toString`, so this generic one is only ever actually reached for
  * plain objects (and anything else that doesn't override it). */
 
+static inline bool is_object_type_value(JsValue v) {
+    return js_is_object(v) || js_is_function(v) || js_is_promise(v);
+}
+
 static bool objp_hasOwnProperty(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                                 JsValue *r) {
     if (is_function_name_key(tv, ARG(0))) {
         *r = js_bool(true);
+        return true;
+    }
+    if (!is_object_type_value(tv)) {
+        /* ToPropertyKey first, then ToObject(this), as V8: a string's own keys are its indices and
+         * length; a number's and boolean's none */
+        JsString *k = js_native_string(ctx, ARG(0)); /* kept: the index check allocates */
+        if (!k)
+            return oom(ctx, r);
+        if (js_is_undefined(tv) || js_is_null(tv))
+            return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
+        bool own = false;
+        if (js_is_string(tv)) {
+            uint32_t len = js_value_string(tv)->length;
+            double d = js_units_to_number(k->units, k->length);
+            JsString *canon = NULL;
+            if (d >= 0 && d < len && d == __builtin_floor(d))
+                canon = js_number_to_string(ctx->vm, d); /* "1", not "01" or "1.0" */
+            own = (canon && canon->length == k->length &&
+                   memcmp(canon->units, k->units, k->length * sizeof(uint16_t)) == 0) ||
+                  (k->length == 6 && memcmp(k->units, (const uint16_t[]){'l', 'e', 'n', 'g', 't', 'h'}, 12) == 0);
+        }
+        *r = js_bool(own);
         return true;
     }
     if (js_is_function(tv)) {
@@ -2865,12 +3096,23 @@ static bool objp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int a
     return true;
 }
 
+/* Object.prototype.valueOf: ToObject(this), which for a primitive is the primitive itself here
+ * (there are no wrapper objects) */
 static bool objp_valueOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    (void)ctx;
     (void)args;
     (void)argc;
+    if (js_is_undefined(tv) || js_is_null(tv))
+        return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
     *r = tv;
     return true;
+}
+
+/* For ToPrimitive, which skips calling it (it gives the object back) */
+bool js_native_is_object_valueof(JsValue fn) {
+    if (!js_is_function(fn) || js_value_cell(fn)->kind != JS_KIND_NATIVE)
+        return false;
+    const JsNative *nf = (const JsNative *)js_value_cell(fn);
+    return !nf->is_bound && nf->fn == objp_valueOf;
 }
 
 /* Functions (closures/natives) aren't JS_KIND_OBJECT and so have no [[Prototype]]
@@ -2894,7 +3136,8 @@ static bool obj_getPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, 
     JsObject *p = js_is_function(v)  ? ctx->function_methods
                   : js_is_promise(v) ? ctx->promise_methods
                   : js_is_number(v)  ? ctx->number_methods
-                  : js_is_string(v)  ? ctx->string_methods : NULL;
+                  : js_is_string(v)  ? ctx->string_methods
+                  : js_is_bool(v)    ? ctx->boolean_methods : NULL;
     if (js_is_function(v) && js_value_cell(v)->kind == JS_KIND_NATIVE && ((JsNative *)js_value_cell(v))->parent) {
         *r = js_value_from_cell(&((JsNative *)js_value_cell(v))->parent->gc);
         return true;
@@ -3120,7 +3363,12 @@ static bool g_parseInt(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     /* Spec: radix = ToInt32(arg). js_to_int32 is UB-free (unlike a raw
      * (int)-cast of an Infinity/huge double) and wraps mod 2^32 as ToInt32
      * requires; an out-of-2..36 result is rejected below. */
-    int radix = argc > 1 && !js_is_undefined(ARG(1)) ? (int)js_to_int32(js_to_number_value(ctx, ARG(1))) : 0;
+    int radix = 0;
+    if (argc > 1 && !js_is_undefined(ARG(1))) {
+        double rd;
+        TO_NUM(rd, ARG(1));
+        radix = (int)js_to_int32(rd);
+    }
     uint32_t i = 0;
     while (i < s->length && is_ws(s->units[i]))
         i++;
@@ -3376,7 +3624,8 @@ static bool g_parseFloat(JsContext *ctx, JsValue tv, const JsValue *args, int ar
 static bool g_isNaN(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     (void)argc;
-    double d = js_to_number_value(ctx, ARG(0));
+    double d;
+    TO_NUM(d, ARG(0));
     *r = js_bool(d != d);
     return true;
 }
@@ -3384,7 +3633,8 @@ static bool g_isNaN(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
 static bool g_isFinite(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     (void)argc;
-    double d = js_to_number_value(ctx, ARG(0));
+    double d;
+    TO_NUM(d, ARG(0));
     *r = js_bool(d == d && d != __builtin_inf() && d != -__builtin_inf());
     return true;
 }
@@ -3396,7 +3646,7 @@ static bool g_String(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
         *r = e ? js_value_from_cell(&e->gc) : js_undefined();
         return e ? true : oom(ctx, r);
     }
-    JsString *s = js_to_string_cell(ctx, ARG(0), 0);
+    JsString *s = js_op_to_string(ctx, ARG(0));
     if (!s)
         return oom(ctx, r);
     *r = js_value_from_cell(&s->gc);
@@ -3405,7 +3655,10 @@ static bool g_String(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
 
 static bool g_Number(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
-    *r = js_number(argc == 0 ? 0 : js_to_number_value(ctx, ARG(0)));
+    double d = 0;
+    if (argc > 0)
+        TO_NUM(d, ARG(0));
+    *r = js_number(d);
     return true;
 }
 
@@ -3421,8 +3674,14 @@ static bool str_fromCharCode(JsContext *ctx, JsValue tv, const JsValue *args, in
     (void)tv;
     StrBuf sb;
     sb_init(&sb, ctx->vm);
-    for (int i = 0; i < argc; i++)
-        sb_unit(&sb, to_uint16(js_to_number_value(ctx, args[i])));
+    for (int i = 0; i < argc; i++) {
+        double d;
+        if (!js_op_to_number(ctx, args[i], &d)) {
+            sb_free(&sb);
+            return oom(ctx, r);
+        }
+        sb_unit(&sb, to_uint16(d));
+    }
     *r = sb_finish(&sb);
     return js_is_undefined(*r) && argc ? oom(ctx, r) : true;
 }
@@ -3432,7 +3691,11 @@ static bool str_fromCodePoint(JsContext *ctx, JsValue tv, const JsValue *args, i
     StrBuf sb;
     sb_init(&sb, ctx->vm);
     for (int i = 0; i < argc; i++) {
-        double d = js_to_number_value(ctx, args[i]);
+        double d;
+        if (!js_op_to_number(ctx, args[i], &d)) {
+            sb_free(&sb);
+            return oom(ctx, r);
+        }
         /* real RangeError, not a garbage cast, for an invalid code point —
          * String.fromCodePoint(-1) / (1e20) previously cast an out-of-range
          * double straight to uint32_t (UB) */
@@ -3478,7 +3741,9 @@ static bool install_methods(JsContext *ctx, JsObject *table, const MethodDef *de
                        int argc, JsValue *r) {                                 \
         (void)tv;                                                              \
         (void)argc;                                                           \
-        *r = js_number(kernel(js_to_number_value(ctx, ARG(0))));              \
+        double x;                                                              \
+        TO_NUM(x, ARG(0));                                                     \
+        *r = js_number(kernel(x));                                             \
         return true;                                                          \
     }
 MATH1(math_abs, m_abs)
@@ -3504,7 +3769,8 @@ MATH1(math_log10, js_k_log10)
 static bool math_round(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     (void)argc;
-    double x = js_to_number_value(ctx, ARG(0));
+    double x;
+    TO_NUM(x, ARG(0));
     double result;
     if (x != x || x == __builtin_inf() || x == -__builtin_inf()) {
         result = x;
@@ -3581,7 +3847,7 @@ static void hide_all(JsObject *o) {
  * ones a script or the host adds later are. */
 static void hide_builtin_keys(JsContext *ctx) {
     JsObject *objs[] = {ctx->globals, ctx->object_proto, ctx->array_proto, ctx->function_methods,
-                        ctx->number_methods, ctx->string_methods, ctx->promise_methods,
+                        ctx->number_methods, ctx->boolean_methods, ctx->string_methods, ctx->promise_methods,
                         ctx->regexp_proto, ctx->date_proto, ctx->map_proto, ctx->set_proto,
                         ctx->math_obj, ctx->json_obj};
     for (size_t i = 0; i < sizeof objs / sizeof objs[0]; i++)
@@ -3631,6 +3897,10 @@ bool js_builtins_init(JsContext *ctx) {
     if (!js_is_object(num))
         return false;
     ctx->number_methods = js_value_object(num);
+    JsValue boo = js_object_new(ctx);
+    if (!js_is_object(boo))
+        return false;
+    ctx->boolean_methods = js_value_object(boo);
     JsValue fnm = js_object_new(ctx);
     if (!js_is_object(fnm))
         return false;
@@ -3646,7 +3916,7 @@ bool js_builtins_init(JsContext *ctx) {
         {"trim", sm_trim}, {"trimStart", sm_trimStart}, {"trimEnd", sm_trimEnd},
         {"repeat", sm_repeat}, {"padStart", sm_padStart}, {"padEnd", sm_padEnd},
         {"replace", sm_replace}, {"replaceAll", sm_replaceAll}, {"split", sm_split},
-        {"concat", sm_concat}, {"toString", sm_toString}, {"valueOf", sm_toString},
+        {"concat", sm_concat}, {"toString", sm_toString}, {"valueOf", sm_valueOf},
 #ifdef LAMASSU_HAS_REGEX
         {"match", js_re_str_match}, {"matchAll", js_re_str_matchAll},
         {"search", js_re_str_search},
@@ -3667,11 +3937,15 @@ bool js_builtins_init(JsContext *ctx) {
         {"hasOwnProperty", objp_hasOwnProperty}, {"toString", fm_toString},
         {NULL, NULL}};
     static const MethodDef number_methods[] = {
-        {"toFixed", nm_toFixed}, {"toString", nm_toString}, {"valueOf", nm_toString},
+        {"toFixed", nm_toFixed}, {"toString", nm_toString}, {"valueOf", nm_valueOf},
+        {NULL, NULL}};
+    static const MethodDef boolean_methods[] = {
+        {"toString", bm_toString}, {"valueOf", bm_valueOf},
         {NULL, NULL}};
     if (!install_methods(ctx, ctx->string_methods, string_methods) ||
         !install_methods(ctx, ctx->array_proto, array_methods) ||
         !install_methods(ctx, ctx->number_methods, number_methods) ||
+        !install_methods(ctx, ctx->boolean_methods, boolean_methods) ||
         !install_methods(ctx, ctx->function_methods, function_methods))
         return false;
     /* call and apply have no frame of their own in a stack trace, as in V8 */
@@ -3808,8 +4082,8 @@ bool js_builtins_init(JsContext *ctx) {
         !link_prototype(ctx, "String", ctx->string_methods))
         return false;
 
-    /* Boolean: callable conversion */
-    if (!def_ctor(ctx, "Boolean", g_Boolean))
+    /* Boolean: callable conversion; Boolean.prototype the booleans' method table */
+    if (!def_ctor(ctx, "Boolean", g_Boolean) || !link_prototype(ctx, "Boolean", ctx->boolean_methods))
         return false;
 
     /* Error + TypeError/RangeError/ReferenceError/SyntaxError (js_error.c) */

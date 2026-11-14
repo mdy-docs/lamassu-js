@@ -627,7 +627,7 @@ static bool all_element_resolve(JsContext *ctx, JsValue bound, JsValue tv,
     JsObject *state = js_value_object(pair->elems[0]);
     uint32_t idx = (uint32_t)js_get_number(pair->elems[1]);
     JsObject *results = js_value_object(state_get(ctx, state, "results"));
-    int mode = (int)js_to_number_value(ctx, state_get(ctx, state, "mode"));
+    int mode = (int)js_primitive_to_number(state_get(ctx, state, "mode"));
     if (mode == ALL_MODE_SETTLED) {
         JsValue ov = js_object_new(ctx);
         if (!js_is_object(ov))
@@ -645,7 +645,7 @@ static bool all_element_resolve(JsContext *ctx, JsValue bound, JsValue tv,
     } else {
         results->elems[idx] = ARG(0);
     }
-    double rem = js_to_number_value(ctx, state_get(ctx, state, "remaining")) - 1;
+    double rem = js_primitive_to_number(state_get(ctx, state, "remaining")) - 1;
     state_set(ctx, state, "remaining", js_number(rem));
     if (rem == 0) {
         JsPromise *rp = js_value_promise(state_get(ctx, state, "promise"));
@@ -661,7 +661,7 @@ static bool all_element_reject(JsContext *ctx, JsValue bound, JsValue tv,
     JsObject *pair = js_value_object(bound);
     JsObject *state = js_value_object(pair->elems[0]);
     uint32_t idx = (uint32_t)js_get_number(pair->elems[1]);
-    int mode = (int)js_to_number_value(ctx, state_get(ctx, state, "mode"));
+    int mode = (int)js_primitive_to_number(state_get(ctx, state, "mode"));
     if (mode == ALL_MODE_SETTLED) {
         JsObject *results = js_value_object(state_get(ctx, state, "results"));
         JsValue ov = js_object_new(ctx);
@@ -677,7 +677,7 @@ static bool all_element_reject(JsContext *ctx, JsValue bound, JsValue tv,
         js_gc_unprotect(ctx->vm, &ov);
         if (!sok)
             return nthrow(ctx, r, "out of memory");
-        double rem = js_to_number_value(ctx, state_get(ctx, state, "remaining")) - 1;
+        double rem = js_primitive_to_number(state_get(ctx, state, "remaining")) - 1;
         state_set(ctx, state, "remaining", js_number(rem));
         if (rem == 0) {
             JsPromise *rp = js_value_promise(state_get(ctx, state, "promise"));
@@ -686,7 +686,7 @@ static bool all_element_reject(JsContext *ctx, JsValue bound, JsValue tv,
     } else if (mode == ALL_MODE_ANY) {
         JsObject *reasons = js_value_object(state_get(ctx, state, "results"));
         reasons->elems[idx] = ARG(0);
-        double rem = js_to_number_value(ctx, state_get(ctx, state, "remaining")) - 1;
+        double rem = js_primitive_to_number(state_get(ctx, state, "remaining")) - 1;
         state_set(ctx, state, "remaining", js_number(rem));
         if (rem == 0)
             reject_all_rejected(ctx, js_value_promise(state_get(ctx, state, "promise")), reasons);

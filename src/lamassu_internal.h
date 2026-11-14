@@ -269,6 +269,7 @@ typedef struct JsFiber JsFiber;
 /* One native call in progress, on the C stack of whoever called it: where it was called from,
  * so a stack trace can put it between the frames of the fibers around it (V8's
  * `at Array.map (<anonymous>)`). */
+#define JS_NATIVE_KEEP_MAX 8
 typedef struct JsNativeAct JsNativeAct;
 struct JsNativeAct {
     JsNativeAct *outer;
@@ -277,6 +278,10 @@ struct JsNativeAct {
     JsFiber *fiber;       /* the fiber whose top frame called it, or NULL (the host) */
     uint32_t frame_count; /* that fiber's frame count at the call */
     bool is_new;
+    /* values the native made and must keep across guest code it runs (a string converted from its
+     * receiver while an argument's valueOf runs): js_native_keep; GC roots */
+    uint8_t nkeep;
+    JsValue keep[JS_NATIVE_KEEP_MAX];
 };
 
 /*
@@ -567,6 +572,7 @@ struct JsContext {
      * X.prototype objects instead — see array_proto etc. below. */
     JsObject *string_methods;
     JsObject *number_methods;
+    JsObject *boolean_methods; /* Boolean.prototype: toString, valueOf */
     JsObject *function_methods; /* call, for every function value (closures and natives) */
     JsObject *promise_methods;
     /* Real, script-visible prototype objects — Ctor.prototype is this same
@@ -631,6 +637,13 @@ struct JsContext {
     JsNative *error_ctor;     /* `Error`, for Error.stackTraceLimit; GC root */
     bool builtins_ready;      /* natives made from here on are the host's, not builtins */
     JsObject *math_obj, *json_obj; /* Math and JSON, whose toString tags are theirs; GC roots */
+    /* What the last failed conversion threw (js_op_to_string and friends), until js_take_error
+     * hands it on; undefined otherwise. GC root. */
+    JsValue pending_error;
+    /* The arrays Array.prototype.join is joining now, outermost first: one met again is cyclic
+     * and joins as "", as in V8. On the C stack's behalf; its entries are rooted by their callers. */
+    JsObject **join_stack;
+    uint32_t join_len, join_cap;
 };
 
 struct JsVm {

@@ -256,7 +256,8 @@ the host hasn't settled yet. In that last case, protect the returned promise,
 settle the host promises it is waiting on, call `js_run_jobs()`, and observe
 the outcome with `js_promise_state` / `js_promise_result`.
 Engine-raised errors are `Error` objects — read `name` / `message` with
-`js_object_get`, or `js_to_string` for `"name: message"`; only an allocation
+`js_object_get`, or `js_to_string` for `"name: message"` (it runs the error's `toString`, which a
+script may have replaced, as `String(e)` does); only an allocation
 failure degrades the value to a bare string.
 
 ```c

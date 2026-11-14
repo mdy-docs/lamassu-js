@@ -42,6 +42,19 @@ that's known to differ, so you're not surprised by one in production.
 - **After `delete f.name` or `delete f.length`**, it reads `""` or `0` as in V8, but
   `f.hasOwnProperty(...)` still says `true`.
 
+## Conversions
+
+- **Conversions nest at most 200 deep** (the limit on nested interpreter entries, which guards
+  the C stack): `String` of an array nested more than about 200 levels, or a `toString` that
+  converts another object that does the same, throws `RangeError: Maximum call stack size
+  exceeded`. V8 goes about ten times deeper.
+- **A stack trace through an object key's `toString`** (`o[k]`, `k in o`, `delete o[k]`) shows the
+  calling frame at its previous call rather than at the access. Keeping that position exact costs
+  the hot property path about a quarter of its speed; operators and templates are exact.
+- **`regexp.lastIndex = v` converts `v` to a number when it is set**; V8 keeps the value and
+  converts it at the next match.
+- **`Object.prototype.valueOf.call(5)`** gives `5`, not a `Number` object (no wrapper objects).
+
 ## Arrays
 
 - **No holes.** Array storage is a flat vector, not a sparse structure —

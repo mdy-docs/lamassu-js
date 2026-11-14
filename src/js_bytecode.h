@@ -181,8 +181,32 @@ bool js_interp_run(JsContext *ctx, JsFunctionCell *fn, JsValue *result);
 
 /* Runtime conversions shared beyond the interpreter. */
 bool      js_to_boolean(JsValue v);
-double    js_to_number_value(JsContext *ctx, JsValue v);
-JsString *js_to_string_cell(JsContext *ctx, JsValue v, int depth); /* NULL on OOM */
+/*
+ * The spec's conversions of a value that may be an object, as V8 has them: an object, function or
+ * promise goes through ToPrimitive, which calls its own (or inherited) valueOf and toString, so guest
+ * code can run, throw, or fail to give a primitive (TypeError). Each reports failure, an exception
+ * or out of memory, by its return value and leaves the error in the context: take it with
+ * js_take_error (the out-of-memory error when nothing is pending). Anything unrooted the caller
+ * holds across one of these can be collected, and arrays it is iterating can change.
+ */
+enum { JS_HINT_DEFAULT, JS_HINT_NUMBER, JS_HINT_STRING };
+__attribute__((warn_unused_result))
+bool      js_to_primitive(JsContext *ctx, JsValue v, int hint, JsValue *out);
+JsString *js_op_to_string(JsContext *ctx, JsValue v); /* NULL: failed */
+__attribute__((warn_unused_result))
+bool      js_op_to_number(JsContext *ctx, JsValue v, double *out);
+JsValue   js_take_error(JsContext *ctx);
+/* base[key] as the language reads it (prototype chain, a primitive's methods); false: error pending */
+bool      js_get_property(JsContext *ctx, JsValue base, JsValue key, JsValue *out);
+/* In a native: roots V until the native returns (false: no room, out of memory pending), and
+ * js_op_to_string with the result kept so (a string V itself needs no keeping). */
+__attribute__((warn_unused_result))
+bool      js_native_keep(JsContext *ctx, JsValue v);
+JsString *js_native_string(JsContext *ctx, JsValue v);
+void      js_set_error(JsContext *ctx, JsValue error);
+/* Of a primitive (never runs guest code); NULL on OOM. */
+JsString *js_primitive_to_string(JsVm *vm, JsValue v);
+double    js_primitive_to_number(JsValue v);
 bool      js_strict_equals(JsValue a, JsValue b);
 JsString *js_ascii_cell(JsVm *vm, const char *s); /* <=128 chars */
 /* The pre-built out-of-memory error; use when building a message may itself

@@ -23,7 +23,6 @@ static inline bool js_date_is(JsValue v) {
 }
 
 /* "Day Mon DD YYYY HH:mm:ss GMT+0000 (UTC)"-style ToString; NULL on OOM. */
-JsString *js_date_repr(JsContext *ctx, JsObject *o);
 
 /* Installs the Date global and a real, script-visible Date.prototype
  * (getFullYear, toISOString, ...) — every instance's [[Prototype]] points

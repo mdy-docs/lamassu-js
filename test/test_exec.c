@@ -494,7 +494,9 @@ static void test_real_prototypes(void) {
     /* getPrototypeOf on values with no [[Prototype]] slot: what V8 gives, not a crash */
     expect_result("Object.getPrototypeOf(5) === Number.prototype;", "true");
     expect_result("Object.getPrototypeOf('s') === String.prototype;", "true");
-    expect_result("Object.getPrototypeOf(true);", "null");
+    expect_result("Object.getPrototypeOf(true) === Boolean.prototype;", "true");
+    /* the primitives' prototypes stand for 0, "" and false, as V8's wrapper objects do */
+    expect_result("String(Boolean.prototype) + String(Number.prototype) + '|' + String(String.prototype) + '|';", "false0||");
     expect_result("Object.getPrototypeOf(function(){}) === Object.getPrototypeOf(Math.max);", "true");
     expect_result("Object.getPrototypeOf(Object.getPrototypeOf(function(){})) === Object.prototype;", "true");
     /* user-defined `new` prototype chains are unaffected by any of this */
@@ -812,6 +814,46 @@ static void test_audit_regressions(void) {
                       &gs, &out);
     CHECK(st == RUN_OK);
     CHECK(strcmp(out, "1,9") == 0);
+    free(out);
+
+    /* ToPrimitive runs guest code inside conversions: every valueOf/toString here allocates and
+     * drops garbage, and some shrink the array being worked on, so each value a conversion site
+     * holds across another conversion must be rooted (the receiver's string while an argument
+     * converts, a separator while elements convert, a pair's value while its key converts). */
+    st = run_src_opts(
+                      "const junk = () => { let a = []; for (let i = 0; i < 20; i++) a.push({ s: 'x' + i }); return a.length; };\n"
+                      "const S = (v) => ({ toString() { junk(); return v + ''; } });\n"
+                      "const N = (v) => ({ valueOf() { junk(); return v; } });\n"
+                      "const r = [];\n"
+                      "r.push(String.prototype.indexOf.call(S('hello'), S('l'), N(1)));\n"
+                      "r.push(String.prototype.slice.call(S('abcdef'), N(1), N(3)));\n"
+                      "r.push('ab'.padEnd(N(5), S('xy')));\n"
+                      "r.push(S('a') + S('b'), N(2) * N(3), N(1) < N(2), S('k') == 'k');\n"
+                      "r.push(`${S('t')}${N(4)}`);\n"
+                      "const arr = [S('p'), S('q'), 3];\n"
+                      "arr.push({ toString() { arr.length = 1; junk(); return 'z'; } }, S('gone'));\n"
+                      "r.push(arr.join(S('-')));\n"
+                      "const sl = [1, 2, 3, 4];\n"
+                      "r.push(sl.slice(N(1), { valueOf() { sl.length = 0; junk(); return 4; } }).join());\n"
+                      "const fl = [1, 2, 3];\n"
+                      "r.push(fl.fill(0, { valueOf() { fl.length = 1; junk(); return 0; } }, N(3)).join());\n"
+                      "const o = {}; o[S('key')] = S('val'); r.push(Object.keys(o).join(), String(o.key));\n"
+                      "r.push(new Date(N(7)).getTime(), new Date(N(2020), N(1)).getMonth());\n"
+                      "r.push('abc'.hasOwnProperty(S('2')));\n"
+                      "const pair = [null, { v: 'kept' }];\n"
+                      "pair[0] = { toString() { pair.length = 0; junk(); return 'k'; } };\n"
+                      "r.push(Object.fromEntries([pair]).k.v);\n"
+                      "r.push(String(new Error(S('msg'))), RegExp.prototype.toString.call({ source: S('src'), flags: S('g') }));\n"
+                      "const re = /a/g; re.lastIndex = N(1); r.push(+re.lastIndex);\n"
+                      "r.push(Math.hypot(N(3), N(4)), String.fromCharCode(N(72), N(105)), Math.max(N(1), N(9)));\n"
+                      "r.push([S('b'), S('c'), S('a')].sort().join(''));\n"
+                      "const cyc = [S('c')]; cyc.push(cyc); r.push(String(cyc));\n"
+                      "r.push([1, [2, [3, [S('d')]]]].toString());\n"
+                      "r.push(String(true), (12).toString(N(16)));\n"
+                      "r.join('|');\n",
+                      &gs, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "2|bc|abxyx|ab|6|true|true|t[object Object]|p-q-3-z-|,,|0,0,0|key|val|7|1|true|kept|Error: msg|/src/g|1|5|Hi|9|abc|c,|1,2,3,d|true|c") == 0);
     free(out);
 
     /* A fiber is reachable from nothing between its allocation and the moment

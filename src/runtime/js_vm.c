@@ -225,6 +225,7 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->host_ud = NULL;
     ctx->string_methods = NULL;
     ctx->number_methods = NULL;
+    ctx->boolean_methods = NULL;
     ctx->function_methods = NULL;
     ctx->promise_methods = NULL;
     ctx->object_proto = NULL;
@@ -259,6 +260,9 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->math_obj = ctx->json_obj = NULL;
     ctx->error_trace_count = 0;
     ctx->error_trace_value = js_undefined();
+    ctx->pending_error = js_undefined();
+    ctx->join_stack = NULL;
+    ctx->join_len = ctx->join_cap = 0;
     ctx->reentry_depth = 0;
 
     JsValue globals = js_object_new(ctx); /* safe point; ctx->object_proto is
@@ -301,6 +305,7 @@ void js_context_free(JsContext *ctx) {
     if (!ctx)
         return;
     js_modules_free_registry(ctx); /* module cells are freed via the GC sweep */
+    js_realloc_raw(ctx->vm, ctx->join_stack, ctx->join_cap * sizeof *ctx->join_stack, 0);
     *ctx->prev_link = ctx->next;
     if (ctx->next)
         ctx->next->prev_link = ctx->prev_link;

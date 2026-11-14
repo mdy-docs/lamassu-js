@@ -31,7 +31,12 @@ static bool re_throw(JsContext *ctx, JsValue *r, const char *msg) {
     return false;
 }
 
+/* A failure's error: what a conversion threw (a toString can run guest code), else out of memory */
 static bool re_oom(JsContext *ctx, JsValue *r) {
+    if (!js_is_undefined(ctx->pending_error)) {
+        *r = js_take_error(ctx);
+        return false;
+    }
     return re_throw(ctx, r, "out of memory");
 }
 
@@ -311,9 +316,12 @@ bool js_regexp_prop_set(JsContext *ctx, JsObject *o, JsValue key, JsValue val,
                         bool *handled, const char **errmsg) {
     JsRegExp *re = (JsRegExp *)o;
     if (key_is(key, "lastIndex")) {
-        re->last_index = js_to_number_value(ctx, val);
+        /* converted as it is set (V8 keeps the value and converts it at the next match) */
         *handled = true;
-        return true;
+        if (js_op_to_number(ctx, val, &re->last_index))
+            return true;
+        *errmsg = NULL; /* not a refused write: the conversion threw (pending) */
+        return false;
     }
     if (key_is(key, "source") || key_is(key, "flags") || key_is(key, "global") ||
         key_is(key, "ignoreCase") || key_is(key, "multiline") || key_is(key, "dotAll") ||
@@ -705,7 +713,7 @@ static bool rexp_exec(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     if (!js_regexp_is(tv))
         return (*r = js_error_receiver(ctx, "RegExp", tv)), false;
     JsRegExp *re = (JsRegExp *)js_value_object(tv);
-    JsString *s = js_to_string_cell(ctx, ARG(0), 0);
+    JsString *s = js_op_to_string(ctx, ARG(0));
     if (!s)
         return re_oom(ctx, r);
     JsValue sv = js_value_from_cell(&s->gc);
@@ -730,7 +738,7 @@ static bool rexp_test(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     if (!js_regexp_is(tv))
         return (*r = js_error_receiver(ctx, "RegExp", tv)), false;
     JsRegExp *re = (JsRegExp *)js_value_object(tv);
-    JsString *s = js_to_string_cell(ctx, ARG(0), 0);
+    JsString *s = js_op_to_string(ctx, ARG(0));
     if (!s)
         return re_oom(ctx, r);
     /* Rooted across the match like every other subject here: matching now
@@ -747,10 +755,50 @@ static bool rexp_test(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     return true;
 }
 
+/* RegExp.prototype.toString on any other object (22.2.6.17), as V8: "/" + ToString(source) +
+ * "/" + ToString(flags), read from it */
+static bool regexp_generic_string(JsContext *ctx, JsValue tv, JsValue *r) {
+    JsVm *vm = ctx->vm;
+    static const uint16_t ks[] = {'s', 'o', 'u', 'r', 'c', 'e'}, kf[] = {'f', 'l', 'a', 'g', 's'};
+    JsValue parts[2] = {js_undefined(), js_undefined()};
+    js_gc_protect(vm, &parts[0]);
+    js_gc_protect(vm, &parts[1]);
+    bool ok = true;
+    for (int i = 0; i < 2 && ok; i++) {
+        JsValue key = i == 0 ? js_atom(vm, ks, 6) : js_atom(vm, kf, 5), v;
+        JsString *str = NULL;
+        ok = js_is_string(key) && js_get_property(ctx, tv, key, &v) && (str = js_op_to_string(ctx, v));
+        if (ok)
+            parts[i] = js_value_from_cell(&str->gc);
+    }
+    JsString *out = NULL;
+    if (ok) {
+        const JsString *a = js_value_string(parts[0]), *b = js_value_string(parts[1]);
+        size_t n = (size_t)a->length + b->length + 2;
+        uint16_t *buf = n <= JS_MAX_STRING_UNITS ? js_realloc_raw(vm, NULL, 0, n * sizeof(uint16_t)) : NULL;
+        if (buf) {
+            buf[0] = '/';
+            memcpy(buf + 1, a->units, a->length * sizeof(uint16_t));
+            buf[1 + a->length] = '/';
+            memcpy(buf + 2 + a->length, b->units, b->length * sizeof(uint16_t));
+            out = js_string_cell_new(vm, buf, n);
+            js_realloc_raw(vm, buf, n * sizeof(uint16_t), 0);
+        }
+    }
+    js_gc_unprotect(vm, &parts[1]);
+    js_gc_unprotect(vm, &parts[0]);
+    if (!out)
+        return re_oom(ctx, r);
+    *r = js_value_from_cell(&out->gc);
+    return true;
+}
+
 static bool rexp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                           JsValue *r) {
     (void)args;
     (void)argc;
+    if (!js_regexp_is(tv) && (js_is_object(tv) || js_is_function(tv) || js_is_promise(tv)))
+        return regexp_generic_string(ctx, tv, r);
     if (!js_regexp_is(tv))
         return (*r = js_error_receiver(ctx, "RegExp", tv)), false;
     JsString *s = js_regexp_repr(ctx, js_value_object(tv));
@@ -783,7 +831,7 @@ static bool g_RegExp(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
             fn = src->flags->length;
         }
     } else if (!js_is_undefined(pv)) {
-        JsString *ps = js_to_string_cell(ctx, pv, 0);
+        JsString *ps = js_op_to_string(ctx, pv);
         if (!ps) {
             ok = false;
         } else {
@@ -793,7 +841,7 @@ static bool g_RegExp(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
         }
     }
     if (ok && !js_is_undefined(fv)) {
-        JsString *fs = js_to_string_cell(ctx, fv, 0);
+        JsString *fs = js_op_to_string(ctx, fv);
         if (!fs) {
             ok = false;
         } else {
@@ -838,7 +886,7 @@ static bool coerce_regexp(JsContext *ctx, JsValue pv, const char *extra_flags,
     JsValue pstr = js_undefined();
     js_gc_protect(vm, &pstr);
     if (!js_is_undefined(pv)) {
-        JsString *ps = js_to_string_cell(ctx, pv, 0);
+        JsString *ps = js_op_to_string(ctx, pv);
         if (!ps) {
             js_gc_unprotect(vm, &pstr);
             return re_oom(ctx, r);
@@ -868,7 +916,7 @@ static bool coerce_regexp(JsContext *ctx, JsValue pv, const char *extra_flags,
 bool js_re_str_match(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                      JsValue *r) {
     JsVm *vm = ctx->vm;
-    JsString *s = js_to_string_cell(ctx, tv, 0);
+    JsString *s = js_op_to_string(ctx, tv);
     if (!s)
         return re_oom(ctx, r);
     JsValue sv = js_value_from_cell(&s->gc);
@@ -926,7 +974,7 @@ bool js_re_str_matchAll(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     JsVm *vm = ctx->vm;
     if (js_regexp_is(ARG(0)) && !((JsRegExp *)js_value_object(args[0]))->global)
         return re_throw(ctx, r, "TypeError: String.prototype.matchAll called with a non-global RegExp argument");
-    JsString *s = js_to_string_cell(ctx, tv, 0);
+    JsString *s = js_op_to_string(ctx, tv);
     if (!s)
         return re_oom(ctx, r);
     JsValue sv = js_value_from_cell(&s->gc);
@@ -971,7 +1019,7 @@ bool js_re_str_matchAll(JsContext *ctx, JsValue tv, const JsValue *args, int arg
 bool js_re_str_search(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                       JsValue *r) {
     JsVm *vm = ctx->vm;
-    JsString *s = js_to_string_cell(ctx, tv, 0);
+    JsString *s = js_op_to_string(ctx, tv);
     if (!s)
         return re_oom(ctx, r);
     JsValue sv = js_value_from_cell(&s->gc);
@@ -1172,7 +1220,7 @@ bool js_re_str_replace(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     JsRegExp *re = (JsRegExp *)js_value_object(args[0]); /* caller-checked */
     if (all && !re->global)
         return re_throw(ctx, r, "TypeError: String.prototype.replaceAll called with a non-global RegExp argument");
-    JsString *s = js_to_string_cell(ctx, tv, 0);
+    JsString *s = js_op_to_string(ctx, tv);
     if (!s)
         return re_oom(ctx, r);
     JsValue sv = js_value_from_cell(&s->gc);
@@ -1184,7 +1232,7 @@ bool js_re_str_replace(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     JsValue repsv = js_undefined();
     js_gc_protect(vm, &repsv);
     if (!is_fn) {
-        reps = js_to_string_cell(ctx, repfn, 0);
+        reps = js_op_to_string(ctx, repfn);
         if (!reps) {
             js_gc_unprotect(vm, &repsv);
             js_gc_unprotect(vm, &sv);
@@ -1224,7 +1272,7 @@ bool js_re_str_replace(JsContext *ctx, JsValue tv, const JsValue *args, int argc
             }
             js_gc_unprotect(vm, &argv);
             js_gc_protect(vm, &res);
-            JsString *rs = js_to_string_cell(ctx, res, 0);
+            JsString *rs = js_op_to_string(ctx, res);
             js_gc_unprotect(vm, &res);
             if (!rs) {
                 ok = false;
@@ -1266,7 +1314,7 @@ bool js_re_str_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     (void)argc;
     JsVm *vm = ctx->vm;
     JsRegExp *re = (JsRegExp *)js_value_object(args[0]); /* caller-checked */
-    JsString *s = js_to_string_cell(ctx, tv, 0);
+    JsString *s = js_op_to_string(ctx, tv);
     if (!s)
         return re_oom(ctx, r);
     JsValue sv = js_value_from_cell(&s->gc);

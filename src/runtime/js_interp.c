@@ -15,15 +15,17 @@
  * and trigger collection safely, and later phases get suspension for free.
  *
  * Semantics notes (documented approximations, revisited with builtins):
- * - ToPrimitive(object) is ToString: arrays join with ',', others are
- *   "[object Object]".
  * - % is a - trunc(a/b)*b (may differ in the last ulp for extreme ratios).
  * - ** supports integer exponents and ±0.5 exactly; other fractional
  *   exponents yield NaN (TODO transcendental pow).
  * - delete on array elements writes undefined instead of making a hole.
  */
 
-#define JS_TOSTRING_MAX_DEPTH 8
+#define JS_MAX_REENTRY 200
+
+/* A property access's outcome. JS_PROP_OOM is any failure whose error is pending in the context
+ * (js_take_error): out of memory, or a key's conversion that threw. */
+typedef enum { JS_PROP_OK, JS_PROP_OOM, JS_PROP_TYPE_ERROR } JsPropStatus;
 
 /* ---- small helpers ---- */
 
@@ -64,109 +66,168 @@ static bool is_array(JsValue v) {
     return js_is_object(v) && js_value_object(v)->obj_kind == JS_OBJ_ARRAY;
 }
 
-JsString *js_to_string_cell(JsContext *ctx, JsValue v, int depth) {
-    JsVm *vm = ctx->vm;
+/* ---- conversions (ECMA-262 7.1) ---- */
+
+static inline bool is_object_type(JsValue v);
+static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key, JsValue *out);
+bool js_native_is_object_valueof(JsValue fn); /* js_builtins.c */
+
+void js_set_error(JsContext *ctx, JsValue error) { ctx->pending_error = error; }
+
+JsValue js_take_error(JsContext *ctx) {
+    JsValue e = ctx->pending_error;
+    ctx->pending_error = js_undefined();
+    return js_is_undefined(e) ? js_oom_value(ctx->vm) : e;
+}
+
+static bool fail_oom(JsContext *ctx) {
+    ctx->pending_error = js_oom_value(ctx->vm);
+    return false;
+}
+
+static bool fail_ascii(JsContext *ctx, const char *msg) {
+    ctx->pending_error = js_error_from_ascii(ctx, msg);
+    return false;
+}
+
+JsString *js_primitive_to_string(JsVm *vm, JsValue v) {
     if (js_is_string(v))
         return js_value_string(v);
     if (js_is_number(v))
         return js_number_to_string(vm, js_get_number(v));
-    if (js_is_undefined(v))
-        return js_ascii_cell(vm, "undefined");
     if (js_is_null(v))
         return js_ascii_cell(vm, "null");
     if (v.bits == JS_SPECIAL_TRUE)
         return js_ascii_cell(vm, "true");
     if (v.bits == JS_SPECIAL_FALSE)
         return js_ascii_cell(vm, "false");
-    if (js_is_function(v))
-        return js_function_source(ctx, v);
-    if (js_is_promise(v))
-        return js_ascii_cell(vm, "[object Promise]");
-    if (js_is_object(v)) {
-        JsObject *o = js_value_object(v);
-#ifdef LAMASSU_HAS_REGEX
-        if (o->obj_kind == JS_OBJ_REGEXP)
-            return js_regexp_repr(ctx, o);
-#endif
-        if (o->obj_kind == JS_OBJ_DATE)
-            return js_date_repr(ctx, o);
-        if (o->obj_kind == JS_OBJ_MAP)
-            return js_ascii_cell(vm, "[object Map]");
-        if (o->obj_kind == JS_OBJ_SET)
-            return js_ascii_cell(vm, "[object Set]");
-        if (o->obj_kind == JS_OBJ_ERROR)
-            return js_error_repr(ctx, o, depth);
-        if (o == ctx->math_obj || o == ctx->json_obj)
-            return js_ascii_cell(vm, o == ctx->math_obj ? "[object Math]" : "[object JSON]");
-        if (o->obj_kind != JS_OBJ_ARRAY)
-            return js_ascii_cell(vm, "[object Object]");
-        if (depth >= JS_TOSTRING_MAX_DEPTH)
-            return js_string_cell_new(vm, NULL, 0);
-        /* Array.prototype.join(',') — undefined/null elements print empty. */
-        uint16_t *buf = NULL;
-        size_t cap = 0, len = 0;
-        for (uint32_t i = 0; i < o->elem_count; i++) {
-            JsString *part = NULL;
-            JsValue el = o->elems[i];
-            if (!is_nullish(el)) {
-                part = js_to_string_cell(ctx, el, depth + 1);
-                if (!part) {
-                    js_realloc_raw(vm, buf, cap * sizeof(uint16_t), 0);
-                    return NULL;
-                }
-            }
-            size_t need = len + (part ? part->length : 0) + 1;
-            if (need > JS_MAX_STRING_UNITS) {
-                js_realloc_raw(vm, buf, cap * sizeof(uint16_t), 0);
-                return NULL;
-            }
-            if (need > cap) {
-                size_t ncap = cap ? cap * 2 : 64;
-                while (ncap < need)
-                    ncap *= 2;
-                uint16_t *nb = js_realloc_raw(vm, buf, cap * sizeof(uint16_t),
-                                              ncap * sizeof(uint16_t));
-                if (!nb) {
-                    js_realloc_raw(vm, buf, cap * sizeof(uint16_t), 0);
-                    return NULL;
-                }
-                buf = nb;
-                cap = ncap;
-            }
-            if (i)
-                buf[len++] = ',';
-            if (part) {
-                memcpy(buf + len, part->units, (size_t)part->length * sizeof(uint16_t));
-                len += part->length;
-            }
-        }
-        JsString *s = js_string_cell_new(vm, buf, len);
-        js_realloc_raw(vm, buf, cap * sizeof(uint16_t), 0);
-        return s;
-    }
     return js_ascii_cell(vm, "undefined");
 }
 
-double js_to_number_value(JsContext *ctx, JsValue v) {
+double js_primitive_to_number(JsValue v) {
     if (js_is_number(v))
         return js_get_number(v);
-    if (js_is_undefined(v))
-        return __builtin_nan("");
-    if (js_is_null(v))
+    if (js_is_null(v) || v.bits == JS_SPECIAL_FALSE)
         return 0.0;
     if (v.bits == JS_SPECIAL_TRUE)
         return 1.0;
-    if (v.bits == JS_SPECIAL_FALSE)
-        return 0.0;
     if (js_is_string(v)) {
         JsString *s = js_value_string(v);
         return js_units_to_number(s->units, s->length);
     }
-    /* object -> ToPrimitive (string) -> number */
-    JsString *s = js_to_string_cell(ctx, v, 0);
+    return __builtin_nan(""); /* undefined */
+}
+
+/*
+ * ToPrimitive (7.1.1) with OrdinaryToPrimitive (7.1.1.1): valueOf then toString, or toString first
+ * for the string hint, each looked up through the prototype chain and called when it is a
+ * function; the first primitive result wins, and neither giving one is a TypeError. A Date's default
+ * hint is string (its @@toPrimitive, the only one there is without symbols). Object.prototype.valueOf
+ * gives the object back, so it is skipped without a call. The calls nest on the C stack (a builtin
+ * toString converting an element converts again), so they count against the interpreter's
+ * re-entry limit.
+ */
+bool js_to_primitive(JsContext *ctx, JsValue v, int hint, JsValue *out) {
+    if (!is_object_type(v)) {
+        *out = v;
+        return true;
+    }
+    if (hint == JS_HINT_DEFAULT && js_is_object(v) && js_value_object(v)->obj_kind == JS_OBJ_DATE)
+        hint = JS_HINT_STRING;
+    if (ctx->reentry_depth >= JS_MAX_REENTRY)
+        return fail_ascii(ctx, "RangeError: Maximum call stack size exceeded");
+    JsVm *vm = ctx->vm;
+    static const uint16_t vo[] = {'v', 'a', 'l', 'u', 'e', 'O', 'f'};
+    static const uint16_t ts[] = {'t', 'o', 'S', 't', 'r', 'i', 'n', 'g'};
+    JsValue m = js_undefined(), res = js_undefined();
+    js_gc_protect(vm, &v);
+    js_gc_protect(vm, &m);
+    js_gc_protect(vm, &res);
+    ctx->reentry_depth++;
+    bool ok = false, done = false;
+    for (int i = 0; i < 2 && !done; i++) {
+        bool want_ts = (hint == JS_HINT_STRING) == (i == 0);
+        JsValue key = want_ts ? js_atom(vm, ts, 8) : js_atom(vm, vo, 7);
+        m = js_undefined();
+        if (!js_is_string(key) || get_property(ctx, v, key, &m) != JS_PROP_OK) {
+            if (js_is_undefined(ctx->pending_error))
+                ctx->pending_error = js_oom_value(vm);
+            done = true;
+            break;
+        }
+        if (!js_is_function(m) || js_native_is_object_valueof(m))
+            continue;
+        if (!js_call(ctx, m, v, NULL, 0, &res)) {
+            ctx->pending_error = res;
+            done = true;
+            break;
+        }
+        if (!is_object_type(res)) {
+            *out = res;
+            ok = done = true;
+        }
+    }
+    ctx->reentry_depth--;
+    js_gc_unprotect(vm, &res);
+    js_gc_unprotect(vm, &m);
+    js_gc_unprotect(vm, &v);
+    if (!done)
+        return fail_ascii(ctx, "TypeError: Cannot convert object to primitive value");
+    return ok;
+}
+
+bool js_get_property(JsContext *ctx, JsValue base, JsValue key, JsValue *out) {
+    *out = js_undefined();
+    JsPropStatus st = get_property(ctx, base, key, out);
+    if (st == JS_PROP_OK)
+        return true;
+    if (st == JS_PROP_TYPE_ERROR)
+        return fail_ascii(ctx, "TypeError: Cannot convert undefined or null to object");
+    return false;
+}
+
+bool js_native_keep(JsContext *ctx, JsValue v) {
+    JsNativeAct *a = ctx->native_act;
+    if (!js_is_string(v) && !is_object_type(v))
+        return true; /* not a cell */
+    if (!a || a->nkeep == JS_NATIVE_KEEP_MAX)
+        return fail_oom(ctx); /* fails closed: a value it cannot root is never used */
+    a->keep[a->nkeep++] = v;
+    return true;
+}
+
+JsString *js_native_string(JsContext *ctx, JsValue v) {
+    JsString *s = js_op_to_string(ctx, v);
+    if (s && s != (js_is_string(v) ? js_value_string(v) : NULL) &&
+        !js_native_keep(ctx, js_value_from_cell(&s->gc)))
+        return NULL;
+    return s;
+}
+
+JsString *js_op_to_string(JsContext *ctx, JsValue v) {
+    if (js_is_string(v))
+        return js_value_string(v);
+    JsValue p;
+    if (!js_to_primitive(ctx, v, JS_HINT_STRING, &p))
+        return NULL;
+    JsString *s = js_primitive_to_string(ctx->vm, p);
     if (!s)
-        return __builtin_nan("");
-    return js_units_to_number(s->units, s->length);
+        fail_oom(ctx);
+    return s;
+}
+
+bool js_op_to_number(JsContext *ctx, JsValue v, double *out) {
+    if (js_is_number(v)) {
+        *out = js_get_number(v);
+        return true;
+    }
+    JsValue p;
+    if (!js_to_primitive(ctx, v, JS_HINT_NUMBER, &p)) {
+        *out = __builtin_nan("");
+        return false;
+    }
+    *out = js_primitive_to_number(p);
+    return true;
 }
 
 bool js_strict_equals(JsValue a, JsValue b) {
@@ -177,7 +238,8 @@ bool js_strict_equals(JsValue a, JsValue b) {
     return a.bits == b.bits;
 }
 
-static bool loose_eq_values(JsContext *ctx, JsValue a, JsValue b) {
+/* IsLooselyEqual (7.2.14). 1 or 0, or -1 when converting an object failed (error pending). */
+__attribute__((noinline)) static int loose_eq_values(JsContext *ctx, JsValue a, JsValue b) {
     for (int guard = 0; guard < 4; guard++) {
         if (is_nullish(a) || is_nullish(b))
             return is_nullish(a) && is_nullish(b);
@@ -187,6 +249,9 @@ static bool loose_eq_values(JsContext *ctx, JsValue a, JsValue b) {
             return js_get_number(a) == js_get_number(b);
         if (as && bs)
             return js_string_equals(a, b);
+        bool acell = is_object_type(a), bcell = is_object_type(b);
+        if (acell && bcell)
+            return a.bits == b.bits;
         if (js_is_bool(a)) {
             a = js_number(js_get_bool(a) ? 1 : 0);
             continue;
@@ -196,34 +261,42 @@ static bool loose_eq_values(JsContext *ctx, JsValue a, JsValue b) {
             continue;
         }
         if (an && bs)
-            return js_get_number(a) == js_to_number_value(ctx, b);
+            return js_get_number(a) == js_primitive_to_number(b);
         if (as && bn)
-            return js_to_number_value(ctx, a) == js_get_number(b);
-        bool acell = js_is_object(a) || js_is_function(a) || js_is_promise(a);
-        bool bcell = js_is_object(b) || js_is_function(b) || js_is_promise(b);
-        if (acell && bcell)
-            return a.bits == b.bits;
-        if (acell && (bn || bs)) {
-            JsString *s = js_to_string_cell(ctx, a, 0);
-            if (!s)
-                return false;
-            a = js_value_from_cell(&s->gc);
+            return js_primitive_to_number(a) == js_get_number(b);
+        /* an object against a number or string: its primitive, default hint (a and b are the
+         * caller's rooted operands; the primitive replaces one of them) */
+        if (acell) {
+            if (!js_to_primitive(ctx, a, JS_HINT_DEFAULT, &a))
+                return -1;
             continue;
         }
-        if (bcell && (an || as)) {
-            JsString *s = js_to_string_cell(ctx, b, 0);
-            if (!s)
-                return false;
-            b = js_value_from_cell(&s->gc);
+        if (bcell) {
+            if (!js_to_primitive(ctx, b, JS_HINT_DEFAULT, &b))
+                return -1;
             continue;
         }
-        return false;
+        return 0;
     }
-    return false;
+    return 0;
 }
 
-/* -1: a<b, 0: equal, 1: a>b, 2: unordered (NaN) */
-static int js_compare_values(JsContext *ctx, JsValue a, JsValue b) {
+/* IsLessThan (7.2.13) after both operands' ToPrimitive (number hint), left first.
+ * -1: a<b, 0: equal, 1: a>b, 2: unordered (NaN), 3: a conversion failed (error pending).
+ * The caller roots a and b; a primitive made from an object is rooted here while b converts. */
+__attribute__((noinline)) static int js_compare_values(JsContext *ctx, JsValue a, JsValue b) {
+    if (is_object_type(a) || is_object_type(b)) {
+        JsValue pa = a, pb = b;
+        if (!js_to_primitive(ctx, a, JS_HINT_NUMBER, &pa))
+            return 3;
+        js_gc_protect(ctx->vm, &pa);
+        bool ok = js_to_primitive(ctx, b, JS_HINT_NUMBER, &pb);
+        js_gc_unprotect(ctx->vm, &pa);
+        if (!ok)
+            return 3;
+        a = pa;
+        b = pb;
+    }
     if (js_is_string(a) && js_is_string(b)) {
         JsString *x = js_value_string(a), *y = js_value_string(b);
         uint32_t n = x->length < y->length ? x->length : y->length;
@@ -233,8 +306,8 @@ static int js_compare_values(JsContext *ctx, JsValue a, JsValue b) {
         }
         return x->length == y->length ? 0 : (x->length < y->length ? -1 : 1);
     }
-    double da = js_to_number_value(ctx, a);
-    double db = js_to_number_value(ctx, b);
+    double da = js_primitive_to_number(a);
+    double db = js_primitive_to_number(b);
     if (da != da || db != db)
         return 2;
     if (da < db)
@@ -330,7 +403,7 @@ static JsString *to_prop_key(JsContext *ctx, JsValue key) {
     if (js_is_string(key))
         s = js_value_string(key);
     else {
-        s = js_to_string_cell(ctx, key, 0);
+        s = js_op_to_string(ctx, key); /* ToPropertyKey: an object's toString may run */
         if (!s)
             return NULL;
     }
@@ -461,7 +534,6 @@ bool js_native_is_construct_call(JsContext *ctx) {
     return ctx && ctx->native_act && ctx->native_act->is_new;
 }
 
-typedef enum { JS_PROP_OK, JS_PROP_OOM, JS_PROP_TYPE_ERROR } JsPropStatus;
 
 /* Builtin method lookup on the hidden per-type tables. */
 static JsPropStatus method_lookup(JsContext *ctx, JsObject *table, JsValue key,
@@ -476,6 +548,19 @@ static JsPropStatus method_lookup(JsContext *ctx, JsObject *table, JsValue key,
     if (found)
         *out = v;
     return JS_PROP_OK;
+}
+
+/* A primitive's (or function's, or promise's) method: its table, which is the constructor's
+ * prototype, then Object.prototype, the table's own [[Prototype]] as in V8 (`(1).hasOwnProperty`,
+ * `f.valueOf`). The tables are fixed objects, so the chain is just these two. */
+static JsPropStatus proto_table_lookup(JsContext *ctx, JsObject *table, JsValue key, JsValue *out) {
+    JsValue v = js_undefined();
+    JsPropStatus st = method_lookup(ctx, table, key, &v);
+    if (st == JS_PROP_OK && js_is_undefined(v) && table)
+        st = method_lookup(ctx, ctx->object_proto, key, &v);
+    if (st == JS_PROP_OK && !js_is_undefined(v))
+        *out = v;
+    return st;
 }
 
 /* The own-property object of a function value (closure or native): what a script wrote onto it.
@@ -566,6 +651,16 @@ static bool is_length_key(JsValue key) {
 /* `delete fn[key]`, out of the dispatch loop: 0 done, 1 refused (*err the TypeError), 2 OOM.
  * name and length are configurable: deleting one leaves Function.prototype's, "" or 0. */
 JS_COLD static int delete_function_prop(JsContext *ctx, JsValue fn, JsValue key, JsValue *err) {
+    if (is_object_type(key)) { /* ToPropertyKey: its toString may run (fn and key are rooted) */
+        JsString *ks = js_op_to_string(ctx, key);
+        if (!ks)
+            return 2;
+        JsValue kv = js_value_from_cell(&ks->gc);
+        js_gc_protect(ctx->vm, &kv);
+        int r = delete_function_prop(ctx, fn, kv, err);
+        js_gc_unprotect(ctx->vm, &kv);
+        return r;
+    }
     JsObject *own = js_function_props(ctx, fn, false);
     bool special = is_name_key(key) || is_length_key(key);
     if ((own && own->obj_flags) || (has_own_prototype(js_value_cell(fn)) && is_prototype_key(key))) {
@@ -629,12 +724,66 @@ __attribute__((noinline)) static bool special_prop_get(JsContext *ctx, JsObject 
 __attribute__((noinline)) static JsPropStatus parent_ctor_lookup(JsContext *ctx, JsNative *p, JsValue key,
                                                                JsValue *out);
 
+/*
+ * ToPropertyKey (7.1.19) of a key that is an object, for an access on a base that has properties:
+ * its toString runs (hint string) and the access goes on with the string. Only after the base is
+ * known not to be null or undefined, as in V8 (`null[k]` is a TypeError before k converts), and on
+ * every access (`o[k] += 1` converts it twice, as V8). Out of line: the property paths are hot. The
+ * base and key are the caller's, rooted.
+ */
+static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key, JsValue *out);
+static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key, JsValue val,
+                                 const char **errmsg);
+static JsPropStatus has_property(JsContext *ctx, JsValue base, JsValue key, bool *out);
+
+__attribute__((noinline)) static bool object_key(JsContext *ctx, JsValue key, JsValue *skey) {
+    JsString *s = js_op_to_string(ctx, key);
+    if (!s)
+        return false;
+    *skey = js_value_from_cell(&s->gc);
+    js_gc_protect(ctx->vm, skey);
+    return true;
+}
+
+__attribute__((noinline)) static JsPropStatus get_property_object_key(JsContext *ctx, JsValue base,
+                                                                      JsValue key, JsValue *out) {
+    JsValue sk;
+    if (!object_key(ctx, key, &sk))
+        return JS_PROP_OOM;
+    JsPropStatus st = get_property(ctx, base, sk, out);
+    js_gc_unprotect(ctx->vm, &sk);
+    return st;
+}
+
+__attribute__((noinline)) static JsPropStatus set_property_object_key(JsContext *ctx, JsValue base,
+                                                                      JsValue key, JsValue val,
+                                                                      const char **errmsg) {
+    JsValue sk;
+    if (!object_key(ctx, key, &sk))
+        return JS_PROP_OOM;
+    JsPropStatus st = set_property(ctx, base, sk, val, errmsg);
+    js_gc_unprotect(ctx->vm, &sk);
+    return st;
+}
+
+__attribute__((noinline)) static JsPropStatus has_property_object_key(JsContext *ctx, JsValue base,
+                                                                      JsValue key, bool *out) {
+    JsValue sk;
+    if (!object_key(ctx, key, &sk))
+        return JS_PROP_OOM;
+    JsPropStatus st = has_property(ctx, base, sk, out);
+    js_gc_unprotect(ctx->vm, &sk);
+    return st;
+}
+
 static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
                                  JsValue *out) {
     JsVm *vm = ctx->vm;
     *out = js_undefined();
     if (is_nullish(base))
         return JS_PROP_TYPE_ERROR;
+    if (JS_UNLIKELY(is_object_type(key)))
+        return get_property_object_key(ctx, base, key, out);
 
     if (js_is_string(base)) {
         JsString *s = js_value_string(base);
@@ -652,7 +801,7 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
             *out = js_number(s->length);
             return JS_PROP_OK;
         }
-        return method_lookup(ctx, ctx->string_methods, key, out);
+        return proto_table_lookup(ctx, ctx->string_methods, key, out);
     }
     if (js_is_object(base)) {
         JsObject *o = js_value_object(base);
@@ -703,9 +852,9 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
         return JS_PROP_OK;
     }
     if (js_is_number(base))
-        return method_lookup(ctx, ctx->number_methods, key, out);
+        return proto_table_lookup(ctx, ctx->number_methods, key, out);
     if (js_is_promise(base))
-        return method_lookup(ctx, ctx->promise_methods, key, out);
+        return proto_table_lookup(ctx, ctx->promise_methods, key, out);
     if (js_is_function(base)) {
         JsGcCell *c = js_value_cell(base);
         if (has_own_prototype(c) && is_prototype_key(key))
@@ -738,9 +887,10 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
         if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->parent)
             return parent_ctor_lookup(ctx, ((JsNative *)c)->parent, key, out);
         /* Function.prototype methods (call), shared by closures and natives */
-        return method_lookup(ctx, ctx->function_methods, key, out);
+        return proto_table_lookup(ctx, ctx->function_methods, key, out);
     }
-    /* booleans: no properties */
+    if (js_is_bool(base))
+        return proto_table_lookup(ctx, ctx->boolean_methods, key, out);
     return JS_PROP_OK;
 }
 
@@ -817,6 +967,8 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
         *errmsg = SET_NULLISH;
         return JS_PROP_TYPE_ERROR;
     }
+    if (JS_UNLIKELY(is_object_type(key)))
+        return set_property_object_key(ctx, base, key, val, errmsg);
     if (js_is_function(base)) {
         JsGcCell *c = js_value_cell(base);
         if (has_own_prototype(c) && is_prototype_key(key)) {
@@ -872,7 +1024,7 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
     if (o->obj_kind == JS_OBJ_REGEXP) {
         bool handled = false;
         if (!js_regexp_prop_set(ctx, o, key, val, &handled, errmsg))
-            return JS_PROP_TYPE_ERROR;
+            return *errmsg ? JS_PROP_TYPE_ERROR : JS_PROP_OOM;
         if (handled)
             return JS_PROP_OK;
     }
@@ -888,7 +1040,12 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
             /* very sparse: fall through to the props map */
         } else if (js_is_string(key) &&
                    units_is_ascii_str(js_value_string(key), "length")) {
-            double d = js_to_number_value(ctx, val);
+            /* ArraySetLength (10.4.2.4) converts twice, ToUint32 and ToNumber, as V8 does: a
+             * valueOf runs twice. val is the caller's rooted operand. */
+            double d, d2;
+            if (!js_op_to_number(ctx, val, &d) || !js_op_to_number(ctx, val, &d2))
+                return JS_PROP_OOM;
+            (void)d2;
             /* bounds-check before the cast: (uint32_t)d is UB for d outside
              * [0, UINT32_MAX], e.g. arr.length = -1 or arr.length = 1e20 */
             if (!(d >= 0 && d < 4294967296.0)) {
@@ -924,6 +1081,8 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
 static JsPropStatus has_property(JsContext *ctx, JsValue base, JsValue key,
                                  bool *out) {
     *out = false;
+    if (JS_UNLIKELY(is_object_type(key)) && is_object_type(base))
+        return has_property_object_key(ctx, base, key, out);
     if (js_is_function(base)) {
         /* `k in fn`: what reading fn[k] would find (own properties, builtin statics, methods) */
         if (has_own_prototype(js_value_cell(base)) && is_prototype_key(key)) {
@@ -1065,6 +1224,84 @@ JsString *js_concat_cells(JsVm *vm, const JsString *a, const JsString *b) {
     return s;
 }
 
+/* ---- the slow paths of operators, out of line (see RT_THROW_PENDING on why the loop must not
+ * grow): operands that are not all numbers, where ToPrimitive can run guest code. Each
+ * works on the fiber's top slots, rooted there, first records IP (just past the opcode) as the
+ * frame's position, since guest valueOf/toString may run and its stack trace reads it, and
+ * returns false with the error pending (RT_THROW_PENDING). ---- */
+
+static inline void slow_path_at(JsFiber *fb, uint32_t ip) { fb->frames[fb->frame_count - 1].ip = ip; }
+
+/* `+` (13.15.3): each operand's ToPrimitive (default hint, left first), then concatenation when
+ * either is a string, else addition. The result replaces both operands. */
+__attribute__((noinline)) static bool add_slow(JsContext *ctx, JsFiber *fb, uint32_t ip) {
+    slow_path_at(fb, ip);
+    JsVm *vm = ctx->vm;
+    uint32_t ia = fb->sp - 2, ib = fb->sp - 1;
+    JsValue p;
+    if (is_object_type(fb->stack[ia])) {
+        if (!js_to_primitive(ctx, fb->stack[ia], JS_HINT_DEFAULT, &p))
+            return false;
+        fb->stack[ia] = p;
+    }
+    if (is_object_type(fb->stack[ib])) {
+        if (!js_to_primitive(ctx, fb->stack[ib], JS_HINT_DEFAULT, &p))
+            return false;
+        fb->stack[ib] = p;
+    }
+    JsValue a = fb->stack[ia], b = fb->stack[ib];
+    if (js_is_string(a) || js_is_string(b)) {
+        JsString *sa = js_primitive_to_string(vm, a);
+        if (!sa)
+            return fail_oom(ctx);
+        fb->stack[ia] = js_value_from_cell(&sa->gc);
+        JsString *sb = js_primitive_to_string(vm, b);
+        if (!sb)
+            return fail_oom(ctx);
+        fb->stack[ib] = js_value_from_cell(&sb->gc);
+        JsString *r = js_concat_cells(vm, sa, sb);
+        if (!r)
+            return fail_ascii(ctx, "RangeError: Invalid string length");
+        fb->sp--;
+        fb->stack[fb->sp - 1] = js_value_from_cell(&r->gc);
+        return true;
+    }
+    double x = js_primitive_to_number(a) + js_primitive_to_number(b);
+    fb->sp--;
+    fb->stack[fb->sp - 1] = js_number(x);
+    return true;
+}
+
+/* ToNumber of the top two operands, left first. */
+JS_COLD static bool number_operands(JsContext *ctx, JsFiber *fb, uint32_t ip,
+                                                      double *a, double *b) {
+    slow_path_at(fb, ip);
+    return js_op_to_number(ctx, fb->stack[fb->sp - 2], a) &&
+           js_op_to_number(ctx, fb->stack[fb->sp - 1], b);
+}
+
+/* ToNumber of the top operand. */
+JS_COLD static bool number_operand(JsContext *ctx, JsFiber *fb, uint32_t ip,
+                                                     double *d) {
+    slow_path_at(fb, ip);
+    return js_op_to_number(ctx, fb->stack[fb->sp - 1], d);
+}
+
+/* == on the top two operands: 1 or 0, or -1 with the error pending */
+JS_COLD static int eq_slow(JsContext *ctx, JsFiber *fb, uint32_t ip) {
+    slow_path_at(fb, ip);
+    return loose_eq_values(ctx, fb->stack[fb->sp - 2], fb->stack[fb->sp - 1]);
+}
+
+/* < and friends on the top two operands: js_compare_values's answer, 3 with the error pending */
+JS_COLD static int compare_slow(JsContext *ctx, JsFiber *fb, uint32_t ip) {
+    slow_path_at(fb, ip);
+    return js_compare_values(ctx, fb->stack[fb->sp - 2], fb->stack[fb->sp - 1]);
+}
+
+
+
+
 /* ---- the dispatch loop ---- */
 
 static uint32_t lookup_pos(const JsFunctionCell *fn, uint32_t ip) {
@@ -1112,8 +1349,14 @@ __attribute__((noinline)) static bool call_native(JsContext *ctx, JsFiber *fiber
                                                   bool is_new, JsValue *res) {
     JsNative *outer_native = ctx->running_native;
     ctx->running_native = nf;
-    JsNativeAct act = {ctx->native_act, nf, is_new ? js_undefined() : this_val, fiber,
-                       fiber ? fiber->frame_count : 0, is_new};
+    JsNativeAct act;
+    act.outer = ctx->native_act;
+    act.nf = nf;
+    act.this_val = is_new ? js_undefined() : this_val;
+    act.fiber = fiber;
+    act.frame_count = fiber ? fiber->frame_count : 0;
+    act.is_new = is_new;
+    act.nkeep = 0;
     ctx->native_act = &act;
     bool ok = nf->is_bound ? nf->bound_fn(ctx, nf->bound, this_val, args, argc, res)
                            : nf->fn(ctx, this_val, args, argc, res);
@@ -1166,6 +1409,16 @@ __attribute__((noinline)) static void record_raise(JsContext *ctx, JsFiber *fb) 
 
 /* `delete o[key]` on an object neither sealed nor frozen. False on OOM. */
 __attribute__((noinline)) static bool delete_object_prop(JsContext *ctx, JsObject *o, JsValue key) {
+    if (is_object_type(key)) { /* ToPropertyKey: its toString may run (o and key are rooted) */
+        JsString *ks = js_op_to_string(ctx, key);
+        if (!ks)
+            return false;
+        JsValue kv = js_value_from_cell(&ks->gc);
+        js_gc_protect(ctx->vm, &kv);
+        bool r = delete_object_prop(ctx, o, kv);
+        js_gc_unprotect(ctx->vm, &kv);
+        return r;
+    }
     uint32_t idx;
     if (o->obj_kind == JS_OBJ_ARRAY && value_to_index(key, &idx)) {
         if (idx < o->elem_count)
@@ -1213,7 +1466,7 @@ __attribute__((noinline)) static int instance_of(JsContext *ctx, JsValue v, JsVa
     JsPropStatus st = js_is_string(key) ? get_property(ctx, c, key, &proto) : JS_PROP_OOM;
     js_gc_unprotect(ctx->vm, &c);
     if (st == JS_PROP_OOM) {
-        *err = js_oom_value(ctx->vm);
+        *err = js_take_error(ctx);
         return -1;
     }
     if (!js_is_object(proto)) {
@@ -1339,8 +1592,15 @@ JsValue js_oom_value(JsVm *vm) {
 
 /* Engine-raised errors are Error objects (js_error.h); the "Name: " prefix of
  * the message selects the subclass. Falls back to the bare string on OOM. */
+/* RT_THROW. Its "out of memory" sites follow the calls that fail on out of memory, and those calls
+ * also fail when a conversion inside them threw (an object key's toString, a template's ${x}):
+ * that error is pending, and it is the one raised. Keeping that decision here, rather than a
+ * separate raise in each opcode, leaves the dispatch loop's code as it was: see run_fiber. */
 static void fiber_throw(JsContext *ctx, JsFiber *fb, const char *ascii_msg) {
-    fb->error = js_error_from_ascii(ctx, ascii_msg);
+    if (!js_is_undefined(ctx->pending_error) && strcmp(ascii_msg, "out of memory") == 0)
+        fb->error = js_take_error(ctx);
+    else
+        fb->error = js_error_from_ascii(ctx, ascii_msg);
     fb->failed = true;
 }
 
@@ -1495,7 +1755,6 @@ static void fiber_throw_read(JsContext *ctx, JsFiber *fb, const JsFunctionCell *
  * fresh fiber, so the per-fiber JS_MAX_FRAMES limit cannot see the depth. This
  * caps the real C-stack recursion; kept well under JS_MAX_FRAMES since each
  * level here also nests a full native + interpreter C frame. */
-#define JS_MAX_REENTRY 200
 
 static JsClosure *closure_new(JsVm *vm, JsFunctionCell *fn) {
     size_t sz = sizeof(JsClosure) + (size_t)fn->n_upvals * sizeof(JsUpvalue *);
@@ -1819,6 +2078,19 @@ run:; /* (re)load the top frame */
         goto on_error;                                                          \
     } while (0)
 
+/* Raise what a conversion left pending (js_take_error), from an opcode without operands (ip is then
+ * op_ip + 1): the shared exit after the loop.
+ *
+ * The loop's speed hangs on which of its hot values (fb, ip, code, ...) the register allocator
+ * keeps in the five callee-saved registers across its calls, a whole-function decision that small
+ * edits anywhere in it can flip: adding ToPrimitive first cost the benchmarks 25-55%, with the hot
+ * handlers' code unchanged, because the loop head then reloaded fb, ip and four more values from
+ * the stack at every instruction. So conversions add almost nothing here: the operators' slow
+ * paths are calls (add_slow, number_operands, ...), object keys convert inside the property
+ * functions, and the property opcodes' existing "out of memory" raises take a pending conversion
+ * error (fiber_throw). Measure against the previous build after any change to this loop. */
+#define RT_THROW_PENDING() goto throw_pending
+
         for (;;) {
             /* Fuel and interrupt are one check because both mean "stop now".
              * Fuel re-arms to 1 and the interrupt flag stays set, so each is
@@ -2046,43 +2318,19 @@ run:; /* (re)load the top frame */
                     PEEK(0) = js_number(js_get_number(a) + js_get_number(b));
                     break;
                 }
-                if (js_is_object(a) || js_is_function(a) || js_is_promise(a)) {
-                    JsString *s = js_to_string_cell(ctx, a, 0);
-                    if (!s)
-                        RT_THROW("out of memory");
-                    PEEK(1) = a = js_value_from_cell(&s->gc);
-                }
-                if (js_is_object(b) || js_is_function(b) || js_is_promise(b)) {
-                    JsString *s = js_to_string_cell(ctx, b, 0);
-                    if (!s)
-                        RT_THROW("out of memory");
-                    PEEK(0) = b = js_value_from_cell(&s->gc);
-                }
-                if (js_is_string(a) || js_is_string(b)) {
-                    JsString *sa = js_to_string_cell(ctx, a, 0);
-                    if (!sa)
-                        RT_THROW("out of memory");
-                    PEEK(1) = js_value_from_cell(&sa->gc);
-                    JsString *sb = js_to_string_cell(ctx, b, 0);
-                    if (!sb)
-                        RT_THROW("out of memory");
-                    PEEK(0) = js_value_from_cell(&sb->gc);
-                    JsString *r = js_concat_cells(vm, sa, sb);
-                    if (!r)
-                        RT_THROW("RangeError: Invalid string length");
-                    fb->sp--;
-                    PEEK(0) = js_value_from_cell(&r->gc);
-                    break;
-                }
-                double x = js_to_number_value(ctx, a), y = js_to_number_value(ctx, b);
-                fb->sp--;
-                PEEK(0) = js_number(x + y);
+                if (!add_slow(ctx, fb, ip))
+                    RT_THROW_PENDING();
                 break;
             }
             case JS_OP_SUB: case JS_OP_MUL: case JS_OP_DIV:
             case JS_OP_MOD: case JS_OP_POW: {
-                double a = js_to_number_value(ctx, PEEK(1));
-                double b = js_to_number_value(ctx, PEEK(0));
+                double a, b;
+                if (js_is_number(PEEK(1)) && js_is_number(PEEK(0))) {
+                    a = js_get_number(PEEK(1));
+                    b = js_get_number(PEEK(0));
+                } else if (!number_operands(ctx, fb, ip, &a, &b)) {
+                    RT_THROW_PENDING();
+                }
                 double r;
                 switch (op) {
                 case JS_OP_SUB: r = a - b; break;
@@ -2095,22 +2343,28 @@ run:; /* (re)load the top frame */
                 PEEK(0) = js_number(r);
                 break;
             }
-            case JS_OP_NEG:
-                PEEK(0) = js_number(-js_to_number_value(ctx, PEEK(0)));
+            case JS_OP_NEG: case JS_OP_POS: case JS_OP_BITNOT: {
+                double d;
+                if (js_is_number(PEEK(0))) {
+                    d = js_get_number(PEEK(0));
+                } else if (!number_operand(ctx, fb, ip, &d)) {
+                    RT_THROW_PENDING();
+                }
+                PEEK(0) = js_number(op == JS_OP_NEG ? -d : op == JS_OP_POS ? d : ~js_to_int32(d));
                 break;
-            case JS_OP_POS:
-                PEEK(0) = js_number(js_to_number_value(ctx, PEEK(0)));
-                break;
+            }
             case JS_OP_NOT:
                 PEEK(0) = js_bool(!js_to_boolean(PEEK(0)));
                 break;
-            case JS_OP_BITNOT:
-                PEEK(0) = js_number(~js_to_int32(js_to_number_value(ctx, PEEK(0))));
-                break;
             case JS_OP_BITAND: case JS_OP_BITOR: case JS_OP_BITXOR:
             case JS_OP_SHL: case JS_OP_SHR: case JS_OP_USHR: {
-                double da = js_to_number_value(ctx, PEEK(1));
-                double db = js_to_number_value(ctx, PEEK(0));
+                double da, db;
+                if (js_is_number(PEEK(1)) && js_is_number(PEEK(0))) {
+                    da = js_get_number(PEEK(1));
+                    db = js_get_number(PEEK(0));
+                } else if (!number_operands(ctx, fb, ip, &da, &db)) {
+                    RT_THROW_PENDING();
+                }
                 fb->sp--;
                 double r;
                 switch (op) {
@@ -2127,7 +2381,12 @@ run:; /* (re)load the top frame */
                 break;
             }
             case JS_OP_EQ: case JS_OP_NEQ: {
-                bool eq = loose_eq_values(ctx, PEEK(1), PEEK(0));
+                int eq;
+                if (js_is_number(PEEK(1)) && js_is_number(PEEK(0))) {
+                    eq = js_get_number(PEEK(1)) == js_get_number(PEEK(0));
+                } else if ((eq = eq_slow(ctx, fb, ip)) < 0) {
+                    RT_THROW_PENDING();
+                }
                 fb->sp--;
                 PEEK(0) = js_bool(op == JS_OP_EQ ? eq : !eq);
                 break;
@@ -2139,7 +2398,13 @@ run:; /* (re)load the top frame */
                 break;
             }
             case JS_OP_LT: case JS_OP_GT: case JS_OP_LE: case JS_OP_GE: {
-                int c = js_compare_values(ctx, PEEK(1), PEEK(0));
+                int c;
+                if (js_is_number(PEEK(1)) && js_is_number(PEEK(0))) {
+                    double x = js_get_number(PEEK(1)), y = js_get_number(PEEK(0));
+                    c = x != x || y != y ? 2 : x < y ? -1 : x == y ? 0 : 1;
+                } else if ((c = compare_slow(ctx, fb, ip)) == 3) {
+                    RT_THROW_PENDING();
+                }
                 fb->sp--;
                 bool r;
                 switch (op) {
@@ -2192,7 +2457,8 @@ run:; /* (re)load the top frame */
                 break;
             }
             case JS_OP_TO_STRING: {
-                JsString *s = js_to_string_cell(ctx, PEEK(0), 0);
+                fr->ip = ip; /* a template's ${x}: its toString may run, and read the frame */
+                JsString *s = js_op_to_string(ctx, PEEK(0));
                 if (!s)
                     RT_THROW("out of memory");
                 PEEK(0) = js_value_from_cell(&s->gc);
@@ -2869,9 +3135,11 @@ run:; /* (re)load the top frame */
                  * value is a fresh closure with no name of its own */
                 JsValue f = PEEK(0);
                 if (js_is_function(f) && js_value_cell(f)->kind == JS_KIND_CLOSURE) {
-                    JsString *nm = js_to_string_cell(ctx, PEEK(1), 0);
+                    /* a computed key converts here, once: DEFINE_PROP then finds the string */
+                    JsString *nm = js_op_to_string(ctx, PEEK(1));
                     if (!nm)
                         RT_THROW("out of memory");
+                    PEEK(1) = js_value_from_cell(&nm->gc);
                     ((JsClosure *)js_value_cell(PEEK(0)))->name = nm;
                 }
                 break;
@@ -2940,6 +3208,12 @@ run:; /* (re)load the top frame */
                 RT_THROW("internal error: bad opcode");
             }
         }
+    throw_pending: /* RT_THROW_PENDING: only from an opcode without operands */
+        fb->error = js_take_error(ctx);
+        fb->failed = true;
+        fb->err_pos = lookup_pos(fn, ip - 1);
+        fb->frames[fb->frame_count - 1].ip = ip;
+        goto on_error;
     }
 
 on_error:
@@ -3088,8 +3362,7 @@ static JsRunStatus advance_fiber(JsContext *ctx, JsFiber *fb, JsValue *out) {
      * calling back into JS) cannot exhaust the C stack — the per-fiber frame
      * limit can't see across the fresh fibers each re-entry spawns. */
     if (ctx->reentry_depth >= JS_MAX_REENTRY) {
-        JsString *s = js_ascii_cell(ctx->vm, "RangeError: Maximum call stack size exceeded");
-        fb->error = s ? js_value_from_cell(&s->gc) : js_undefined();
+        fb->error = js_error_from_ascii(ctx, "RangeError: Maximum call stack size exceeded");
         fb->failed = true;
         *out = fb->error;
         st = JS_RUN_ERROR;
@@ -3347,7 +3620,9 @@ JsValue js_run_module(JsContext *ctx, JsValue fnv) {
 }
 
 JsValue js_to_string(JsContext *ctx, JsValue v) {
-    JsString *s = js_to_string_cell(ctx, v, 0);
+    JsString *s = js_op_to_string(ctx, v);
+    if (!s)
+        ctx->pending_error = js_undefined(); /* the host asked for display: drop what it threw */
     return s ? js_value_from_cell(&s->gc) : js_undefined();
 }
 
@@ -3364,6 +3639,7 @@ static bool lengths_owner(JsContext *ctx, const char *owner, JsValue *out) {
     static const struct { const char *name; size_t off; } tables[] = {
         {"String.prototype", offsetof(JsContext, string_methods)},
         {"Number.prototype", offsetof(JsContext, number_methods)},
+        {"Boolean.prototype", offsetof(JsContext, boolean_methods)},
         {"Function.prototype", offsetof(JsContext, function_methods)},
         {"Promise.prototype", offsetof(JsContext, promise_methods)},
         {"Object.prototype", offsetof(JsContext, object_proto)},

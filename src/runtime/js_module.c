@@ -484,7 +484,7 @@ static bool graph_on_fetched(JsContext *ctx, JsValue bound, JsValue tv,
             return true;
         }
     }
-    double rem = js_to_number_value(ctx, mstate_get(ctx, state, "remaining")) - 1;
+    double rem = js_primitive_to_number(mstate_get(ctx, state, "remaining")) - 1;
     mstate_set(ctx, state, "remaining", js_number(rem));
     if (rem == 0) {
         JsValue rootspec = mstate_get(ctx, state, "root");
@@ -543,7 +543,7 @@ static bool graph_enqueue(JsContext *ctx, JsValue statev, JsModule *referrer,
             if (!js_map_set(ctx->vm, &seen->props, spec, js_number(1))) {
                 ok = false;
             } else {
-                double rem = js_to_number_value(ctx, mstate_get(ctx, state, "remaining"));
+                double rem = js_primitive_to_number(mstate_get(ctx, state, "remaining"));
                 mstate_set(ctx, state, "remaining", js_number(rem + 1));
                 JsValue fp = fetch_module_async(ctx, referrer, spec);
                 ok = js_is_promise(fp) && then_bound(ctx, fp, graph_on_fetched, graph_on_failed, statev);
@@ -826,7 +826,7 @@ static bool eval_on_dep_done(JsContext *ctx, JsValue bound, JsValue tv,
     (void)argc;
     *r = js_undefined();
     JsObject *state = js_value_object(bound);
-    double i = js_to_number_value(ctx, mstate_get(ctx, state, "index"));
+    double i = js_primitive_to_number(mstate_get(ctx, state, "index"));
     mstate_set(ctx, state, "index", js_number(i + 1));
     eval_step(ctx, bound);
     return true;
@@ -868,7 +868,7 @@ static bool eval_step(JsContext *ctx, JsValue statev) {
     JsModule *m = value_module(mstate_get(ctx, state, "module"));
     if (!m)
         return false; /* a state whose module could not be recorded: OOM */
-    uint32_t i = (uint32_t)js_to_number_value(ctx, mstate_get(ctx, state, "index"));
+    uint32_t i = (uint32_t)js_primitive_to_number(mstate_get(ctx, state, "index"));
     for (; i < m->dep_count; i++) {
         JsModule *dep = m->deps[i];
         if (!dep)
@@ -1124,10 +1124,15 @@ JsValue js_module_dynamic_import(JsContext *ctx, JsModule *referrer, JsValue spe
 
     /* ToString + intern the specifier */
     js_gc_protect(vm, &specv);
-    JsString *ss = js_to_string_cell(ctx, specv, 0);
+    JsString *ss = js_op_to_string(ctx, specv); /* its toString may run, and throw */
     js_gc_unprotect(vm, &specv);
+    if (!ss) {
+        js_promise_reject(ctx, js_value_promise(donev), js_take_error(ctx));
+        js_gc_unprotect(vm, &donev);
+        return donev;
+    }
     JsString *spec = NULL;
-    if (ss) {
+    {
         JsValue ssv = js_value_from_cell(&ss->gc);
         js_gc_protect(vm, &ssv);
         spec = js_intern_cell(vm, ss);

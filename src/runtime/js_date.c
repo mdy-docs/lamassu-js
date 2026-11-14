@@ -21,6 +21,24 @@ static bool nthrow(JsContext *ctx, JsValue *r, const char *msg) {
     return false;
 }
 
+/* ToNumber of V into D, or the native returns what it threw (a valueOf can run guest code) */
+#define TO_NUM(d, v)                                                            \
+    do {                                                                        \
+        if (!js_op_to_number(ctx, (v), &(d)))                                   \
+            return (*r = js_take_error(ctx)), false;                            \
+    } while (0)
+
+/* Up to 7 date fields from args, each ToNumber in order; absent ones take DEFAULTS */
+static bool date_fields(JsContext *ctx, const JsValue *args, int argc, const double defaults[7],
+                        double f[7], JsValue *r) {
+    for (int i = 0; i < 7; i++) {
+        f[i] = defaults[i];
+        if (i < argc)
+            TO_NUM(f[i], args[i]);
+    }
+    return true;
+}
+
 static double dnan(void) { return __builtin_nan(""); }
 static bool is_finite_num(double d) {
     return d == d && d != __builtin_inf() && d != -__builtin_inf();
@@ -304,22 +322,25 @@ static bool g_Date(JsContext *ctx, JsValue tv, const JsValue *args, int argc, Js
         JsValue a = ARG(0);
         if (js_date_is(a)) {
             time = ((JsDateObject *)js_value_object(a))->time;
-        } else if (js_is_string(a)) {
-            size_t slen;
-            const uint16_t *su = js_string_units(a, &slen);
-            time = parse_iso(su, slen);
         } else {
-            time = time_clip(js_to_number_value(ctx, a));
+            /* ToPrimitive (default hint): a string parses, anything else is a time value */
+            JsValue p;
+            if (!js_to_primitive(ctx, a, JS_HINT_DEFAULT, &p))
+                return (*r = js_take_error(ctx)), false;
+            if (js_is_string(p)) {
+                size_t slen;
+                const uint16_t *su = js_string_units(p, &slen);
+                time = parse_iso(su, slen);
+            } else {
+                time = time_clip(js_primitive_to_number(p));
+            }
         }
     } else {
-        double year = js_to_number_value(ctx, ARG(0));
-        double month = js_to_number_value(ctx, ARG(1));
-        double day = argc > 2 ? js_to_number_value(ctx, ARG(2)) : 1;
-        double hours = argc > 3 ? js_to_number_value(ctx, ARG(3)) : 0;
-        double minutes = argc > 4 ? js_to_number_value(ctx, ARG(4)) : 0;
-        double seconds = argc > 5 ? js_to_number_value(ctx, ARG(5)) : 0;
-        double msec = argc > 6 ? js_to_number_value(ctx, ARG(6)) : 0;
-        time = make_date(year, month, day, hours, minutes, seconds, msec, true);
+        static const double defaults[7] = {0, 0, 1, 0, 0, 0, 0};
+        double f[7];
+        if (!date_fields(ctx, args, argc, defaults, f, r))
+            return false;
+        time = make_date(f[0], f[1], f[2], f[3], f[4], f[5], f[6], true);
     }
     JsValue dv;
     if (!alloc_date(ctx, time, &dv))
@@ -336,22 +357,19 @@ static bool date_now(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
 
 static bool date_UTC(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
-    double year = argc > 0 ? js_to_number_value(ctx, ARG(0)) : dnan();
-    double month = argc > 1 ? js_to_number_value(ctx, ARG(1)) : 0;
-    double day = argc > 2 ? js_to_number_value(ctx, ARG(2)) : 1;
-    double hours = argc > 3 ? js_to_number_value(ctx, ARG(3)) : 0;
-    double minutes = argc > 4 ? js_to_number_value(ctx, ARG(4)) : 0;
-    double seconds = argc > 5 ? js_to_number_value(ctx, ARG(5)) : 0;
-    double msec = argc > 6 ? js_to_number_value(ctx, ARG(6)) : 0;
-    *r = js_number(make_date(year, month, day, hours, minutes, seconds, msec, true));
+    const double defaults[7] = {dnan(), 0, 1, 0, 0, 0, 0};
+    double f[7];
+    if (!date_fields(ctx, args, argc, defaults, f, r))
+        return false;
+    *r = js_number(make_date(f[0], f[1], f[2], f[3], f[4], f[5], f[6], true));
     return true;
 }
 
 static bool date_parse(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
-    JsString *s = js_to_string_cell(ctx, ARG(0), 0);
+    JsString *s = js_op_to_string(ctx, ARG(0));
     if (!s)
-        return nthrow(ctx, r, "out of memory");
+        return (*r = js_take_error(ctx)), false;
     *r = js_number(parse_iso(s->units, s->length));
     return true;
 }
@@ -375,7 +393,9 @@ static bool date_setTime(JsContext *ctx, JsValue tv, const JsValue *args, int ar
     JsDateObject *d;
     if (!this_date(ctx, tv, &d, r))
         return false;
-    d->time = time_clip(js_to_number_value(ctx, ARG(0)));
+    double t;
+    TO_NUM(t, ARG(0));
+    d->time = time_clip(t);
     *r = js_number(d->time);
     return true;
 }
@@ -445,7 +465,7 @@ static bool set_field(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     if (n < 1)
         n = 1;
     for (int k = 0; k < n; k++)
-        f[start + k] = js_to_number_value(ctx, ARG(k));
+        TO_NUM(f[start + k], ARG(k));
     d->time = make_date(f[0], f[1], f[2], f[3], f[4], f[5], f[6], false);
     *r = js_number(d->time);
     return true;
@@ -670,23 +690,6 @@ static bool date_toJSON(JsContext *ctx, JsValue tv, const JsValue *args, int arg
         return true;
     }
     return date_toISOString(ctx, tv, args, argc, r);
-}
-
-/* used by js_to_string_cell for implicit ToString (`'' + date`, template
- * literals, String(date)) — this engine's coercion doesn't do a general
- * user-property toString/valueOf lookup, so built-in object kinds that need
- * a real string form (Date, RegExp) are special-cased there directly. */
-JsString *js_date_repr(JsContext *ctx, JsObject *o) {
-    JsDateObject *d = (JsDateObject *)o;
-    if (d->time != d->time)
-        return js_ascii_cell(ctx->vm, "Invalid Date");
-    DateParts p;
-    decompose(d->time, &p);
-    uint16_t buf[64];
-    size_t n = fmt_date_part(buf, &p);
-    buf[n++] = ' ';
-    n += fmt_time_part(buf + n, &p);
-    return js_string_cell_new(ctx->vm, buf, n);
 }
 
 /* ---- registration ---- */

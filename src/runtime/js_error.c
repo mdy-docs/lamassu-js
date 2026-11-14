@@ -6,7 +6,6 @@
 #include "js_bytecode.h"
 
 #define ARG(i) ((i) < argc ? args[i] : js_undefined())
-#define REPR_MAX_DEPTH 8
 
 static const char *const kind_names[JS_ERROR_KIND_COUNT] = {
     "Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError",
@@ -286,7 +285,7 @@ JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
         } else if (js_is_promise(v)) {
             fb_ascii(b, "#<Promise>", 10);
         } else {
-            JsString *s = js_to_string_cell(ctx, v, 0); /* a primitive: no guest code runs */
+            JsString *s = js_primitive_to_string(vm, v);
             if (s)
                 fb_piece(b, s->units, s->length);
             else
@@ -361,10 +360,11 @@ JsValue js_error_from_ascii(JsContext *ctx, const char *msg) {
     return s ? js_error_from_cell(ctx, s) : js_oom_value(ctx->vm);
 }
 
-JsString *js_error_repr(JsContext *ctx, JsObject *o, int depth) {
+/* Error.prototype.toString's "name: message" (20.5.3.4): each read from O and converted with
+ * ToString, which can run their own toString (and nest, through an error as a name, up to the
+ * re-entry limit, as V8's stack overflow). NULL: failed, the error pending (js_take_error). */
+JsString *js_error_repr(JsContext *ctx, JsObject *o) {
     JsVm *vm = ctx->vm;
-    if (depth >= REPR_MAX_DEPTH)
-        return js_string_cell_new(vm, NULL, 0);
     JsValue ov = js_value_from_cell(&o->gc);
     js_gc_protect(vm, &ov);
     JsString *out = NULL;
@@ -373,7 +373,7 @@ JsString *js_error_repr(JsContext *ctx, JsObject *o, int depth) {
     if (!chain_get(ctx, o, "name", &nv, &found))
         goto done;
     JsString *name = js_is_undefined(nv) ? js_ascii_cell(vm, "Error")
-                                         : js_to_string_cell(ctx, nv, depth + 1);
+                                         : js_op_to_string(ctx, nv);
     if (!name)
         goto done;
     nsv = js_value_from_cell(&name->gc);
@@ -383,7 +383,7 @@ JsString *js_error_repr(JsContext *ctx, JsObject *o, int depth) {
         goto done;
     }
     JsString *msg = js_is_undefined(mv) ? js_string_cell_new(vm, NULL, 0)
-                                        : js_to_string_cell(ctx, mv, depth + 1);
+                                        : js_op_to_string(ctx, mv);
     js_gc_unprotect(vm, &nsv);
     if (!msg)
         goto done;
@@ -723,7 +723,7 @@ static void frame_text(JsContext *ctx, FmtBuf *b, const JsErrorFrame *fr) {
 /* "Name: message" and a line per frame, as V8's default Error.prepareStackTrace gives it. O and
  * its frames are rooted by the caller. NULL on OOM. */
 static JsString *stack_text(JsContext *ctx, JsObject *o, const JsErrorFrame *frames, uint32_t n) {
-    JsString *head = js_error_repr(ctx, o, 0);
+    JsString *head = js_error_repr(ctx, o);
     if (!head)
         return NULL;
     JsValue hv = js_value_from_cell(&head->gc);
@@ -876,9 +876,9 @@ static bool error_ctor(JsContext *ctx, JsErrorKind kind, const JsValue *args, in
     JsValue mv = ARG(0);
     JsString *msg = NULL;
     if (!js_is_undefined(mv)) {
-        msg = js_to_string_cell(ctx, mv, 0);
+        msg = js_native_string(ctx, mv); /* its toString may run; kept while the error is made */
         if (!msg)
-            return nthrow(ctx, r, "out of memory");
+            return (*r = js_take_error(ctx)), false;
     }
     /* the frames below the constructor's own, as V8 leaves it out */
     JsValue self = ctx->running_native ? js_value_from_cell(&ctx->running_native->gc) : js_undefined();
@@ -938,9 +938,9 @@ static bool errp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int a
     (void)argc;
     if (!js_is_object(tv))
         return (*r = js_error_receiver(ctx, "Error", tv)), false;
-    JsString *s = js_error_repr(ctx, js_value_object(tv), 0);
+    JsString *s = js_error_repr(ctx, js_value_object(tv));
     if (!s)
-        return nthrow(ctx, r, "out of memory");
+        return (*r = js_take_error(ctx)), false;
     *r = js_value_from_cell(&s->gc);
     return true;
 }

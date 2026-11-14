@@ -523,7 +523,8 @@ bool    js_context_evict_module(JsContext *ctx, const uint16_t *specifier, size_
 JsValue js_module_get_export(JsContext *ctx, JsValue ns, const uint16_t *name,
                              size_t name_len);
 
-/* ToString for host display; undefined on OOM. */
+/* String(v), as a script's: an object's own or inherited toString/valueOf run (guest code, on this
+ * context). Undefined if one throws or memory runs out; what it threw is dropped. */
 JsValue js_to_string(JsContext *ctx, JsValue v);
 
 /* ---- bytecode loading (phase 8) ---- */

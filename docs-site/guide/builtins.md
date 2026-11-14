@@ -13,6 +13,28 @@ either way; see the [C embedding API](/api/c-embedding) note on native
 constructors.
 :::
 
+## Converting objects to primitives
+
+An object, function or promise used where a primitive is needed is converted as V8 converts it
+(ToPrimitive): its own or inherited `valueOf` and `toString` are called, `valueOf` first, or
+`toString` first where a string is wanted, and the first to return a primitive wins. Neither
+giving one is `TypeError: Cannot convert object to primitive value`, and what either throws
+propagates. That covers every conversion: `+` and the other operators, comparisons, `==`,
+templates, `String(x)` and `Number(x)`, a computed key (`o[k]`, `k in o`, `delete o[k]`, `{ [k]: v }`),
+and every builtin argument that is converted (`'abc'.slice(x)`, `Math.max(x)`, `new Date(x)`,
+`arr.join(sep)`, `new Error(message)`, …).
+
+- The hint is V8's: string for `String(x)`, templates and keys; number for arithmetic and `<`;
+  the default (as number) for `+` and `==`, except a `Date`, which takes the string hint there.
+- A computed key converts on each use (`o[k] += 1` converts `k` twice, as V8), after the
+  right-hand side, and not at all when the base is `null` or `undefined` (the TypeError comes
+  first).
+- `Array.prototype.join` (so `String(array)`) skips an array it is already joining further out:
+  a cyclic array joins its cycle as `""`.
+- Conversions nest on the C stack (an element's `toString` converting another array), so they share
+  the limit on nested interpreter entries: past 200 levels they throw `RangeError: Maximum call
+  stack size exceeded`, where V8 goes about ten times deeper.
+
 ## `Object`
 
 `Object()` / `new Object()`: no argument (or `undefined`/`null`) creates a
@@ -52,7 +74,7 @@ attributes; see [Deviations](/guide/deviations).
 **`Object.prototype`**: `hasOwnProperty`, `toString` (`"[object Object]"`, and V8's tag for
 anything else: `Object.prototype.toString.call([])` is `"[object Array]"`, an error's
 `"[object Error]"`, `null`'s `"[object Null]"`),
-`valueOf` (returns the object itself). This is the root of *every*
+`valueOf` (returns the object itself; a `TypeError` on `null`/`undefined`). This is the root of *every*
 `[[Prototype]]` chain in the engine — a plain object literal's own
 `[[Prototype]]` is `Object.prototype`, and `Array.prototype`/
 `Date.prototype`/`Map.prototype`/`Set.prototype`/`RegExp.prototype`, every
@@ -73,7 +95,8 @@ array of that length; anything else behaves like `Array.of`.
 - **`Array.prototype`**: `push`, `pop`, `shift`, `unshift`, `at`,
   `indexOf`, `lastIndexOf`, `includes`, `slice`, `join`, `reverse`, `fill`,
   `concat`, `map`, `filter`, `forEach`, `some`, `every`, `find`,
-  `findIndex`, `reduce`, `sort`, `flat`, `toString`.
+  `findIndex`, `reduce`, `sort`, `flat`, `toString` (generic, as V8's: `this.join()` when `join`
+  is a function, else `Object.prototype.toString`).
 
 Array elements are a flat `JsValue` vector (no holes/sparse storage), so
 `arr.length = n` or `Array(n)` for a very large `n` throws
@@ -107,7 +130,11 @@ boxed `String` object — this engine has no boxed-primitive type at all).
 - **Constants**: `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`,
   `MIN_VALUE`, `EPSILON`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`, `NaN`.
 - **`Number.prototype`**: `toFixed`, `toString`, `valueOf` (the same object `(5).constructor`
-  and `Object.getPrototypeOf(5)` lead to; likewise `String.prototype`).
+  and `Object.getPrototypeOf(5)` lead to; likewise `String.prototype`). Their receiver must be a
+  number (`Number.prototype.toString requires that 'this' be a Number`), as `String.prototype`'s
+  `toString`/`valueOf` need a string; the prototypes themselves stand for `0` and `""`, as V8's
+  wrapper objects do. These tables, and functions' and promises', go on to `Object.prototype`
+  (`(1).hasOwnProperty`, `f.valueOf`).
 
 `toString()`/number-to-string prints what V8 prints: the shortest digits that
 read back as the same double, and of those the nearest to its value (ties to
@@ -185,9 +212,10 @@ unlisted); deleting it and making it again gives an ordinary one.
 
 ## `Boolean`
 
-`Boolean(x)` converts to a primitive boolean. No instance methods table
-(booleans have no prototype-method chain in this engine, unlike strings and
-numbers).
+`Boolean(x)` converts to a primitive boolean.
+
+- **`Boolean.prototype`**: `toString`, `valueOf` (receiver a boolean, or the prototype itself,
+  which stands for `false`); `Object.getPrototypeOf(true)` is it.
 
 ## `Math`
 
