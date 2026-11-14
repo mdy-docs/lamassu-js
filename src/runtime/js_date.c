@@ -746,7 +746,7 @@ bool js_date_builtins_init(JsContext *ctx) {
     if (!js_is_function(ctor))
         return false;
     js_gc_protect(ctx->vm, &ctor); /* keep rooted through statics + global set */
-    ((JsNative *)js_value_cell(ctor))->prototype = ctx->date_proto;
+    js_native_builtin_ctor(ctor, ctx->date_proto);
     JsValue staticsv = js_object_new(ctx);
     bool ok = js_is_object(staticsv);
     JsObject *statics = ok ? js_value_object(staticsv) : NULL;

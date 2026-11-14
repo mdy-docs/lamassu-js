@@ -304,6 +304,16 @@ bool js_bind_call(JsContext *ctx, JsValue bound, JsValue this_val, const JsValue
                   JsValue *r);
 /* Defines an own property by ASCII key; false on OOM. */
 bool js_object_set_ascii(JsContext *ctx, JsObject *obj, const char *key, JsValue v);
+/* Makes the native CTOR a builtin constructor (JS_CTOR_FACTORY) whose read-only `prototype` is
+ * PROTO; NULL: one made when first read. No allocation. */
+void js_native_builtin_ctor(JsValue ctor, JsObject *proto);
+/* Whether `new` may call V (V8's IsConstructor): a script function other than an arrow, a method
+ * or an async function, a builtin or host constructor, or a function from bind() of one */
+bool js_is_constructor(JsValue v);
+/* Whether FN has `prototype` as its own property: a constructor, other than one from bind() */
+bool js_function_has_own_prototype(JsValue fn);
+/* js_object_set_ascii, the property not enumerable (JS_ATTR_HIDDEN), as V8 makes a built-in one */
+bool js_object_set_hidden(JsContext *ctx, JsObject *obj, const char *key, JsValue v);
 
 /* js_mathkernel.c — freestanding transcendentals (~1e-12 accuracy). */
 double js_k_exp(double x);

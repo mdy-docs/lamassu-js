@@ -346,40 +346,119 @@ static JsString *single_unit_string(JsVm *vm, uint16_t u) {
  * bytecode. */
 #define JS_PROTO_CHAIN_LIMIT 1000
 
-/* Lazily creates cl's `.prototype` object (the constructor-function pattern
- * `new` relies on). NULL on OOM. */
-static JsObject *closure_prototype(JsContext *ctx, JsClosure *cl) {
-    if (cl->prototype_obj)
-        return cl->prototype_obj;
-    JsValue pv = js_object_new(ctx);
-    if (!js_is_object(pv))
-        return NULL;
-    cl->prototype_obj = js_value_object(pv); /* reachable via cl from here */
-    if (!js_object_set_ascii(ctx, cl->prototype_obj, "constructor",
-                             js_value_from_cell(&cl->gc))) {
-        cl->prototype_obj = NULL;
-        return NULL;
-    }
-    return cl->prototype_obj;
+/* Whether V is an object to the language (typeof "object" or "function", not null): functions and
+ * promises are their own kinds of cell here */
+static inline bool is_object_type(JsValue v) {
+    return js_is_object(v) || js_is_function(v) || js_is_promise(v);
 }
 
-/* Same lazy-create-on-first-access shape as closure_prototype, for natives
- * that don't already have one set up eagerly (js_mapobj_builtins_init and
- * friends set RegExp/Date/Map/Set's up front, since instance allocation
- * needs it before any script could have touched `.prototype` — this path
- * only fires for some other native someone registered by hand). */
-static JsObject *native_prototype(JsContext *ctx, JsNative *nf) {
-    if (nf->prototype)
-        return nf->prototype;
-    JsValue pv = js_object_new(ctx);
-    if (!js_is_object(pv))
-        return NULL;
-    nf->prototype = js_value_object(pv);
-    if (!js_object_set_ascii(ctx, nf->prototype, "constructor", js_value_from_cell(&nf->gc))) {
-        nf->prototype = NULL;
-        return NULL;
+/* ---- a function's `prototype` ----
+ *
+ * As in V8: a constructor has `prototype` as its own property (not enumerable, not deletable,
+ * writable with any value, read-only on a builtin constructor or a frozen function), made the
+ * first time it is read or `new` needs it. A function that is no constructor (an arrow, a method,
+ * an async function, a builtin function, a function from bind()) has none, and `prototype` is an
+ * ordinary property of it, which a script may add. */
+
+/* The target of a function from bind() (unwrapped to the innermost), else V itself */
+static JsValue bind_target(JsValue v) {
+    while (js_is_function(v) && js_value_cell(v)->kind == JS_KIND_NATIVE &&
+           ((JsNative *)js_value_cell(v))->is_bound &&
+           ((JsNative *)js_value_cell(v))->bound_fn == js_bind_call)
+        v = js_value_object(((JsNative *)js_value_cell(v))->bound)->elems[0];
+    return v;
+}
+
+/* Whether C has its own `prototype`: a constructor, other than one from bind() */
+static bool has_own_prototype(const JsGcCell *c) {
+    if (c->kind == JS_KIND_CLOSURE)
+        return !(((const JsClosure *)c)->fn->fn_flags & (JS_FN_ARROW | JS_FN_ASYNC | JS_FN_METHOD));
+    if (c->kind == JS_KIND_NATIVE)
+        return ((const JsNative *)c)->ctor != JS_CTOR_NONE;
+    return false;
+}
+
+bool js_function_has_own_prototype(JsValue fn) {
+    return js_is_function(fn) && has_own_prototype(js_value_cell(fn));
+}
+
+bool js_is_constructor(JsValue v) {
+    v = bind_target(v);
+    return js_is_function(v) && has_own_prototype(js_value_cell(v));
+}
+
+/* C's `prototype` (has_own_prototype(C)), made on first use: an object whose `constructor`, not
+ * enumerable, is C. C must be rooted. False on OOM. */
+static bool function_prototype(JsContext *ctx, JsGcCell *c, JsValue *out) {
+    JsValue *slot = c->kind == JS_KIND_CLOSURE ? &((JsClosure *)c)->prototype
+                                               : &((JsNative *)c)->prototype;
+    bool *made = c->kind == JS_KIND_CLOSURE ? &((JsClosure *)c)->proto_made
+                                            : &((JsNative *)c)->proto_made;
+    if (!*made) {
+        JsValue pv = js_object_new(ctx);
+        if (!js_is_object(pv))
+            return false;
+        *slot = pv; /* reachable through C from here */
+        *made = true;
+        if (!js_object_set_hidden(ctx, js_value_object(pv), "constructor", js_value_from_cell(c))) {
+            *slot = js_undefined();
+            *made = false;
+            return false;
+        }
     }
-    return nf->prototype;
+    *out = *slot;
+    return true;
+}
+
+/* The [[Prototype]] `new C` gives the object it makes: C.prototype when that is an object, else
+ * Object.prototype (V8's, for `F.prototype = 5`). C must be rooted. NULL on OOM. */
+static JsObject *construct_proto(JsContext *ctx, JsGcCell *c) {
+    JsValue p;
+    if (!function_prototype(ctx, c, &p))
+        return NULL;
+    return js_is_object(p) ? js_value_object(p) : ctx->object_proto;
+}
+
+/* Whether a script may not assign C's own `prototype`: a builtin constructor's, or a frozen
+ * function's */
+static bool prototype_read_only(JsContext *ctx, JsValue fn) {
+    JsGcCell *c = js_value_cell(fn);
+    if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->ctor == JS_CTOR_FACTORY)
+        return true;
+    JsObject *own = js_function_props(ctx, fn, false);
+    return own && (own->obj_flags & JS_OBJ_FROZEN);
+}
+
+static bool is_prototype_key(JsValue key) {
+    return js_is_string(key) && units_is_ascii_str(js_value_string(key), "prototype");
+}
+
+void js_native_builtin_ctor(JsValue ctor, JsObject *proto) {
+    JsNative *nf = (JsNative *)js_value_cell(ctor);
+    nf->ctor = JS_CTOR_FACTORY;
+    if (proto) {
+        nf->prototype = js_value_from_cell(&proto->gc);
+        nf->proto_made = true;
+    }
+}
+
+bool js_native_set_constructor(JsContext *ctx, JsValue fn, bool constructor) {
+    (void)ctx;
+    if (!js_is_function(fn) || js_value_cell(fn)->kind != JS_KIND_NATIVE)
+        return false;
+    JsNative *nf = (JsNative *)js_value_cell(fn);
+    if (nf->builtin || nf->is_bound)
+        return false;
+    nf->ctor = constructor ? JS_CTOR_ORDINARY : JS_CTOR_NONE;
+    if (!constructor) {
+        nf->prototype = js_undefined();
+        nf->proto_made = false;
+    }
+    return true;
+}
+
+bool js_native_is_construct_call(JsContext *ctx) {
+    return ctx && ctx->native_act && ctx->native_act->is_new;
 }
 
 typedef enum { JS_PROP_OK, JS_PROP_OOM, JS_PROP_TYPE_ERROR } JsPropStatus;
@@ -489,7 +568,8 @@ static bool is_length_key(JsValue key) {
 JS_COLD static int delete_function_prop(JsContext *ctx, JsValue fn, JsValue key, JsValue *err) {
     JsObject *own = js_function_props(ctx, fn, false);
     bool special = is_name_key(key) || is_length_key(key);
-    if (own && own->obj_flags) {
+    if ((own && own->obj_flags) || (has_own_prototype(js_value_cell(fn)) && is_prototype_key(key))) {
+        /* `prototype` is not configurable */
         *err = js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of %v", key, fn);
         return 1;
     }
@@ -628,18 +708,8 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
         return method_lookup(ctx, ctx->promise_methods, key, out);
     if (js_is_function(base)) {
         JsGcCell *c = js_value_cell(base);
-        bool is_proto_key = js_is_string(key) && units_is_ascii_str(js_value_string(key), "prototype");
-        if (is_proto_key) {
-            JsObject *proto = c->kind == JS_KIND_CLOSURE
-                ? closure_prototype(ctx, (JsClosure *)c)
-                : c->kind == JS_KIND_NATIVE ? native_prototype(ctx, (JsNative *)c) : NULL;
-            if (proto) {
-                *out = js_value_from_cell(&proto->gc);
-                return JS_PROP_OK;
-            }
-            if (c->kind == JS_KIND_CLOSURE || c->kind == JS_KIND_NATIVE)
-                return JS_PROP_OOM;
-        }
+        if (has_own_prototype(c) && is_prototype_key(key))
+            return function_prototype(ctx, c, out) ? JS_PROP_OK : JS_PROP_OOM;
         if (is_name_key(key)) {
             JsString *nm = js_function_name(base);
             if (!nm) {
@@ -749,15 +819,17 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
     }
     if (js_is_function(base)) {
         JsGcCell *c = js_value_cell(base);
-        if ((c->kind == JS_KIND_CLOSURE || c->kind == JS_KIND_NATIVE) && js_is_string(key) &&
-            units_is_ascii_str(js_value_string(key), "prototype")) {
-            /* assigning a non-object leaves the auto-created prototype in
-             * place, matching real JS's "F.prototype must be an Object". */
-            if (js_is_object(val)) {
-                if (c->kind == JS_KIND_CLOSURE)
-                    ((JsClosure *)c)->prototype_obj = js_value_object(val);
-                else
-                    ((JsNative *)c)->prototype = js_value_object(val);
+        if (has_own_prototype(c) && is_prototype_key(key)) {
+            if (prototype_read_only(ctx, base)) {
+                *errmsg = SET_READ_ONLY;
+                return JS_PROP_TYPE_ERROR;
+            }
+            if (c->kind == JS_KIND_CLOSURE) {
+                ((JsClosure *)c)->prototype = val;
+                ((JsClosure *)c)->proto_made = true;
+            } else {
+                ((JsNative *)c)->prototype = val;
+                ((JsNative *)c)->proto_made = true;
             }
             return JS_PROP_OK;
         }
@@ -854,7 +926,7 @@ static JsPropStatus has_property(JsContext *ctx, JsValue base, JsValue key,
     *out = false;
     if (js_is_function(base)) {
         /* `k in fn`: what reading fn[k] would find (own properties, builtin statics, methods) */
-        if (js_is_string(key) && units_is_ascii_str(js_value_string(key), "prototype")) {
+        if (has_own_prototype(js_value_cell(base)) && is_prototype_key(key)) {
             *out = true;
             return JS_PROP_OK;
         }
@@ -957,7 +1029,7 @@ bool js_spread_into_object(JsContext *ctx, JsObject *dst, JsValue src, JsString 
     js_map_sort_keys(&o->props);
     for (uint32_t i = 0; i < o->props.capacity; i++) {
         JsMapEntry *e = &o->props.entries[i];
-        if (e->key && e->key != JS_MAP_TOMBSTONE && !js_prop_hidden(o, e->key)) {
+        if (e->key && e->key != JS_MAP_TOMBSTONE && !js_prop_hidden_at(o, i)) {
             if (e->value.bits == JS_SPECIAL_TDZ) { /* a namespace's uninitialized export */
                 *uninit = e->key;
                 return false;
@@ -1050,6 +1122,39 @@ __attribute__((noinline)) static bool call_native(JsContext *ctx, JsFiber *fiber
     return ok;
 }
 
+/* The object `new C` makes for `this`: an ordinary object whose [[Prototype]] is construct_proto's.
+ * C must be rooted. Undefined on OOM. */
+__attribute__((noinline)) static JsValue construct_this(JsContext *ctx, JsGcCell *c) {
+    JsObject *proto = construct_proto(ctx, c);
+    if (!proto)
+        return js_undefined();
+    JsValue instv = js_object_new(ctx);
+    if (js_is_object(instv))
+        js_value_object(instv)->proto = js_value_from_cell(&proto->gc);
+    return instv;
+}
+
+/* `new` on a native constructor; its arguments at stack[nb...], the slot for `this` at nb - 1. A
+ * builtin one (Array, Map, Error, ...) makes its own object: String/Number/Boolean return their
+ * primitive, as there are no wrapper objects. A host's is called with `this` made as a script
+ * function's is, and gives it unless the native returns an object. */
+__attribute__((noinline)) static bool construct_native(JsContext *ctx, JsFiber *fb, JsNative *nf,
+                                                       uint32_t nb, uint32_t argc, JsValue *res) {
+    if (nf->ctor == JS_CTOR_ORDINARY) {
+        JsValue thisv = construct_this(ctx, &nf->gc); /* nf is the callee, on the stack */
+        if (!js_is_object(thisv)) {
+            *res = js_oom_value(ctx->vm);
+            return false;
+        }
+        fb->stack[nb - 1] = thisv;
+    }
+    if (!call_native(ctx, fb, nf, fb->stack[nb - 1], &fb->stack[nb], (int)argc, true, res))
+        return false;
+    if (nf->ctor == JS_CTOR_ORDINARY && !is_object_type(*res))
+        *res = fb->stack[nb - 1];
+    return true;
+}
+
 /* A raise, before any frame is popped: where it was raised (js_context_error_stack), and the
  * frames of an error the interpreter made for it, now that the instruction's position is
  * recorded. Out of line, to keep the interpreter loop small. */
@@ -1072,8 +1177,7 @@ __attribute__((noinline)) static bool delete_object_prop(JsContext *ctx, JsObjec
     JsString *k = to_prop_key(ctx, key);
     if (!k)
         return false;
-    if (js_map_delete(&o->props, k) && o->obj_kind == JS_OBJ_ERROR) /* made again, it enumerates */
-        ((JsErrorObject *)o)->hidden &= (uint8_t)~js_error_hide_bit(k);
+    js_map_delete(&o->props, k); /* made again, a hidden key enumerates */
     return true;
 }
 
@@ -1402,7 +1506,8 @@ static JsClosure *closure_new(JsVm *vm, JsFunctionCell *fn) {
     cl->fn = fn;
     cl->this_val = js_undefined();
     cl->has_this = false;
-    cl->prototype_obj = NULL;
+    cl->prototype = js_undefined();
+    cl->proto_made = false;
     cl->props = NULL;
     cl->name = NULL;
     cl->length_deleted = false;
@@ -1466,11 +1571,13 @@ JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *ud)
     nf->name = js_is_string(nmv) ? js_value_string(nmv) : NULL;
     nf->statics = NULL;
     nf->props = NULL;
-    nf->prototype = NULL;
+    nf->prototype = js_undefined();
+    nf->proto_made = false;
     nf->bound = js_undefined();
     nf->is_bound = false;
     nf->name_deleted = false;
     nf->builtin = !ctx->builtins_ready;
+    nf->ctor = nf->builtin ? JS_CTOR_NONE : JS_CTOR_ORDINARY;
     nf->length = 0;
     nf->parent = NULL;
     return js_value_from_cell(c);
@@ -1491,25 +1598,37 @@ JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound) {
     nf->name = NULL;
     nf->statics = NULL;
     nf->props = NULL;
-    nf->prototype = NULL;
+    nf->prototype = js_undefined();
+    nf->proto_made = false;
     nf->bound = bound;
     nf->is_bound = true;
     nf->name_deleted = false;
     nf->builtin = !ctx->builtins_ready;
+    nf->ctor = JS_CTOR_NONE;
     nf->length = 0;
     nf->parent = NULL;
     return js_value_from_cell(c);
 }
 
-bool js_object_set_ascii(JsContext *ctx, JsObject *obj, const char *key, JsValue v) {
+static bool object_set_ascii(JsContext *ctx, JsObject *obj, const char *key, JsValue v, uint8_t attrs) {
     JsVm *vm = ctx->vm;
     js_gc_protect(vm, &v);
     JsString *k = js_ascii_cell(vm, key);
     JsString *ik = k ? js_intern_cell(vm, k) : NULL;
     js_gc_unprotect(vm, &v);
-    if (!ik)
+    if (!ik || !js_map_set(vm, &obj->props, ik, v))
         return false;
-    return js_map_set(vm, &obj->props, ik, v);
+    if (attrs)
+        js_map_add_attrs(&obj->props, ik, attrs);
+    return true;
+}
+
+bool js_object_set_ascii(JsContext *ctx, JsObject *obj, const char *key, JsValue v) {
+    return object_set_ascii(ctx, obj, key, v, 0);
+}
+
+bool js_object_set_hidden(JsContext *ctx, JsObject *obj, const char *key, JsValue v) {
+    return object_set_ascii(ctx, obj, key, v, JS_ATTR_HIDDEN);
 }
 
 void js_context_set_userdata(JsContext *ctx, void *ud) {
@@ -1537,12 +1656,14 @@ bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
     nf->ud = userdata;
     nf->statics = NULL;
     nf->props = NULL;
-    nf->prototype = NULL;
+    nf->prototype = js_undefined();
+    nf->proto_made = false;
     nf->name = js_value_string(key);
     nf->bound = js_undefined();
     nf->is_bound = false;
     nf->name_deleted = false;
     nf->builtin = !ctx->builtins_ready;
+    nf->ctor = nf->builtin ? JS_CTOR_NONE : JS_CTOR_ORDINARY;
     nf->length = 0;
     nf->parent = NULL;
     return js_map_set(vm, &ctx->globals->props, js_value_string(key),
@@ -2577,15 +2698,16 @@ run:; /* (re)load the top frame */
                     { fiber_throw_callee(ctx, fb, fn, op_ip, callee, " is not a constructor"); RT_RAISE(); }
                 JsGcCell *cc = js_value_cell(callee);
                 if (cc->kind == JS_KIND_NATIVE) {
-                    /* Builtins (Array, Object, RegExp, ...) are factory
-                     * functions that already return a suitable object;
-                     * `new` on them just calls them. String/Number/Boolean
-                     * return their primitive form rather than a wrapper
-                     * object — this engine has no boxed-primitive type. */
-                    JsNative *nf = (JsNative *)cc;
+                    if (((JsNative *)cc)->ctor == JS_CTOR_NONE)
+                        { fiber_throw_callee(ctx, fb, fn, op_ip, callee, " is not a constructor"); RT_RAISE(); }
                     fr->ip = ip;
                     JsValue res;
-                    bool ok = call_native(ctx, fb, nf, S[nb - 1], &S[nb], (int)argc, true, &res);
+                    /* A builtin makes its own object: called straight from here. (Routing it
+                     * through construct_native too cost 15-20% on every benchmark, the loop's
+                     * register allocation being sensitive to its call sites.) */
+                    bool ok = ((JsNative *)cc)->ctor == JS_CTOR_ORDINARY
+                        ? construct_native(ctx, fb, (JsNative *)cc, nb, argc, &res)
+                        : call_native(ctx, fb, (JsNative *)cc, S[nb - 1], &S[nb], (int)argc, true, &res);
                     fb->sp = nb - 2;
                     if (!ok) {
                         fb->error = res;
@@ -2598,16 +2720,12 @@ run:; /* (re)load the top frame */
                 if (cc->kind != JS_KIND_CLOSURE)
                     { fiber_throw_callee(ctx, fb, fn, op_ip, callee, " is not a constructor"); RT_RAISE(); }
                 JsClosure *ctor = (JsClosure *)cc;
-                if (ctor->fn->fn_flags & (JS_FN_ARROW | JS_FN_ASYNC))
+                if (ctor->fn->fn_flags & (JS_FN_ARROW | JS_FN_ASYNC | JS_FN_METHOD))
                     { fiber_throw_callee(ctx, fb, fn, op_ip, callee, " is not a constructor"); RT_RAISE(); }
                 fr->ip = ip; /* GC-safe point before allocations below */
-                JsObject *proto = closure_prototype(ctx, ctor);
-                if (!proto)
-                    RT_THROW("out of memory");
-                JsValue instv = js_object_new(ctx);
+                JsValue instv = construct_this(ctx, cc);
                 if (!js_is_object(instv))
                     RT_THROW("out of memory");
-                js_value_object(instv)->proto = js_value_from_cell(&proto->gc);
                 S[nb - 1] = instv; /* this */
                 int rc = frame_setup(ctx, fb, ctor, nb, argc, true);
                 if (rc == -1)
@@ -2801,9 +2919,9 @@ run:; /* (re)load the top frame */
                 RT_RAISE();
             case JS_OP_RETURN: {
                 JsValue ret = POPV();
-                /* `new`: a non-object return value is discarded in favor of
-                 * the constructed `this` (still live at base-1). */
-                if (fr->is_construct && !js_is_object(ret))
+                /* `new`: a return value that is not an object (functions and promises are)
+                 * is discarded in favor of the constructed `this` (still live at base-1). */
+                if (fr->is_construct && !is_object_type(ret))
                     ret = S[base - 1];
                 upvalues_close_from(fb, base);
                 /* drop try entries owned by this frame */

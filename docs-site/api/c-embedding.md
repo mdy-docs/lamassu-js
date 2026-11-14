@@ -311,6 +311,8 @@ void     js_context_set_fuel(JsContext *ctx, uint64_t fuel); // 0 = unlimited
 ```c
 JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *userdata);
 void   *js_native_userdata(JsContext *ctx);
+bool    js_native_set_constructor(JsContext *ctx, JsValue fn, bool constructor);
+bool    js_native_is_construct_call(JsContext *ctx);
 
 typedef enum JsErrorKind { JS_ERROR_PLAIN, JS_ERROR_TYPE, JS_ERROR_RANGE, JS_ERROR_REFERENCE, JS_ERROR_SYNTAX } JsErrorKind;
 JsValue js_error_new_ascii(JsContext *ctx, JsErrorKind kind, const char *message);
@@ -322,6 +324,16 @@ wherever a function may go: a property of a namespace object, a method on a prot
 element, a callback. Inside the native, `js_native_userdata` returns the `userdata` that was passed
 when it was created (nested calls through `js_call` see their own and the outer value is restored),
 so one C function can serve many natives.
+
+As a function made through V8's embedding API is, a host native is a constructor. It has a
+`prototype` (made when first read, writable, its `constructor` the native), and `new f(...)` calls
+it with `this` a new object whose prototype is `f.prototype` (`Object.prototype` when a script set
+that to something other than an object); the result is `this` unless the native returns an object,
+so a native can fill in `this` or make and return an object of its own (a host object, say).
+`js_native_is_construct_call` tells the two kinds of call apart inside the native.
+`js_native_set_constructor(ctx, f, false)` makes `f` a plain function, as V8's
+`ConstructorBehavior::kThrow` does: no `prototype`, and `new f()` throws
+`TypeError: f is not a constructor`. It returns false for anything but a host native.
 
 A native that fails returns `false` with `*result` set to the value to throw. The constructors make
 a real `TypeError`, `RangeError`, … with `name` and `message` set, catchable by guest code and

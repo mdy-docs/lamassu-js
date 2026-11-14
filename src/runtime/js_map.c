@@ -23,8 +23,14 @@ void js_map_init(JsMap *m) {
     m->by_name = false;
 }
 
+/* Bytes of an entries allocation with room for CAP entries: the entries, then an attribute byte
+ * for each (JS_MAP_ATTRS) */
+static size_t entries_bytes(uint32_t cap) {
+    return (size_t)cap * (sizeof(JsMapEntry) + 1);
+}
+
 void js_map_free(JsVm *vm, JsMap *m) {
-    js_realloc_raw(vm, m->entries, (size_t)m->capacity * sizeof *m->entries, 0);
+    js_realloc_raw(vm, m->entries, entries_bytes(m->capacity), 0);
     js_realloc_raw(vm, m->index, (size_t)m->index_cap * sizeof *m->index, 0);
     js_map_init(m);
 }
@@ -48,15 +54,16 @@ static JsMapEntry *js_map_find(const JsMap *m, const JsString *key) {
 /* Rebuild with room for `ncap` entries: the live ones, packed, in order. */
 static bool js_map_grow(JsVm *vm, JsMap *m, uint32_t ncap) {
     uint32_t nidx = ncap * 2; /* load stays at or under a half */
-    JsMapEntry *ne = js_realloc_raw(vm, NULL, 0, (size_t)ncap * sizeof *ne);
+    JsMapEntry *ne = js_realloc_raw(vm, NULL, 0, entries_bytes(ncap));
     if (!ne)
         return false;
     uint32_t *ni = js_realloc_raw(vm, NULL, 0, (size_t)nidx * sizeof *ni);
     if (!ni) {
-        js_realloc_raw(vm, ne, (size_t)ncap * sizeof *ne, 0);
+        js_realloc_raw(vm, ne, entries_bytes(ncap), 0);
         return false;
     }
-    memset(ne, 0, (size_t)ncap * sizeof *ne);
+    memset(ne, 0, entries_bytes(ncap)); /* every attribute byte 0 too */
+    uint8_t *na = (uint8_t *)(ne + ncap);
     memset(ni, 0xff, (size_t)nidx * sizeof *ni); /* every slot JS_MAP_EMPTY */
     uint32_t mask = nidx - 1;
     uint32_t n = 0;
@@ -65,13 +72,14 @@ static bool js_map_grow(JsVm *vm, JsMap *m, uint32_t ncap) {
         if (!e->key || e->key == JS_MAP_TOMBSTONE)
             continue;
         ne[n] = *e;
+        na[n] = JS_MAP_ATTRS(m)[i];
         uint32_t j = e->key->hash & mask;
         while (ni[j] != JS_MAP_EMPTY)
             j = (j + 1) & mask;
         ni[j] = n;
         n++;
     }
-    js_realloc_raw(vm, m->entries, (size_t)m->capacity * sizeof *ne, 0);
+    js_realloc_raw(vm, m->entries, entries_bytes(m->capacity), 0);
     js_realloc_raw(vm, m->index, (size_t)m->index_cap * sizeof *ni, 0);
     m->entries = ne;
     m->index = ni;
@@ -143,13 +151,17 @@ void js_map_sort_keys(JsMap *m) {
     if (!m->unsorted)
         return;
     m->unsorted = false;
+    uint8_t *attrs = JS_MAP_ATTRS(m);
     uint32_t n = 0;
     for (uint32_t i = 0; i < m->used; i++)
-        if (m->entries[i].key && m->entries[i].key != JS_MAP_TOMBSTONE)
+        if (m->entries[i].key && m->entries[i].key != JS_MAP_TOMBSTONE) {
+            attrs[n] = attrs[i];
             m->entries[n++] = m->entries[i];
+        }
     for (uint32_t i = n; i < m->used; i++) {
         m->entries[i].key = NULL;
         m->entries[i].value = js_undefined();
+        attrs[i] = 0;
     }
     m->used = n;
     m->count = n;
@@ -168,15 +180,18 @@ void js_map_sort_keys(JsMap *m) {
         if (perm[s] == s)
             continue;
         JsMapEntry first = m->entries[s];
+        uint8_t first_attrs = attrs[s];
         uint32_t j = s;
         for (;;) {
             uint32_t src = perm[j];
             perm[j] = j;
             if (src == s) {
                 m->entries[j] = first;
+                attrs[j] = first_attrs;
                 break;
             }
             m->entries[j] = m->entries[src];
+            attrs[j] = attrs[src];
             j = src;
         }
     }
@@ -238,6 +253,15 @@ bool js_map_delete(JsMap *m, const JsString *key) {
         return false;
     e->key = JS_MAP_TOMBSTONE;
     e->value = js_undefined();
+    JS_MAP_ATTRS(m)[e - m->entries] = 0;
     m->count--;
+    return true;
+}
+
+bool js_map_add_attrs(JsMap *m, const JsString *key, uint8_t attrs) {
+    JsMapEntry *e = js_map_find(m, key);
+    if (!e)
+        return false;
+    JS_MAP_ATTRS(m)[e - m->entries] |= attrs;
     return true;
 }

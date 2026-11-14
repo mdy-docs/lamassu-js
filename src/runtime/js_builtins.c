@@ -1933,7 +1933,7 @@ static bool json_str(JsContext *ctx, StrBuf *sb, JsValue v, const uint16_t *inde
     js_map_sort_keys(&o->props);
     for (uint32_t i = 0; i < o->props.capacity; i++) {
         JsMapEntry *e = &o->props.entries[i];
-        if (!e->key || e->key == JS_MAP_TOMBSTONE || js_prop_hidden(o, e->key))
+        if (!e->key || e->key == JS_MAP_TOMBSTONE || js_prop_hidden_at(o, i))
             continue;
         uint32_t mark = sb->len; /* rewind point if the value emits nothing */
         if (!first)
@@ -2454,7 +2454,7 @@ static bool obj_keys_impl(JsContext *ctx, JsValue tv, const JsValue *args, int a
         {
             for (uint32_t i = 0; i < o->props.capacity && ok; i++) {
                 JsMapEntry *e = &o->props.entries[i];
-                if (!e->key || e->key == JS_MAP_TOMBSTONE || js_prop_hidden(o, e->key))
+                if (!e->key || e->key == JS_MAP_TOMBSTONE || js_prop_hidden_at(o, i))
                     continue;
                 if (e->value.bits == JS_SPECIAL_TDZ) { /* a namespace's uninitialized export */
                     js_gc_unprotect(ctx->vm, &outv);
@@ -2714,9 +2714,11 @@ static bool str_is_ascii(JsValue key, const char *a) {
     return true;
 }
 
-/* Every function has `name` and `length` as own properties (read-only, not enumerable), as in V8. */
+/* Every function has `name` and `length` as own properties (read-only, not enumerable), and a
+ * constructor `prototype`, as in V8. */
 static bool is_function_name_key(JsValue fn, JsValue key) {
-    return js_is_function(fn) && (str_is_ascii(key, "name") || str_is_ascii(key, "length"));
+    return js_is_function(fn) && (str_is_ascii(key, "name") || str_is_ascii(key, "length") ||
+                                  (str_is_ascii(key, "prototype") && js_function_has_own_prototype(fn)));
 }
 
 static bool obj_hasOwn(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
@@ -3541,7 +3543,7 @@ static bool link_prototype(JsContext *ctx, const char *name, JsObject *table) {
     JsValue ctor = js_map_get(&ctx->globals->props, ik, &found);
     if (!found || !js_is_function(ctor) || js_value_cell(ctor)->kind != JS_KIND_NATIVE)
         return false;
-    ((JsNative *)js_value_cell(ctor))->prototype = table;
+    js_native_builtin_ctor(ctor, table);
     return js_object_set_ascii(ctx, table, "constructor", ctor);
 }
 
@@ -3558,9 +3560,34 @@ static JsObject *def_ctor(JsContext *ctx, const char *name, JsNativeFn fn) {
     }
     JsNative *native = (JsNative *)js_value_cell(nf);
     native->statics = js_value_object(statics);
+    js_native_builtin_ctor(nf, NULL); /* Number, String, Boolean */
     bool ok = js_object_set_ascii(ctx, ctx->globals, name, nf);
     js_gc_unprotect(ctx->vm, &nf);
     return ok ? native->statics : NULL;
+}
+
+/* Every property O has: not enumerable, as V8 makes a built-in object's */
+static void hide_all(JsObject *o) {
+    if (!o || !o->props.entries)
+        return;
+    uint8_t *attrs = JS_MAP_ATTRS(&o->props);
+    for (uint32_t i = 0; i < o->props.used; i++)
+        if (o->props.entries[i].key && o->props.entries[i].key != JS_MAP_TOMBSTONE)
+            attrs[i] |= JS_ATTR_HIDDEN;
+}
+
+/* The properties the engine made on the global object, the builtin prototypes and Math and JSON
+ * are not enumerable (Object.keys(Map.prototype) and Object.keys(globalThis) are [], as in V8);
+ * ones a script or the host adds later are. */
+static void hide_builtin_keys(JsContext *ctx) {
+    JsObject *objs[] = {ctx->globals, ctx->object_proto, ctx->array_proto, ctx->function_methods,
+                        ctx->number_methods, ctx->string_methods, ctx->promise_methods,
+                        ctx->regexp_proto, ctx->date_proto, ctx->map_proto, ctx->set_proto,
+                        ctx->math_obj, ctx->json_obj};
+    for (size_t i = 0; i < sizeof objs / sizeof objs[0]; i++)
+        hide_all(objs[i]);
+    for (int k = 0; k < JS_ERROR_KIND_COUNT; k++)
+        hide_all(ctx->error_protos[k]);
 }
 
 bool js_builtins_init(JsContext *ctx) {
@@ -3704,7 +3731,7 @@ bool js_builtins_init(JsContext *ctx) {
     if (!js_is_function(objv))
         return false;
     js_gc_protect(vm, &objv); /* keep rooted through statics + global set */
-    ((JsNative *)js_value_cell(objv))->prototype = ctx->object_proto;
+    js_native_builtin_ctor(objv, ctx->object_proto);
     JsValue objectv = js_object_new(ctx);
     bool obj_ok = js_is_object(objectv);
     JsObject *object = obj_ok ? js_value_object(objectv) : NULL;
@@ -3734,7 +3761,7 @@ bool js_builtins_init(JsContext *ctx) {
     if (!js_is_function(arrv))
         return false;
     js_gc_protect(vm, &arrv); /* keep rooted through statics + global set */
-    ((JsNative *)js_value_cell(arrv))->prototype = ctx->array_proto;
+    js_native_builtin_ctor(arrv, ctx->array_proto);
     JsValue arrayv = js_object_new(ctx);
     bool arr_ok = js_is_object(arrayv);
     JsObject *array = arr_ok ? js_value_object(arrayv) : NULL;
@@ -3825,5 +3852,6 @@ bool js_builtins_init(JsContext *ctx) {
         !def_fn(ctx, ctx->globals, "decodeURI", g_decodeURI) ||
         !def_fn(ctx, ctx->globals, "decodeURIComponent", g_decodeURIComponent))
         return false;
+    hide_builtin_keys(ctx);
     return true;
 }

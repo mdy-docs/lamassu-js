@@ -29,6 +29,10 @@ that's known to differ, so you're not surprised by one in production.
   `writable`/`configurable` distinction and no `Object.defineProperty` to set
   one. That covers everything guest code can observe of an ordinary frozen
   object; it only differs if you were reaching for a partially frozen one.
+  Enumerability is per property, though: what V8 makes non-enumerable (a builtin
+  prototype's methods, a function's `prototype.constructor`, an error's `message`)
+  is left out of `Object.keys`, JSON, spread and `Object.assign` here too. There is
+  no `Object.getOwnPropertyNames` to list those.
 
 ## Functions
 

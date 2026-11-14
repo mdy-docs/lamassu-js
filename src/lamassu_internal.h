@@ -70,7 +70,9 @@ typedef struct JsMapEntry {
  * that enumerates (rather than marks or frees) calls it first.
  */
 typedef struct JsMap {
-    JsMapEntry *entries; /* [0, used) written, in insertion order; NULL keys past that */
+    JsMapEntry *entries; /* [0, used) written, in insertion order; NULL keys past that. The same
+                          * allocation carries one JS_ATTR_* byte per entry after the last
+                          * (JS_MAP_ATTRS), which moves with its entry and starts at 0. */
     uint32_t *index;     /* hash slot -> entry position, or JS_MAP_EMPTY */
     uint32_t count;      /* live entries */
     uint32_t used;       /* entries written, tombstones included */
@@ -81,6 +83,12 @@ typedef struct JsMap {
 } JsMap;
 
 #define JS_MAP_EMPTY UINT32_MAX
+
+/* Property attributes, one byte per JsMap entry; 0 is an ordinary data property (enumerable,
+ * writable, configurable). Setting an existing key keeps them; deleting a key drops them, so a
+ * key made again is ordinary. */
+#define JS_ATTR_HIDDEN 1u /* not enumerable: left out of Object.keys, JSON, spread, assign */
+#define JS_MAP_ATTRS(m) ((uint8_t *)((m)->entries + (m)->capacity))
 
 #define JS_MAP_TOMBSTONE ((JsString *)(uintptr_t)1)
 
@@ -158,35 +166,12 @@ typedef struct JsErrorObject {
     uint32_t frame_count;
     uint8_t stack_state;   /* JS_STACK_*: PENDING = made by the interpreter for a raise,
                             * captured when the raise unwinds */
-    uint8_t hidden;        /* JS_ERR_HIDE_*: own properties made with the error, which V8 makes
-                            * non-enumerable (deleting one clears its bit) */
 } JsErrorObject;
-#define JS_ERR_HIDE_MESSAGE 1u
-#define JS_ERR_HIDE_CAUSE 2u
-#define JS_ERR_HIDE_ERRORS 4u /* an AggregateError's `errors` */
 
-static inline bool js_units_are(const JsString *s, const char *a, uint32_t n) {
-    if (s->length != n)
-        return false;
-    for (uint32_t i = 0; i < n; i++)
-        if (s->units[i] != (uint16_t)(unsigned char)a[i])
-            return false;
-    return true;
-}
-
-/* The JS_ERR_HIDE_* bit KEY names on an error, or 0 */
-static inline uint8_t js_error_hide_bit(const JsString *key) {
-    return js_units_are(key, "message", 7) ? JS_ERR_HIDE_MESSAGE
-           : js_units_are(key, "cause", 5)   ? JS_ERR_HIDE_CAUSE
-           : js_units_are(key, "errors", 6)  ? JS_ERR_HIDE_ERRORS : 0;
-}
-
-/* Whether enumerating O's own properties leaves KEY out: an error's `message`, `cause` and
- * `errors`, as
- * V8 makes them non-enumerable (Object.keys, JSON.stringify, spread, Object.assign) */
-static inline bool js_prop_hidden(const JsObject *o, const JsString *key) {
-    return o->obj_kind == JS_OBJ_ERROR && ((const JsErrorObject *)o)->hidden &&
-           (((const JsErrorObject *)o)->hidden & js_error_hide_bit(key));
+/* Whether enumerating O's own properties leaves out the one at position I of its map (a
+ * non-enumerable one: an error's `message`, a prototype's `constructor`, a builtin's methods) */
+static inline bool js_prop_hidden_at(const JsObject *o, uint32_t i) {
+    return o->props.entries && (JS_MAP_ATTRS(&o->props)[i] & JS_ATTR_HIDDEN);
 }
 
 typedef struct JsHostObject {
@@ -225,6 +210,9 @@ typedef struct JsUpvalDesc {
  * plain array of the actual args into local slot n_params. Never set on an
  * arrow (arrows see the enclosing function's `arguments` as an upvalue). */
 #define JS_FN_USES_ARGUMENTS 0x08
+/* An object literal's method (`{ m() {} }`, async or not). With ARROW and ASYNC, one of the kinds
+ * of function that is no constructor and has no `prototype` (js_is_constructor). */
+#define JS_FN_METHOD 0x10
 
 typedef struct JsModule JsModule;
 
@@ -312,10 +300,11 @@ typedef struct JsClosure {
     JsValue this_val; /* arrows: lexically captured `this` */
     bool has_this;
     bool length_deleted; /* `delete f.length` ran: it reads 0 (Function.prototype's) */
+    bool proto_made;     /* `prototype` holds the function's prototype (see js_is_constructor) */
     uint16_t n_upvals;
-    /* `new`: lazily-created .prototype object (constructor pattern); NULL
-     * until first accessed via `fn.prototype` or `new fn()`. */
-    JsObject *prototype_obj;
+    /* A constructor's `prototype`: any value a script gives it. Made (an object whose hidden
+     * `constructor` is the function) the first time it is read or `new` needs it. */
+    JsValue prototype;
     /* Properties a script gives the function (statics on a constructor: F.create = ...); a plain
      * object, created on the first write. NULL until then. */
     JsObject *props;
@@ -335,19 +324,31 @@ typedef struct JsNative {
     void *ud;
     JsString *name;      /* may be NULL */
     JsObject *statics;   /* namespace statics (String.fromCharCode, ...); may be NULL */
-    /* lazily-created .prototype object (mirrors JsClosure's prototype_obj);
-     * instances of builtin types (RegExp, Date, Map, Set, ...) point their
-     * [[Prototype]] here. NULL until first accessed via `Ctor.prototype`. */
-    JsObject *prototype;
+    /* A constructor's `prototype` (JsClosure's, likewise made when first needed). A builtin
+     * constructor's is set when it is made and is read-only: instances of builtin types (RegExp,
+     * Date, Map, Set, ...) point their [[Prototype]] at it. */
+    JsValue prototype;
     JsValue bound;       /* captured value for bound natives */
     JsObject *props;     /* properties a script gives it (like JsClosure.props); NULL until written */
     bool is_bound;
     bool builtin;        /* made by the engine (js_builtins_init): shown in a stack trace */
     bool name_deleted;   /* `delete f.name`: reads "", while toString still gives the name */
     uint8_t length;      /* `length`: V8's for a builtin (js_builtin_lengths_apply), else 0 */
+    uint8_t ctor;        /* JS_CTOR_*: whether and how `new` may call it */
+    bool proto_made;     /* `prototype` holds it */
     struct JsNative *parent; /* its [[Prototype]] when that is another constructor (TypeError's
                               * is Error), whose statics it inherits; NULL: Function.prototype */
 } JsNative;
+
+/* JsNative.ctor. A function from bind() is a constructor when its target is (js_is_constructor). */
+enum {
+    JS_CTOR_NONE,     /* not a constructor, no `prototype`: builtin functions, promise resolvers */
+    JS_CTOR_FACTORY,  /* a builtin constructor (Map, Error, ...): makes its own object, and its
+                       * `prototype` is read-only */
+    JS_CTOR_ORDINARY, /* a host's native (V8's default for one): `new` makes `this` from its
+                       * `prototype`, as for a script's function, and gives it unless the native
+                       * returns an object */
+};
 
 /* ---- promises & microtasks ---- */
 
@@ -778,6 +779,8 @@ JsValue js_map_get(const JsMap *m, const JsString *key, bool *found);
 bool    js_map_delete(JsMap *m, const JsString *key);
 void    js_map_free(JsVm *vm, JsMap *m);
 void    js_map_sort_keys(JsMap *m); /* enumeration order; no allocation, so safe anywhere */
+/* Adds ATTRS (JS_ATTR_*) to KEY's entry; false when KEY is not in M */
+bool    js_map_add_attrs(JsMap *m, const JsString *key, uint8_t attrs);
 
 /* ---- strings / atoms (js_string.c) ---- */
 

@@ -161,7 +161,27 @@ classes out of the language: `F.from = (v) => new F(v)`, `F.ORIGIN = new F(0)`, 
 `in`, `delete`, `hasOwnProperty`, `Object.keys`/`values`/`entries`/`assign`/`hasOwn` and
 `freeze`/`seal` see them. A builtin constructor's own statics (`Object.keys`, `Array.isArray`) can be
 replaced but are not listed by `Object.keys(Object)`, as in other engines. `typeof` a function
-is still `"function"`, and `prototype` keeps its special meaning.
+is still `"function"`.
+
+`prototype` is V8's. A constructor has it as its own property: a `function` declaration or
+expression, a builtin constructor (`Map`, `Error`, `Number`, ...), a host's native. It starts as an
+object whose `constructor` is the function, and `in`, `hasOwnProperty` and `Object.hasOwn` see it;
+`Object.keys` does not, and `constructor` is not enumerable either (`Object.keys(F.prototype)` is
+`[]`). A script may give it any value: after `F.prototype = 5`, `F.prototype` is 5 and `new F()`
+makes an object whose prototype is `Object.prototype`, while `instanceof F` throws V8's
+`TypeError: Function has non-object prototype '5' in instanceof check`. It cannot be deleted
+(`TypeError: Cannot delete property 'prototype' of function F() {}`), and a builtin
+constructor's, or a frozen function's, is read-only. Every other function — an arrow, an object
+literal's method (`{ m() {} }`), an async function, a builtin function such as `Math.max`, a
+function from `bind()` — is no constructor: it has no `prototype`, `new` on it throws
+`TypeError: m is not a constructor`, and `prototype` is an ordinary property a script may add. A
+function from `bind()` constructs its target. A constructor's return value replaces the new object
+when it is an object (a function or a promise counts).
+
+The properties the engine makes on the global object, the builtin prototypes, `Math` and `JSON`
+are not enumerable (`Object.keys(Map.prototype)` and `Object.keys(globalThis)` are `[]`), as in
+V8; ones a script adds are. Assigning one keeps it so (replacing `Map.prototype.get` leaves it
+unlisted); deleting it and making it again gives an ordinary one.
 
 ## `Boolean`
 

@@ -1072,6 +1072,51 @@ static void test_uri(void) {
        "URIError: URI malformed|URIError: URI malformed|URIError: URI malformed|%F4%8F%BF%BF");
 }
 
+/* A function's `prototype`, as V8 has it (expected values from Node): only constructors have one;
+ * it takes any value; it is not deletable, read-only on builtins and frozen functions; the
+ * `constructor` it starts with, like every builtin prototype's property, is not enumerable */
+static void test_prototype(void) {
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; function F() {} [F.hasOwnProperty('prototype'), typeof F.prototype, F.prototype.constructor === F, F.prototype === F.prototype, JSON.stringify(Object.keys(F.prototype)), JSON.stringify(F.prototype)].join();",
+       "true,object,true,true,[],{}");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const o = { m() {}, async a() {}, p: function () {} }; async function af() {} [(() => {}).hasOwnProperty('prototype'), o.m.hasOwnProperty('prototype'), o.a.hasOwnProperty('prototype'), o.p.hasOwnProperty('prototype'), af.hasOwnProperty('prototype'), typeof (() => {}).prototype, 'prototype' in o.m].join();",
+       "false,false,false,true,false,undefined,false");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; [Math.max, [].push, Object.keys, parseInt, (function () {}).bind(null), Map, Error, TypeError, Object, Array, Promise].map((f) => f.hasOwnProperty('prototype') + ':' + ('prototype' in f)).join();",
+       "false:false,false:false,false:false,false:false,false:false,true:true,true:true,true:true,true:true,true:true,true:true");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const o = { m() {} }; const k = 'c'; const p = { [k]() {} }; async function af() {} const ar = () => {}; [E(() => new ar()), E(() => new o.m()), E(() => new p.c()), E(() => new af()), E(() => new Math.max()), E(() => new (o.m.bind(null))())].join('|');",
+       "TypeError: ar is not a constructor|TypeError: o.m is not a constructor|TypeError: p.c is not a constructor|TypeError: af is not a constructor|TypeError: Math.max is not a constructor|TypeError: o.m.bind(...) is not a constructor");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; function P() {} P.prototype = 5; [P.prototype, P.hasOwnProperty('prototype'), Object.getPrototypeOf(new P()) === Object.prototype, E(() => ({}) instanceof P), 5 instanceof P].join('|');",
+       "5|true|true|TypeError: Function has non-object prototype '5' in instanceof check|false");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; function N() {} N.prototype = null; function U() {} U.prototype = undefined; [N.prototype, Object.getPrototypeOf(new N()) === Object.prototype, U.prototype, Object.getPrototypeOf(new U()) === Object.prototype].join();",
+       ",true,,true");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const a = () => {}; [E(() => ({}) instanceof a), E(() => 1 instanceof a), (a.prototype = Object.prototype, ({}) instanceof a), a.hasOwnProperty('prototype'), JSON.stringify(Object.keys(a)), delete a.prototype, a.hasOwnProperty('prototype')].join('|');",
+       "TypeError: Function has non-object prototype 'undefined' in instanceof check|false|true|true|[\"prototype\"]|true|false");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; function F() {} [E(() => delete F.prototype), E(() => delete Map.prototype), E(() => { Map.prototype = {}; }), E(() => { Error.prototype = {}; }), E(() => { Number.prototype = {}; })].join('|');",
+       "TypeError: Cannot delete property 'prototype' of function F() {}|TypeError: Cannot delete property 'prototype' of function Map() { [native code] }|TypeError: Cannot assign to read only property 'prototype' of function 'function Map() { [native code] }'|TypeError: Cannot assign to read only property 'prototype' of function 'function Error() { [native code] }'|TypeError: Cannot assign to read only property 'prototype' of function 'function Number() { [native code] }'");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; function F() {} Object.freeze(F); function G() {} Object.seal(G); G.prototype = { q: 1 }; [E(() => { F.prototype = {}; }), typeof F.prototype, G.prototype.q].join('|');",
+       "TypeError: Cannot assign to read only property 'prototype' of function 'function F() {}'|object|1");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; function F() { return function g() {}; } function G() { return Promise.resolve(1); } function H() { this.k = 1; return 3; } [typeof new F(), new G() instanceof Promise, new H().k].join();",
+       "function,true,1");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; function F(a, b) { this.s = a + b; } const B = F.bind(null, 1); const x = new B(2); [x.s, x instanceof F, x instanceof B, B.hasOwnProperty('prototype'), Object.getPrototypeOf(x) === F.prototype].join();",
+       "3,true,true,false,true");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; function F() {} const p = F.prototype; delete p.constructor; p.constructor = F; function G() {} G.prototype.constructor = 1; [JSON.stringify(Object.keys(p)), JSON.stringify(Object.keys(G.prototype))].join();",
+       "[\"constructor\"],[]");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; function F() {} const p = F.prototype; for (let i = 0; i < 40; i++) p['k' + i] = i; for (let i = 0; i < 30; i++) delete p['k' + i]; p[3] = 'x'; p.z = 1; Object.keys(p).join() + ':' + (p.constructor === F);",
+       "3,k30,k31,k32,k33,k34,k35,k36,k37,k38,k39,z:true");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; Map.prototype.zz = 1; const g = Map.prototype.get; Map.prototype.get = function () { return 9; }; JSON.stringify(Object.keys(Map.prototype)) + new Map().get(1);",
+       "[\"zz\"]9");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; [Map, Set, Date, RegExp, Error, TypeError, Array, Object, Promise, Number, String, Boolean].map((C) => Object.keys(C.prototype).length + ':' + (C.prototype.constructor === C)).join() + '|' + Object.keys(Math).length + Object.keys(JSON).length + JSON.stringify(Object.keys(Error));",
+       "0:true,0:true,0:true,0:true,0:true,0:true,0:true,0:true,0:true,0:true,0:true,0:true|00[\"stackTraceLimit\"]");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; globalThis.myG = 1; Object.keys(globalThis).filter((k) => k !== 'print').join();",
+       "myG");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; const e = new Error('m', { cause: 1 }); const f = new Error('m'); delete f.message; f.message = 'n'; const g = new Error('m'); g.message = 'n'; [JSON.stringify(Object.keys(e)), JSON.stringify(e), JSON.stringify(Object.keys(f)), JSON.stringify(Object.keys(g)) + g.message, JSON.stringify(Object.keys(new AggregateError([1])))].join('|');",
+       "[]|{}|[\"message\"]|[]n|[]");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; function A(n) { this.n = n; } A.prototype.hi = function () { return 'hi ' + this.n; }; function B(n) { A.call(this, n); } B.prototype = Object.create(A.prototype); B.prototype.constructor = B; const b = new B(3); [b.hi(), b instanceof A, b instanceof B, b.constructor === B, JSON.stringify(Object.keys(B.prototype)), JSON.stringify(b), JSON.stringify({ ...A.prototype })].join('|');",
+       "hi 3|true|true|true|[\"constructor\"]|{\"n\":3}|{}");
+    eq("const E = (f) => { try { return String(f()); } catch (e) { return e.name + ': ' + e.message; } }; let r; new Promise((res) => { r = res; }); [E(() => new r()), E(() => new (Promise.resolve(1).then)()), typeof Boolean.prototype, Boolean.prototype.constructor === Boolean].join('|');",
+       "TypeError: r is not a constructor|TypeError: Promise.resolve(...).then is not a constructor|object|true");
+
+}
+
 int main(void) {
     test_freeze_seal();
     test_string();
@@ -1089,6 +1134,7 @@ int main(void) {
     test_error();
     test_error_types();
     test_uri();
+    test_prototype();
     test_stress();
     test_integration();
     if (checks_failed) {

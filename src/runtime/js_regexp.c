@@ -1355,7 +1355,7 @@ bool js_regexp_builtins_init(JsContext *ctx) {
         !js_object_set_ascii(ctx, ctx->regexp_proto, "constructor", ctor) ||
         !js_object_set_ascii(ctx, ctx->globals, "RegExp", ctor))
         return false;
-    ((JsNative *)js_value_cell(ctor))->prototype = ctx->regexp_proto;
+    js_native_builtin_ctor(ctor, ctx->regexp_proto);
     return true;
 }
 

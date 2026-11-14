@@ -279,8 +279,23 @@ bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
  * object (a namespace or a prototype), an array element, a callback. `name`
  * is ASCII (the function's .name, may be NULL). Returns undefined on OOM.
  * js_register_native is this plus a js_object_set on the globals.
+ *
+ * Like a function made through V8's embedding API, a host native is a constructor: it has a
+ * `prototype` (made when first read, writable), and `new f(...)` calls it with `this` a new object
+ * whose [[Prototype]] is f.prototype (Object.prototype when that is not an object), giving `this`
+ * unless the native returns an object. js_native_set_constructor turns that off.
  */
 JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *userdata);
+
+/*
+ * Whether `new` may call the host native FN (V8's ConstructorBehavior). Off, FN has no `prototype`
+ * and `new FN()` throws "TypeError: ... is not a constructor", as for a builtin function such as
+ * Math.max. False when FN is not a host native.
+ */
+bool js_native_set_constructor(JsContext *ctx, JsValue fn, bool constructor);
+
+/* Inside a JsNativeFn: whether this call came through `new` (V8's IsConstructCall). */
+bool js_native_is_construct_call(JsContext *ctx);
 
 /*
  * The userdata of the native currently executing — what js_native_new or

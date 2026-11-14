@@ -138,6 +138,7 @@ typedef enum JsAstKind {
 #define JS_F_ASYNC       0x01 /* FUNC_* */
 #define JS_F_ARROW       0x02 /* FUNC_EXPR */
 #define JS_F_EXPR_BODY   0x04 /* FUNC_EXPR: arrow with expression body */
+#define JS_F_METHOD_FN   0x08 /* FUNC_EXPR: an object literal's method (`{ m() {} }`): no constructor */
 #define JS_F_COMPUTED    0x01 /* MEMBER, PROPERTY */
 #define JS_F_OPTIONAL    0x02 /* MEMBER, CALL: ?. */
 #define JS_F_SHORTHAND   0x04 /* PROPERTY */

@@ -252,7 +252,8 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
      * own `arguments`, so the pair is contradictory.
      */
     if ((fn_flags & ~(uint8_t)(JS_FN_ARROW | JS_FN_HAS_REST | JS_FN_ASYNC |
-                               JS_FN_USES_ARGUMENTS)) ||
+                               JS_FN_USES_ARGUMENTS | JS_FN_METHOD)) ||
+        ((fn_flags & JS_FN_ARROW) && (fn_flags & JS_FN_METHOD)) ||
         n_locals > JSBC_MAX_LOCALS || n_params > n_locals || length > n_params ||
         ((fn_flags & JS_FN_HAS_REST) && n_params == 0) ||
         ((fn_flags & JS_FN_USES_ARGUMENTS) &&

@@ -812,12 +812,10 @@ static JsValue error_object_new(JsContext *ctx, JsErrorKind kind, JsString *mess
         eo->frames = NULL;
         eo->frame_count = 0;
         eo->stack_state = JS_STACK_PENDING;
-        eo->hidden = 0;
         ev = js_value_from_cell(c);
         js_gc_protect(vm, &ev);
         if (message) {
-            ok = js_object_set_ascii(ctx, e, "message", mv);
-            eo->hidden |= JS_ERR_HIDE_MESSAGE;
+            ok = js_object_set_hidden(ctx, e, "message", mv);
         }
         if (ok && js_in_native(ctx))
             ok = js_error_capture(ctx, e, skip);
@@ -830,10 +828,7 @@ static JsValue error_object_new(JsContext *ctx, JsErrorKind kind, JsString *mess
 
 /* An AggregateError's own `errors`: LIST, made non-enumerable as V8 makes it */
 static bool set_errors(JsContext *ctx, JsValue ev, JsObject *list) {
-    if (!js_object_set_ascii(ctx, js_value_object(ev), "errors", js_value_from_cell(&list->gc)))
-        return false;
-    ((JsErrorObject *)js_value_object(ev))->hidden |= JS_ERR_HIDE_ERRORS;
-    return true;
+    return js_object_set_hidden(ctx, js_value_object(ev), "errors", js_value_from_cell(&list->gc));
 }
 
 JsValue js_error_new(JsContext *ctx, JsErrorKind kind, JsString *message) {
@@ -896,9 +891,7 @@ static bool error_ctor(JsContext *ctx, JsErrorKind kind, const JsValue *args, in
         JsValue cause;
         bool found;
         bool ok = chain_get(ctx, js_value_object(opts), "cause", &cause, &found) &&
-                  (!found || js_object_set_ascii(ctx, js_value_object(ev), "cause", cause));
-        if (ok && found)
-            ((JsErrorObject *)js_value_object(ev))->hidden |= JS_ERR_HIDE_CAUSE;
+                  (!found || js_object_set_hidden(ctx, js_value_object(ev), "cause", cause));
         js_gc_unprotect(vm, &ev);
         if (!ok)
             return nthrow(ctx, r, "out of memory");
@@ -1018,7 +1011,7 @@ bool js_error_builtins_init(JsContext *ctx) {
         JsValue ctor = js_native_new(ctx, kind_names[k], kind_ctors[k], NULL);
         if (!js_is_function(ctor))
             return false;
-        ((JsNative *)js_value_cell(ctor))->prototype = proto;
+        js_native_builtin_ctor(ctor, proto);
         if (k != JS_ERROR_PLAIN) /* TypeError's [[Prototype]] is Error: it inherits its statics */
             ((JsNative *)js_value_cell(ctor))->parent = ctx->error_ctor;
         if (!js_object_set_ascii(ctx, proto, "constructor", ctor) ||
@@ -1031,7 +1024,7 @@ bool js_error_builtins_init(JsContext *ctx) {
             if (!own || !js_object_set_ascii(ctx, own, "stackTraceLimit", js_number(10)))
                 return false;
             JsValue cst = js_native_new(ctx, "captureStackTrace", err_captureStackTrace, NULL);
-            if (!js_is_function(cst) || !js_object_set_ascii(ctx, own, "captureStackTrace", cst))
+            if (!js_is_function(cst) || !js_object_set_hidden(ctx, own, "captureStackTrace", cst))
                 return false;
         }
     }

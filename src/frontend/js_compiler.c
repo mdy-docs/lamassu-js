@@ -2116,6 +2116,8 @@ static bool compile_function_as(JsCompiler *cx, const JsAstNode *fnode, const ui
     fn->fn_flags = (uint8_t)((fs.is_arrow ? JS_FN_ARROW : 0) |
                              (has_rest ? JS_FN_HAS_REST : 0) |
                              ((fnode->flags & JS_F_ASYNC) ? JS_FN_ASYNC : 0) |
+                             ((fnode->kind == JS_AST_FUNC_EXPR && (fnode->flags & JS_F_METHOD_FN))
+                                  ? JS_FN_METHOD : 0) |
                              (fs.uses_arguments ? JS_FN_USES_ARGUMENTS : 0));
     fn->n_locals = fs.slot_max;
     fn->max_stack = (uint32_t)(fs.max_depth < 0 ? 0 : fs.max_depth) + 8;

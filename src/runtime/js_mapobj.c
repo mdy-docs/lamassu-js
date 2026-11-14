@@ -369,7 +369,7 @@ bool js_mapobj_builtins_init(JsContext *ctx) {
     JsValue ctor = js_native_new(ctx, "Map", g_Map, NULL);
     if (!js_is_function(ctor))
         return false;
-    ((JsNative *)js_value_cell(ctor))->prototype = ctx->map_proto;
+    js_native_builtin_ctor(ctor, ctx->map_proto);
     return js_object_set_ascii(ctx, ctx->map_proto, "constructor", ctor) &&
         js_object_set_ascii(ctx, ctx->globals, "Map", ctor);
 }

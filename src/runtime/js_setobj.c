@@ -327,7 +327,7 @@ bool js_setobj_builtins_init(JsContext *ctx) {
     JsValue ctor = js_native_new(ctx, "Set", g_Set, NULL);
     if (!js_is_function(ctor))
         return false;
-    ((JsNative *)js_value_cell(ctor))->prototype = ctx->set_proto;
+    js_native_builtin_ctor(ctor, ctx->set_proto);
     return js_object_set_ascii(ctx, ctx->set_proto, "constructor", ctor) &&
         js_object_set_ascii(ctx, ctx->globals, "Set", ctor);
 }

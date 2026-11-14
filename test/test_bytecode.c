@@ -227,6 +227,10 @@ static void test_roundtrip(void) {
     eq("'a1b2c3'.replace(/[0-9]/g, '#');", "a#b#c#"); /* NEW_REGEXP const survives */
     eq("/(?<y>\\d+)/.exec('x42').groups.y;", "42");
 #endif
+    /* the method flag survives: a method is no constructor and has no prototype; a function is */
+    eq("const o = { m() {}, f: function () {} }; let r = ''; try { new o.m(); } catch (e) { r = e.message; }"
+       " [r, o.m.hasOwnProperty('prototype'), o.f.hasOwnProperty('prototype'), typeof new o.f()].join('|');",
+       "o.m is not a constructor|false|true|object");
     /* deeply nested closures exercise recursive function-const serialization */
     eq("const f = a => b => c => d => a+b+c+d; f(1)(2)(3)(4);", "10");
     /* JS_OP_DYNAMIC_IMPORT survives the round-trip (no loader registered, so

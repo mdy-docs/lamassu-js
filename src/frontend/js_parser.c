@@ -1002,7 +1002,7 @@ static JsAstNode *parse_object_literal(JsParser *p) {
                 JsAstNode *fn = new_node(p, JS_AST_FUNC_EXPR, prop->a->pos);
                 if (!fn)
                     return NULL;
-                fn->flags = (prop->flags & JS_F_PROP_ASYNC) ? JS_F_ASYNC : 0;
+                fn->flags = (uint8_t)(JS_F_METHOD_FN | ((prop->flags & JS_F_PROP_ASYNC) ? JS_F_ASYNC : 0));
                 JsNodeVec params = {0};
                 if (!parse_params(p, &params))
                     return NULL;

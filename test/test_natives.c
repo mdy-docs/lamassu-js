@@ -83,6 +83,68 @@ static bool native_fail(JsContext *ctx, JsValue this_val, const JsValue *args, i
     return false;
 }
 
+/* a host constructor: sets this.v = arg0, and records whether it was called through `new` */
+static int g_construct_calls;
+static bool native_point(JsContext *ctx, JsValue this_val, const JsValue *args, int argc, JsValue *result) {
+    JsVm *vm = js_context_vm(ctx);
+    if (js_native_is_construct_call(ctx)) {
+        g_construct_calls++;
+        js_object_set(vm, this_val, atom(vm, "v"), argc > 0 ? args[0] : js_undefined());
+    }
+    *result = js_undefined();
+    return true;
+}
+/* a host constructor that returns an object of its own */
+static bool native_make(JsContext *ctx, JsValue this_val, const JsValue *args, int argc, JsValue *result) {
+    (void)this_val; (void)args; (void)argc;
+    JsValue o = js_object_new(ctx);
+    js_object_set(js_context_vm(ctx), o, atom(js_context_vm(ctx), "own"), js_bool(true));
+    *result = o;
+    return true;
+}
+
+/* A host native is a constructor with a `prototype`, as through V8's embedding API, unless the
+ * host turns that off */
+static void test_native_constructors(void) {
+    JsVm *vm = js_vm_new(NULL);
+    JsContext *ctx = js_context_new(vm);
+    JsValue globals = js_context_globals(ctx);
+    js_object_set(vm, globals, atom(vm, "Point"), js_native_new(ctx, "Point", native_point, NULL));
+    js_object_set(vm, globals, atom(vm, "Make"), js_native_new(ctx, "Make", native_make, NULL));
+    JsValue plain = js_native_new(ctx, "plain", native_point, NULL);
+    js_gc_protect(vm, &plain);
+    CHECK(js_native_set_constructor(ctx, plain, false), "a host native can stop being a constructor");
+    js_object_set(vm, globals, atom(vm, "plain"), plain);
+    JsValue maxv = js_object_get(vm, js_object_get(vm, globals, atom(vm, "Math")), atom(vm, "max"));
+    CHECK(!js_native_set_constructor(ctx, maxv, true), "a builtin's kind is not the host's to change");
+
+    const char *src =
+        "Point.prototype.norm = function () { return this.v * 2; };\n"
+        "const p = new Point(21);\n"
+        "Point(5);\n"
+        "let e1 = '';\n"
+        "try { new plain(); } catch (e) { e1 = e.message; }\n"
+        "[p.norm(), p instanceof Point, p.constructor === Point, Object.keys(Point.prototype).join(),\n"
+        " Point.hasOwnProperty('prototype'), plain.hasOwnProperty('prototype'), 'prototype' in plain,\n"
+        " e1, new Make().own === true, new Make() instanceof Make].join('|')";
+    size_t len;
+    uint16_t *u = to_u16(src, &len);
+    const char *em = NULL; uint32_t ep = 0;
+    JsValue fn = js_compile_module(ctx, u, len, &em, &ep);
+    CHECK(js_is_function(fn), em ? em : "compiles");
+    js_gc_protect(vm, &fn);
+    JsValue p = js_run_module(ctx, fn);
+    CHECK(js_promise_state(p) == 1, "runs");
+    CHECK(str_is(js_promise_result(p), "42|true|true|norm|true|false|false|plain is not a constructor|true|false"),
+          "new on host natives");
+    CHECK(g_construct_calls == 1, "js_native_is_construct_call tells new from a call");
+    CHECK(!js_native_is_construct_call(ctx), "no construct call outside a native");
+    js_gc_unprotect(vm, &fn);
+    js_gc_unprotect(vm, &plain);
+    free(u);
+    js_vm_free(vm);
+}
+
 static void test_native_values(void) {
     JsVm *vm = js_vm_new(NULL);
     JsContext *ctx = js_context_new(vm);
@@ -155,6 +217,7 @@ static void test_native_values(void) {
 
 int main(void) {
     test_native_values();
+    test_native_constructors();
     printf("test_natives: %d checks, %d failed\n", checks_run, checks_failed);
     return checks_failed ? 1 : 0;
 }

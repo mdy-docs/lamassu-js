@@ -460,8 +460,8 @@ static void test_new(void) {
     expect_error("async function f() {} new f();", RUN_RUNTIME_ERR, "not a constructor");
     expect_error("new (5)();", RUN_RUNTIME_ERR, "not a constructor");
     expect_error("new NoSuchThing();", RUN_RUNTIME_ERR, "is not defined");
-    /* assigning a non-object to .prototype is a harmless no-op */
-    expect_result("function F() {} F.prototype = 5; typeof F.prototype;", "object");
+    /* `prototype` takes any value, as in V8; `new` then uses Object.prototype */
+    expect_result("function F() {} F.prototype = 5; typeof F.prototype;", "number");
 }
 
 /* Array/RegExp/Date/Map/Set instance methods are reached purely through a
