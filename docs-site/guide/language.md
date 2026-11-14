@@ -158,7 +158,8 @@ These are permanent scoping decisions, not a "not yet implemented" list:
   for untrusted scripts needs to prevent.
 - **Sloppy (non-strict) mode.** Every unit of source is a module; there is
   no script goal to make sloppy.
-- **`for...in`, labeled statements, `with`.**
+- **`for...in` and `with`.** (Labeled statements are supported: `break` and `continue` to a
+  label, on loops, blocks and other statements.)
 - **Advanced built-ins**: `Reflect`, `Proxy`, `Symbol`, generators, typed
   arrays, `Intl`.
 - **Full spec conformance.** Where the subset overlaps real JS, behavior is

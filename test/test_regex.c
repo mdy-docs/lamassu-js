@@ -206,12 +206,15 @@ static void test_match(void) {
 }
 
 static void test_match_all(void) {
-    eq("'a1b2'.matchAll(/\\d/g).length;", "2");
-    eq("'a1b2'.matchAll(/\\d/g)[1].index;", "3");
-    eq("'a1b2'.matchAll(/(\\d)/g)[0][1];", "1");
-    eq_s("'x@y z@w'.matchAll(/(?<l>\\w)@/g)[1].groups.l;", "z");
-    eq("'abc'.matchAll(/x/g).length;", "0");
-    eq("'a1'.matchAll('\\\\d').length;", "1"); /* string arg gets /g */
+    eq("[...'a1b2'.matchAll(/\\d/g)].length;", "2");
+    eq("[...'a1b2'.matchAll(/\\d/g)][1].index;", "3");
+    eq("[...'a1b2'.matchAll(/(\\d)/g)][0][1];", "1");
+    eq_s("[...'x@y z@w'.matchAll(/(?<l>\\w)@/g)][1].groups.l;", "z");
+    eq("[...'abc'.matchAll(/x/g)].length;", "0");
+    eq("[...'a1'.matchAll('\\\\d')].length;", "1"); /* string arg gets /g */
+    /* an iterator, one search per step */
+    eq("const it = 'a1b2'.matchAll(/\\d/g); [Array.isArray(it), it.next().value[0], [...it].length].join();",
+       "false,1,1");
     err("'a1'.matchAll(/\\d/);", "TypeError: String.prototype.matchAll called with a non-global RegExp argument");
 }
 

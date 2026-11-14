@@ -75,8 +75,6 @@ that's known to differ, so you're not surprised by one in production.
 - **`Array.prototype.sort` is a stable O(n²) binary insertion sort** —
   fine for templating-sized arrays; revisit if you're sorting something
   large.
-- **`Array.from` supports strings and arrays**, not arbitrary array-likes
-  or iterators.
 
 ## Numbers
 
@@ -92,16 +90,13 @@ that's known to differ, so you're not surprised by one in production.
   exponent (beyond about 1e±22) is slower than in V8: each candidate is checked
   by parsing it back exactly.
 
-## Strings
+## Iteration
 
-**Case mapping (`toUpperCase`/`toLowerCase`) is ASCII-only** — no full
-Unicode case folding.
-
-## Regular expressions
-
-`String.prototype.matchAll` returns a plain array rather than a lazy
-iterator (`for...of` over the result behaves the same either way).
-`String.prototype.split` ignores its `limit` argument.
+- **Only the built-in iterables iterate** (strings, arrays, `Map`, `Set` and their iterators):
+  there is no `Symbol.iterator` for an object to define its own. See
+  [Built-ins → Iteration](/guide/builtins#iteration).
+- **No `Iterator` helpers**: the iterators' shared prototype has no `map`, `filter`, `take`,
+  `toArray` and the rest, and there is no `Iterator` global.
 
 ## Errors
 
@@ -118,13 +113,13 @@ iterator (`for...of` over the result behaves the same either way).
   a feature lamassu leaves out says so (`'var' is not supported; use 'let' or
   'const'`, `classes are not supported`) where V8 would compile the script;
   a few of V8's own quirks are not copied (in a module V8 reports `let let`
-  and `let 1x` as `Unexpected strict mode reserved word`, and spreading a
-  non-iterable object into a call as `Spread syntax requires
-  ...iterable[Symbol.iterator] to be a function`; lamassu says `let is
-  disallowed as a lexically bound name`, `Invalid or unexpected token` and
-  `o is not iterable`); a callee with no readable name shows its value
-  (`undefined is not a function` for `(void 0)()`, where V8 prints the
-  expression); and a duplicate label is not an error.
+  and `let 1x` as `Unexpected strict mode reserved word`; lamassu says `let is
+  disallowed as a lexically bound name` and `Invalid or unexpected token`); an
+  operand with no readable name shows its value (`undefined is not a function` for `(void 0)()`
+  and `#<Object> is not iterable` for `[...{}]`, where V8 prints the expression,
+  `{(intermediate value)}` for an object literal); an object named in a message is `#<Object>`
+  whatever its kind (V8 says `#<Map>`, `[object Date]`), except an array, a module namespace and an
+  iterator; and a duplicate label is not an error.
 - **Out-of-memory errors may still be bare strings**: when the engine
   cannot allocate an Error object, it throws the message text instead so
   the failure is never lost.

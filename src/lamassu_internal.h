@@ -101,6 +101,7 @@ typedef enum JsObjKind {
     JS_OBJ_SET = 5,    /* JsSetObj (js_setobj.h) */
     JS_OBJ_ERROR = 6,  /* plain JsObject shape; see js_error.h */
     JS_OBJ_HOST = 7,   /* JsHostObject: an ordinary object owning a host pointer (lamassu.h) */
+    JS_OBJ_ITER = 8,   /* JsIterObj (js_iter.h): a Map, Set or RegExp String Iterator */
 } JsObjKind;
 
 /* JsObject.obj_flags. Extensibility only — this engine has no per-property
@@ -119,11 +120,14 @@ typedef enum JsObjKind {
 
 /* An error path the interpreter loop calls rarely: kept out of line, so that it does not take
  * registers or code space from the hot cases around it. */
+/* JS_NOINLINE: an opcode's whole body, kept out of the loop for the same reason, but not cold. */
 #if defined(__GNUC__) || defined(__clang__)
 #define JS_COLD __attribute__((noinline, cold))
+#define JS_NOINLINE __attribute__((noinline))
 #define JS_UNLIKELY(c) __builtin_expect(!!(c), 0)
 #else
 #define JS_COLD
+#define JS_NOINLINE
 #define JS_UNLIKELY(c) (c)
 #endif
 
@@ -610,6 +614,10 @@ struct JsContext {
     JsObject *date_proto;
     JsObject *map_proto;
     JsObject *set_proto;
+    /* %IteratorPrototype% and the Map, Set and RegExp String Iterator prototypes that chain to
+     * it (js_iter.h; indexed by JS_ITER_PROTO_*) */
+    JsObject *iterator_proto;
+    JsObject *iter_protos[3];
     JsObject *error_protos[JS_ERROR_KIND_COUNT]; /* Error.prototype and subclasses */
     /* persistent REPL lexical scope: top-level let/const/function bindings
      * that survive across evaluations. repl_scope holds values (TDZ sentinel
@@ -701,6 +709,9 @@ struct JsVm {
     bool mark_overflow;
     JsValue **roots;
     size_t roots_len, roots_cap;
+    /* Map and Set iterators not yet done, held weakly: a delete or clear moves their positions
+     * (js_iter.h), and the collector drops the unmarked ones before it sweeps */
+    struct JsIterObj *live_iters;
 
     JsAtomTable atoms;
     JsContext *contexts;
@@ -778,6 +789,8 @@ bool js_array_append(JsVm *vm, JsObject *arr, JsValue v);
 /* A new array of what `for (const x of V)` visits (an array's elements, a string's code points,
  * a Map's entries, a Set's values); NULL with *ERR set (V8's TypeError, or out of memory). */
 JsObject *js_iterable_to_array(JsContext *ctx, JsValue v, JsValue *err);
+/* split's ToUint32(limit) (undefined: 2^32 - 1); false thrown, the error pending */
+bool js_split_limit(JsContext *ctx, JsValue limit, uint32_t *lim);
 /* The tag Object.prototype.toString gives V ("Array" for "[object Array]"), as V8's */
 const char *js_to_string_tag(const JsContext *ctx, JsValue v);
 bool js_array_set_index(JsVm *vm, JsObject *arr, uint32_t idx, JsValue v);

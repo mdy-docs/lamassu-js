@@ -287,7 +287,13 @@ JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
                 fb_ascii(b, "[object Array]", 14);
             else if (js_value_object(v)->obj_flags & JS_OBJ_NAMESPACE)
                 fb_ascii(b, "[object Module]", 15);
-            else
+            else if (js_value_object(v)->obj_kind == JS_OBJ_ITER) {
+                /* V8 finds no constructor for these, so it names them by their tag */
+                const char *tag = js_to_string_tag(ctx, v);
+                fb_ascii(b, "[object ", 8);
+                fb_ascii(b, tag, strlen(tag));
+                fb_ascii(b, "]", 1);
+            } else
                 fb_ascii(b, "#<Object>", 9);
         } else if (js_is_promise(v)) {
             fb_ascii(b, "#<Promise>", 10);

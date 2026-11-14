@@ -5,6 +5,7 @@
 #include "js_date.h"
 #include "js_mapobj.h"
 #include "js_setobj.h"
+#include "js_iter.h"
 #ifdef LAMASSU_HAS_REGEX
 #include "js_regexp.h"
 #endif
@@ -1040,8 +1041,9 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
             if (st != JS_PROP_OK || !js_is_undefined(*out))
                 return st;
         }
+        /* a bare compiled function (JS_KIND_FUNCTION) is tagged a function too and has no slot */
         if (JS_UNLIKELY(c->kind == JS_KIND_CLOSURE ? ((JsClosure *)c)->proto_set
-                                                   : ((JsNative *)c)->proto_set))
+                        : c->kind == JS_KIND_NATIVE && ((JsNative *)c)->proto_set))
             return proto_value_get(ctx, c->kind == JS_KIND_CLOSURE ? ((JsClosure *)c)->own_proto
                                                                    : ((JsNative *)c)->own_proto,
                                    key, out);
@@ -1857,6 +1859,137 @@ static void fiber_throw_operand(JsContext *ctx, JsFiber *fb, const JsFunctionCel
 static void fiber_throw_callee(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip,
                                JsValue callee, const char *what) {
     fiber_throw_operand(ctx, fb, fn, ip, callee, what);
+}
+
+/* ---- iteration beyond strings and arrays (js_iter.h), out of the dispatch loop ---- */
+
+/* ITER_NEW for anything but a string or an array: a Map or a Set becomes an iterator over its
+ * entries or values, an iterator object is its own iterable, anything else is "x is not
+ * iterable". False raised. */
+JS_COLD static bool iter_open_slow(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip,
+                                   JsValue *slot) {
+    JsIterCursor c;
+    int rc = js_iter_open(ctx, *slot, &c);
+    if (rc > 0) {
+        *slot = c.src;
+        return true;
+    }
+    if (rc < 0)
+        fiber_throw(ctx, fb, "out of memory");
+    else
+        fiber_throw_operand(ctx, fb, fn, ip, *slot, " is not iterable");
+    return false;
+}
+
+/* The next value of the iterator in IT_SLOT at position *IDX_SLOT (as ITER_NEW left them): 1
+ * and *out, 0 done (*out undefined, and the position stays done), -1 raised. The position is only
+ * a string's or an array's; an iterator object keeps its own. */
+JS_COLD static int iter_next_slow(JsContext *ctx, JsFiber *fb, JsValue *it_slot, JsValue *idx_slot,
+                                  JsValue *out) {
+    JsValue src = *it_slot;
+    uint32_t i;
+    if (!(js_is_string(src) || js_iterobj_is(src) || is_array(src)) || !value_to_index(*idx_slot, &i)) {
+        fiber_throw(ctx, fb, "internal error: bad iterator operands");
+        return -1;
+    }
+    JsIterCursor c = {src, i};
+    int rc = js_iter_next(ctx, &c, out);
+    if (rc < 0) {
+        fiber_throw_value(fb, *out);
+        return -1;
+    }
+    *idx_slot = js_number((double)c.i);
+    if (rc == 0)
+        *out = js_undefined();
+    return rc;
+}
+
+/* ITER_REST: what is left of the iterator, as a new array; the position ends done. NULL raised. */
+JS_COLD static JsObject *iter_rest_slow(JsContext *ctx, JsFiber *fb, JsValue *it_slot, JsValue *idx_slot) {
+    JsVm *vm = ctx->vm;
+    JsObject *out = js_array_new_cell(ctx, 0);
+    if (!out) {
+        fiber_throw(ctx, fb, "out of memory");
+        return NULL;
+    }
+    JsValue outv = js_value_from_cell(&out->gc);
+    js_gc_protect(vm, &outv);
+    JsValue v;
+    int rc;
+    while ((rc = iter_next_slow(ctx, fb, it_slot, idx_slot, &v)) > 0) {
+        if (!js_array_append(vm, out, v)) {
+            fiber_throw(ctx, fb, "out of memory");
+            rc = -1;
+            break;
+        }
+    }
+    js_gc_unprotect(vm, &outv);
+    return rc < 0 ? NULL : out;
+}
+
+/* ITER_STEP on the stack's [it i]: pushes the next value, undefined once done. False raised. */
+static JS_NOINLINE bool iter_step(JsContext *ctx, JsFiber *fb) {
+    JsValue *it = &fb->stack[fb->sp - 2], *idx = &fb->stack[fb->sp - 1];
+    uint32_t i;
+    if (is_array(*it) && value_to_index(*idx, &i)) {
+        JsObject *a = js_value_object(*it);
+        if (i < a->elem_count) {
+            *idx = js_number((double)(i + 1));
+            fb->stack[fb->sp++] = a->elems[i];
+        } else {
+            *idx = js_number((double)JS_ITER_DONE_INDEX);
+            fb->stack[fb->sp++] = js_undefined();
+        }
+        return true;
+    }
+    JsValue v;
+    if (iter_next_slow(ctx, fb, it, idx, &v) < 0)
+        return false;
+    fb->stack[fb->sp++] = v;
+    return true;
+}
+
+/* ITER_REST on the stack's [it i]: pushes what is left as a new array. False raised. */
+static JS_NOINLINE bool iter_rest(JsContext *ctx, JsFiber *fb) {
+    JsObject *rest = iter_rest_slow(ctx, fb, &fb->stack[fb->sp - 2], &fb->stack[fb->sp - 1]);
+    if (!rest)
+        return false;
+    fb->stack[fb->sp++] = js_value_from_cell(&rest->gc);
+    return true;
+}
+
+/* ARRAY_SPREAD (or a call's ARGS_SPREAD, CALL) of a Map, a Set or an iterator object onto the
+ * array ARR. False raised. */
+JS_COLD static bool spread_slow(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip,
+                                JsObject *arr, JsValue src, bool call) {
+    JsVm *vm = ctx->vm;
+    JsIterCursor c;
+    int rc = js_iter_open(ctx, src, &c);
+    if (rc <= 0) {
+        if (rc < 0)
+            fiber_throw(ctx, fb, "out of memory");
+        else if (!call)
+            fiber_throw_operand(ctx, fb, fn, ip, src, " is not iterable");
+        else if (js_is_undefined(src)) /* V8's spread call words these two its own way */
+            fiber_throw_operand(ctx, fb, fn, ip, src, " is not iterable (cannot read property undefined)");
+        else if (js_is_null(src))
+            fiber_throw_operand(ctx, fb, fn, ip, src, " is not iterable (cannot read property null)");
+        else
+            fiber_throw(ctx, fb, "TypeError: Spread syntax requires ...iterable[Symbol.iterator] to be a function");
+        return false;
+    }
+    js_gc_protect(vm, &c.src); /* a Map's or Set's new iterator is held nowhere else */
+    JsValue v;
+    while ((rc = js_iter_next(ctx, &c, &v)) > 0) {
+        if (!js_array_append(vm, arr, v)) {
+            fiber_throw(ctx, fb, "out of memory");
+            break;
+        }
+    }
+    js_gc_unprotect(vm, &c.src);
+    if (rc < 0)
+        fiber_throw_value(fb, v);
+    return rc == 0;
 }
 
 /* V8's ReferenceError for a let/const read before its declaration ran, named when the compiler
@@ -2762,7 +2895,8 @@ run:; /* (re)load the top frame */
                 fb->sp--;
                 break;
             }
-            case JS_OP_ARRAY_SPREAD: {
+            case JS_OP_ARRAY_SPREAD:
+            case JS_OP_ARGS_SPREAD: {
                 JsValue src = PEEK(0);
                 if (!is_array(PEEK(1)))
                     RT_THROW("internal error: array builder on non-array");
@@ -2787,41 +2921,11 @@ run:; /* (re)load the top frame */
                         i += n;
                     }
                 } else {
-                    fiber_throw_operand(ctx, fb, fn, op_ip, src, " is not iterable");
-                    RT_RAISE();
+                    fr->ip = ip; /* GC-safe point before allocating */
+                    if (!spread_slow(ctx, fb, fn, op_ip, a, src, op == JS_OP_ARGS_SPREAD))
+                        RT_RAISE();
                 }
                 fb->sp--;
-                break;
-            }
-            case JS_OP_ARRAY_REST: {
-                /* PEEK(0) is the "skip this many" count the compiler always
-                 * pushes as a small non-negative integer; validated-yet-
-                 * hostile bytecode could put something else here, so guard
-                 * the cast (see ARRAY_APPEND above for the same idea
-                 * applied to a type instead of a number). */
-                uint32_t from;
-                if (!value_to_index(PEEK(0), &from))
-                    RT_THROW("internal error: bad rest-count operand");
-                JsValue src = PEEK(1);
-                JsObject *out = js_array_new_cell(ctx, 0);
-                if (!out)
-                    RT_THROW("out of memory");
-                if (js_is_object(src) && js_value_object(src)->obj_kind == JS_OBJ_ARRAY) {
-                    JsObject *s = js_value_object(src);
-                    for (uint32_t i = from; i < s->elem_count; i++) {
-                        if (!js_array_append(vm, out, s->elems[i]))
-                            RT_THROW("out of memory");
-                    }
-                } else if (js_is_string(src)) {
-                    JsString *s = js_value_string(src);
-                    for (uint32_t i = from; i < s->length; i++) {
-                        JsString *c = js_string_cell_new(vm, s->units + i, 1);
-                        if (!c || !js_array_append(vm, out, js_value_from_cell(&c->gc)))
-                            RT_THROW("out of memory");
-                    }
-                }
-                fb->sp -= 2;
-                PUSH(js_value_from_cell(&out->gc));
                 break;
             }
             case JS_OP_OBJ_SPREAD: {
@@ -2937,25 +3041,10 @@ run:; /* (re)load the top frame */
             }
             case JS_OP_ITER_NEW: {
                 JsValue it = PEEK(0);
-                if (js_mapobj_is(it) || js_setobj_is(it)) {
-                    /* no lazy MapIterator/SetIterator: substitute a real
-                     * (and thus array-iterable) snapshot right here — a
-                     * Map's default iterator is its entries, a Set's is
-                     * its values */
-                    fr->ip = ip; /* GC-safe point before allocating it */
-                    JsObject *snap = js_mapobj_is(it)
-                        ? js_mapobj_entries_array(ctx, js_value_object(it))
-                        : js_setobj_values_array(ctx, js_value_object(it));
-                    if (!snap)
-                        RT_THROW("out of memory");
-                    it = js_value_from_cell(&snap->gc);
-                    PEEK(0) = it;
-                }
-                bool ok = js_is_string(it) ||
-                          (js_is_object(it) && js_value_object(it)->obj_kind == JS_OBJ_ARRAY);
-                if (!ok) {
-                    fiber_throw_operand(ctx, fb, fn, op_ip, it, " is not iterable");
-                    RT_RAISE();
+                if (!js_is_string(it) && !is_array(it)) {
+                    fr->ip = ip; /* GC-safe point before allocating an iterator */
+                    if (!iter_open_slow(ctx, fb, fn, op_ip, &PEEK(0)))
+                        RT_RAISE();
                 }
                 PUSH(js_number(0));
                 break;
@@ -2965,7 +3054,7 @@ run:; /* (re)load the top frame */
                 JsValue it = PEEK(1);
                 /* PEEK(0) is the iterator index the compiler always keeps a
                  * small non-negative integer; guard the cast against
-                 * hostile bytecode the same way as ARRAY_REST above. */
+                 * hostile bytecode the same way as ARRAY_APPEND above. */
                 uint32_t i;
                 if (!value_to_index(PEEK(0), &i))
                     RT_THROW("internal error: bad iterator index operand");
@@ -2986,12 +3075,7 @@ run:; /* (re)load the top frame */
                         RT_THROW("out of memory");
                     PEEK(0) = js_number((double)(i + n));
                     PUSH(js_value_from_cell(&c->gc));
-                } else {
-                    /* ITER_NEW only pushes string/array iterators; guard the
-                     * cast against hostile bytecode that reaches ITER_NEXT
-                     * with some other value in the iterator slot */
-                    if (!is_array(it))
-                        RT_THROW("TypeError: value is not iterable");
+                } else if (is_array(it)) {
                     JsObject *a = js_value_object(it);
                     if (i >= a->elem_count) {
                         fb->sp -= 2;
@@ -3000,7 +3084,33 @@ run:; /* (re)load the top frame */
                     }
                     PEEK(0) = js_number((double)(i + 1));
                     PUSH(a->elems[i]);
+                } else {
+                    /* an iterator object (ITER_NEW made one of a Map or a Set) */
+                    fr->ip = ip;
+                    JsValue v;
+                    int rc = iter_next_slow(ctx, fb, &PEEK(1), &PEEK(0), &v);
+                    if (rc < 0)
+                        RT_RAISE();
+                    if (rc == 0) {
+                        fb->sp -= 2;
+                        ip = done_target;
+                        break;
+                    }
+                    PUSH(v);
                 }
+                break;
+            }
+            case JS_OP_ITER_STEP: {
+                /* destructuring's next element: undefined once done, and done stays done */
+                fr->ip = ip;
+                if (!iter_step(ctx, fb))
+                    RT_RAISE();
+                break;
+            }
+            case JS_OP_ITER_REST: {
+                fr->ip = ip;
+                if (!iter_rest(ctx, fb))
+                    RT_RAISE();
                 break;
             }
             case JS_OP_CLOSURE: {

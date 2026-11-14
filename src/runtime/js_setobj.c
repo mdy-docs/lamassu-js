@@ -1,10 +1,10 @@
 /*
- * Set: construction, mutators, lookups, and snapshot iteration views. See
- * js_setobj.h for the storage/equality tradeoffs (linear scan, no lazy
- * SetIterator).
+ * Set: construction, mutators, lookups, and its iterators (js_iter.h). See js_setobj.h for the
+ * storage and equality.
  */
 #include "js_bytecode.h"
 #include "js_error.h"
+#include "js_iter.h"
 #include "js_setobj.h"
 #include "js_valindex.h"
 
@@ -54,7 +54,7 @@ static bool setobj_add(JsVm *vm, JsSetObj *s, JsValue value) {
 
 /* Shifts later entries left to close the gap, preserving insertion order
  * (the same O(n) tradeoff Map's delete makes). */
-static bool setobj_delete(JsSetObj *s, JsValue value) {
+static bool setobj_delete(JsVm *vm, JsSetObj *s, JsValue value) {
     int64_t idx = setobj_find(s, value);
     if (idx < 0)
         return false;
@@ -62,8 +62,11 @@ static bool setobj_delete(JsSetObj *s, JsValue value) {
     for (uint32_t k = i; k + 1 < s->count; k++)
         s->items[k] = s->items[k + 1];
     s->count--;
-    /* The shift renumbered every entry from i on; rebuild the position index. */
+    /* The shift renumbered every entry from i on; rebuild the position index, and the
+     * iterators past i move back. */
     js_valindex_rebuild(s->index, s->index_cap, s->items, s->count);
+    if (vm->live_iters)
+        js_iter_on_delete(vm, &s->obj, i);
     return true;
 }
 
@@ -98,6 +101,8 @@ static bool this_set(JsContext *ctx, JsValue tv, JsSetObj **out, JsValue *r) {
 /* Source may be another Set (copied) or an Array (each element added).
  * Strings and other array-likes aren't iterated — same scope cut as
  * Map's constructor. */
+static bool set_add(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r);
+
 static bool g_Set(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     JsValue src = ARG(0);
@@ -105,23 +110,11 @@ static bool g_Set(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsV
     if (!alloc_setobj(ctx, &sv))
         return nthrow(ctx, r, "out of memory");
     if (!js_is_undefined(src) && !js_is_null(src)) {
-        JsSetObj *s = (JsSetObj *)js_value_object(sv);
-        if (js_setobj_is(src)) {
-            JsSetObj *ss = (JsSetObj *)js_value_object(src);
-            for (uint32_t i = 0; i < ss->count; i++) {
-                if (!setobj_add(ctx->vm, s, ss->items[i]))
-                    return nthrow(ctx, r, "out of memory");
-            }
-        } else if (js_is_object(src) && js_value_object(src)->obj_kind == JS_OBJ_ARRAY) {
-            JsObject *a = js_value_object(src);
-            for (uint32_t i = 0; i < a->elem_count; i++) {
-                if (!setobj_add(ctx->vm, s, a->elems[i]))
-                    return nthrow(ctx, r, "out of memory");
-            }
-        } else {
-            return (*r = js_error_fmt(ctx, "TypeError: %t is not iterable (cannot read property Symbol(Symbol.iterator))",
-                                      src)), false;
-        }
+        js_gc_protect(ctx->vm, &sv);
+        bool ok = js_collection_fill(ctx, sv, src, false, set_add, r);
+        js_gc_unprotect(ctx->vm, &sv);
+        if (!ok)
+            return false;
     }
     *r = sv;
     return true;
@@ -151,7 +144,7 @@ static bool set_delete(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     JsSetObj *s;
     if (!this_set(ctx, tv, &s, r))
         return false;
-    *r = js_bool(setobj_delete(s, ARG(0)));
+    *r = js_bool(setobj_delete(ctx->vm, s, ARG(0)));
     return true;
 }
 
@@ -162,16 +155,14 @@ static bool set_clear(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
         return false;
     s->count = 0;
     js_valindex_rebuild(s->index, s->index_cap, s->items, 0); /* empty the index */
+    if (ctx->vm->live_iters)
+        js_iter_on_clear(ctx->vm, &s->obj);
     *r = js_undefined();
     return true;
 }
 
-/* callback(value, value, set) per spec (a Set has no separate key). Same
- * re-read-fresh-each-iteration discipline as Map's forEach: never cache
- * s->items across the js_call, since the callback may grow the set and
- * move the backing storage via realloc. A callback that deletes an
- * earlier-visited value shifts later ones down and can make forEach skip
- * one — the same linear-storage tradeoff as Map. */
+/* callback(value, value, set) per spec (a Set has no separate key), live as Map's forEach is:
+ * it walks the set with an iterator (js_iter.h). */
 static bool set_forEach(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsSetObj *s;
     if (!this_set(ctx, tv, &s, r))
@@ -179,88 +170,49 @@ static bool set_forEach(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     if (!js_is_function(ARG(0)))
         return (*r = js_error_fmt(ctx, "TypeError: %t is not a function", ARG(0))), false;
     JsValue cb = ARG(0), thisArg = ARG(1), setv = tv;
-    js_gc_protect(ctx->vm, &setv);
+    JsValue itv = js_iterobj_new(ctx, JS_ITER_SET_VALUES, setv, js_undefined(), 0);
+    if (js_is_undefined(itv))
+        return nthrow(ctx, r, "out of memory");
+    js_gc_protect(ctx->vm, &itv);
     js_gc_protect(ctx->vm, &cb);
     js_gc_protect(ctx->vm, &thisArg);
+    JsIterObj *it = (JsIterObj *)js_value_object(itv);
     bool ok = true;
-    for (uint32_t i = 0; i < s->count && ok; i++) {
-        JsValue argv[3] = {s->items[i], s->items[i], setv};
+    JsValue v;
+    while (js_iterobj_step(ctx, it, &v) > 0) {
+        JsValue argv[3] = {v, v, setv};
         JsValue cbres;
         if (!js_call(ctx, cb, thisArg, argv, 3, &cbres)) {
             *r = cbres;
             ok = false;
+            break;
         }
     }
     js_gc_unprotect(ctx->vm, &thisArg);
     js_gc_unprotect(ctx->vm, &cb);
-    js_gc_unprotect(ctx->vm, &setv);
+    js_gc_unprotect(ctx->vm, &itv);
     if (!ok)
         return false;
     *r = js_undefined();
     return true;
 }
 
-JsObject *js_setobj_values_array(JsContext *ctx, JsObject *o) {
-    JsSetObj *s = (JsSetObj *)o;
-    JsObject *out = js_array_new_cell(ctx, s->count);
-    if (!out)
-        return NULL;
-    for (uint32_t i = 0; i < s->count; i++) {
-        if (!js_array_append(ctx->vm, out, s->items[i]))
-            return NULL;
-    }
-    return out;
-}
-
-JsObject *js_setobj_entries_array(JsContext *ctx, JsObject *o) {
-    JsSetObj *s = (JsSetObj *)o;
-    JsVm *vm = ctx->vm;
-    JsObject *out = js_array_new_cell(ctx, s->count);
-    if (!out)
-        return NULL;
-    JsValue outv = js_value_from_cell(&out->gc);
-    js_gc_protect(vm, &outv);
-    bool ok = true;
-    for (uint32_t i = 0; ok && i < s->count; i++) {
-        JsObject *pair = js_array_new_cell(ctx, 2);
-        if (!pair) {
-            ok = false;
-            break;
-        }
-        JsValue pairv = js_value_from_cell(&pair->gc);
-        js_gc_protect(vm, &pairv);
-        pair->elems[0] = s->items[i];
-        pair->elems[1] = s->items[i];
-        pair->elem_count = 2;
-        ok = js_array_append(vm, out, pairv);
-        js_gc_unprotect(vm, &pairv);
-    }
-    js_gc_unprotect(vm, &outv);
-    return ok ? out : NULL;
+static bool set_iterator(JsContext *ctx, JsValue tv, JsValue *r, JsIterKind kind) {
+    JsSetObj *s;
+    if (!this_set(ctx, tv, &s, r))
+        return false;
+    *r = js_iterobj_new(ctx, kind, tv, js_undefined(), 0);
+    return js_is_undefined(*r) ? nthrow(ctx, r, "out of memory") : true;
 }
 
 static bool set_values(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)args; (void)argc;
-    JsSetObj *s;
-    if (!this_set(ctx, tv, &s, r))
-        return false;
-    JsObject *out = js_setobj_values_array(ctx, &s->obj);
-    if (!out)
-        return nthrow(ctx, r, "out of memory");
-    *r = js_value_from_cell(&out->gc);
-    return true;
+    return set_iterator(ctx, tv, r, JS_ITER_SET_VALUES);
 }
 
 static bool set_entries(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)args; (void)argc;
-    JsSetObj *s;
-    if (!this_set(ctx, tv, &s, r))
-        return false;
-    JsObject *out = js_setobj_entries_array(ctx, &s->obj);
-    if (!out)
-        return nthrow(ctx, r, "out of memory");
-    *r = js_value_from_cell(&out->gc);
-    return true;
+    return set_iterator(ctx, tv, r, JS_ITER_SET_ENTRIES);
 }
 
 /* ---- synthesized `size` (js_interp.c get_property) ---- */
@@ -316,13 +268,17 @@ bool js_setobj_builtins_init(JsContext *ctx) {
     } methods[] = {
         {"add", set_add}, {"has", set_has}, {"delete", set_delete}, {"clear", set_clear},
         {"forEach", set_forEach},
-        {"values", set_values}, {"keys", set_values}, /* keys() === values() per spec */
         {"entries", set_entries},
     };
     for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
         if (!def_method(ctx, ctx->set_proto, methods[i].name, methods[i].fn))
             return false;
     }
+    /* keys is the very same function as values, as the spec has it */
+    JsValue values = js_native_new(ctx, "values", set_values, NULL);
+    if (!js_is_function(values) || !js_object_set_ascii(ctx, ctx->set_proto, "values", values) ||
+        !js_object_set_ascii(ctx, ctx->set_proto, "keys", values))
+        return false;
 
     JsValue ctor = js_native_new(ctx, "Set", g_Set, NULL);
     if (!js_is_function(ctor))

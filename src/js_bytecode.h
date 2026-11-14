@@ -49,7 +49,7 @@ typedef enum JsOp {
     JS_OP_NEW_ARRAY,       /* u16 count; pops count elements */
     JS_OP_ARRAY_APPEND,    /* arr v -> arr */
     JS_OP_ARRAY_SPREAD,    /* arr iterable -> arr */
-    JS_OP_ARRAY_REST,      /* src i -> restArray (elems src[i..]) */
+    JS_OP_ARGS_SPREAD,     /* arr iterable -> arr (a call's ...args: V8's spread-call errors) */
     JS_OP_OBJ_SPREAD,      /* obj src -> obj */
     JS_OP_DEFINE_PROP,     /* obj k v -> obj */
     JS_OP_GET_PROP,        /* obj k -> v */
@@ -57,8 +57,10 @@ typedef enum JsOp {
     JS_OP_GET_PROP_ATOM,   /* u16; obj -> v */
     JS_OP_SET_PROP_ATOM,   /* u16; obj v -> v */
     JS_OP_DELETE_PROP,     /* obj k -> bool */
-    JS_OP_ITER_NEW,        /* iterable -> iterable 0 */
+    JS_OP_ITER_NEW,        /* iterable -> it 0 (a Map or Set becomes an iterator over it) */
     JS_OP_ITER_NEXT,       /* u32 done target; it i -> it i' v | (pops both, jumps) */
+    JS_OP_ITER_STEP,       /* it i -> it i' v (undefined once done; destructuring) */
+    JS_OP_ITER_REST,       /* it i -> it i' restArray (what is left; destructuring's ...rest) */
     JS_OP_THROW,
     JS_OP_RETURN,          /* pops; closes frame upvalues; pops frame */
     /* phase 4 */

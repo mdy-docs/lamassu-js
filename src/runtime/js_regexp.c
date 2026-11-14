@@ -9,16 +9,14 @@
  * rooted, so `args`/`this` survive; every cell created and held across a
  * further allocation (or a js_call into user code) is protected.
  *
- * Known deviations (documented): matchAll returns an array of match results
- * rather than an iterator (for-of over it behaves the same here); split
- * ignores the `limit` argument (as the non-regex split already does); the
- * string methods leave lastIndex at 0 (global) / untouched (non-global)
- * rather than emulating every intermediate spec mutation.
+ * Known deviation (documented): the string methods leave lastIndex at 0 (global) / untouched
+ * (non-global) rather than emulating every intermediate spec mutation.
  */
 #ifdef LAMASSU_HAS_REGEX
 
 #include "js_bytecode.h"
 #include "js_error.h"
+#include "js_iter.h"
 #include "js_regexp.h"
 
 #define ARG(i) ((i) < argc ? args[i] : js_undefined())
@@ -969,6 +967,9 @@ bool js_re_str_match(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     return ok ? true : re_oom(ctx, r);
 }
 
+/* matchAll: a RegExp String Iterator (js_iter.h) that runs one search per step, from the
+ * regexp's lastIndex (ToLength) as V8's clone of it starts; the regexp's own lastIndex is left
+ * alone. Its matches are exec's results. */
 bool js_re_str_matchAll(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                         JsValue *r) {
     JsVm *vm = ctx->vm;
@@ -982,38 +983,37 @@ bool js_re_str_matchAll(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     JsValue rev = js_undefined();
     js_gc_protect(vm, &rev);
     JsRegExp *re;
-    if (!coerce_regexp(ctx, ARG(0), "g", &rev, &re, r)) {
-        js_gc_unprotect(vm, &rev);
-        js_gc_unprotect(vm, &sv);
-        return false;
-    }
-    JsObject *arr = js_array_new_cell(ctx, 0);
-    JsValue arrv = arr ? js_value_from_cell(&arr->gc) : js_undefined();
-    bool ok = arr != NULL, budget = false;
+    bool ok = coerce_regexp(ctx, ARG(0), "g", &rev, &re, r);
     if (ok) {
-        js_gc_protect(vm, &arrv);
-        bool uni = re_is_unicode(re);
-        int32_t caps[CAPS_MAX];
-        uint32_t pos = 0;
-        int rc = RE_RUN_NOMATCH;
-        while (ok && pos <= s->length &&
-               (rc = re_run(re, s, pos, false, caps)) == RE_RUN_MATCH) {
-            JsValue m;
-            ok = build_exec_result(ctx, re, sv, caps, &m) &&
-                 js_array_append(vm, js_value_object(arrv), m);
-            pos = caps[1] == caps[0] ? advance_index(s, (uint32_t)caps[1], uni)
-                                     : (uint32_t)caps[1];
-        }
-        budget = rc == RE_RUN_BUDGET;
-        if (ok && !budget)
-            *r = arrv;
-        js_gc_unprotect(vm, &arrv);
+        double li = js_regexp_is(ARG(0)) ? re->last_index : 0;
+        uint32_t start = li != li || li <= 0 ? 0
+                         : li > (double)s->length ? s->length + 1 : (uint32_t)li;
+        *r = js_iterobj_new(ctx, JS_ITER_REGEXP, js_value_from_cell(&re->obj.gc), sv, start);
+        if (js_is_undefined(*r))
+            ok = re_oom(ctx, r);
     }
     js_gc_unprotect(vm, &rev);
     js_gc_unprotect(vm, &sv);
-    if (budget)
-        return re_budget_throw(ctx, r);
-    return ok ? true : re_oom(ctx, r);
+    return ok;
+}
+
+int js_re_iter_step(JsContext *ctx, JsValue rev, JsValue sv, uint32_t *pos, JsValue *out) {
+    JsRegExp *re = (JsRegExp *)js_value_object(rev);
+    JsString *s = js_value_string(sv);
+    if (*pos > s->length)
+        return 0;
+    int32_t caps[CAPS_MAX];
+    int rc = re_run(re, s, *pos, false, caps);
+    if (rc == RE_RUN_BUDGET)
+        return re_budget_throw(ctx, out), -1;
+    if (rc == RE_RUN_NOMATCH)
+        return 0;
+    uint32_t next = caps[1] == caps[0] ? advance_index(s, (uint32_t)caps[1], re_is_unicode(re))
+                                       : (uint32_t)caps[1];
+    if (!build_exec_result(ctx, re, sv, caps, out))
+        return re_oom(ctx, out), -1;
+    *pos = next;
+    return 1;
 }
 
 bool js_re_str_search(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
@@ -1311,7 +1311,6 @@ bool js_re_str_replace(JsContext *ctx, JsValue tv, const JsValue *args, int argc
 
 bool js_re_str_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                      JsValue *r) {
-    (void)argc;
     JsVm *vm = ctx->vm;
     JsRegExp *re = (JsRegExp *)js_value_object(args[0]); /* caller-checked */
     JsString *s = js_op_to_string(ctx, tv);
@@ -1319,6 +1318,11 @@ bool js_re_str_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
         return re_oom(ctx, r);
     JsValue sv = js_value_from_cell(&s->gc);
     js_gc_protect(vm, &sv);
+    uint32_t lim; /* after the string, as RegExp.prototype[@@split] converts them */
+    if (!js_split_limit(ctx, ARG(1), &lim)) {
+        js_gc_unprotect(vm, &sv);
+        return re_oom(ctx, r);
+    }
 
     JsObject *arr = js_array_new_cell(ctx, 0);
     if (!arr) {
@@ -1333,7 +1337,9 @@ bool js_re_str_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     bool ok = true, oom = false, budget = false;
     bool uni = re_is_unicode(re);
 
-    if (s->length == 0) {
+    if (lim == 0) {
+        /* [] */
+    } else if (s->length == 0) {
         /* whole-string match -> []; otherwise [S] */
         int rc = re_run(re, s, 0, true, caps);
         budget = rc == RE_RUN_BUDGET;
@@ -1355,14 +1361,20 @@ bool js_re_str_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
             uint32_t e = (uint32_t)caps[1];
             JsValue piece = substr_or_undef(vm, s, (int32_t)p, (int32_t)q, &oom);
             ok = !oom && js_array_append(vm, js_value_object(arrv), piece);
+            if (ok && js_value_object(arrv)->elem_count == lim)
+                break;
             for (int g = 1; ok && g <= ng; g++) {
                 JsValue cap = substr_or_undef(vm, s, caps[g * 2], caps[g * 2 + 1], &oom);
                 ok = !oom && js_array_append(vm, js_value_object(arrv), cap);
+                if (ok && js_value_object(arrv)->elem_count == lim)
+                    break;
             }
+            if (js_value_object(arrv)->elem_count == lim)
+                break;
             p = e;
             q = e;
         }
-        if (ok && !budget) {
+        if (ok && !budget && js_value_object(arrv)->elem_count < lim) {
             JsValue tail = substr_or_undef(vm, s, (int32_t)p, (int32_t)s->length, &oom);
             ok = !oom && js_array_append(vm, js_value_object(arrv), tail);
         }

@@ -1,10 +1,10 @@
 /*
- * Map: construction, mutators, lookups, and snapshot iteration views. See
- * js_mapobj.h for the storage/equality tradeoffs (linear scan, no lazy
- * MapIterator).
+ * Map: construction, mutators, lookups, and its iterators (js_iter.h). See js_mapobj.h for the
+ * storage and equality.
  */
 #include "js_bytecode.h"
 #include "js_error.h"
+#include "js_iter.h"
 #include "js_mapobj.h"
 #include "js_valindex.h"
 
@@ -13,11 +13,6 @@
 static bool nthrow(JsContext *ctx, JsValue *r, const char *msg) {
     *r = js_error_from_ascii(ctx, msg); /* Error object; string on OOM */
     return false;
-}
-
-static bool is_pair_like(JsValue v) {
-    return js_is_object(v) && js_value_object(v)->obj_kind == JS_OBJ_ARRAY &&
-          js_value_object(v)->elem_count >= 2;
 }
 
 /* ---- storage ---- */
@@ -70,7 +65,7 @@ static bool mapobj_set(JsVm *vm, JsMapObj *m, JsValue key, JsValue value) {
 /* Shifts later entries left to close the gap, preserving insertion order
  * (this is the O(n) storage's delete cost; sets/gets/has pay linear scan
  * instead). */
-static bool mapobj_delete(JsMapObj *m, JsValue key) {
+static bool mapobj_delete(JsVm *vm, JsMapObj *m, JsValue key) {
     int64_t idx = mapobj_find(m, key);
     if (idx < 0)
         return false;
@@ -81,8 +76,10 @@ static bool mapobj_delete(JsMapObj *m, JsValue key) {
     }
     m->count--;
     /* The shift renumbered every entry from i on, so the position index must
-     * be rebuilt against the new ordering. */
+     * be rebuilt against the new ordering, and the iterators past i move back. */
     js_valindex_rebuild(m->index, m->index_cap, m->keys, m->count);
+    if (vm->live_iters)
+        js_iter_on_delete(vm, &m->obj, i);
     return true;
 }
 
@@ -115,6 +112,8 @@ static bool this_map(JsContext *ctx, JsValue tv, JsMapObj **out, JsValue *r) {
 
 /* ---- constructor ---- */
 
+static bool map_set(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r);
+
 static bool g_Map(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     JsValue src = ARG(0);
@@ -122,27 +121,11 @@ static bool g_Map(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsV
     if (!alloc_mapobj(ctx, &mv))
         return nthrow(ctx, r, "out of memory");
     if (!js_is_undefined(src) && !js_is_null(src)) {
-        JsMapObj *m = (JsMapObj *)js_value_object(mv);
-        if (js_mapobj_is(src)) {
-            JsMapObj *sm = (JsMapObj *)js_value_object(src);
-            for (uint32_t i = 0; i < sm->count; i++) {
-                if (!mapobj_set(ctx->vm, m, sm->keys[i], sm->values[i]))
-                    return nthrow(ctx, r, "out of memory");
-            }
-        } else if (js_is_object(src) && js_value_object(src)->obj_kind == JS_OBJ_ARRAY) {
-            JsObject *a = js_value_object(src);
-            for (uint32_t i = 0; i < a->elem_count; i++) {
-                if (!is_pair_like(a->elems[i]))
-                    return (*r = js_error_fmt(ctx, "TypeError: Iterator value %v is not an entry object",
-                                              a->elems[i])), false;
-                JsObject *pair = js_value_object(a->elems[i]);
-                if (!mapobj_set(ctx->vm, m, pair->elems[0], pair->elems[1]))
-                    return nthrow(ctx, r, "out of memory");
-            }
-        } else {
-            return (*r = js_error_fmt(ctx, "TypeError: %t is not iterable (cannot read property Symbol(Symbol.iterator))",
-                                      src)), false;
-        }
+        js_gc_protect(ctx->vm, &mv);
+        bool ok = js_collection_fill(ctx, mv, src, true, map_set, r);
+        js_gc_unprotect(ctx->vm, &mv);
+        if (!ok)
+            return false;
     }
     *r = mv;
     return true;
@@ -181,7 +164,7 @@ static bool map_delete(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     JsMapObj *m;
     if (!this_map(ctx, tv, &m, r))
         return false;
-    *r = js_bool(mapobj_delete(m, ARG(0)));
+    *r = js_bool(mapobj_delete(ctx->vm, m, ARG(0)));
     return true;
 }
 
@@ -192,17 +175,15 @@ static bool map_clear(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
         return false;
     m->count = 0;
     js_valindex_rebuild(m->index, m->index_cap, m->keys, 0); /* empty the index */
+    if (ctx->vm->live_iters)
+        js_iter_on_clear(ctx->vm, &m->obj);
     *r = js_undefined();
     return true;
 }
 
-/* callback(value, key, map); re-reads m->keys/values[i] fresh each
- * iteration (never caches the array pointer across the js_call) since the
- * callback may grow the map and move the backing storage via realloc — same
- * discipline js_builtins.c's array_iterate uses for Array.prototype methods.
- * A callback that deletes an earlier-visited key shifts later entries down
- * and can make forEach skip one; matches the storage's general "linear
- * array, not a spec-exact live list" tradeoff. */
+/* callback(value, key, map), live as V8's is: it walks the map with an iterator (js_iter.h), so
+ * an entry the callback adds is visited and one it deletes before reaching it is not. The
+ * entry is re-read after each step, never cached across the js_call. */
 static bool map_forEach(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsMapObj *m;
     if (!this_map(ctx, tv, &m, r))
@@ -210,96 +191,55 @@ static bool map_forEach(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     if (!js_is_function(ARG(0)))
         return (*r = js_error_fmt(ctx, "TypeError: %t is not a function", ARG(0))), false;
     JsValue cb = ARG(0), thisArg = ARG(1), mapv = tv;
-    js_gc_protect(ctx->vm, &mapv);
+    JsValue itv = js_iterobj_new(ctx, JS_ITER_MAP_KEYS, mapv, js_undefined(), 0);
+    if (js_is_undefined(itv))
+        return nthrow(ctx, r, "out of memory");
+    js_gc_protect(ctx->vm, &itv);
     js_gc_protect(ctx->vm, &cb);
     js_gc_protect(ctx->vm, &thisArg);
+    JsIterObj *it = (JsIterObj *)js_value_object(itv);
     bool ok = true;
-    for (uint32_t i = 0; i < m->count && ok; i++) {
-        JsValue argv[3] = {m->values[i], m->keys[i], mapv};
+    JsValue key;
+    int rc;
+    while ((rc = js_iterobj_step(ctx, it, &key)) > 0) {
+        JsValue argv[3] = {m->values[it->index - 1], key, mapv};
         JsValue cbres;
         if (!js_call(ctx, cb, thisArg, argv, 3, &cbres)) {
             *r = cbres;
             ok = false;
+            break;
         }
     }
     js_gc_unprotect(ctx->vm, &thisArg);
     js_gc_unprotect(ctx->vm, &cb);
-    js_gc_unprotect(ctx->vm, &mapv);
+    js_gc_unprotect(ctx->vm, &itv);
     if (!ok)
         return false;
     *r = js_undefined();
     return true;
 }
 
-static bool map_keys(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    (void)args; (void)argc;
+static bool map_iterator(JsContext *ctx, JsValue tv, JsValue *r, JsIterKind kind) {
     JsMapObj *m;
     if (!this_map(ctx, tv, &m, r))
         return false;
-    JsObject *out = js_array_new_cell(ctx, m->count);
-    if (!out)
-        return nthrow(ctx, r, "out of memory");
-    for (uint32_t i = 0; i < m->count; i++) {
-        if (!js_array_append(ctx->vm, out, m->keys[i]))
-            return nthrow(ctx, r, "out of memory");
-    }
-    *r = js_value_from_cell(&out->gc);
-    return true;
+    *r = js_iterobj_new(ctx, kind, tv, js_undefined(), 0);
+    return js_is_undefined(*r) ? nthrow(ctx, r, "out of memory") : true;
+}
+
+static bool map_keys(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args; (void)argc;
+    return map_iterator(ctx, tv, r, JS_ITER_MAP_KEYS);
 }
 
 static bool map_values(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)args; (void)argc;
-    JsMapObj *m;
-    if (!this_map(ctx, tv, &m, r))
-        return false;
-    JsObject *out = js_array_new_cell(ctx, m->count);
-    if (!out)
-        return nthrow(ctx, r, "out of memory");
-    for (uint32_t i = 0; i < m->count; i++) {
-        if (!js_array_append(ctx->vm, out, m->values[i]))
-            return nthrow(ctx, r, "out of memory");
-    }
-    *r = js_value_from_cell(&out->gc);
-    return true;
-}
-
-JsObject *js_mapobj_entries_array(JsContext *ctx, JsObject *o) {
-    JsMapObj *m = (JsMapObj *)o;
-    JsVm *vm = ctx->vm;
-    JsObject *out = js_array_new_cell(ctx, m->count);
-    if (!out)
-        return NULL;
-    JsValue outv = js_value_from_cell(&out->gc);
-    js_gc_protect(vm, &outv);
-    bool ok = true;
-    for (uint32_t i = 0; ok && i < m->count; i++) {
-        JsObject *pair = js_array_new_cell(ctx, 2);
-        if (!pair) {
-            ok = false;
-            break;
-        }
-        JsValue pairv = js_value_from_cell(&pair->gc);
-        js_gc_protect(vm, &pairv);
-        pair->elems[0] = m->keys[i];
-        pair->elems[1] = m->values[i];
-        pair->elem_count = 2;
-        ok = js_array_append(vm, out, pairv);
-        js_gc_unprotect(vm, &pairv);
-    }
-    js_gc_unprotect(vm, &outv);
-    return ok ? out : NULL;
+    return map_iterator(ctx, tv, r, JS_ITER_MAP_VALUES);
 }
 
 static bool map_entries(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)args; (void)argc;
-    JsMapObj *m;
-    if (!this_map(ctx, tv, &m, r))
-        return false;
-    JsObject *out = js_mapobj_entries_array(ctx, &m->obj);
-    if (!out)
-        return nthrow(ctx, r, "out of memory");
-    *r = js_value_from_cell(&out->gc);
-    return true;
+    return map_iterator(ctx, tv, r, JS_ITER_MAP_ENTRIES);
 }
 
 /* ---- synthesized `size` (js_interp.c get_property) ---- */

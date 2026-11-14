@@ -44,12 +44,6 @@ size_t js_mapobj_release(JsVm *vm, JsObject *o);
  * the props map. *handled is false for any other key. */
 bool js_mapobj_prop_get(JsObject *o, JsValue key, JsValue *out, bool *handled);
 
-/* Snapshots entries as a real (and therefore iterable) array of [k, v]
- * pairs, in insertion order — used for `for (const [k, v] of map)`, which
- * this engine implements by substituting this snapshot for the map at
- * JS_OP_ITER_NEW rather than a lazy MapIterator. NULL on OOM. */
-JsObject *js_mapobj_entries_array(JsContext *ctx, JsObject *o);
-
 /* Installs the Map global and a real, script-visible Map.prototype (every
  * instance's [[Prototype]] points there — see js_mapobj.c). Called from
  * js_builtins_init. */

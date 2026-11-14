@@ -113,8 +113,8 @@ as in V8: callable with anything, returning `undefined`, not a constructor, with
 `Array(...)` / `new Array(...)`: one numeric argument creates an empty
 array of that length; anything else behaves like `Array.of`.
 
-- **Statics**: `isArray`, `of`, `from` (strings and arrays only — not
-  arbitrary array-likes or iterators).
+- **Statics**: `isArray`, `of`, `from` (any iterable, else an array-like's `[0, length)`; with
+  `mapFn(value, index)` and its `thisArg`).
 - **`Array.prototype`**: `push`, `pop`, `shift`, `unshift`, `at`,
   `indexOf`, `lastIndexOf`, `includes`, `slice`, `join`, `reverse`, `fill`,
   `concat`, `map`, `filter`, `forEach`, `some`, `every`, `find`,
@@ -134,11 +134,11 @@ boxed `String` object — this engine has no boxed-primitive type at all).
 - **Statics**: `fromCharCode`, `fromCodePoint`.
 - **`String.prototype`**: `charAt`, `charCodeAt`, `codePointAt`, `at`,
   `indexOf`, `lastIndexOf`, `includes`, `startsWith`, `endsWith`, `slice`,
-  `substring`, `substr`, `toUpperCase`, `toLowerCase` (**ASCII-only** case
-  mapping), `trim`, `trimStart`, `trimEnd`, `repeat`, `padStart`, `padEnd`,
+  `substring`, `substr`, `toUpperCase`, `toLowerCase` (full Unicode case mapping, as V8's),
+  `trim`, `trimStart`, `trimEnd`, `repeat`, `padStart`, `padEnd`,
   `replace`, `replaceAll`, `split`, `concat`, `toString`, `valueOf`, and,
-  when regex support is compiled in (the default): `match`, `matchAll`
-  (returns an array, not a lazy iterator), `search`.
+  when regex support is compiled in (the default): `match`, `matchAll` (a lazy
+  `RegExp String Iterator`, one search per step, starting at the regexp's `lastIndex`), `search`.
 - **`replace`/`replaceAll` with a string pattern** take a replacement string
   (`$$`, `$&`, `` $` `` and `$'` expand; `$1` and `$<name>` stay literal, as
   there are no groups) or a function, called as `fn(match, position, string)`
@@ -293,7 +293,7 @@ not the full parser for arbitrary date strings).
 `TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`, `EvalError` and `URIError` with the
 same signature and `Error.prototype` in their chain, and
 `new AggregateError(errors, message?, { cause }?)`, whose own `errors` is a new array of what
-`errors` iterates (an array, a string, a `Map` or a `Set`; anything else is V8's `TypeError`).
+`errors` iterates (see [Iteration](#iteration); anything else is V8's `TypeError`).
 Each subclass constructor's `[[Prototype]]` is `Error`, so `TypeError.captureStackTrace` is
 `Error.captureStackTrace`.
 
@@ -331,15 +331,33 @@ Each subclass constructor's `[[Prototype]]` is `Error`, so `TypeError.captureSta
 
 ## `Map` / `Set`
 
-Both accept an iterable (array) to seed from — `new Map([["a", 1]])`,
-`new Set([1, 2, 3])` — and expose a synthesized `.size` property (not a
-regular own property; it shadows a same-named data property the way
-`RegExp.lastIndex` does).
+Both accept any iterable to seed from — `new Map([["a", 1]])`, `new Map(otherMap)`,
+`new Set("abc")` — each value going through the collection's own `set` or `add`, as V8 does (a
+Map's entries can be any object with `0` and `1`). Both expose a synthesized `.size` property
+(not a regular own property; it shadows a same-named data property the way `RegExp.lastIndex`
+does).
 
 - **`Map.prototype`**: `set`, `get`, `has`, `delete`, `clear`, `forEach`,
   `keys`, `values`, `entries`.
 - **`Set.prototype`**: `add`, `has`, `delete`, `clear`, `forEach`,
-  `values`, `keys` (alias for `values`, per spec), `entries`.
+  `values`, `keys` (the same function as `values`, per spec), `entries`.
+- `keys`, `values` and `entries` return iterators (`Map Iterator`, `Set Iterator`) with `next()`,
+  and `forEach` and `for...of` walk the collection the same way. They are live, as V8's are: an
+  entry added before the iterator reaches the end is visited, one deleted before it is reached is
+  not, and `clear()` sends it back to the start of whatever is added next. A done iterator stays
+  done.
+
+## Iteration
+
+There is no `Symbol`, so what is iterable is fixed: strings (by code point), arrays, `Map`s
+(their entries), `Set`s (their values), and the iterators `keys()`/`values()`/`entries()` and
+`matchAll` return (each its own iterable, so `[...map.keys()]` works and a part-consumed iterator
+spreads what is left). `for...of`, spread, array destructuring, `Array.from`, `Object.fromEntries`,
+the `Map`/`Set` constructors, `Promise.all`/`race`/`allSettled`/`any` and `AggregateError` all
+accept exactly these. Destructuring steps the iterator only as far as the pattern needs, as V8
+does. The iterator prototypes chain to one `%IteratorPrototype%`, which holds none of the
+`Iterator` helpers (`map`, `filter`, `take`, `toArray`, ...): the `Iterator` global is not
+implemented.
 
 ## `Promise`
 
@@ -347,7 +365,7 @@ regular own property; it shadows a same-named data property the way
 engine's subset, callable **without** `new` too.
 
 - **Statics**: `resolve`, `reject`, `all`, `race`, `allSettled`, `any`. The four combinators take
-  any iterable (an array, a string, a `Map` or a `Set`); given something else they return a
+  any iterable ([Iteration](#iteration)); given something else they return a
   promise rejected with V8's `TypeError`, as V8 does, rather than throwing. `Promise.any` rejects
   with an `AggregateError` (`All promises were rejected`) whose `errors` are the reasons in
   input order.
@@ -368,8 +386,7 @@ protocol, named capture groups, and `/d` (indices) all work.
 
 - **`RegExp.prototype`**: `exec`, `test`, `toString`.
 - Consumed by `String.prototype.match`/`matchAll`/`search`/`replace`/
-  `replaceAll`/`split` when given a `RegExp` argument. `split` ignores its
-  `limit` argument (as the plain string `split` already did).
+  `replaceAll`/`split` when given a `RegExp` argument.
 - Catastrophic backtracking is bounded by an engine-side step budget — see
   [Supported syntax](/guide/language#regular-expressions).
 

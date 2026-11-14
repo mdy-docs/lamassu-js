@@ -3,6 +3,7 @@
 #include "js_date.h"
 #include "js_mapobj.h"
 #include "js_setobj.h"
+#include "js_iter.h"
 #ifdef LAMASSU_HAS_REGEX
 #include "js_regexp.h"
 #endif
@@ -97,6 +98,8 @@ static void js_gc_trace(JsVm *vm) {
                 js_mapobj_mark(vm, o);
             if (o->obj_kind == JS_OBJ_SET)
                 js_setobj_mark(vm, o);
+            if (o->obj_kind == JS_OBJ_ITER)
+                js_iterobj_mark(vm, o);
             if (o->obj_kind == JS_OBJ_ERROR) {
                 JsErrorObject *e = (JsErrorObject *)o;
                 js_gc_mark_value(vm, e->stack);
@@ -231,6 +234,8 @@ void js_gc_free_cell(JsVm *vm, JsGcCell *c, bool remove_atoms) {
             size = js_mapobj_release(vm, o);
         if (o->obj_kind == JS_OBJ_SET)
             size = js_setobj_release(vm, o);
+        if (o->obj_kind == JS_OBJ_ITER)
+            size = js_iterobj_release(vm, o);
         if (o->obj_kind == JS_OBJ_HOST)
             size = js_host_object_release(vm, o);
         if (o->obj_kind == JS_OBJ_ERROR) {
@@ -338,6 +343,12 @@ void js_gc_collect(JsVm *vm) {
             js_gc_mark_cell(vm, &ctx->map_proto->gc);
         if (ctx->set_proto)
             js_gc_mark_cell(vm, &ctx->set_proto->gc);
+        if (ctx->iterator_proto)
+            js_gc_mark_cell(vm, &ctx->iterator_proto->gc);
+        for (int k = 0; k < 3; k++) {
+            if (ctx->iter_protos[k])
+                js_gc_mark_cell(vm, &ctx->iter_protos[k]->gc);
+        }
         for (int k = 0; k < JS_ERROR_KIND_COUNT; k++) {
             if (ctx->error_protos[k])
                 js_gc_mark_cell(vm, &ctx->error_protos[k]->gc);
@@ -380,6 +391,9 @@ void js_gc_collect(JsVm *vm) {
         vm->gc_running = false;
         return;
     }
+
+    /* the weak list of live collection iterators loses what is about to be swept */
+    js_iter_prune(vm);
 
     JsGcCell **link = &vm->cells;
     while (*link) {

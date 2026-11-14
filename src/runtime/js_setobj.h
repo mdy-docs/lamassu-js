@@ -34,16 +34,6 @@ size_t js_setobj_release(JsVm *vm, JsObject *o);
 /* Synthesized `size` property (js_interp.c get_property), mirroring Map's. */
 bool js_setobj_prop_get(JsObject *o, JsValue key, JsValue *out, bool *handled);
 
-/* Snapshots in insertion order — used for values()/keys() and for
- * `for (const x of set)`, which this engine implements by substituting
- * this snapshot for the set at JS_OP_ITER_NEW (a Set's default iterator is
- * its values, unlike Map's, which is its entries). NULL on OOM. */
-JsObject *js_setobj_values_array(JsContext *ctx, JsObject *o);
-
-/* Snapshots [v, v] pairs, matching Set.prototype.entries()'s spec'd shape
- * (kept symmetric with Map's entries()). NULL on OOM. */
-JsObject *js_setobj_entries_array(JsContext *ctx, JsObject *o);
-
 /* Installs the Set global and a real, script-visible Set.prototype (every
  * instance's [[Prototype]] points there — see js_setobj.c). Called from
  * js_builtins_init. */

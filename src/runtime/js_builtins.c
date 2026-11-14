@@ -24,6 +24,7 @@
 #include "js_date.h"
 #include "js_mapobj.h"
 #include "js_setobj.h"
+#include "js_iter.h"
 #ifdef LAMASSU_HAS_REGEX
 #include "js_regexp.h"
 #endif
@@ -788,47 +789,63 @@ static bool sm_replaceAll(JsContext *ctx, JsValue tv, const JsValue *a, int c, J
     return sm_replace_impl(ctx, tv, a, c, r, true);
 }
 
+/* ToUint32(limit), the most pieces split returns; undefined is no limit (2^32 - 1). False
+ * thrown (its valueOf may throw), the error pending. */
+bool js_split_limit(JsContext *ctx, JsValue limit, uint32_t *lim) {
+    *lim = 4294967295u;
+    if (js_is_undefined(limit))
+        return true;
+    double d;
+    if (!js_op_to_number(ctx, limit, &d))
+        return false;
+    *lim = js_to_uint32(d);
+    return true;
+}
+
 static bool sm_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
 #ifdef LAMASSU_HAS_REGEX
     if (js_regexp_is(ARG(0)))
         return js_re_str_split(ctx, tv, args, argc, r);
 #endif
+    /* this, then the limit, then the separator, as the spec orders the conversions; the
+     * strings stay rooted for the call (js_native_string) */
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
-    JsObject *out = js_array_new_cell(ctx, 0);
-    if (!out)
+    uint32_t lim;
+    if (!js_split_limit(ctx, ARG(1), &lim))
+        return (*r = js_take_error(ctx)), false;
+    JsString *sep = NULL;
+    if (!js_is_undefined(ARG(0)) && !(sep = arg_string(ctx, ARG(0))))
         return oom(ctx, r);
-    JsValue outv = js_value_from_cell(&out->gc);
+    JsObject *out = js_array_new_cell(ctx, 0);
+    JsValue outv = out ? js_value_from_cell(&out->gc) : js_undefined();
     js_gc_protect(ctx->vm, &outv);
 
-    bool ok = true;
-    if (js_is_undefined(ARG(0))) {
+    bool ok = out != NULL;
+    if (!ok || lim == 0) {
+        /* nothing more */
+    } else if (!sep) {
         JsString *whole = js_string_cell_new(ctx->vm, s->units, s->length);
         ok = whole && js_array_append(ctx->vm, out, js_value_from_cell(&whole->gc));
+    } else if (sep->length == 0) {
+        for (uint32_t i = 0; i < s->length && ok && out->elem_count < lim; i++) {
+            JsString *c = js_string_cell_new(ctx->vm, s->units + i, 1);
+            ok = c && js_array_append(ctx->vm, out, js_value_from_cell(&c->gc));
+        }
     } else {
-        JsString *sep = arg_string(ctx, ARG(0));
-        if (!sep) {
-            ok = false;
-        } else if (sep->length == 0) {
-            for (uint32_t i = 0; i < s->length && ok; i++) {
-                JsString *c = js_string_cell_new(ctx->vm, s->units + i, 1);
-                ok = c && js_array_append(ctx->vm, out, js_value_from_cell(&c->gc));
+        uint32_t pos = 0;
+        while (out->elem_count < lim) {
+            long f = units_find(s->units, s->length, sep->units, sep->length, pos);
+            uint32_t end = f < 0 ? s->length : (uint32_t)f;
+            JsString *piece = js_string_cell_new(ctx->vm, s->units + pos, end - pos);
+            if (!piece || !js_array_append(ctx->vm, out, js_value_from_cell(&piece->gc))) {
+                ok = false;
+                break;
             }
-        } else {
-            uint32_t pos = 0;
-            for (;;) {
-                long f = units_find(s->units, s->length, sep->units, sep->length, pos);
-                uint32_t end = f < 0 ? s->length : (uint32_t)f;
-                JsString *piece = js_string_cell_new(ctx->vm, s->units + pos, end - pos);
-                if (!piece || !js_array_append(ctx->vm, out, js_value_from_cell(&piece->gc))) {
-                    ok = false;
-                    break;
-                }
-                if (f < 0)
-                    break;
-                pos = (uint32_t)f + sep->length;
-            }
+            if (f < 0)
+                break;
+            pos = (uint32_t)f + sep->length;
         }
     }
     js_gc_unprotect(ctx->vm, &outv);
@@ -3535,42 +3552,42 @@ static bool obj_isSealed(JsContext *ctx, JsValue tv, const JsValue *args, int ar
 
 static bool obj_fromEntries(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
+    JsVm *vm = ctx->vm;
     JsValue src = ARG(0);
-    if (!js_is_object(src) || js_value_object(src)->obj_kind != JS_OBJ_ARRAY)
-        return native_throw_fmt(ctx, r, js_is_undefined(src) || js_is_null(src)
-                                    ? "TypeError: %v is not iterable"
-                                    : "TypeError: %t is not iterable (cannot read property Symbol(Symbol.iterator))",
-                                src);
+    if (js_is_undefined(src) || js_is_null(src)) /* V8 says undefined for null too */
+        return native_throw_fmt(ctx, r, "TypeError: undefined is not iterable");
+    JsIterCursor cur;
+    int open = js_iter_open(ctx, src, &cur);
+    if (open <= 0)
+        return open < 0 ? oom(ctx, r) : (*r = js_iter_not_iterable(ctx, src), false);
+    js_gc_protect(vm, &cur.src);
     JsValue outv = js_object_new(ctx);
-    if (!js_is_object(outv))
-        return oom(ctx, r);
-    JsObject *out = js_value_object(outv);
-    js_gc_protect(ctx->vm, &outv);
-    JsObject *arr = js_value_object(src);
-    bool ok = true;
-    JsValue bad = js_undefined();
-    bool have_bad = false;
-    for (uint32_t i = 0; i < arr->elem_count && ok; i++) {
-        JsValue pair = arr->elems[i];
-        if (!js_is_object(pair) || js_value_object(pair)->obj_kind != JS_OBJ_ARRAY) {
-            bad = pair;
-            have_bad = true;
+    js_gc_protect(vm, &outv);
+    JsValue item = js_undefined(), k = js_undefined(), val = js_undefined();
+    js_gc_protect(vm, &item);
+    js_gc_protect(vm, &k);
+    js_gc_protect(vm, &val);
+    bool ok = js_is_object(outv), thrown = false;
+    int rc;
+    while (ok && (rc = js_iter_next(ctx, &cur, &item)) != 0) {
+        if (rc < 0 || !js_iter_entry(ctx, item, &k, &val, &item)) {
+            *r = item;
             ok = false;
+            thrown = true;
             break;
         }
-        JsObject *pa = js_value_object(pair);
-        JsValue k = pa->elem_count > 0 ? pa->elems[0] : js_undefined();
-        JsValue val = pa->elem_count > 1 ? pa->elems[1] : js_undefined();
-        /* ToPropertyKey may run k's toString, which may drop val from the pair */
-        js_gc_protect(ctx->vm, &val);
+        /* ToPropertyKey may run k's toString, which may run anything; val stays rooted */
         JsString *ks = js_op_to_string(ctx, k);
-        JsString *iks = ks ? js_intern_cell(ctx->vm, ks) : NULL;
-        ok = iks && js_map_set(ctx->vm, &out->props, iks, val);
-        js_gc_unprotect(ctx->vm, &val);
+        JsString *iks = ks ? js_intern_cell(vm, ks) : NULL;
+        ok = iks && js_map_set(vm, &js_value_object(outv)->props, iks, val);
     }
-    js_gc_unprotect(ctx->vm, &outv);
-    if (have_bad) /* bad is an element of src, which the caller holds */
-        return native_throw_fmt(ctx, r, "TypeError: Iterator value %v is not an entry object", bad);
+    js_gc_unprotect(vm, &val);
+    js_gc_unprotect(vm, &k);
+    js_gc_unprotect(vm, &item);
+    js_gc_unprotect(vm, &outv);
+    js_gc_unprotect(vm, &cur.src);
+    if (thrown)
+        return false;
     if (!ok)
         return oom(ctx, r);
     *r = outv;
@@ -3704,7 +3721,10 @@ static const char *inherited_tag(const JsContext *ctx, JsValue p) {
     return o == ctx->async_function_proto ? "AsyncFunction"
            : o == ctx->promise_methods    ? "Promise"
            : o == ctx->math_obj           ? "Math"
-           : o == ctx->json_obj           ? "JSON" : NULL;
+           : o == ctx->json_obj           ? "JSON"
+           : o == ctx->iter_protos[JS_ITER_PROTO_MAP]    ? "Map Iterator"
+           : o == ctx->iter_protos[JS_ITER_PROTO_SET]    ? "Set Iterator"
+           : o == ctx->iter_protos[JS_ITER_PROTO_REGEXP] ? "RegExp String Iterator" : NULL;
 }
 
 const char *js_to_string_tag(const JsContext *ctx, JsValue v) {
@@ -3757,45 +3777,33 @@ const char *js_to_string_tag(const JsContext *ctx, JsValue v) {
 
 JsObject *js_iterable_to_array(JsContext *ctx, JsValue v, JsValue *err) {
     JsVm *vm = ctx->vm;
-    if (js_mapobj_is(v) || js_setobj_is(v)) {
-        JsObject *a = js_mapobj_is(v) ? js_mapobj_entries_array(ctx, js_value_object(v))
-                                      : js_setobj_values_array(ctx, js_value_object(v));
-        if (!a)
-            *err = js_oom_value(vm);
-        return a;
-    }
-    bool str = js_is_string(v);
-    if (!str && !(js_is_object(v) && js_value_object(v)->obj_kind == JS_OBJ_ARRAY)) {
-        *err = js_error_fmt(ctx, "TypeError: %t is not iterable (cannot read property Symbol(Symbol.iterator))", v);
+    JsIterCursor cur;
+    int open = js_iter_open(ctx, v, &cur);
+    if (open <= 0) {
+        *err = open < 0 ? js_oom_value(vm) : js_iter_not_iterable(ctx, v);
         return NULL;
     }
-    js_gc_protect(vm, &v);
-    JsObject *a = js_array_new_cell(ctx, str ? 0 : js_value_object(v)->elem_count);
+    js_gc_protect(vm, &cur.src);
+    JsObject *a = js_array_new_cell(ctx, 0);
     JsValue av = a ? js_value_from_cell(&a->gc) : js_undefined();
     js_gc_protect(vm, &av);
     bool ok = a != NULL;
-    if (ok && str) {
-        for (uint32_t i = 0; ok && i < js_value_string(v)->length;) {
-            JsString *s = js_value_string(v);
-            uint32_t n = 1;
-            if (s->units[i] >= 0xD800 && s->units[i] <= 0xDBFF && i + 1 < s->length &&
-                s->units[i + 1] >= 0xDC00 && s->units[i + 1] <= 0xDFFF)
-                n = 2;
-            JsString *c = js_string_cell_new(vm, s->units + i, n);
-            ok = c && js_array_append(vm, a, js_value_from_cell(&c->gc));
-            i += n;
+    if (!ok)
+        *err = js_oom_value(vm);
+    JsValue item;
+    int rc;
+    while (ok && (rc = js_iter_next(ctx, &cur, &item)) != 0) {
+        if (rc < 0) {
+            *err = item;
+            ok = false;
+        } else if (!js_array_append(vm, a, item)) {
+            *err = js_oom_value(vm);
+            ok = false;
         }
-    } else if (ok) {
-        for (uint32_t i = 0; ok && i < js_value_object(v)->elem_count; i++)
-            ok = js_array_append(vm, a, js_value_object(v)->elems[i]);
     }
     js_gc_unprotect(vm, &av);
-    js_gc_unprotect(vm, &v);
-    if (!ok) {
-        *err = js_oom_value(vm);
-        return NULL;
-    }
-    return a;
+    js_gc_unprotect(vm, &cur.src);
+    return ok ? a : NULL;
 }
 
 /* Object.prototype.toString: "[object Tag]", V8's tag for the receiver */
@@ -3932,58 +3940,83 @@ static bool arr_of(JsContext *ctx, JsValue tv, const JsValue *args, int argc, Js
     return true;
 }
 
+/* Array.from(items, mapFn, thisArg): an iterable's values in order, else an array-like's
+ * [0, length) (ToLength of its length), each through mapFn(value, index) when it is given. */
 static bool arr_from(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
-    JsValue src = ARG(0);
-    JsValue mapfn = ARG(1);
-    bool has_map = js_is_function(mapfn);
+    JsVm *vm = ctx->vm;
+    JsValue src = ARG(0), mapfn = ARG(1), thisArg = ARG(2);
+    bool has_map = !js_is_undefined(mapfn);
+    if (has_map && !js_is_function(mapfn))
+        return native_throw_fmt(ctx, r, "TypeError: %t is not a function", mapfn);
+    JsIterCursor cur;
+    int open = js_iter_open(ctx, src, &cur);
+    if (open < 0)
+        return oom(ctx, r);
+    if (open == 0 && (js_is_undefined(src) || js_is_null(src)))
+        return (*r = js_iter_not_iterable(ctx, src)), false;
     JsObject *out = js_array_new_cell(ctx, 0);
     if (!out)
         return oom(ctx, r);
-    JsValue outv = js_value_from_cell(&out->gc);
-    js_gc_protect(ctx->vm, &outv);
-    js_gc_protect(ctx->vm, &mapfn);
-    JsValue srcv = src;
-    js_gc_protect(ctx->vm, &srcv);
-    bool ok = true, failed = false;
-
-#define FROM_EMIT(val, idx)                                                    \
-    do {                                                                       \
-        JsValue e = (val);                                                     \
-        if (has_map) {                                                         \
-            JsValue argv2[2] = {e, js_number(idx)};                            \
-            JsValue mapped;                                                    \
-            if (!js_call(ctx, mapfn, js_undefined(), argv2, 2, &mapped)) {     \
-                *r = mapped; failed = true; ok = false; break;                 \
-            }                                                                  \
-            e = mapped;                                                        \
-        }                                                                      \
-        ok = js_array_append(ctx->vm, out, e);                                 \
-    } while (0)
-
-    if (js_is_string(src)) {
-        JsString *s = js_value_string(src);
-        for (uint32_t i = 0; i < s->length && ok;) {
-            uint32_t n = 1;
-            if (s->units[i] >= 0xD800 && s->units[i] <= 0xDBFF && i + 1 < s->length &&
-                s->units[i + 1] >= 0xDC00 && s->units[i + 1] <= 0xDFFF)
-                n = 2;
-            JsString *c = js_string_cell_new(ctx->vm, s->units + i, n);
-            if (!c) { ok = false; break; }
-            FROM_EMIT(js_value_from_cell(&c->gc), i);
-            i += n;
+    JsValue outv = js_value_from_cell(&out->gc), item = js_undefined();
+    js_gc_protect(vm, &outv);
+    js_gc_protect(vm, &cur.src);
+    js_gc_protect(vm, &item);
+    bool ok = true, thrown = false;
+    double len = 0;
+    if (open == 0) {
+        /* an array-like: ToLength(items.length) */
+        JsValue lv;
+        JsString *lk = js_ascii_cell(vm, "length");
+        if (!lk || !js_get_property(ctx, src, js_value_from_cell(&lk->gc), &lv) ||
+            !js_op_to_number(ctx, lv, &len)) {
+            *r = js_take_error(ctx);
+            ok = false;
+            thrown = true;
         }
-    } else if (js_is_object(src) && js_value_object(src)->obj_kind == JS_OBJ_ARRAY) {
-        JsObject *o = js_value_object(src);
-        for (uint32_t i = 0; i < o->elem_count && ok; i++)
-            FROM_EMIT(o->elems[i], i);
+        len = len != len || len <= 0 ? 0 : len > 9007199254740991.0 ? 9007199254740991.0 : (double)(uint64_t)len;
+        if (ok && len > 4294967295.0) {
+            *r = js_error_from_ascii(ctx, "RangeError: Invalid array length");
+            ok = false;
+            thrown = true;
+        }
     }
-    /* other array-likes are not supported (documented) */
-#undef FROM_EMIT
-    js_gc_unprotect(ctx->vm, &srcv);
-    js_gc_unprotect(ctx->vm, &mapfn);
-    js_gc_unprotect(ctx->vm, &outv);
-    if (failed)
+    for (uint32_t k = 0; ok; k++) {
+        if (open) {
+            int rc = js_iter_next(ctx, &cur, &item);
+            if (rc == 0)
+                break;
+            if (rc < 0) {
+                *r = item;
+                ok = false;
+                thrown = true;
+                break;
+            }
+        } else {
+            if ((double)k >= len)
+                break;
+            if (!js_get_property(ctx, src, js_number(k), &item)) {
+                *r = js_take_error(ctx);
+                ok = false;
+                thrown = true;
+                break;
+            }
+        }
+        if (has_map) {
+            JsValue argv2[2] = {item, js_number(k)};
+            if (!js_call(ctx, mapfn, thisArg, argv2, 2, &item)) {
+                *r = item;
+                ok = false;
+                thrown = true;
+                break;
+            }
+        }
+        ok = js_array_append(vm, js_value_object(outv), item);
+    }
+    js_gc_unprotect(vm, &item);
+    js_gc_unprotect(vm, &cur.src);
+    js_gc_unprotect(vm, &outv);
+    if (thrown)
         return false;
     if (!ok)
         return oom(ctx, r);
@@ -4556,7 +4589,8 @@ static void hide_builtin_keys(JsContext *ctx) {
     JsObject *objs[] = {ctx->globals, ctx->object_proto, ctx->array_proto, ctx->function_methods,
                         ctx->number_methods, ctx->boolean_methods, ctx->string_methods, ctx->promise_methods,
                         ctx->regexp_proto, ctx->date_proto, ctx->map_proto, ctx->set_proto,
-                        ctx->math_obj, ctx->json_obj};
+                        ctx->math_obj, ctx->json_obj, ctx->iter_protos[0], ctx->iter_protos[1],
+                        ctx->iter_protos[2]};
     for (size_t i = 0; i < sizeof objs / sizeof objs[0]; i++)
         hide_all(objs[i]);
     for (int k = 0; k < JS_ERROR_KIND_COUNT; k++)
@@ -4826,6 +4860,10 @@ bool js_builtins_init(JsContext *ctx) {
 
     /* Date global + real Date.prototype (js_date.c) */
     if (!js_date_builtins_init(ctx))
+        return false;
+
+    /* the iterator prototypes (js_iter.c) */
+    if (!js_iter_builtins_init(ctx))
         return false;
 
     /* Map global + real Map.prototype (js_mapobj.c) */

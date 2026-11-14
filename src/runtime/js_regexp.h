@@ -132,6 +132,10 @@ bool js_re_str_search(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                       JsValue *r);
 bool js_re_str_replace(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                        JsValue *r, bool all);
+/* One step of a RegExp String Iterator (js_iter.h): the match at or after *POS as exec's
+ * result in *OUT, and *POS past it; 1 matched, 0 none left, -1 thrown (*OUT the error). REV and
+ * SV must be rooted. */
+int js_re_iter_step(JsContext *ctx, JsValue rev, JsValue sv, uint32_t *pos, JsValue *out);
 bool js_re_str_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                      JsValue *r);
 

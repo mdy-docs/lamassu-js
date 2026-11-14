@@ -1119,10 +1119,10 @@ static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat,
     case JS_AST_DEFAULT:
         return compile_pattern_default(cx, pat, declaring);
     case JS_AST_ARRAY_PATTERN: {
-        /* the value must be iterable: ITER_NEW checks it (and turns a Map or Set into its
-         * entries or values), and the index it pushes is not needed */
+        /* the value must be iterable: ITER_NEW checks it (and turns a Map or Set into an
+         * iterator over it), and each element steps it, as V8's iterator protocol does */
         note_text(cx, src, false);
-        if (!emit_op(cx, JS_OP_ITER_NEW, +1) || !emit_op(cx, JS_OP_POP, -1))
+        if (!emit_op(cx, JS_OP_ITER_NEW, +1))
             return false;
         cx->cur->pattern_depth++;
         bool ok = compile_array_pattern_items(cx, pat, declaring);
@@ -1143,26 +1143,28 @@ static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat,
 static bool compile_array_pattern_items(JsCompiler *cx, const JsAstNode *pat, bool declaring) {
     {
         uint32_t i = 0;
+        /* stack [it i]: each element steps the iterator */
         for (; i < pat->count; i++) {
             const JsAstNode *el = pat->items[i];
             if (el->kind == JS_AST_REST) {
-                /* rest: collect elems [i..] into a new array */
-                if (!emit_op(cx, JS_OP_DUP, +1) || !emit_number(cx, (double)i, el->pos) ||
-                    !emit_op(cx, JS_OP_ARRAY_REST, -1))
+                /* rest: what is left, as a new array */
+                if (!emit_op(cx, JS_OP_ITER_REST, +1))
                     return false;
                 if (!compile_pattern_store(cx, el->a, declaring))
                     return false;
                 break;
             }
-            if (el->kind == JS_AST_HOLE)
-                continue;
-            if (!emit_op(cx, JS_OP_DUP, +1) || !emit_number(cx, (double)i, el->pos) ||
-                !emit_op(cx, JS_OP_GET_PROP, -1))
+            if (!emit_op(cx, JS_OP_ITER_STEP, +1))
                 return false;
+            if (el->kind == JS_AST_HOLE) {
+                if (!emit_op(cx, JS_OP_POP, -1))
+                    return false;
+                continue;
+            }
             if (!compile_pattern_store(cx, el, declaring))
                 return false;
         }
-        return emit_op(cx, JS_OP_POP, -1);
+        return emit_op(cx, JS_OP_POP, -1) && emit_op(cx, JS_OP_POP, -1);
     }
 }
 
@@ -1588,7 +1590,7 @@ static bool compile_args(JsCompiler *cx, JsAstNode *const *args, uint32_t count,
             if (!compile_expr(cx, args[i]->a))
                 return false;
             note_text(cx, args[i]->a, false);
-            if (!emit_op(cx, JS_OP_ARRAY_SPREAD, -1))
+            if (!emit_op(cx, JS_OP_ARGS_SPREAD, -1))
                 return false;
         } else {
             if (!compile_expr(cx, args[i]) || !emit_op(cx, JS_OP_ARRAY_APPEND, -1))

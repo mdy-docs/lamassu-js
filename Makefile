@@ -65,7 +65,7 @@ RUNTIME_SRC := src/runtime/js_vm.c src/runtime/js_gc.c src/runtime/js_string.c \
                src/runtime/js_case.c \
                src/runtime/js_module.c src/runtime/js_regexp.c \
                src/runtime/js_bytecode_read.c src/runtime/js_date.c \
-               src/runtime/js_mapobj.c src/runtime/js_setobj.c \
+               src/runtime/js_mapobj.c src/runtime/js_setobj.c src/runtime/js_iter.c \
                src/runtime/js_error.c \
                src/runtime/fdlibm/scalbn.c src/runtime/fdlibm/rem_pio2_large.c src/runtime/fdlibm/rem_pio2.c \
                src/runtime/fdlibm/k_sin.c src/runtime/fdlibm/k_cos.c src/runtime/fdlibm/k_tan.c src/runtime/fdlibm/sin.c src/runtime/fdlibm/cos.c src/runtime/fdlibm/tan.c src/runtime/fdlibm/atan.c \
@@ -82,11 +82,11 @@ FRONTEND_SRC := src/frontend/js_lexer.c src/frontend/js_parser.c \
 HDR := include/lamassu.h include/lamassu_compile.h src/lamassu_internal.h \
        src/js_bytecode.h src/js_bcformat.h src/js_valindex.h \
        src/frontend/js_syntax.h src/runtime/js_regexp.h src/runtime/js_date.h \
-       src/runtime/js_mapobj.h src/runtime/js_setobj.h src/runtime/js_error.h \
+       src/runtime/js_mapobj.h src/runtime/js_setobj.h src/runtime/js_iter.h src/runtime/js_error.h \
        src/runtime/js_builtin_lengths.h src/runtime/fdlibm/libm.h
 INC := -Iinclude -Isrc -Isrc/runtime -Isrc/frontend
 
-ASAN := -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
+ASAN := -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 
 # Regex engine (third_party/baru-re), enabled via -DLAMASSU_HAS_REGEX in every
 # build. Compiled as separate objects because re_vm.c contains three VLAs the
