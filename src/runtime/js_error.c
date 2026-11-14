@@ -40,6 +40,13 @@ static bool chain_get(JsContext *ctx, JsObject *o, const char *k, JsValue *out, 
             *out = v;
             return true;
         }
+        if (js_is_function(cur->proto) || js_is_promise(cur->proto)) { /* the chain goes on through one */
+            JsValue p = cur->proto;
+            if (!js_get_property(ctx, p, js_value_from_cell(&ik->gc), out))
+                return false;
+            *found = !js_is_undefined(*out);
+            return true;
+        }
         cur = js_is_object(cur->proto) ? js_value_object(cur->proto) : NULL;
     }
     return true;

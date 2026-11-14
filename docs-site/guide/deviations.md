@@ -39,13 +39,6 @@ that's known to differ, so you're not surprised by one in production.
   itself a function, so it has no `length`, `name`, `constructor`, `arguments`
   or `caller`.
 
-- **`Object.setPrototypeOf` cannot change a function's or a promise's
-  prototype, nor make either one another object's prototype.** A function's
-  [[Prototype]] is fixed as `Function.prototype` (or the constructor it
-  extends) and a promise's as `Promise.prototype`; `setPrototypeOf(f, p)`
-  leaves it as it was and returns `f`, and `setPrototypeOf(o, f)` throws
-  V8's `TypeError: Object prototype may only be an Object or null`.
-
 ## Functions
 
 - **There is no `Function` global.** The constructor is left out, as `eval` is, so that

@@ -316,6 +316,13 @@ JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound);
  * create, made on first use (NULL on OOM); without, NULL when it has none. Object builtins use it
  * to treat them as objects. */
 JsObject *js_cell_props(JsContext *ctx, JsValue v, bool create);
+/* V's [[Prototype]] (js_interp.c): an object, function or promise, or null. A function's is
+ * Function.prototype (or the constructor it inherits from) and a promise's Promise.prototype
+ * until a script sets another; a number's, string's and boolean's their methods' table. */
+JsValue js_get_proto(JsContext *ctx, JsValue v);
+/* [[SetPrototypeOf]] of an object, function or promise V to PROTO (one of those, or null):
+ * 0 done, 1 refused (V is sealed or frozen), 2 refused (PROTO's chain reaches V). */
+int js_set_proto(JsContext *ctx, JsValue v, JsValue proto);
 /* Whether V is a function or promise: a value whose own properties are js_cell_props */
 static inline bool js_has_cell_props(JsValue v) { return js_is_function(v) || js_is_promise(v); }
 /* A function value's `name` (closure or native); NULL for none, which reads as "". */

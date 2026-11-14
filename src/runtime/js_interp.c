@@ -415,7 +415,7 @@ static JsString *single_unit_string(JsVm *vm, uint16_t u) {
 }
 
 /* Bound on [[Prototype]] chain walks; script code has no way to construct a
- * cycle (no __proto__/setPrototypeOf), so this only guards hostile/corrupt
+ * cycle (there is no __proto__, and Object.setPrototypeOf refuses one), so this only guards hostile/corrupt
  * bytecode. */
 #define JS_PROTO_CHAIN_LIMIT 1000
 
@@ -485,11 +485,11 @@ static bool function_prototype(JsContext *ctx, JsGcCell *c, JsValue *out) {
 
 /* The [[Prototype]] `new C` gives the object it makes: C.prototype when that is an object, else
  * Object.prototype (V8's, for `F.prototype = 5`). C must be rooted. NULL on OOM. */
-static JsObject *construct_proto(JsContext *ctx, JsGcCell *c) {
+static JsValue construct_proto(JsContext *ctx, JsGcCell *c) {
     JsValue p;
     if (!function_prototype(ctx, c, &p))
-        return NULL;
-    return js_is_object(p) ? js_value_object(p) : ctx->object_proto;
+        return js_undefined();
+    return is_object_type(p) ? p : js_value_from_cell(&ctx->object_proto->gc);
 }
 
 /* Whether a script may not assign C's own `prototype`: a builtin constructor's, or a frozen
@@ -561,6 +561,75 @@ static JsPropStatus proto_table_lookup(JsContext *ctx, JsObject *table, JsValue 
     if (st == JS_PROP_OK && !js_is_undefined(v))
         *out = v;
     return st;
+}
+
+/* A function's or promise's [[Prototype]] slot, with its flag in *SET; NULL for other cells */
+static JsValue *cell_proto_slot(JsGcCell *c, bool **set) {
+    switch (c->kind) {
+    case JS_KIND_CLOSURE:
+        *set = &((JsClosure *)c)->proto_set;
+        return &((JsClosure *)c)->own_proto;
+    case JS_KIND_NATIVE:
+        *set = &((JsNative *)c)->proto_set;
+        return &((JsNative *)c)->own_proto;
+    case JS_KIND_PROMISE:
+        *set = &((JsPromise *)c)->proto_set;
+        return &((JsPromise *)c)->own_proto;
+    default:
+        return NULL;
+    }
+}
+
+JsValue js_get_proto(JsContext *ctx, JsValue v) {
+    if (js_is_object(v)) {
+        JsValue p = js_value_object(v)->proto;
+        return is_object_type(p) ? p : js_null();
+    }
+    if (js_is_function(v) || js_is_promise(v)) {
+        JsGcCell *c = js_value_cell(v);
+        bool *set;
+        JsValue *slot = cell_proto_slot(c, &set);
+        if (slot && *set)
+            return is_object_type(*slot) ? *slot : js_null();
+        if (c->kind == JS_KIND_PROMISE)
+            return js_value_from_cell(&ctx->promise_methods->gc);
+        if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->parent)
+            return js_value_from_cell(&((JsNative *)c)->parent->gc);
+        return js_value_from_cell(&ctx->function_methods->gc);
+    }
+    JsObject *t = js_is_number(v) ? ctx->number_methods : js_is_string(v) ? ctx->string_methods
+                  : js_is_bool(v) ? ctx->boolean_methods : NULL;
+    return t ? js_value_from_cell(&t->gc) : js_null();
+}
+
+int js_set_proto(JsContext *ctx, JsValue v, JsValue proto) {
+    if (js_get_proto(ctx, v).bits == proto.bits)
+        return 0; /* the same: allowed even when it is not extensible */
+    JsObject *flags_of = js_is_object(v) ? js_value_object(v) : js_cell_props(ctx, v, false);
+    if (flags_of && (flags_of->obj_flags & (JS_OBJ_SEALED | JS_OBJ_FROZEN)))
+        return 1;
+    for (JsValue p = proto; is_object_type(p); p = js_get_proto(ctx, p))
+        if (p.bits == v.bits)
+            return 2;
+    JsValue np = is_object_type(proto) ? proto : js_undefined();
+    if (js_is_object(v)) {
+        js_value_object(v)->proto = np;
+    } else {
+        bool *set;
+        JsValue *slot = cell_proto_slot(js_value_cell(v), &set);
+        if (slot) {
+            *slot = np;
+            *set = true;
+        }
+    }
+    return 0;
+}
+
+/* A lookup that has reached P, a [[Prototype]] that is a function or promise: [[Get]] on it,
+ * which goes on up its own chain. Null (undefined here): not found. Out of line: chains that
+ * pass through a function or promise are rare. */
+JS_COLD static JsPropStatus proto_value_get(JsContext *ctx, JsValue p, JsValue key, JsValue *out) {
+    return is_object_type(p) ? get_property(ctx, p, key, out) : JS_PROP_OK;
 }
 
 /* The own-property object of a function value (closure or native) or a promise: what a script
@@ -671,6 +740,9 @@ JS_COLD static JsPropStatus promise_get(JsContext *ctx, JsValue p, JsValue key, 
         if (st != JS_PROP_OK || !js_is_undefined(*out))
             return st;
     }
+    JsPromise *pr = (JsPromise *)js_value_cell(p);
+    if (pr->proto_set)
+        return proto_value_get(ctx, pr->own_proto, key, out);
     return proto_table_lookup(ctx, ctx->promise_methods, key, out);
 }
 
@@ -918,6 +990,8 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
             }
             proto = po->proto;
         }
+        if (JS_UNLIKELY(js_is_function(proto) || js_is_promise(proto)))
+            return proto_value_get(ctx, proto, key, out); /* Object.create(fn) */
         return JS_PROP_OK;
     }
     if (js_is_number(base))
@@ -955,6 +1029,11 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
             if (st != JS_PROP_OK || !js_is_undefined(*out))
                 return st;
         }
+        if (JS_UNLIKELY(c->kind == JS_KIND_CLOSURE ? ((JsClosure *)c)->proto_set
+                                                   : ((JsNative *)c)->proto_set))
+            return proto_value_get(ctx, c->kind == JS_KIND_CLOSURE ? ((JsClosure *)c)->own_proto
+                                                                   : ((JsNative *)c)->own_proto,
+                                   key, out);
         if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->parent)
             return parent_ctor_lookup(ctx, ((JsNative *)c)->parent, key, out);
         /* Function.prototype methods (call), shared by closures and natives */
@@ -1224,6 +1303,8 @@ static JsPropStatus has_property(JsContext *ctx, JsValue base, JsValue key,
         }
         proto = po->proto;
     }
+    if (js_is_function(proto) || js_is_promise(proto)) /* the chain goes on through one */
+        return has_property(ctx, proto, js_value_from_cell(&k->gc), out);
     return JS_PROP_OK;
 }
 
@@ -1448,12 +1529,12 @@ __attribute__((noinline)) static bool call_native(JsContext *ctx, JsFiber *fiber
 /* The object `new C` makes for `this`: an ordinary object whose [[Prototype]] is construct_proto's.
  * C must be rooted. Undefined on OOM. */
 __attribute__((noinline)) static JsValue construct_this(JsContext *ctx, JsGcCell *c) {
-    JsObject *proto = construct_proto(ctx, c);
-    if (!proto)
+    JsValue proto = construct_proto(ctx, c); /* C.prototype, reachable from rooted C */
+    if (js_is_undefined(proto))
         return js_undefined();
     JsValue instv = js_object_new(ctx);
     if (js_is_object(instv))
-        js_value_object(instv)->proto = js_value_from_cell(&proto->gc);
+        js_value_object(instv)->proto = proto;
     return instv;
 }
 
@@ -1525,9 +1606,8 @@ __attribute__((noinline)) static bool delete_object_prop(JsContext *ctx, JsObjec
 }
 
 /* `V instanceof C`, as V8 runs it (there is no Symbol.hasInstance): C must be a function; a bound
- * one stands for its target; true when C.prototype is on V's prototype chain. A function's chain
- * starts at the function methods (Function.prototype), a promise's at Promise.prototype; both go
- * on to Object.prototype. 1 or 0, or -1 with *ERR the TypeError. */
+ * one stands for its target; true when C.prototype is on V's prototype chain (js_get_proto's,
+ * through functions and promises too). 1 or 0, or -1 with *ERR the TypeError. */
 __attribute__((noinline)) static int instance_of(JsContext *ctx, JsValue v, JsValue c, JsValue *err) {
     if (!js_is_object(c) && !js_is_function(c) && !js_is_promise(c)) {
         *err = js_error_from_ascii(ctx, "TypeError: Right-hand side of 'instanceof' is not an object");
@@ -1540,14 +1620,7 @@ __attribute__((noinline)) static int instance_of(JsContext *ctx, JsValue v, JsVa
     while (js_value_cell(c)->kind == JS_KIND_NATIVE && ((JsNative *)js_value_cell(c))->is_bound &&
            ((JsNative *)js_value_cell(c))->bound_fn == js_bind_call)
         c = js_value_object(((JsNative *)js_value_cell(c))->bound)->elems[0];
-    JsObject *start;
-    if (js_is_object(v))
-        start = js_is_object(js_value_object(v)->proto) ? js_value_object(js_value_object(v)->proto) : NULL;
-    else if (js_is_function(v))
-        start = ctx->function_methods;
-    else if (js_is_promise(v))
-        start = ctx->promise_methods;
-    else
+    if (!js_is_object(v) && !js_is_function(v) && !js_is_promise(v))
         return 0; /* a primitive is no instance */
     static const uint16_t kp[] = {'p', 'r', 'o', 't', 'o', 't', 'y', 'p', 'e'};
     js_gc_protect(ctx->vm, &c);
@@ -1559,13 +1632,12 @@ __attribute__((noinline)) static int instance_of(JsContext *ctx, JsValue v, JsVa
         *err = js_take_error(ctx);
         return -1;
     }
-    if (!js_is_object(proto)) {
+    if (!is_object_type(proto)) {
         *err = js_error_fmt(ctx, "TypeError: Function has non-object prototype '%v' in instanceof check", proto);
         return -1;
     }
-    const JsObject *target = js_value_object(proto);
-    for (const JsObject *p = start; p; p = js_is_object(p->proto) ? js_value_object(p->proto) : NULL)
-        if (p == target)
+    for (JsValue p = js_get_proto(ctx, v); is_object_type(p); p = js_get_proto(ctx, p))
+        if (p.bits == proto.bits)
             return 1;
     return 0;
 }
@@ -1859,6 +1931,8 @@ static JsClosure *closure_new(JsVm *vm, JsFunctionCell *fn) {
     cl->proto_made = false;
     cl->props = NULL;
     cl->name = NULL;
+    cl->own_proto = js_undefined();
+    cl->proto_set = false;
     cl->length_deleted = false;
     cl->n_upvals = fn->n_upvals;
     for (uint16_t i = 0; i < fn->n_upvals; i++)
@@ -1919,6 +1993,8 @@ JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *ud)
     nf->ud = ud;
     nf->name = js_is_string(nmv) ? js_value_string(nmv) : NULL;
     nf->statics = NULL;
+    nf->own_proto = js_undefined();
+    nf->proto_set = false;
     nf->props = NULL;
     nf->prototype = js_undefined();
     nf->proto_made = false;
@@ -1946,6 +2022,8 @@ JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound) {
     nf->ud = NULL;
     nf->name = NULL;
     nf->statics = NULL;
+    nf->own_proto = js_undefined();
+    nf->proto_set = false;
     nf->props = NULL;
     nf->prototype = js_undefined();
     nf->proto_made = false;
@@ -2004,6 +2082,8 @@ bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
     nf->bound_fn = NULL;
     nf->ud = userdata;
     nf->statics = NULL;
+    nf->own_proto = js_undefined();
+    nf->proto_set = false;
     nf->props = NULL;
     nf->prototype = js_undefined();
     nf->proto_made = false;
@@ -3797,6 +3877,8 @@ __attribute__((noinline)) static JsPropStatus parent_ctor_lookup(JsContext *ctx,
             if (st != JS_PROP_OK || !js_is_undefined(*out))
                 return st;
         }
+        if (p->proto_set) /* a script gave this one another [[Prototype]] */
+            return proto_value_get(ctx, p->own_proto, key, out);
     }
     return proto_table_lookup(ctx, ctx->function_methods, key, out);
 }

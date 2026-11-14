@@ -148,6 +148,7 @@ static void js_gc_trace(JsVm *vm) {
             js_gc_mark_value(vm, p->value);
             if (p->props)
                 js_gc_mark_cell(vm, &p->props->gc);
+            js_gc_mark_value(vm, p->own_proto);
             for (JsReaction *rx = p->reactions; rx; rx = rx->next) {
                 js_gc_mark_value(vm, rx->on_fulfilled);
                 js_gc_mark_value(vm, rx->on_rejected);
@@ -167,6 +168,7 @@ static void js_gc_trace(JsVm *vm) {
                 js_gc_mark_cell(vm, &cl->props->gc);
             if (cl->name)
                 js_gc_mark_cell(vm, &cl->name->gc);
+            js_gc_mark_value(vm, cl->own_proto);
             for (uint16_t i = 0; i < cl->n_upvals; i++) {
                 if (cl->upvals[i])
                     js_gc_mark_cell(vm, &cl->upvals[i]->gc);
@@ -192,6 +194,7 @@ static void js_gc_trace(JsVm *vm) {
             js_gc_mark_value(vm, nf->prototype);
             if (nf->parent)
                 js_gc_mark_cell(vm, &nf->parent->gc);
+            js_gc_mark_value(vm, nf->own_proto);
             if (nf->is_bound)
                 js_gc_mark_value(vm, nf->bound);
             break;

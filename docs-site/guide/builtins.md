@@ -58,8 +58,16 @@ statics and what a script wrote onto it; an error's `stack`, `message`, `cause`;
 `undefined` or `null`. On a module namespace, `getOwnPropertyNames` lists an export that has not
 run yet, while `hasOwn` reads it and throws, as in V8.
 
-`Object.create(proto)` makes a plain object whose prototype is `proto` (an object) or none
-(`null`); anything else is V8's `TypeError: Object prototype may only be an Object or null`. A
+`Object.setPrototypeOf(v, proto)` works on any object, function or promise, as in V8: a
+function given another prototype inherits from it instead of `Function.prototype` (statics
+through `Object.setPrototypeOf(B, A)`, or none with `null`), and a function or promise can be
+another object's prototype (`Object.create(f)` reads `f`'s properties, `name` and statics
+included). A chain may not loop (`TypeError: Cyclic __proto__ value`), and a sealed or frozen
+value keeps its prototype. `instanceof` and `Object.getPrototypeOf` follow such chains. A
+function from `bind` starts with its target's prototype.
+
+`Object.create(proto)` makes a plain object whose prototype is `proto` (an object, function or
+promise) or none (`null`); anything else is V8's `TypeError: Object prototype may only be an Object or null`. A
 second argument (property descriptors) is a `TypeError`: there are no property attributes to give
 the properties it describes.
 

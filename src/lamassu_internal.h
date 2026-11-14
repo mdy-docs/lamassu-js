@@ -316,6 +316,10 @@ typedef struct JsClosure {
     JsObject *props;
     /* The name a computed key gave it (JS_OP_SET_FUNCTION_NAME); NULL: fn->name. */
     JsString *name;
+    /* Its [[Prototype]] once Object.setPrototypeOf has set one (proto_set): an object, function
+     * or promise, or undefined for null. Until then Function.prototype. */
+    JsValue own_proto;
+    bool proto_set;
     JsUpvalue *upvals[];
 } JsClosure;
 
@@ -344,6 +348,9 @@ typedef struct JsNative {
     bool proto_made;     /* `prototype` holds it */
     struct JsNative *parent; /* its [[Prototype]] when that is another constructor (TypeError's
                               * is Error), whose statics it inherits; NULL: Function.prototype */
+    JsValue own_proto;       /* its [[Prototype]] once a script has set one (proto_set), as
+                              * JsClosure's; replaces parent and Function.prototype */
+    bool proto_set;
 } JsNative;
 
 /* JsNative.ctor. A function from bind() is a constructor when its target is (js_is_constructor). */
@@ -384,6 +391,9 @@ typedef struct JsPromise {
     JsValue value;     /* fulfillment value or rejection reason */
     JsReaction *reactions; /* non-empty only while PENDING */
     JsObject *props;       /* properties a script gives it (like JsClosure.props); NULL until written */
+    JsValue own_proto;     /* its [[Prototype]] once a script has set one (proto_set), as
+                            * JsClosure's; until then Promise.prototype */
+    bool proto_set;
 } JsPromise;
 
 /* A queued microtask. Raw allocation; the VM's queue is a GC root. */

@@ -29,6 +29,8 @@ JsPromise *js_promise_alloc(JsContext *ctx) {
     p->value = js_undefined();
     p->reactions = NULL;
     p->props = NULL;
+    p->own_proto = js_undefined();
+    p->proto_set = false;
     return p;
 }
 

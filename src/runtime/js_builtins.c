@@ -1722,6 +1722,12 @@ static bool fm_bind(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     uint32_t tl = js_function_length(tv), bound = argc > 1 ? (uint32_t)(argc - 1) : 0;
     uint32_t bl = tl > bound ? tl - bound : 0;
     ((JsNative *)js_value_cell(fn))->length = (uint8_t)(bl > 255 ? 255 : bl);
+    /* its [[Prototype]] is the target's, as it is now (BoundFunctionCreate) */
+    JsValue tp = js_get_proto(ctx, tv);
+    if (tp.bits != js_value_from_cell(&ctx->function_methods->gc).bits) {
+        ((JsNative *)js_value_cell(fn))->own_proto = js_is_null(tp) ? js_undefined() : tp;
+        ((JsNative *)js_value_cell(fn))->proto_set = true;
+    }
     *r = fn;
     return true;
 }
@@ -3802,60 +3808,52 @@ static bool obj_getPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, 
     JsValue v = ARG(0);
     if (js_is_undefined(v) || js_is_null(v))
         return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
-    if (js_is_object(v)) {
-        JsValue proto = js_value_object(v)->proto;
-        *r = js_is_object(proto) ? proto : js_null();
-        return true;
-    }
-    /* a function's is Function.prototype, or the constructor it inherits from (TypeError's is
-     * Error); a promise's, number's and string's their constructor's prototype. A boolean's is
-     * null: there is no Boolean.prototype object. */
-    JsObject *p = js_is_function(v)  ? ctx->function_methods
-                  : js_is_promise(v) ? ctx->promise_methods
-                  : js_is_number(v)  ? ctx->number_methods
-                  : js_is_string(v)  ? ctx->string_methods
-                  : js_is_bool(v)    ? ctx->boolean_methods : NULL;
-    if (js_is_function(v) && js_value_cell(v)->kind == JS_KIND_NATIVE && ((JsNative *)js_value_cell(v))->parent) {
-        *r = js_value_from_cell(&((JsNative *)js_value_cell(v))->parent->gc);
-        return true;
-    }
-    *r = p ? js_value_from_cell(&p->gc) : js_null();
+    /* an object's, function's or promise's [[Prototype]] (a function's is Function.prototype, or
+     * the constructor it inherits from, until a script sets another); a number's, string's and
+     * boolean's their constructor's prototype */
+    *r = js_get_proto(ctx, v);
     return true;
 }
 
-/* Object.create(proto): a new plain object whose prototype is PROTO (an object) or none (null).
- * A second argument (property descriptors) is refused: there are no property attributes here
- * to give the properties it describes, so there is nothing faithful to do with it. */
+static inline bool is_object_type_arg(JsValue v) {
+    return js_is_object(v) || js_is_function(v) || js_is_promise(v);
+}
+
+/* Object.create(proto): a new plain object whose prototype is PROTO (an object, function or
+ * promise) or none (null). A second argument (property descriptors) is refused: there are no
+ * property attributes here to give the properties it describes, so there is nothing faithful to
+ * do with it. */
 static bool obj_create(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     JsValue proto = ARG(0);
-    if (!js_is_object(proto) && !js_is_null(proto))
+    if (!is_object_type_arg(proto) && !js_is_null(proto))
         return native_throw_fmt(ctx, r, "TypeError: Object prototype may only be an Object or null: %v", proto);
     if (!js_is_undefined(ARG(1)))
         return native_throw(ctx, r, "TypeError: Object.create with property descriptors is not supported");
     JsValue o = js_object_new(ctx); /* proto is the caller's argument: rooted */
     if (!js_is_object(o))
         return oom(ctx, r);
-    js_value_object(o)->proto = js_is_object(proto) ? proto : js_undefined();
+    js_value_object(o)->proto = is_object_type_arg(proto) ? proto : js_undefined();
     *r = o;
     return true;
 }
 
+/* Object.setPrototypeOf(v, proto): for an object, function or promise, as V8 (a sealed or frozen
+ * one keeps its prototype; a chain may not loop); a primitive is returned as it is. */
 static bool obj_setPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                                JsValue *r) {
     (void)tv;
     JsValue v = ARG(0), proto = ARG(1);
     if (js_is_undefined(v) || js_is_null(v))
         return native_throw(ctx, r, "TypeError: Object.setPrototypeOf called on null or undefined");
-    if (!js_is_object(proto) && !js_is_null(proto))
+    if (!is_object_type_arg(proto) && !js_is_null(proto))
         return native_throw_fmt(ctx, r, "TypeError: Object prototype may only be an Object or null: %v", proto);
-    if (js_is_object(v)) {
-        JsObject *o = js_value_object(v);
-        JsValue np = js_is_object(proto) ? proto : js_undefined();
-        /* a sealed or frozen object (a namespace too) is not extensible: its prototype stays */
-        if ((o->obj_flags & (JS_OBJ_SEALED | JS_OBJ_FROZEN)) && np.bits != o->proto.bits)
+    if (is_object_type_arg(v)) {
+        int st = js_set_proto(ctx, v, proto);
+        if (st == 1)
             return native_throw_fmt(ctx, r, "TypeError: %v is not extensible", v);
-        o->proto = np;
+        if (st == 2)
+            return native_throw(ctx, r, "TypeError: Cyclic __proto__ value");
     }
     *r = v;
     return true;
