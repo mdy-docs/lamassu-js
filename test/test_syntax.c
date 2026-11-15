@@ -368,6 +368,9 @@ static void dump_node(Sb *sb, const JsAstNode *n) {
     case JS_AST_THIS:
         sb_printf(sb, "this");
         break;
+    case JS_AST_NEW_TARGET:
+        sb_printf(sb, "(new.target)");
+        break;
     case JS_AST_ARRAY:
     case JS_AST_ARRAY_PATTERN:
         sb_printf(sb, n->kind == JS_AST_ARRAY ? "(arr" : "(apat");
@@ -752,7 +755,7 @@ static void test_errors(void) {
     check_err("let x = yield;", "reserved word", -1);
     check_err("for (let k in o) {}", "for-in is not supported", -1);
     check_err("for (k in o) {}", "for-in is not supported", -1);
-    check_err("new.target;", "'new.target' is not supported", -1);
+    check_err("new.target;", "new.target expression is not allowed here", -1);
     check_parses("x instanceof y;"); /* V8's operator, at the relational level */
     check_parses("a instanceof B === c in d;");
     check_err("function f() { await g(); }", "Unexpected reserved word", -1);

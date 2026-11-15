@@ -41,6 +41,9 @@ supported. `debugger;` is a statement that does nothing (there is no debugger to
   the one deliberate divergence: `Array.isArray(arguments)` is `true`. As in
   strict mode, it is not aliased to the parameters, and
   `arguments.callee`/`arguments.caller` do not exist.
+- `new.target` is the function when it was called with `new`, else `undefined` (an arrow sees
+  its enclosing function's); outside a function it is V8's `SyntaxError: new.target expression
+  is not allowed here`.
 - Duplicate parameter names are a compile error.
 
 ## Objects, arrays, and constructors

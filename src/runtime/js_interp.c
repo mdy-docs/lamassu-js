@@ -2562,6 +2562,8 @@ static int frame_setup(JsContext *ctx, JsFiber *fb, JsClosure *cl, uint32_t base
         fb->stack[base + i] = js_undefined();
     if (uses_args)
         fb->stack[base + fn->n_params] = args_val;
+    if (JS_UNLIKELY(fn->fn_flags & JS_FN_NEW_TARGET)) /* its hidden new.target local, after arguments */
+        fb->stack[base + fn->n_params + 1] = is_construct ? js_value_from_cell(&cl->gc) : js_undefined();
 
     if (!frames_ensure(vm, fb, fb->frame_count + 1))
         return -1;

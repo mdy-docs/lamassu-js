@@ -257,12 +257,15 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
      * own `arguments`, so the pair is contradictory.
      */
     if ((fn_flags & ~(uint8_t)(JS_FN_ARROW | JS_FN_HAS_REST | JS_FN_ASYNC |
-                               JS_FN_USES_ARGUMENTS | JS_FN_METHOD)) ||
+                               JS_FN_USES_ARGUMENTS | JS_FN_METHOD | JS_FN_NEW_TARGET)) ||
         ((fn_flags & JS_FN_ARROW) && (fn_flags & JS_FN_METHOD)) ||
         n_locals > JSBC_MAX_LOCALS || n_params > n_locals || length > n_params ||
         ((fn_flags & JS_FN_HAS_REST) && n_params == 0) ||
         ((fn_flags & JS_FN_USES_ARGUMENTS) &&
-         ((fn_flags & JS_FN_ARROW) || n_locals <= n_params))) {
+         ((fn_flags & JS_FN_ARROW) || n_locals <= n_params)) ||
+        /* NEW_TARGET fills slot n_params + 1, after arguments; an arrow has none of its own */
+        ((fn_flags & JS_FN_NEW_TARGET) &&
+         ((fn_flags & JS_FN_ARROW) || (uint32_t)n_locals <= (uint32_t)n_params + 1))) {
         *err = "SyntaxError: invalid bytecode function header";
         return NULL;
     }

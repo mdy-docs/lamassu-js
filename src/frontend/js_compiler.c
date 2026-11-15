@@ -94,6 +94,7 @@ typedef struct JsFuncState {
      * including an inner arrow capturing it as an upvalue. */
     int arguments_local;
     bool uses_arguments;
+    bool uses_new_target; /* new.target in the local after arguments (JS_FN_NEW_TARGET) */
     JsLocalVar *locals;
     uint32_t local_count, local_cap;
     uint16_t slot_count, slot_max;
@@ -157,6 +158,8 @@ static bool compile_array_pattern_items(JsCompiler *cx, const JsAstNode *pat, bo
 static bool compile_object_pattern_items(JsCompiler *cx, const JsAstNode *pat, bool declaring,
                                          const JsAstNode *src, bool outer);
 static bool compile_function(JsCompiler *cx, const JsAstNode *fnode);
+/* The hidden local a function keeps new.target in for its arrows: no identifier can name it */
+static const uint16_t new_target_name[] = {'%', 'n', 'e', 'w', '.', 't', 'a', 'r', 'g', 'e', 't'};
 static int emit_module_load(JsCompiler *cx, const JsAstNode *n);
 static bool compile_function(JsCompiler *cx, const JsAstNode *fnode);
 static bool compile_function_as(JsCompiler *cx, const JsAstNode *fnode, const uint16_t *name,
@@ -304,6 +307,9 @@ static void render_callee(CalleeBuf *b, const JsAstNode *n, int depth) {
         return;
     case JS_AST_THIS:
         cb_ascii(b, "this");
+        return;
+    case JS_AST_NEW_TARGET:
+        cb_ascii(b, "new.target");
         return;
     case JS_AST_NULL_LIT:
         cb_ascii(b, "null");
@@ -1888,6 +1894,16 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
         return emit_op(cx, (n->flags & JS_F_TRUE) ? JS_OP_TRUE : JS_OP_FALSE, +1);
     case JS_AST_THIS:
         return emit_op(cx, JS_OP_GET_THIS, +1);
+    case JS_AST_NEW_TARGET: {
+        /* the hidden local the function keeps it in (frame_setup fills it); an arrow's is its
+         * enclosing function's, reached as any captured variable is */
+        JsAstNode id = {0};
+        id.kind = JS_AST_IDENT;
+        id.pos = n->pos;
+        id.units = new_target_name;
+        id.len = sizeof new_target_name / sizeof new_target_name[0];
+        return compile_ident_load(cx, &id);
+    }
     case JS_AST_IDENT:
         return compile_ident_load(cx, n);
     case JS_AST_TEMPLATE:
@@ -1982,10 +1998,16 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
             if (m->kind != JS_AST_MEMBER)
                 return compile_expr(cx, m) && emit_op(cx, JS_OP_POP, -1) &&
                        emit_op(cx, JS_OP_TRUE, +1);
-            if (m->flags & JS_F_OPTIONAL)
-                return cerr(cx, m->pos, "optional chaining in delete is not supported");
-            if (!compile_expr(cx, m->a))
+            /* `delete a?.b`, `delete a?.b.c`: a nullish link anywhere in the chain makes the whole
+             * expression true, as V8 has it; OPT_CHAIN leaves undefined where the result goes */
+            JsPatchList opt = {0};
+            if (!compile_member_chain(cx, m->a, &opt))
                 return false;
+            if (m->flags & JS_F_OPTIONAL) {
+                uint32_t patch;
+                if (!emit_jump(cx, JS_OP_OPT_CHAIN, 0, &patch) || !patch_list_add(cx, &opt, patch))
+                    return false;
+            }
             if (m->flags & JS_F_COMPUTED) {
                 if (!compile_expr(cx, m->b))
                     return false;
@@ -1993,7 +2015,19 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
                 if (!emit_string_const(cx, m->units, m->len, m->pos))
                     return false;
             }
-            return emit_op(cx, JS_OP_DELETE_PROP, -1);
+            if (!emit_op(cx, JS_OP_DELETE_PROP, -1))
+                return false;
+            if (!opt.count)
+                return true;
+            uint32_t done;
+            if (!emit_jump(cx, JS_OP_JUMP, 0, &done))
+                return false;
+            for (uint32_t i = 0; i < opt.count; i++)
+                patch_here(cx, opt.offs[i]);
+            if (!emit_op(cx, JS_OP_POP, -1) || !emit_op(cx, JS_OP_TRUE, +1))
+                return false;
+            patch_here(cx, done);
+            return true;
         }
         default:
             return cerr(cx, n->pos, "unsupported unary operator");
@@ -2054,6 +2088,8 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
 /* ---- functions ---- */
 
 /* Binds parameters into locals; emits default/destructuring prologue. */
+static bool uses_new_target(const JsAstNode *n, int depth);
+
 static bool bind_params(JsCompiler *cx, const JsAstNode *fnode, uint16_t *n_params,
                         bool *has_rest) {
     JsFuncState *fs = cx->cur;
@@ -2104,6 +2140,18 @@ static bool bind_params(JsCompiler *cx, const JsAstNode *fnode, uint16_t *n_para
         if (slot != np)
             return cerr(cx, fnode->pos, "internal error: arguments slot misplaced");
         fs->arguments_local = (int)fs->local_count - 1;
+        /* new.target, when the function (or one of its arrows) reads it: the next slot */
+        bool nt = false;
+        for (uint32_t i = 0; i < count && !nt; i++)
+            nt = uses_new_target(fnode->items[i], 0);
+        if (nt || uses_new_target(fnode->a, 0)) {
+            if (!declare_local(cx, new_target_name, sizeof new_target_name / sizeof new_target_name[0], true,
+                               fnode->pos, 0, &slot))
+                return false;
+            if (slot != np + 1)
+                return cerr(cx, fnode->pos, "internal error: new.target slot misplaced");
+            fs->uses_new_target = true;
+        }
     }
 
     /* Pass 2: pre-declare names introduced by patterns (slots after params). */
@@ -2187,6 +2235,25 @@ static bool compile_function(JsCompiler *cx, const JsAstNode *fnode) {
 }
 
 /* name: the name the function takes from where it is defined, used when it has none of its own */
+/* Whether N uses new.target, itself or in an arrow (an arrow's is its function's), but not in a
+ * function of its own: the function being compiled then keeps it in a hidden local */
+static bool uses_new_target(const JsAstNode *n, int depth) {
+    if (!n || depth > 512)
+        return false;
+    if (n->kind == JS_AST_NEW_TARGET)
+        return true;
+    if ((n->kind == JS_AST_FUNC_EXPR || n->kind == JS_AST_FUNC_DECL) && !(n->flags & JS_F_ARROW))
+        return false; /* it has a new.target of its own */
+    const JsAstNode *kids[4] = {n->a, n->b, n->c, n->d};
+    for (int i = 0; i < 4; i++)
+        if (uses_new_target(kids[i], depth + 1))
+            return true;
+    for (uint32_t i = 0; i < n->count; i++)
+        if (uses_new_target(n->items[i], depth + 1))
+            return true;
+    return false;
+}
+
 static bool compile_function_as(JsCompiler *cx, const JsAstNode *fnode, const uint16_t *name,
                                 uint32_t name_len) {
     if (++cx->func_depth > 200)
@@ -2264,7 +2331,8 @@ static bool compile_function_as(JsCompiler *cx, const JsAstNode *fnode, const ui
                              ((fnode->flags & JS_F_ASYNC) ? JS_FN_ASYNC : 0) |
                              ((fnode->kind == JS_AST_FUNC_EXPR && (fnode->flags & JS_F_METHOD_FN))
                                   ? JS_FN_METHOD : 0) |
-                             (fs.uses_arguments ? JS_FN_USES_ARGUMENTS : 0));
+                             (fs.uses_arguments ? JS_FN_USES_ARGUMENTS : 0) |
+                             (fs.uses_new_target ? JS_FN_NEW_TARGET : 0));
     fn->n_locals = fs.slot_max;
     fn->max_stack = (uint32_t)(fs.max_depth < 0 ? 0 : fs.max_depth) + 8;
 

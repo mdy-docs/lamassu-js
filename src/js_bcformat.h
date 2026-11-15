@@ -17,7 +17,7 @@
 #ifndef JS_BCFORMAT_H
 #define JS_BCFORMAT_H
 
-#define JSBC_VERSION 15u /* 3: JS_FN_USES_ARGUMENTS function flag; 4: callee-name table after the line table;
+#define JSBC_VERSION 16u /* 3: JS_FN_USES_ARGUMENTS function flag; 4: callee-name table after the line table;
                            5: JS_OP_THROW_CONST_ASSIGN, and the name table also marks iteration,
                            destructuring and TDZ-able reads;
                            6: JS_OP_SET_LOCAL_CHECKED, JS_OP_SET_UPVAL_CHECKED, JS_OP_INIT_EXPORT,
@@ -36,7 +36,9 @@
                            replace JS_OP_ARRAY_REST, and JS_OP_ARGS_SPREAD for a call's spread;
                            15: JS_OP_ITER_CLOSE, JS_OP_ITER_CLOSE_THROW and JS_OP_ITER_CLOSE_LOCAL
                            (for-of and destructuring close their iterator), and break, continue and
-                           return pop the try handlers they leave */
+                           return pop the try handlers they leave;
+                           16: JS_FN_NEW_TARGET function flag (new.target in the local after
+                           `arguments`) */
 #define JSBC_FLAG_HAS_REGEX 1u /* producer had regex enabled (informational) */
 
 /* Sanity caps: reject absurd sizes early (before allocating) rather than

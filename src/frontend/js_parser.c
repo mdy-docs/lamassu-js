@@ -21,6 +21,7 @@ typedef struct JsParser {
     bool in_function;
     bool fn_async;   /* await allowed (module top level counts) */
     int fn_nesting;  /* 0 = module top level */
+    bool new_target_ok; /* inside a function that is not an arrow (an arrow inherits it) */
     int loop_depth, switch_depth;
     /* pending {a = 1} cover-initializers awaiting pattern conversion */
     int cover_init_open;
@@ -752,13 +753,14 @@ static JsAstNode *collapse_cover(JsParser *p, JsAstNode *cover) {
 /* ---- function bodies / arrows ---- */
 
 typedef struct {
-    bool in_function, fn_async;
+    bool in_function, fn_async, new_target_ok;
     int loop_depth, switch_depth;
 } JsSavedCtx;
 
-static JsSavedCtx ctx_enter_function(JsParser *p, bool is_async) {
-    JsSavedCtx s = {p->in_function, p->fn_async, p->loop_depth, p->switch_depth};
+static JsSavedCtx ctx_enter_function(JsParser *p, bool is_async, bool arrow) {
+    JsSavedCtx s = {p->in_function, p->fn_async, p->new_target_ok, p->loop_depth, p->switch_depth};
     p->in_function = true;
+    p->new_target_ok = p->new_target_ok || !arrow;
     p->fn_async = is_async;
     p->fn_nesting++;
     p->loop_depth = 0;
@@ -768,6 +770,7 @@ static JsSavedCtx ctx_enter_function(JsParser *p, bool is_async) {
 
 static void ctx_leave_function(JsParser *p, JsSavedCtx s) {
     p->in_function = s.in_function;
+    p->new_target_ok = s.new_target_ok;
     p->fn_async = s.fn_async;
     p->fn_nesting--;
     p->loop_depth = s.loop_depth;
@@ -820,7 +823,7 @@ static JsAstNode *parse_func_common(JsParser *p, uint8_t flags, bool need_name,
     if (!parse_params(p, &params))
         return NULL;
     vec_store(fn, &params);
-    JsSavedCtx s = ctx_enter_function(p, (flags & JS_F_ASYNC) != 0);
+    JsSavedCtx s = ctx_enter_function(p, (flags & JS_F_ASYNC) != 0, false);
     fn->a = parse_block(p);
     ctx_leave_function(p, s);
     fn->src_start = src_start;
@@ -865,7 +868,7 @@ static JsAstNode *build_arrow(JsParser *p, JsAstNode *params_src, bool is_async,
     }
     vec_store(fn, &params);
 
-    JsSavedCtx s = ctx_enter_function(p, is_async);
+    JsSavedCtx s = ctx_enter_function(p, is_async, true);
     if (TOK(p).kind == JS_T_LBRACE) {
         fn->a = parse_block(p);
     } else {
@@ -1022,7 +1025,7 @@ static JsAstNode *parse_object_literal(JsParser *p) {
                 if (!parse_params(p, &params))
                     return NULL;
                 vec_store(fn, &params);
-                JsSavedCtx s = ctx_enter_function(p, (fn->flags & JS_F_ASYNC) != 0);
+                JsSavedCtx s = ctx_enter_function(p, (fn->flags & JS_F_ASYNC) != 0, false);
                 fn->a = parse_block(p);
                 ctx_leave_function(p, s);
                 if (!fn->a)
@@ -1313,8 +1316,18 @@ static JsAstNode *parse_new_expr(JsParser *p) {
     uint32_t pos = TOK(p).pos;
     if (!advance(p)) /* consume 'new' */
         return NULL;
-    if (TOK(p).kind == JS_T_DOT)
-        return perr_here(p, "'new.target' is not supported");
+    if (TOK(p).kind == JS_T_DOT) { /* new.target */
+        if (!advance(p))
+            return NULL;
+        if (TOK(p).kind != JS_T_IDENT || !tok_is_name(&TOK(p), "target"))
+            return perr_here(p, unexpected_text(p));
+        if (!p->new_target_ok)
+            return perr(p, pos, "new.target expression is not allowed here");
+        JsAstNode *nt = new_node(p, JS_AST_NEW_TARGET, pos);
+        if (!nt || !advance(p))
+            return NULL;
+        return nt;
+    }
     JsAstNode *callee = parse_new_callee(p);
     if (!callee)
         return NULL;

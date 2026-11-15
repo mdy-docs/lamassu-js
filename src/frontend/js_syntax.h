@@ -132,6 +132,7 @@ typedef enum JsAstKind {
     JS_AST_IMPORT_CALL, /* dynamic import(): a = specifier, b = options or NULL */
     JS_AST_HOLE,
     JS_AST_COVER, /* transient: parenthesized list before arrow/expr decision */
+    JS_AST_NEW_TARGET, /* `new.target` (only inside a function that is not an arrow, or its arrows) */
     /* patterns */
     JS_AST_ARRAY_PATTERN, JS_AST_OBJECT_PATTERN, JS_AST_REST, JS_AST_DEFAULT,
 } JsAstKind;

@@ -239,6 +239,7 @@ typedef struct JsUpvalDesc {
 /* An object literal's method (`{ m() {} }`, async or not). With ARROW and ASYNC, one of the kinds
  * of function that is no constructor and has no `prototype` (js_is_constructor). */
 #define JS_FN_METHOD 0x10
+#define JS_FN_NEW_TARGET 0x20 /* uses new.target: frame_setup puts it in the local after `arguments` */
 
 typedef struct JsModule JsModule;
 
