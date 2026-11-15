@@ -499,6 +499,14 @@ protocol, named capture groups, and `/d` (indices) all work.
 
 - **`RegExp.prototype`**: `exec`, `test`, `toString`. **`RegExp.escape(s)`** escapes what a
   pattern could read as syntax, as V8 does (`RegExp.escape("a.b")` is `"\\x61\\.b"`).
+- **`RegExp.prototype.compile(pattern, flags)`** (Annex B) recompiles the regexp in place and sets
+  its `lastIndex` to 0.
+- **The legacy statics**, as V8 has them: `RegExp.input` (`$_`), `lastMatch` (`$&`), `lastParen`
+  (`$+`), `leftContext` (`` $` ``), `rightContext` (`$'`) and `$1`–`$9` describe the last
+  successful match of any regexp (`exec`, `test`, and the string methods), and stay as they were
+  after one that fails. `input` can be set (to a string); writing the others does nothing, as
+  V8's setters do. Each can be deleted or redefined. V8 has them as accessors; here they are
+  answered by the constructor itself, so a descriptor shows a `value`.
 - Consumed by `String.prototype.match`/`matchAll`/`search`/`replace`/
   `replaceAll`/`split` when given a `RegExp` argument.
 - Catastrophic backtracking is bounded by an engine-side step budget — see

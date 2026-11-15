@@ -11,8 +11,6 @@ prototype in both engines (2026-11-15).
 
 **Not yet implemented** (nothing stands in the way; each is queued):
 
-- `RegExp.prototype.compile` and the legacy `RegExp.$1`–`$9`, `lastMatch`, `input` (and the
-  rest) statics, V8's Annex B leftovers.
 - `BigInt` (a primitive type of its own, with `10n` literals; see the syntax below).
 
 **Left out by design:**
@@ -83,7 +81,8 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   storage; a frozen or sealed array's elements are), nor can an **array's `length`** or a
   **regexp's `lastIndex`** be made read-only (outside `freeze`). An error's **`stack`** is a data
   property here where V8 has an accessor; it reads, writes and redefines as V8's does, but its
-  descriptor has `value`/`writable` rather than `get`/`set`.
+  descriptor has `value`/`writable` rather than `get`/`set`. The same goes for RegExp's legacy
+  statics (`RegExp.$1`, `lastMatch`, `input`, ...).
 - **`Array.fromAsync` closes an iterator once.** When a value it awaits rejects, V8 calls the
   iterator's `return` twice; the spec's async-from-sync iterator closes it once, and so does
   lamassu. (There are no async iterables to give it: no symbols, no async generators.)

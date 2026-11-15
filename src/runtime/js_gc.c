@@ -383,6 +383,9 @@ void js_gc_collect(JsVm *vm) {
                 js_gc_mark_cell(vm, &weak_protos[k]->gc);
         if (ctx->weak_kept)
             js_weak_mark_kept(vm, ctx->weak_kept);
+        if (ctx->re_subject)
+            js_gc_mark_cell(vm, &ctx->re_subject->gc);
+        js_gc_mark_value(vm, ctx->re_input);
         /* the natives running now: their receivers (the callee is on its caller's stack, or
          * held by the host) */
         for (const JsNativeAct *a = ctx->native_act; a; a = a->outer) {

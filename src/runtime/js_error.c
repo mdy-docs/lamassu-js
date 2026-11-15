@@ -221,6 +221,40 @@ static void fb_function(JsContext *ctx, FmtBuf *b, JsValue v) {
 }
 
 static const JsString *type_name_of(JsContext *ctx, JsValue recv, const char **fixed_out, bool frame);
+static bool chain_get(JsContext *ctx, JsObject *o, const char *key, JsValue *out, bool *found);
+
+/* An error, or what inherits Error.prototype, as V8 names it in a message: "Name: message" (its
+ * name if the message is empty, the message if the name is), from string properties only, with
+ * no side effects. False when O is no error. */
+static bool fb_error_like(JsContext *ctx, FmtBuf *b, JsObject *o) {
+    bool is_error = o->obj_kind == JS_OBJ_ERROR;
+    JsObject *ep = ctx->error_protos[JS_ERROR_PLAIN];
+    for (JsValue p = o->proto; !is_error && ep && js_is_object(p); p = js_value_object(p)->proto)
+        is_error = js_value_object(p) == ep;
+    if (!is_error)
+        return false;
+    JsValue nv = js_undefined(), mv = js_undefined();
+    bool found;
+    if (!chain_get(ctx, o, "name", &nv, &found) || !chain_get(ctx, o, "message", &mv, &found)) {
+        b->oom = true;
+        return true;
+    }
+    const JsString *name = js_is_string(nv) ? js_value_string(nv) : NULL;
+    const JsString *msg = js_is_string(mv) ? js_value_string(mv) : NULL;
+    bool has_name = name ? name->length > 0 : js_is_undefined(nv);
+    bool has_msg = msg && msg->length > 0;
+    if (has_name) {
+        if (name)
+            fb_piece(b, name->units, name->length);
+        else
+            fb_ascii(b, "Error", 5);
+    }
+    if (has_name && has_msg)
+        fb_ascii(b, ": ", 2);
+    if (has_msg)
+        fb_piece(b, msg->units, msg->length);
+    return true;
+}
 
 JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
     JsVm *vm = ctx->vm;
@@ -314,6 +348,14 @@ JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
             } else if (inherits_iterator(ctx, v))
                 /* nor for what inherits Iterator.prototype (its constructor is an accessor) */
                 fb_ascii(b, "[object Object]", 15);
+            else if (js_value_object(v)->obj_kind == JS_OBJ_DATE)
+                fb_ascii(b, "[object Date]", 13); /* as V8's NoSideEffectsToString */
+#ifdef LAMASSU_HAS_REGEX
+            else if (js_value_object(v)->obj_kind == JS_OBJ_REGEXP)
+                fb_ascii(b, "[object RegExp]", 15);
+#endif
+            else if (fb_error_like(ctx, b, js_value_object(v)))
+                ; /* an error: "Name: message" */
             else {
                 /* #<Set>, #<F>: its constructor's name, as V8's GetConstructorName */
                 const char *fixed;

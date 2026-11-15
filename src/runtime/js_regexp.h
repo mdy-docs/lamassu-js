@@ -102,6 +102,14 @@ const char *js_regexp_validate(JsVm *vm, const uint16_t *pat, uint32_t pat_len,
 
 /* GC hooks (js_gc.c). Release frees the engine-owned class string buffers,
  * decrements the live count, and returns the true cell size. */
+/* RegExp's legacy statics (RegExp.$1, lastMatch, input, ...), the 19 names V8 has (js_regexp.c) */
+#define JS_REGEXP_LEGACY_COUNT 19
+int  js_regexp_legacy_index(JsContext *ctx, JsValue key); /* 0..18, or -1 (or deleted) */
+bool js_regexp_legacy_get(JsContext *ctx, int idx, JsValue *out);  /* false on OOM */
+bool js_regexp_legacy_set(JsContext *ctx, int idx, JsValue v);     /* false, error pending */
+void js_regexp_legacy_delete(JsContext *ctx, int idx);
+bool js_regexp_legacy_names(JsContext *ctx, JsObject *out);        /* appends the names */
+
 void   js_regexp_mark(JsVm *vm, JsObject *o);
 size_t js_regexp_release(JsVm *vm, JsObject *o);
 

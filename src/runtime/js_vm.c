@@ -271,6 +271,13 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->math_obj = ctx->json_obj = NULL;
     ctx->weakmap_proto = ctx->weakset_proto = ctx->weakref_proto = ctx->finreg_proto = NULL;
     ctx->weak_kept = NULL;
+    ctx->regexp_ctor = NULL;
+    ctx->re_subject = NULL;
+    ctx->re_input = js_undefined();
+    for (int i = 0; i < 20; i++)
+        ctx->re_caps[i] = -1;
+    ctx->re_last_paren[0] = ctx->re_last_paren[1] = -1;
+    ctx->re_legacy_deleted = 0;
     ctx->error_trace_count = 0;
     ctx->error_trace_value = js_undefined();
     ctx->pending_error = js_undefined();

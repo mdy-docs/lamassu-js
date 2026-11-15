@@ -210,6 +210,7 @@ static const JsBuiltinLength js_builtin_lengths[] = {
     {"", "RegExp", 2},
     {"RegExp", "escape", 1},
     {"RegExp.prototype", "exec", 1},
+    {"RegExp.prototype", "compile", 2},
     {"RegExp.prototype", "toString", 0},
     {"RegExp.prototype", "test", 1},
     {"", "Date", 7},

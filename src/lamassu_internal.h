@@ -694,6 +694,16 @@ struct JsContext {
     JsObject *math_obj, *json_obj; /* Math and JSON, whose toString tags are theirs; GC roots */
     JsObject *weakmap_proto, *weakset_proto, *weakref_proto, *finreg_proto; /* GC roots */
     JsObject *weak_kept; /* WeakRef targets kept alive to the end of the job (an array); GC root */
+    /* RegExp's legacy statics (RegExp.$1, lastMatch, input, ...): the last successful match's
+     * subject and groups 0-9 ([start, end], -1 for none), its last group, RegExp.input (which a
+     * script may set), and which of the 22 names a script deleted. GC roots: re_subject,
+     * re_input. */
+    struct JsNative *regexp_ctor;
+    JsString *re_subject;
+    JsValue re_input;
+    int32_t re_caps[20];
+    int32_t re_last_paren[2];
+    uint32_t re_legacy_deleted;
     /* What the last failed conversion threw (js_op_to_string and friends), until js_take_error
      * hands it on; undefined otherwise. GC root. */
     JsValue pending_error;

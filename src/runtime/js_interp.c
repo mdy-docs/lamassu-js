@@ -831,6 +831,15 @@ JS_COLD static int delete_function_prop(JsContext *ctx, JsValue fn, JsValue key,
         js_gc_unprotect(ctx->vm, &kv);
         return r;
     }
+#ifdef LAMASSU_HAS_REGEX
+    if (JS_UNLIKELY(js_value_cell(fn) == (JsGcCell *)ctx->regexp_ctor)) {
+        int li = js_regexp_legacy_index(ctx, key);
+        if (li >= 0) { /* configurable, as V8's accessors are */
+            js_regexp_legacy_delete(ctx, li);
+            return 0;
+        }
+    }
+#endif
     JsObject *own = js_cell_props(ctx, fn, false);
     bool isfn = js_is_function(fn); /* else a promise: only its own properties */
     bool special = isfn && (is_name_key(key) || is_length_key(key));
@@ -1084,6 +1093,13 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
             return function_prototype(ctx, c, out) ? JS_PROP_OK : JS_PROP_OOM;
         if (JS_UNLIKELY(is_name_key(key) || is_length_key(key)) && function_defined_special(ctx, base, key, out))
             return JS_PROP_OK;
+#ifdef LAMASSU_HAS_REGEX
+        if (JS_UNLIKELY(c == (JsGcCell *)ctx->regexp_ctor)) { /* RegExp.$1, lastMatch, ... */
+            int li = js_regexp_legacy_index(ctx, key);
+            if (li >= 0)
+                return js_regexp_legacy_get(ctx, li, out) ? JS_PROP_OK : JS_PROP_OOM;
+        }
+#endif
         if (is_name_key(key)) {
             JsString *nm = js_function_name(base);
             if (!nm) {
@@ -1141,6 +1157,10 @@ static bool own_prop_present(JsContext *ctx, JsObject *o, JsValue key) {
         return idx < o->elem_count;
     if (o->obj_kind == JS_OBJ_ARRAY && js_is_string(key) && units_is_ascii_str(js_value_string(key), "length"))
         return true;
+#ifdef LAMASSU_HAS_REGEX
+    if (o->obj_kind == JS_OBJ_REGEXP && js_is_string(key) && units_is_ascii_str(js_value_string(key), "lastIndex"))
+        return true;
+#endif
     JsString *k = to_prop_key(ctx, key);
     if (!k)
         return false;
@@ -1260,6 +1280,13 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
             *errmsg = SET_READ_ONLY;
             return JS_PROP_TYPE_ERROR;
         }
+#ifdef LAMASSU_HAS_REGEX
+        if (JS_UNLIKELY(c == (JsGcCell *)ctx->regexp_ctor)) {
+            int li = js_regexp_legacy_index(ctx, key);
+            if (li >= 0) /* input takes a string; the others' setters do nothing */
+                return js_regexp_legacy_set(ctx, li, val) ? JS_PROP_OK : JS_PROP_OOM;
+        }
+#endif
         /* any other key: the function's own properties (statics, constants, caches) */
         JsObject *own = js_cell_props(ctx, base, true);
         if (!own)
@@ -4238,7 +4265,7 @@ bool js_function_has_own_special(JsValue fn, bool name) {
 
 typedef enum {
     OWN_NONE, OWN_MAP, OWN_ELEMENT, OWN_ARRAY_LENGTH, OWN_FN_NAME, OWN_FN_LENGTH, OWN_FN_PROTO,
-    OWN_STATIC, OWN_STR_INDEX, OWN_STR_LENGTH, OWN_ERROR_STACK, OWN_LAST_INDEX
+    OWN_STATIC, OWN_STR_INDEX, OWN_STR_LENGTH, OWN_ERROR_STACK, OWN_LAST_INDEX, OWN_RE_LEGACY
 } OwnKind;
 
 /* The object whose map holds V's own properties: V, or a function's or promise's own-property
@@ -4288,6 +4315,12 @@ static OwnKind own_prop_find(JsContext *ctx, JsValue v, JsValue key, uint8_t *at
             *attrs = JS_ATTR_HIDDEN | JS_ATTR_FIXED | (prototype_read_only(ctx, v) ? JS_ATTR_READONLY : 0);
             return OWN_FN_PROTO;
         }
+#ifdef LAMASSU_HAS_REGEX
+        if (c == (JsGcCell *)ctx->regexp_ctor && js_regexp_legacy_index(ctx, key) >= 0) {
+            *attrs = JS_ATTR_HIDDEN; /* V8's accessor: writable as far as a script can tell */
+            return OWN_RE_LEGACY;
+        }
+#endif
         if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->statics && k) {
             JsObject *st = ((JsNative *)c)->statics;
             js_map_get(&st->props, k, &found);
@@ -4419,7 +4452,7 @@ bool js_define_own_property(JsContext *ctx, JsValue v, JsValue key, const JsProp
             na = d->writable ? (na & ~JS_ATTR_READONLY) : (na | JS_ATTR_READONLY);
         if (d->has & JS_DESC_CONFIGURABLE)
             na = d->configurable ? (na & ~JS_ATTR_FIXED) : (na | JS_ATTR_FIXED);
-        if (kind == OWN_ERROR_STACK && (d->has & (JS_DESC_VALUE | JS_DESC_WRITABLE))) {
+        if ((kind == OWN_ERROR_STACK || kind == OWN_RE_LEGACY) && (d->has & (JS_DESC_VALUE | JS_DESC_WRITABLE))) {
             /* V8's stack is an accessor: a data descriptor turns it into a data property, read-only
              * unless the descriptor says writable, and not at all when it is not configurable */
             if (cur & JS_ATTR_FIXED) {
@@ -4504,6 +4537,21 @@ bool js_define_own_property(JsContext *ctx, JsValue v, JsValue key, const JsProp
         ok = k && js_error_stack_delete(ctx, o, key) && map_put(ctx, o, k, nv, na);
         break;
     }
+#ifdef LAMASSU_HAS_REGEX
+    case OWN_RE_LEGACY: /* an ordinary property from now on, as V8's accessor becomes */
+        k = to_prop_key(ctx, key);
+        if (k) {
+            js_regexp_legacy_delete(ctx, js_regexp_legacy_index(ctx, key));
+            JsObject *o = own_map_object(ctx, v, true);
+            ok = o && map_put(ctx, o, k, nv, na);
+        } else {
+            ok = false;
+        }
+        break;
+#else
+    case OWN_RE_LEGACY:
+        break;
+#endif
     case OWN_STR_INDEX:  /* a new array element, written above */
     case OWN_STR_LENGTH: /* unreachable: a string is not an object */
         break;

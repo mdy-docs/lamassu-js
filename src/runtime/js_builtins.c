@@ -4121,6 +4121,10 @@ static bool obj_getOwnPropertyNames(JsContext *ctx, JsValue tv, const JsValue *a
              (!(js_function_has_own_special(v, true) || map_has_ascii(own0, "name")) ||
               append_ascii_key(ctx, out, "name")) &&
              (!js_function_has_own_prototype(v) || append_ascii_key(ctx, out, "prototype"));
+#ifdef LAMASSU_HAS_REGEX
+        if (ok && c == (JsGcCell *)ctx->regexp_ctor) /* RegExp's legacy statics, where V8 lists them */
+            ok = js_regexp_legacy_names(ctx, out);
+#endif
         if (ok && c->kind == JS_KIND_NATIVE && ((JsNative *)c)->statics)
             ok = append_map_keys(ctx, out, ((JsNative *)c)->statics);
         JsObject *own = js_cell_props(ctx, v, false);
@@ -4427,6 +4431,12 @@ static bool value_has_own(JsContext *ctx, JsValue v, JsString *ks, bool *out) {
             *out = true;
             return true;
         }
+#ifdef LAMASSU_HAS_REGEX
+        if (js_value_cell(v) == (JsGcCell *)ctx->regexp_ctor && js_regexp_legacy_index(ctx, kv) >= 0) {
+            *out = true;
+            return true;
+        }
+#endif
         JsGcCell *c = js_value_cell(v);
         maps[0] = js_cell_props(ctx, v, false);
         if (c->kind == JS_KIND_NATIVE)
