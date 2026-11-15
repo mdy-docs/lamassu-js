@@ -344,6 +344,8 @@ JsValue js_module_dynamic_import(JsContext *ctx, JsModule *referrer, JsValue spe
 /* js_native_new: public, lamassu.h */
 /* Bound native carrying a captured value (js_interp.c). */
 JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound);
+/* Array.fromAsync (js_promise.c) */
+bool js_array_from_async(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r);
 /* The own-property object of a function or promise (js_interp.c), which are not JsObjects: with
  * create, made on first use (NULL on OOM); without, NULL when it has none. Object builtins use it
  * to treat them as objects. */

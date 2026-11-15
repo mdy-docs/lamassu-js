@@ -11,7 +11,6 @@ prototype in both engines (2026-11-15).
 
 **Not yet implemented** (nothing stands in the way; each is queued):
 
-- `Array.fromAsync`.
 - `RegExp.prototype.compile` and the legacy `RegExp.$1`–`$9`, `lastMatch`, `input` (and the
   rest) statics, V8's Annex B leftovers.
 - `BigInt` (a primitive type of its own, with `10n` literals; see the syntax below).
@@ -85,6 +84,9 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   **regexp's `lastIndex`** be made read-only (outside `freeze`). An error's **`stack`** is a data
   property here where V8 has an accessor; it reads, writes and redefines as V8's does, but its
   descriptor has `value`/`writable` rather than `get`/`set`.
+- **`Array.fromAsync` closes an iterator once.** When a value it awaits rejects, V8 calls the
+  iterator's `return` twice; the spec's async-from-sync iterator closes it once, and so does
+  lamassu. (There are no async iterables to give it: no symbols, no async generators.)
 - **`FinalizationRegistry` callbacks run when the job queue empties.** The collector notes the
   dead targets; their callbacks run from `js_run_jobs` once the microtask queue is empty (and any
   jobs they queue run in the same drain), where V8 runs them as a task of their own. A callback

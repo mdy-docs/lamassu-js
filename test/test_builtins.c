@@ -1371,6 +1371,13 @@ static void test_iterator_helpers(void) {
 }
 
 
+/* Array.fromAsync, and promises adopting thenables (Promise.resolve, resolve functions, await, async
+ * returns) with resolving functions that act once; expected values from Node */
+static void test_from_async(void) {
+    eq_s("const out = []; const log = []; const ITER = (vals, tag) => { let i = 0; const it = Object.create(Iterator.prototype); it.next = () => i < vals.length ? { value: vals[i++], done: false } : { value: undefined, done: true }; it.return = () => { log.push('return ' + tag); return {}; }; return it; }; const cases = [ ['arr', () => Array.fromAsync([1, Promise.resolve(2), 3])], ['map', () => Array.fromAsync([1, 2], (x, i) => Promise.resolve(x * 10 + i))], ['set', () => Array.fromAsync(new Set([1, 2]))], ['arraylike', () => Array.fromAsync({ length: 2, 0: 'a', 1: Promise.resolve('b') })], ['string', () => Array.fromAsync('a\\u{1F600}')], ['map throws', () => Array.fromAsync(ITER([1, 2], 'mt'), () => { throw new Error('m'); })], ['map rejects', () => Array.fromAsync(ITER([1, 2], 'mr'), () => Promise.reject(new Error('mr')))], ['bad map', () => Array.fromAsync([1], 's')], ['null', () => Array.fromAsync(null)], ['num', () => Array.fromAsync(5)], ['this', () => Array.fromAsync([1], function (x) { return this.k + x; }, { k: 10 })], ['thenable', () => Array.fromAsync([{ then(r) { r(7); } }])], ['arraylike reject', () => Array.fromAsync({ length: 1, 0: Promise.reject(new Error('al')) })], ['long', () => Array.fromAsync(Array.from({ length: 300 }, (_, i) => Promise.resolve(i))).then((a) => a.length + a[299])], ['thenables', () => Promise.all([Promise.resolve({ then(r) { r(1); } }), (async () => ({ then(r) { r(2); } }))(), new Promise((res) => { res(new Promise(() => {})); res(5); }).then(() => 'x', () => 'y') === undefined])], ['first wins', () => new Promise((res, rej) => { rej(new Error('r')); res(1); }).catch((e) => e.message)], ['then throws', () => Promise.resolve({ then() { throw new Error('t'); } }).catch((e) => e.message)], ['await thenable', async () => await { then(r) { r(9); } }], ['log', () => log], ]; for (const [s, f] of cases) { try { out.push(s + ' => ' + JSON.stringify(await f())); } catch (e) { out.push(s + ' => ' + e.constructor.name + ': ' + e.message); } } out.push([typeof Array.fromAsync, Array.fromAsync.length].join()); out.join('\\n');",
+       "arr => [1,2,3]\nmap => [10,21]\nset => [1,2]\narraylike => [\"a\",\"b\"]\nstring => [\"a\",\"\xf0\x9f\x98\x80""\"]\nmap throws => Error: m\nmap rejects => Error: mr\nbad map => TypeError: s is not a function\nnull => TypeError: Cannot read properties of null (reading 'Symbol(Symbol.asyncIterator)')\nnum => []\nthis => [11]\nthenable => [7]\narraylike reject => Error: al\nlong => 599\nthenables => [1,2,false]\nfirst wins => \"r\"\nthen throws => \"t\"\nawait thenable => 9\nlog => [\"return mt\",\"return mr\"]\nfunction,1");
+}
+
 /* String.prototype.normalize; expected values from Node (every code point in all four forms, and
  * Unicode's NormalizationTest.txt, were checked against Node and pass; too big to keep here) */
 static void test_normalize(void) {
@@ -1566,6 +1573,7 @@ int main(void) {
     test_descriptors();
     test_weak();
     test_normalize();
+    test_from_async();
     test_stress();
     test_integration();
     if (checks_failed) {

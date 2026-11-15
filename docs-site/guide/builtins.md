@@ -138,7 +138,8 @@ as in V8: callable with anything, returning `undefined`, not a constructor, with
 array of that length; anything else behaves like `Array.of`.
 
 - **Statics**: `isArray`, `of`, `from` (any iterable, else an array-like's `[0, length)`; with
-  `mapFn(value, index)` and its `thisArg`).
+  `mapFn(value, index)` and its `thisArg`), `fromAsync` (the same, as a promise: each value
+  awaited, and each `mapFn` result; a rejection or a throwing `mapFn` closes the iterator).
 - **`Array.prototype`**: `push`, `pop`, `shift`, `unshift`, `splice`, `at`, `with`,
   `indexOf`, `lastIndexOf`, `includes` (SameValueZero, so `[NaN].includes(NaN)`), `slice`, `join`,
   `reverse`, `toReversed`, `fill`, `copyWithin`, `concat`, `map`, `filter`, `forEach`, `some`,
@@ -477,6 +478,11 @@ engine's subset, callable **without** `new` too.
   with an `AggregateError` (`All promises were rejected`) whose `errors` are the reasons in
   input order.
 - **`Promise.prototype`**: `then`, `catch`, `finally`.
+- Resolving with a thenable (any object or function with a callable `then`) adopts it, as V8
+  does: `Promise.resolve`, an executor's `resolve`, `await`, an async function's return value and
+  the combinators' inputs call its `then` in a job of its own. An executor's `resolve` and
+  `reject` act once between them: the first call wins, even while a thenable it was given is
+  still pending.
 - A promise holds properties as any object does (`p.label = 'load'`): reads, `in`, `delete`,
   `Object.keys`, spread, `Object.assign`, `JSON.stringify` and `freeze`/`seal` see them, and one
   can shadow `then`.

@@ -82,6 +82,7 @@ static const JsBuiltinLength js_builtin_lengths[] = {
     {"", "Array", 1},
     {"Array", "isArray", 1},
     {"Array", "from", 1},
+    {"Array", "fromAsync", 1},
     {"Array", "of", 0},
     {"Array.prototype", "at", 1},
     {"Array.prototype", "concat", 1},

@@ -14,10 +14,12 @@
 #include "js_weak.h"
 #include "js_bytecode.h"
 #include "js_error.h"
+#include "js_iter.h"
 #include "lamassu_internal.h"
 
 #define RX_THEN 0
 #define RX_AWAIT 1
+#define RX_THENABLE 2 /* NewPromiseResolveThenableJob: value.then(resolve, reject) for result */
 
 /* ---- allocation ---- */
 
@@ -242,12 +244,49 @@ static JsReaction *reaction_alloc(JsContext *ctx) {
     return rx;
 }
 
+/* Promise Resolve Functions, steps 8-16, for an object VALUE that is not a promise: its `then`
+ * read now (a throw rejects P); callable, P follows it through a job that calls
+ * value.then(resolve, reject) (NewPromiseResolveThenableJob), else P fulfills with VALUE. */
+static void resolve_thenable(JsContext *ctx, JsPromise *p, JsValue value) {
+    JsValue pv = js_value_from_cell(&p->gc), then = js_undefined();
+    js_gc_protect(ctx->vm, &pv);
+    js_gc_protect(ctx->vm, &value);
+    static const uint16_t kthen[] = {'t', 'h', 'e', 'n'};
+    JsValue key = js_atom(ctx->vm, kthen, 4);
+    if (!js_is_string(key) || !js_get_property(ctx, value, key, &then)) {
+        JsValue e = js_is_undefined(ctx->pending_error) ? js_oom_value(ctx->vm) : js_take_error(ctx);
+        js_promise_reject(ctx, p, e);
+    } else if (!js_is_function(then)) {
+        js_promise_fulfill(ctx, p, value);
+    } else {
+        js_gc_protect(ctx->vm, &then);
+        JsJob *job = job_alloc(ctx->vm);
+        if (!job) {
+            js_promise_reject(ctx, p, js_oom_value(ctx->vm));
+        } else {
+            job->kind = RX_THENABLE;
+            job->value = value;
+            job->on_fulfilled = then;
+            job->result = p;
+            job_enqueue(ctx->vm, job);
+        }
+        js_gc_unprotect(ctx->vm, &then);
+    }
+    js_gc_unprotect(ctx->vm, &value);
+    js_gc_unprotect(ctx->vm, &pv);
+}
+
 /*
  * Resolution procedure: if value is a promise, p adopts its eventual state;
  * otherwise p fulfills with value.
  */
 void js_promise_resolve_with(JsContext *ctx, JsPromise *p, JsValue value) {
     if (!js_is_promise(value)) {
+        /* an object a script can see (a host's bytecode buffer carries the object tag too) */
+        if ((js_is_object(value) && js_value_cell(value)->kind == JS_KIND_OBJECT) || js_is_function(value)) {
+            resolve_thenable(ctx, p, value);
+            return;
+        }
         js_promise_fulfill(ctx, p, value);
         return;
     }
@@ -313,6 +352,8 @@ bool js_promise_await(JsContext *ctx, JsPromise *p, JsFiber *fiber) {
 
 /* ---- running microtasks ---- */
 
+static void run_thenable_job(JsContext *ctx, JsJob *job);
+
 static void run_then_job(JsContext *ctx, JsJob *job) {
     JsValue handler = job->fulfilled ? job->on_fulfilled : job->on_rejected;
     JsPromise *r = job->result;
@@ -355,6 +396,8 @@ again:
         vm->running_job = job;
         if (job->kind == RX_AWAIT)
             js_resume_fiber(ctx, job->fiber, job->value, job->is_throw);
+        else if (job->kind == RX_THENABLE)
+            run_thenable_job(ctx, job);
         else
             run_then_job(ctx, job);
         vm->running_job = job->next;
@@ -428,10 +471,15 @@ static bool nthrow(JsContext *ctx, JsValue *r, const char *msg) {
 static JsPromise *coerce_promise(JsContext *ctx, JsValue v) {
     if (js_is_promise(v))
         return js_value_promise(v);
+    js_gc_protect(ctx->vm, &v);
     JsPromise *p = js_promise_alloc(ctx);
+    js_gc_unprotect(ctx->vm, &v);
     if (!p)
         return NULL;
-    js_promise_fulfill(ctx, p, v);
+    JsValue pv = js_value_from_cell(&p->gc);
+    js_gc_protect(ctx->vm, &pv);
+    js_promise_resolve_with(ctx, p, v); /* a thenable is adopted, as PromiseResolve does */
+    js_gc_unprotect(ctx->vm, &pv);
     return p;
 }
 
@@ -883,6 +931,84 @@ static bool ps_race(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     return true;
 }
 
+/* CreateResolvingFunctions: resolve and reject for PV, sharing [[AlreadyResolved]]: both are bound
+ * to one array that holds the promise until either is called. False on OOM. RESOLVE and REJECT
+ * are rooted by the caller. */
+static bool rf_settle(JsContext *ctx, JsValue bound, const JsValue *args, int argc, bool reject) {
+    JsObject *a = js_value_object(bound);
+    JsValue pv = a->elems[0];
+    if (!js_is_promise(pv))
+        return true; /* already resolved: a later call does nothing */
+    a->elems[0] = js_undefined();
+    js_gc_protect(ctx->vm, &pv);
+    if (reject)
+        js_promise_reject(ctx, js_value_promise(pv), ARG(0));
+    else
+        js_promise_resolve_with(ctx, js_value_promise(pv), ARG(0));
+    js_gc_unprotect(ctx->vm, &pv);
+    return true;
+}
+
+static bool rf_resolve(JsContext *ctx, JsValue bound, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    *r = js_undefined();
+    return rf_settle(ctx, bound, args, argc, false);
+}
+
+static bool rf_reject(JsContext *ctx, JsValue bound, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    *r = js_undefined();
+    return rf_settle(ctx, bound, args, argc, true);
+}
+
+static bool resolving_functions(JsContext *ctx, JsValue pv, JsValue *resolve, JsValue *reject) {
+    *resolve = *reject = js_undefined();
+    js_gc_protect(ctx->vm, &pv);
+    JsObject *a = js_array_new_cell(ctx, 1);
+    JsValue av = a ? js_value_from_cell(&a->gc) : js_undefined();
+    if (a) {
+        a->elems[0] = pv;
+        a->elem_count = 1;
+    }
+    js_gc_protect(ctx->vm, &av);
+    if (a)
+        *resolve = js_bound_native_new(ctx, rf_resolve, av);
+    if (js_is_function(*resolve)) {
+        js_gc_protect(ctx->vm, resolve);
+        *reject = js_bound_native_new(ctx, rf_reject, av);
+        js_gc_unprotect(ctx->vm, resolve);
+    }
+    js_gc_unprotect(ctx->vm, &av);
+    js_gc_unprotect(ctx->vm, &pv);
+    if (!js_is_function(*reject))
+        return false;
+    /* they take one argument, as V8's say */
+    ((JsNative *)js_value_cell(*resolve))->length = 1;
+    ((JsNative *)js_value_cell(*reject))->length = 1;
+    return true;
+}
+
+/* NewPromiseResolveThenableJob's work: thenable.then(resolve, reject) for the job's promise; a
+ * throw rejects it unless it was resolved first */
+static void run_thenable_job(JsContext *ctx, JsJob *job) {
+    JsValue pv = js_value_from_cell(&job->result->gc), resolve, reject, res;
+    if (!resolving_functions(ctx, pv, &resolve, &reject)) {
+        js_promise_reject(ctx, job->result, js_oom_value(ctx->vm));
+        return;
+    }
+    js_gc_protect(ctx->vm, &resolve);
+    js_gc_protect(ctx->vm, &reject);
+    JsValue args[2] = {resolve, reject};
+    if (!js_call(ctx, job->on_fulfilled, job->value, args, 2, &res)) {
+        js_gc_protect(ctx->vm, &res);
+        JsValue dummy;
+        rf_reject(ctx, ((JsNative *)js_value_cell(reject))->bound, js_undefined(), &res, 1, &dummy);
+        js_gc_unprotect(ctx->vm, &res);
+    }
+    js_gc_unprotect(ctx->vm, &reject);
+    js_gc_unprotect(ctx->vm, &resolve);
+}
+
 /* Callable Promise(executor) */
 static bool promise_ctor(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
@@ -894,19 +1020,18 @@ static bool promise_ctor(JsContext *ctx, JsValue tv, const JsValue *args, int ar
     js_gc_protect(ctx->vm, &pv);
     JsValue executor = ARG(0);
     js_gc_protect(ctx->vm, &executor);
-    JsValue resolve = js_bound_native_new(ctx, race_resolve, pv);
+    JsValue resolve, reject;
+    bool ok = resolving_functions(ctx, pv, &resolve, &reject);
     js_gc_protect(ctx->vm, &resolve);
-    JsValue reject = js_bound_native_new(ctx, race_reject, pv);
     js_gc_protect(ctx->vm, &reject);
-    bool ok = js_is_function(resolve) && js_is_function(reject);
     if (ok) {
-        /* the executor's resolving functions take one argument, as V8's say */
-        ((JsNative *)js_value_cell(resolve))->length = 1;
-        ((JsNative *)js_value_cell(reject))->length = 1;
         JsValue ex_args[2] = {resolve, reject};
-        JsValue ex_res;
-        if (!js_call(ctx, executor, js_undefined(), ex_args, 2, &ex_res))
-            js_promise_reject(ctx, js_value_promise(pv), ex_res); /* executor threw */
+        JsValue ex_res, dummy;
+        if (!js_call(ctx, executor, js_undefined(), ex_args, 2, &ex_res)) {
+            js_gc_protect(ctx->vm, &ex_res); /* executor threw: rejects, unless resolved first */
+            rf_reject(ctx, ((JsNative *)js_value_cell(reject))->bound, js_undefined(), &ex_res, 1, &dummy);
+            js_gc_unprotect(ctx->vm, &ex_res);
+        }
     }
     js_gc_unprotect(ctx->vm, &reject);
     js_gc_unprotect(ctx->vm, &resolve);
@@ -929,16 +1054,14 @@ static bool ps_withResolvers(JsContext *ctx, JsValue tv, const JsValue *args, in
     if (!js_is_promise(pv))
         return nthrow(ctx, r, "out of memory");
     js_gc_protect(ctx->vm, &pv);
-    JsValue resolve = js_bound_native_new(ctx, race_resolve, pv);
+    JsValue resolve, reject;
+    bool made = resolving_functions(ctx, pv, &resolve, &reject);
     js_gc_protect(ctx->vm, &resolve);
-    JsValue reject = js_bound_native_new(ctx, race_reject, pv);
     js_gc_protect(ctx->vm, &reject);
-    JsValue o = js_is_function(resolve) && js_is_function(reject) ? js_object_new(ctx) : js_undefined();
+    JsValue o = made ? js_object_new(ctx) : js_undefined();
     js_gc_protect(ctx->vm, &o); /* the property writes allocate */
     bool ok = js_is_object(o);
     if (ok) {
-        ((JsNative *)js_value_cell(resolve))->length = 1;
-        ((JsNative *)js_value_cell(reject))->length = 1;
         JsObject *obj = js_value_object(o);
         ok = js_object_set_ascii(ctx, obj, "promise", pv) && js_object_set_ascii(ctx, obj, "resolve", resolve) &&
              js_object_set_ascii(ctx, obj, "reject", reject);
@@ -1016,5 +1139,201 @@ bool js_promise_builtins_init(JsContext *ctx) {
         !def_fn(ctx, st, "allSettled", ps_allSettled) || !def_fn(ctx, st, "any", ps_any) ||
         !def_fn(ctx, st, "try", ps_try) || !def_fn(ctx, st, "withResolvers", ps_withResolvers))
         return false;
+    return true;
+}
+
+/* ===================================================================
+ * Array.fromAsync
+ * ===================================================================
+ *
+ * A sync iterable's values (or an array-like's elements) awaited in turn, each mapped (and the
+ * mapping awaited) when a map function is given, into a new array the returned promise fulfills
+ * with. There are no async iterables (no symbols, no async generators), so every source is
+ * read as V8 reads a sync one, through an async-from-sync iterator: a value that rejects closes
+ * the iterator, as does a map function that throws or rejects. The steps run as reactions on the
+ * awaited promises, carrying their state in an array. */
+
+enum { FA_SRC, FA_I, FA_A, FA_MAP, FA_THIS, FA_P, FA_K, FA_LEN, FA_COUNT };
+
+static JsObject *fa_state(JsValue st) {
+    return js_value_object(st);
+}
+
+static void fa_step(JsContext *ctx, JsValue st);
+
+/* Rejects the result with ERR, closing the iterator first when CLOSE (ERR rooted by the caller) */
+static void fa_fail(JsContext *ctx, JsValue st, JsValue err, bool close) {
+    JsObject *s = fa_state(st);
+    if (close && js_get_number(s->elems[FA_LEN]) < 0) {
+        JsIterCursor cur = {s->elems[FA_SRC], (uint32_t)js_get_number(s->elems[FA_I])};
+        JsValue ignored;
+        js_iter_close(ctx, &cur, true, false, &ignored); /* a throw: what return() does is ignored */
+        s->elems[FA_I] = js_number(JS_ITER_DONE_INDEX);
+    }
+    js_promise_reject(ctx, js_value_promise(s->elems[FA_P]), err);
+}
+
+/* Await(V), then ON_F(value) or ON_R(reason) with the state */
+static void fa_await(JsContext *ctx, JsValue st, JsValue v, JsBoundFn on_f, JsBoundFn on_r) {
+    js_gc_protect(ctx->vm, &st);
+    js_gc_protect(ctx->vm, &v);
+    JsPromise *p = NULL;
+    if (js_is_promise(v)) {
+        p = js_value_promise(v);
+    } else if ((p = js_promise_alloc(ctx)) != NULL) {
+        JsValue pv = js_value_from_cell(&p->gc);
+        js_gc_protect(ctx->vm, &pv);
+        js_promise_resolve_with(ctx, p, v); /* a thenable is adopted */
+        js_gc_unprotect(ctx->vm, &pv);
+    }
+    JsValue pv = p ? js_value_from_cell(&p->gc) : js_undefined();
+    js_gc_protect(ctx->vm, &pv);
+    JsValue f = p ? js_bound_native_new(ctx, on_f, st) : js_undefined();
+    js_gc_protect(ctx->vm, &f);
+    JsValue rj = js_is_function(f) ? js_bound_native_new(ctx, on_r, st) : js_undefined();
+    js_gc_protect(ctx->vm, &rj);
+    if (!js_is_function(rj) || !js_promise_then(ctx, p, f, rj))
+        fa_fail(ctx, st, js_error_from_ascii(ctx, "out of memory"), true);
+    js_gc_unprotect(ctx->vm, &rj);
+    js_gc_unprotect(ctx->vm, &f);
+    js_gc_unprotect(ctx->vm, &pv);
+    js_gc_unprotect(ctx->vm, &v);
+    js_gc_unprotect(ctx->vm, &st);
+}
+
+static bool fa_on_mapped(JsContext *ctx, JsValue st, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    JsObject *s = fa_state(st);
+    uint32_t k = (uint32_t)js_get_number(s->elems[FA_K]);
+    if (!js_array_set_index(ctx->vm, js_value_object(s->elems[FA_A]), k, argc ? args[0] : js_undefined())) {
+        fa_fail(ctx, st, js_error_from_ascii(ctx, "out of memory"), true);
+    } else {
+        s->elems[FA_K] = js_number((double)k + 1);
+        fa_step(ctx, st);
+    }
+    *r = js_undefined();
+    return true;
+}
+
+static bool fa_on_rejected_close(JsContext *ctx, JsValue st, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    fa_fail(ctx, st, argc ? args[0] : js_undefined(), true);
+    *r = js_undefined();
+    return true;
+}
+
+static bool fa_on_value(JsContext *ctx, JsValue st, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    JsObject *s = fa_state(st);
+    JsValue v = argc ? args[0] : js_undefined();
+    *r = js_undefined();
+    if (js_is_undefined(s->elems[FA_MAP]))
+        return fa_on_mapped(ctx, st, tv, &v, 1, r);
+    JsValue call_args[2] = {v, s->elems[FA_K]}, res;
+    js_gc_protect(ctx->vm, &st);
+    if (!js_call(ctx, s->elems[FA_MAP], s->elems[FA_THIS], call_args, 2, &res)) {
+        js_gc_protect(ctx->vm, &res);
+        fa_fail(ctx, st, res, true);
+        js_gc_unprotect(ctx->vm, &res);
+    } else {
+        fa_await(ctx, st, res, fa_on_mapped, fa_on_rejected_close);
+    }
+    js_gc_unprotect(ctx->vm, &st);
+    return true;
+}
+
+static void fa_step(JsContext *ctx, JsValue st) {
+    JsObject *s = fa_state(st);
+    JsValue v;
+    js_gc_protect(ctx->vm, &st);
+    double len = js_get_number(s->elems[FA_LEN]);
+    int got;
+    if (len < 0) { /* an iterable */
+        JsIterCursor cur = {s->elems[FA_SRC], (uint32_t)js_get_number(s->elems[FA_I])};
+        js_gc_protect(ctx->vm, &cur.src);
+        got = js_iter_next(ctx, &cur, &v);
+        js_gc_unprotect(ctx->vm, &cur.src);
+        s->elems[FA_SRC] = cur.src;
+        s->elems[FA_I] = js_number(cur.i);
+    } else { /* an array-like */
+        double k = js_get_number(s->elems[FA_K]);
+        got = k >= len ? 0 : 1;
+        if (got) {
+            JsValue key = js_number(k);
+            JsString *ks = js_op_to_string(ctx, key);
+            got = ks && js_get_property(ctx, s->elems[FA_SRC], js_value_from_cell(&ks->gc), &v) ? 1 : -1;
+            if (got < 0)
+                v = js_take_error(ctx);
+        }
+    }
+    js_gc_protect(ctx->vm, &v);
+    if (got == 0) {
+        JsValue a = s->elems[FA_A];
+        js_promise_resolve_with(ctx, js_value_promise(s->elems[FA_P]), a);
+    } else if (got < 0) {
+        js_promise_reject(ctx, js_value_promise(s->elems[FA_P]), v); /* next threw: nothing to close */
+    } else {
+        fa_await(ctx, st, v, fa_on_value, fa_on_rejected_close); /* an array-like has nothing to close */
+    }
+    js_gc_unprotect(ctx->vm, &v);
+    js_gc_unprotect(ctx->vm, &st);
+}
+
+bool js_array_from_async(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    JsPromise *p = js_promise_alloc(ctx);
+    if (!p)
+        return nthrow(ctx, r, "out of memory");
+    JsValue pv = js_value_from_cell(&p->gc);
+    js_gc_protect(ctx->vm, &pv);
+    JsValue src = ARG(0), mapfn = ARG(1);
+    if (!js_is_undefined(mapfn) && !js_is_function(mapfn)) {
+        js_promise_reject(ctx, p, js_error_fmt(ctx, "TypeError: %v is not a function", mapfn)); /* V8 words this one without the type */
+    } else if (js_is_undefined(src) || js_is_null(src)) {
+        js_promise_reject(ctx, p, js_error_fmt(ctx, "TypeError: Cannot read properties of %v (reading 'Symbol(Symbol.asyncIterator)')", src));
+    } else {
+        JsObject *s = js_array_new_cell(ctx, FA_COUNT);
+        JsValue st = s ? js_value_from_cell(&s->gc) : js_undefined();
+        js_gc_protect(ctx->vm, &st);
+        if (s) { /* every slot set, so the collector may trace it from here on */
+            for (int i = 0; i < FA_COUNT; i++)
+                s->elems[i] = js_undefined();
+            s->elem_count = FA_COUNT;
+        }
+        JsObject *a = s ? js_array_new_cell(ctx, 0) : NULL;
+        if (a)
+            s->elems[FA_A] = js_value_from_cell(&a->gc); /* rooted through the state */
+        JsIterCursor cur = {js_undefined(), 0};
+        int open = a ? js_iter_open(ctx, src, &cur) : -1;
+        double len = -1;
+        bool ok = open >= 0;
+        if (ok && open == 0) { /* an array-like: ToObject, then its length */
+            JsValue lv = js_undefined();
+            JsString *lk = js_ascii_cell(ctx->vm, "length");
+            ok = lk && js_get_property(ctx, src, js_value_from_cell(&lk->gc), &lv);
+            double d = 0;
+            if (ok && !js_is_undefined(lv))
+                ok = js_op_to_number(ctx, lv, &d);
+            d = d != d || d <= 0 ? 0 : d > 9007199254740991.0 ? 9007199254740991.0 : __builtin_floor(d);
+            len = d;
+            cur.src = src;
+        }
+        if (ok) {
+            s->elems[FA_SRC] = cur.src;
+            s->elems[FA_I] = js_number(cur.i);
+            s->elems[FA_MAP] = mapfn;
+            s->elems[FA_THIS] = ARG(2);
+            s->elems[FA_P] = pv;
+            s->elems[FA_K] = js_number(0);
+            s->elems[FA_LEN] = js_number(len);
+            fa_step(ctx, st);
+        } else {
+            JsValue e = js_is_undefined(ctx->pending_error) ? js_error_from_ascii(ctx, "out of memory")
+                                                             : js_take_error(ctx);
+            js_promise_reject(ctx, p, e);
+        }
+        js_gc_unprotect(ctx->vm, &st);
+    }
+    js_gc_unprotect(ctx->vm, &pv);
+    *r = pv;
     return true;
 }

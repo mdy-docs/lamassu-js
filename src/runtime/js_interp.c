@@ -3596,7 +3596,7 @@ run:; /* (re)load the top frame */
                     pr = js_promise_alloc(ctx);
                     if (!pr)
                         RT_THROW("out of memory");
-                    js_promise_fulfill(ctx, pr, awaited);
+                    js_promise_resolve_with(ctx, pr, awaited); /* a thenable is adopted */
                 }
                 if (!js_promise_await(ctx, pr, fb))
                     RT_THROW("out of memory");

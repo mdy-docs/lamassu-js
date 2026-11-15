@@ -6144,7 +6144,7 @@ bool js_builtins_init(JsContext *ctx) {
     if (arr_ok) {
         ((JsNative *)js_value_cell(arrv))->statics = array;
         arr_ok = def_fn(ctx, array, "isArray", arr_isArray) && def_fn(ctx, array, "of", arr_of) &&
-                def_fn(ctx, array, "from", arr_from) &&
+                def_fn(ctx, array, "from", arr_from) && def_fn(ctx, array, "fromAsync", js_array_from_async) &&
                 js_object_set_ascii(ctx, ctx->array_proto, "constructor", arrv) &&
                 js_object_set_ascii(ctx, ctx->globals, "Array", arrv);
     }
