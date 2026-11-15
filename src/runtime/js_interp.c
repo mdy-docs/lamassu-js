@@ -197,6 +197,10 @@ bool js_native_keep(JsContext *ctx, JsValue v) {
     return true;
 }
 
+bool js_native_is_new(const JsContext *ctx) {
+    return ctx->native_act && ctx->native_act->is_new;
+}
+
 JsString *js_native_string(JsContext *ctx, JsValue v) {
     JsString *s = js_op_to_string(ctx, v);
     if (s && s != (js_is_string(v) ? js_value_string(v) : NULL) &&
@@ -1894,11 +1898,11 @@ JS_COLD static int iter_next_slow(JsContext *ctx, JsFiber *fb, JsValue *it_slot,
     }
     JsIterCursor c = {src, i};
     int rc = js_iter_next(ctx, &c, out);
+    *idx_slot = js_number((double)c.i); /* done after a throw too: nothing left to close */
     if (rc < 0) {
         fiber_throw_value(fb, *out);
         return -1;
     }
-    *idx_slot = js_number((double)c.i);
     if (rc == 0)
         *out = js_undefined();
     return rc;
@@ -1955,6 +1959,50 @@ static JS_NOINLINE bool iter_rest(JsContext *ctx, JsFiber *fb) {
     if (!rest)
         return false;
     fb->stack[fb->sp++] = js_value_from_cell(&rest->gc);
+    return true;
+}
+
+/* ITER_CLOSE / ITER_CLOSE_THROW / ITER_CLOSE_LOCAL: IteratorClose of IT (as ITER_NEW left it)
+ * at position IDX, unless that is done; LOCAL has no position (a for-of's body is running, so it
+ * is not done). THROWING: an exception is leaving, which stays the one thrown. False raised. */
+JS_COLD static bool iter_close(JsContext *ctx, JsFiber *fb, JsValue it, JsValue idx, bool throwing) {
+    uint32_t i = 0;
+    if (!js_is_undefined(idx) && !value_to_index(idx, &i)) {
+        fiber_throw(ctx, fb, "internal error: bad iterator operands");
+        return false;
+    }
+    if (js_is_string(it) || is_array(it) || i == JS_ITER_DONE_INDEX)
+        return true;
+    if (!js_iterobj_is(it)) {
+        fiber_throw(ctx, fb, "internal error: bad iterator operands");
+        return false;
+    }
+    JsIterCursor c = {it, i};
+    JsValue err;
+    if (js_iter_close(ctx, &c, throwing, true, &err))
+        return true;
+    fiber_throw_value(fb, err);
+    return false;
+}
+
+/* The three close ops, out of the dispatch loop (cases of their own there cost the loop's
+ * register allocation a fifth of its speed): ITER_CLOSE [it i] -> [], ITER_CLOSE_THROW
+ * [it i exc] -> [exc], ITER_CLOSE_LOCAL the iterator in stack slot AT. False raised. */
+static JS_NOINLINE bool iter_close_op(JsContext *ctx, JsFiber *fb, uint8_t op, uint32_t at) {
+    if (op == JS_OP_ITER_CLOSE_LOCAL)
+        return iter_close(ctx, fb, fb->stack[at], js_undefined(), false);
+    JsValue *top = &fb->stack[fb->sp - 1];
+    if (op == JS_OP_ITER_CLOSE) {
+        /* both stay on the stack, rooted, while return() runs */
+        if (!iter_close(ctx, fb, top[-1], top[0], false))
+            return false;
+        fb->sp -= 2;
+        return true;
+    }
+    if (!iter_close(ctx, fb, top[-2], top[-1], true))
+        return false;
+    fb->stack[fb->sp - 3] = fb->stack[fb->sp - 1];
+    fb->sp -= 2;
     return true;
 }
 
@@ -3113,6 +3161,15 @@ run:; /* (re)load the top frame */
                     RT_RAISE();
                 break;
             }
+            case JS_OP_ITER_CLOSE:
+            case JS_OP_ITER_CLOSE_THROW:
+            case JS_OP_ITER_CLOSE_LOCAL: {
+                uint32_t at = op == JS_OP_ITER_CLOSE_LOCAL ? base + READ_U16() : 0;
+                fr->ip = ip;
+                if (!iter_close_op(ctx, fb, op, at))
+                    RT_RAISE();
+                break;
+            }
             case JS_OP_CLOSURE: {
                 uint16_t cidx = READ_U16();
                 uint8_t flags = code[ip++];
@@ -3856,8 +3913,8 @@ JsValue js_run_module(JsContext *ctx, JsValue fnv) {
          * outcome in an already-settled promise. */
         JsValue result;
         bool ok = run_closure(ctx, cl, js_undefined(), NULL, 0, &result);
+        js_gc_protect(vm, &result); /* the jobs allocate: the completion value must survive them */
         js_run_jobs(ctx);
-        js_gc_protect(vm, &result);
         JsPromise *p = js_promise_alloc(ctx);
         js_gc_unprotect(vm, &result);
         if (!p)

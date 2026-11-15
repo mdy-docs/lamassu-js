@@ -116,6 +116,8 @@ static bool map_set(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
 
 static bool g_Map(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
+    if (!js_native_is_new(ctx))
+        return nthrow(ctx, r, "TypeError: Constructor Map requires 'new'");
     JsValue src = ARG(0);
     JsValue mv;
     if (!alloc_mapobj(ctx, &mv))

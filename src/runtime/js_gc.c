@@ -345,7 +345,7 @@ void js_gc_collect(JsVm *vm) {
             js_gc_mark_cell(vm, &ctx->set_proto->gc);
         if (ctx->iterator_proto)
             js_gc_mark_cell(vm, &ctx->iterator_proto->gc);
-        for (int k = 0; k < 3; k++) {
+        for (int k = 0; k < JS_ITER_PROTO_COUNT; k++) {
             if (ctx->iter_protos[k])
                 js_gc_mark_cell(vm, &ctx->iter_protos[k]->gc);
         }

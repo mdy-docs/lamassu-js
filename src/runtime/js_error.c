@@ -4,6 +4,7 @@
 #include <string.h>
 #include "js_error.h"
 #include "js_bytecode.h"
+#include "js_iter.h"
 
 #define ARG(i) ((i) < argc ? args[i] : js_undefined())
 
@@ -197,6 +198,20 @@ static void fb_piece(FmtBuf *b, const uint16_t *u, size_t n) {
 }
 
 /* A function in a message, as V8 shows one: its source text (Function.prototype.toString) */
+/* V's [[Prototype]] chain reaches Iterator.prototype */
+static bool inherits_iterator(JsContext *ctx, JsValue v) {
+    if (!ctx->iterator_proto)
+        return false;
+    JsValue p = js_get_proto(ctx, v);
+    for (int depth = 0; depth < 10000 && (js_is_object(p) || js_is_function(p) || js_is_promise(p));
+         depth++) {
+        if (js_value_cell(p) == &ctx->iterator_proto->gc)
+            return true;
+        p = js_get_proto(ctx, p);
+    }
+    return false;
+}
+
 static void fb_function(JsContext *ctx, FmtBuf *b, JsValue v) {
     JsString *s = js_function_source(ctx, v); /* v is rooted by the caller */
     if (s)
@@ -287,13 +302,17 @@ JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
                 fb_ascii(b, "[object Array]", 14);
             else if (js_value_object(v)->obj_flags & JS_OBJ_NAMESPACE)
                 fb_ascii(b, "[object Module]", 15);
-            else if (js_value_object(v)->obj_kind == JS_OBJ_ITER) {
+            else if (js_value_object(v)->obj_kind == JS_OBJ_ITER &&
+                     ((JsIterObj *)js_value_object(v))->kind != JS_ITER_WRAP) {
                 /* V8 finds no constructor for these, so it names them by their tag */
                 const char *tag = js_to_string_tag(ctx, v);
                 fb_ascii(b, "[object ", 8);
                 fb_ascii(b, tag, strlen(tag));
                 fb_ascii(b, "]", 1);
-            } else
+            } else if (inherits_iterator(ctx, v))
+                /* nor for what inherits Iterator.prototype (its constructor is an accessor) */
+                fb_ascii(b, "[object Object]", 15);
+            else
                 fb_ascii(b, "#<Object>", 9);
         } else if (js_is_promise(v)) {
             fb_ascii(b, "#<Promise>", 10);

@@ -3578,8 +3578,21 @@ static bool obj_fromEntries(JsContext *ctx, JsValue tv, const JsValue *args, int
         }
         /* ToPropertyKey may run k's toString, which may run anything; val stays rooted */
         JsString *ks = js_op_to_string(ctx, k);
+        if (!ks && !js_is_undefined(ctx->pending_error)) {
+            *r = js_take_error(ctx);
+            ok = false;
+            thrown = true;
+            break;
+        }
         JsString *iks = ks ? js_intern_cell(vm, ks) : NULL;
         ok = iks && js_map_set(vm, &js_value_object(outv)->props, iks, val);
+    }
+    if (thrown) {
+        /* an abrupt completion closes the iterator (unless it was its own next that threw) */
+        js_gc_protect(vm, r);
+        JsValue ignored;
+        (void)js_iter_close(ctx, &cur, true, false, &ignored);
+        js_gc_unprotect(vm, r);
     }
     js_gc_unprotect(vm, &val);
     js_gc_unprotect(vm, &k);
@@ -3724,7 +3737,11 @@ static const char *inherited_tag(const JsContext *ctx, JsValue p) {
            : o == ctx->json_obj           ? "JSON"
            : o == ctx->iter_protos[JS_ITER_PROTO_MAP]    ? "Map Iterator"
            : o == ctx->iter_protos[JS_ITER_PROTO_SET]    ? "Set Iterator"
-           : o == ctx->iter_protos[JS_ITER_PROTO_REGEXP] ? "RegExp String Iterator" : NULL;
+           : o == ctx->iter_protos[JS_ITER_PROTO_REGEXP] ? "RegExp String Iterator"
+           : o == ctx->iter_protos[JS_ITER_PROTO_ARRAY]  ? "Array Iterator"
+           : o == ctx->iter_protos[JS_ITER_PROTO_STRING] ? "String Iterator"
+           : o == ctx->iter_protos[JS_ITER_PROTO_HELPER] ? "Iterator Helper"
+           : o == ctx->iterator_proto                    ? "Iterator" : NULL;
 }
 
 const char *js_to_string_tag(const JsContext *ctx, JsValue v) {
@@ -3940,6 +3957,25 @@ static bool arr_of(JsContext *ctx, JsValue tv, const JsValue *args, int argc, Js
     return true;
 }
 
+/* keys(), values(), entries(): an Array Iterator over the array (or array-like), read live */
+static bool am_keys(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args;
+    (void)argc;
+    return js_array_iter_method(ctx, tv, JS_ITER_ARRAY_KEYS, r);
+}
+
+static bool am_values(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args;
+    (void)argc;
+    return js_array_iter_method(ctx, tv, JS_ITER_ARRAY_VALUES, r);
+}
+
+static bool am_entries(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args;
+    (void)argc;
+    return js_array_iter_method(ctx, tv, JS_ITER_ARRAY_ENTRIES, r);
+}
+
 /* Array.from(items, mapFn, thisArg): an iterable's values in order, else an array-like's
  * [0, length) (ToLength of its length), each through mapFn(value, index) when it is given. */
 static bool arr_from(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
@@ -3955,12 +3991,14 @@ static bool arr_from(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
         return oom(ctx, r);
     if (open == 0 && (js_is_undefined(src) || js_is_null(src)))
         return (*r = js_iter_not_iterable(ctx, src)), false;
+    js_gc_protect(vm, &cur.src); /* a Map's or a record's new iterator is held nowhere else */
     JsObject *out = js_array_new_cell(ctx, 0);
-    if (!out)
+    if (!out) {
+        js_gc_unprotect(vm, &cur.src);
         return oom(ctx, r);
+    }
     JsValue outv = js_value_from_cell(&out->gc), item = js_undefined();
     js_gc_protect(vm, &outv);
-    js_gc_protect(vm, &cur.src);
     js_gc_protect(vm, &item);
     bool ok = true, thrown = false;
     double len = 0;
@@ -4008,14 +4046,20 @@ static bool arr_from(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
                 *r = item;
                 ok = false;
                 thrown = true;
+                if (open) { /* the mapper's throw closes the iterator */
+                    js_gc_protect(vm, r);
+                    JsValue ignored;
+                    (void)js_iter_close(ctx, &cur, true, false, &ignored);
+                    js_gc_unprotect(vm, r);
+                }
                 break;
             }
         }
         ok = js_array_append(vm, js_value_object(outv), item);
     }
     js_gc_unprotect(vm, &item);
-    js_gc_unprotect(vm, &cur.src);
     js_gc_unprotect(vm, &outv);
+    js_gc_unprotect(vm, &cur.src);
     if (thrown)
         return false;
     if (!ok)
@@ -4589,8 +4633,7 @@ static void hide_builtin_keys(JsContext *ctx) {
     JsObject *objs[] = {ctx->globals, ctx->object_proto, ctx->array_proto, ctx->function_methods,
                         ctx->number_methods, ctx->boolean_methods, ctx->string_methods, ctx->promise_methods,
                         ctx->regexp_proto, ctx->date_proto, ctx->map_proto, ctx->set_proto,
-                        ctx->math_obj, ctx->json_obj, ctx->iter_protos[0], ctx->iter_protos[1],
-                        ctx->iter_protos[2]};
+                        ctx->math_obj, ctx->json_obj};
     for (size_t i = 0; i < sizeof objs / sizeof objs[0]; i++)
         hide_all(objs[i]);
     for (int k = 0; k < JS_ERROR_KIND_COUNT; k++)
@@ -4688,7 +4731,8 @@ bool js_builtins_init(JsContext *ctx) {
         {"map", am_map}, {"filter", am_filter}, {"forEach", am_forEach},
         {"some", am_some}, {"every", am_every}, {"find", am_find},
         {"findIndex", am_findIndex}, {"reduce", am_reduce}, {"sort", am_sort},
-        {"flat", am_flat}, {"toString", am_toString},
+        {"flat", am_flat}, {"toString", am_toString}, {"keys", am_keys},
+        {"values", am_values}, {"entries", am_entries},
         {NULL, NULL}};
     static const MethodDef function_methods[] = {
         {"apply", fm_apply}, {"bind", fm_bind}, {"call", fm_call}, {"toString", fm_toString},

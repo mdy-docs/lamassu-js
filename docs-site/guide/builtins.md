@@ -119,7 +119,9 @@ array of that length; anything else behaves like `Array.of`.
   `indexOf`, `lastIndexOf`, `includes`, `slice`, `join`, `reverse`, `fill`,
   `concat`, `map`, `filter`, `forEach`, `some`, `every`, `find`,
   `findIndex`, `reduce`, `sort`, `flat`, `toString` (generic, as V8's: `this.join()` when `join`
-  is a function, else `Object.prototype.toString`).
+  is a function, else `Object.prototype.toString`), and `keys`, `values`, `entries`, which return
+  an `Array Iterator` ([Iteration](#iteration)) that reads the array live (an element pushed before
+  it reaches the end is visited) and works on any array-like, as V8's does.
 
 Array elements are a flat `JsValue` vector (no holes/sparse storage), so
 `arr.length = n` or `Array(n)` for a very large `n` throws
@@ -331,9 +333,10 @@ Each subclass constructor's `[[Prototype]]` is `Error`, so `TypeError.captureSta
 
 ## `Map` / `Set`
 
-Both accept any iterable to seed from — `new Map([["a", 1]])`, `new Map(otherMap)`,
-`new Set("abc")` — each value going through the collection's own `set` or `add`, as V8 does (a
-Map's entries can be any object with `0` and `1`). Both expose a synthesized `.size` property
+Both need `new` (`Map()` is `TypeError: Constructor Map requires 'new'`, as in V8). Both accept
+any iterable to seed from — `new Map([["a", 1]])`, `new Map(otherMap)`, `new Set("abc")` — each
+value going through the collection's own `set` or `add`, as V8 does (a Map's entries can be any
+object with `0` and `1`). Both expose a synthesized `.size` property
 (not a regular own property; it shadows a same-named data property the way `RegExp.lastIndex`
 does).
 
@@ -349,15 +352,48 @@ does).
 
 ## Iteration
 
-There is no `Symbol`, so what is iterable is fixed: strings (by code point), arrays, `Map`s
-(their entries), `Set`s (their values), and the iterators `keys()`/`values()`/`entries()` and
-`matchAll` return (each its own iterable, so `[...map.keys()]` works and a part-consumed iterator
-spreads what is left). `for...of`, spread, array destructuring, `Array.from`, `Object.fromEntries`,
-the `Map`/`Set` constructors, `Promise.all`/`race`/`allSettled`/`any` and `AggregateError` all
-accept exactly these. Destructuring steps the iterator only as far as the pattern needs, as V8
-does. The iterator prototypes chain to one `%IteratorPrototype%`, which holds none of the
-`Iterator` helpers (`map`, `filter`, `take`, `toArray`, ...): the `Iterator` global is not
-implemented.
+There is no `Symbol`, so what is iterable is the engine's own: strings (by code point), arrays,
+`Map`s (their entries), `Set`s (their values), every iterator object (each is its own iterable,
+so `[...map.keys()]` works and a part-consumed iterator spreads what is left), and **any object
+that inherits from `Iterator.prototype`**, which is how a script makes its own iterator: in V8
+`Iterator.prototype[Symbol.iterator]` returns the object itself, so its `next` is what steps it.
+
+```js
+const countdown = Object.create(Iterator.prototype);
+let n = 3;
+countdown.next = () => (n > 0 ? { value: n--, done: false } : { value: undefined, done: true });
+[...countdown];                        // [3, 2, 1]
+Iterator.from({ next() { /* ... */ } }) // any object with next(), as an Iterator
+```
+
+`for...of`, spread, array destructuring, `Array.from`, `Object.fromEntries`, the `Map`/`Set`
+constructors, `Promise.all`/`race`/`allSettled`/`any`, `AggregateError` and `Iterator.concat` all
+accept exactly these, and follow V8's iterator protocol: `next` is read once when iteration starts,
+each result must be an object (`Iterator result 1 is not an object`), `done` then `value` are read
+from it, and an iterator that stops early is **closed** — its `return()` is called when `for...of`
+is left by `break`, `return`, a labelled `continue` or a throw, when destructuring takes fewer values
+than the iterator has (or a default or a target throws part way), and when a native's callback
+throws (`Array.from`'s map function, a Map's `set`). A throw from `next()` itself closes nothing.
+Destructuring steps the iterator only as far as the pattern needs, and an assignment pattern's
+target (`[o.x] = it`) is evaluated before the iterator steps, as in V8.
+
+The iterators' prototypes (`Map Iterator`, `Set Iterator`, `Array Iterator`, `String Iterator`,
+`RegExp String Iterator`, `Iterator Helper`) chain to `Iterator.prototype`, which has V8's
+**Iterator helpers**:
+
+- **lazy**, returning an `Iterator Helper` (with `next` and `return`): `map(fn)`, `filter(fn)`,
+  `take(n)`, `drop(n)`, `flatMap(fn)` (each result an iterable or an iterator, not a string);
+- **eager**: `reduce(fn[, initial])`, `toArray()`, `forEach(fn)`, `some(fn)`, `every(fn)`,
+  `find(fn)`;
+- **statics**: `Iterator.from(value)` (an iterable's iterator, a string's code points, or an object
+  with `next` wrapped so that it has the helpers) and `Iterator.concat(...iterables)`.
+
+Callbacks get `(value, index)` (`reduce` gets the accumulator first). The helpers work on any
+object with a `next` method (`Iterator.prototype.toArray.call({ next() { ... } })`), close the
+underlying iterator when they stop early (`take`, `some`, `every`, `find`, a callback that throws,
+`return()` on the helper), and throw V8's errors (`Generator is already running` for a helper
+re-entered from its own callback, `-1 must be positive` for `take(-1)`). `Iterator` itself is
+abstract: `new Iterator()` throws, as it does in V8 without a subclass (and there are no classes).
 
 ## `Promise`
 

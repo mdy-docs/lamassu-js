@@ -114,9 +114,16 @@ typedef enum JsOp {
     JS_OP_SET_FUNCTION_NAME,
     /* stack [v, C] -> [v instanceof C] */
     JS_OP_INSTANCEOF,
+    /* IteratorClose (js_iter_close) of an iterator ITER_NEW opened, unless it is done (the index
+     * says so): destructuring that stopped early, for-of left by break, continue or return
+     * (ITER_CLOSE_LOCAL, from the hidden local the loop keeps it in), and a throw out of either
+     * (ITER_CLOSE_THROW, which ignores whatever return() does) */
+    JS_OP_ITER_CLOSE,        /* it i -> */
+    JS_OP_ITER_CLOSE_THROW,  /* it i exc -> exc */
+    JS_OP_ITER_CLOSE_LOCAL,  /* u16 slot holding the iterator */
 } JsOp;
 
-#define JS_OP__COUNT (JS_OP_INSTANCEOF + 1)
+#define JS_OP__COUNT (JS_OP_ITER_CLOSE_LOCAL + 1)
 
 /*
  * Per-opcode metadata, the single source of truth the bytecode verifier
@@ -205,6 +212,8 @@ bool      js_get_property(JsContext *ctx, JsValue base, JsValue key, JsValue *ou
 __attribute__((warn_unused_result))
 bool      js_native_keep(JsContext *ctx, JsValue v);
 JsString *js_native_string(JsContext *ctx, JsValue v);
+/* Whether the running native was called with `new`. */
+bool      js_native_is_new(const JsContext *ctx);
 void      js_set_error(JsContext *ctx, JsValue error);
 /* Of a primitive (never runs guest code); NULL on OOM. */
 JsString *js_primitive_to_string(JsVm *vm, JsValue v);

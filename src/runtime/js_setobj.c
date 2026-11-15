@@ -105,6 +105,8 @@ static bool set_add(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
 
 static bool g_Set(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
+    if (!js_native_is_new(ctx))
+        return nthrow(ctx, r, "TypeError: Constructor Set requires 'new'");
     JsValue src = ARG(0);
     JsValue sv;
     if (!alloc_setobj(ctx, &sv))

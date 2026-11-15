@@ -20,12 +20,20 @@
  * block exit; captured locals are tracked to emit those closes only when
  * needed. try/finally lowers finally to a GOSUB subroutine that every exit
  * path (normal, exception, break/continue/return) routes through.
+ *
+ * What an exit has to undo is kept on one stack of cleanups, innermost last: a
+ * try handler that is installed (TRY_POP, then GOSUB its finally if it has
+ * one) and a for-of's iterator (TRY_POP the handler that closes it on a throw,
+ * then ITER_CLOSE_LOCAL). break, continue and return unwind it down to their
+ * target in that order, so a finally runs with its own handler gone (a throw
+ * in it is not caught by its own try) and nothing is left installed after the
+ * jump.
  */
 
 #define JS_MAX_LOCALS 60000
 #define JS_MAX_CONSTS 60000
 #define JS_MAX_LOOPS 128
-#define JS_MAX_FINALLY 64
+#define JS_MAX_CLEANUPS 128
 #define JS_COMPLETION_SLOT 0
 
 typedef struct JsPatchList {
@@ -42,13 +50,19 @@ typedef struct JsLoopInfo {
     int continue_depth;
     uint32_t continue_target;
     JsPatchList breaks, continues;
-    int finally_floor;         /* finally-stack height at loop entry */
+    int cleanup_floor;         /* cleanup-stack height at entry: what break unwinds to */
+    int continue_floor;        /* what continue unwinds to (a for-of's iterator stays open) */
     int loopvar_slot;          /* -1, else slot floor to close per iteration */
 } JsLoopInfo;
 
-typedef struct JsFinallyInfo {
-    JsPatchList gosubs;        /* GOSUB operand offsets to patch to the body */
-} JsFinallyInfo;
+enum { CLEANUP_TRY, CLEANUP_ITER };
+
+typedef struct JsCleanup {
+    uint8_t kind;              /* CLEANUP_TRY: a handler is installed; CLEANUP_ITER: a for-of */
+    bool has_finally;          /* CLEANUP_TRY: GOSUB its finally after the TRY_POP */
+    uint16_t iter_slot;        /* CLEANUP_ITER: the hidden local holding the iterator */
+    JsPatchList gosubs;        /* GOSUB operand offsets to patch to the finally body */
+} JsCleanup;
 
 typedef struct JsLocalVar {
     const uint16_t *name;      /* NULL/len 0: anonymous (unnamed param slot) */
@@ -89,12 +103,19 @@ typedef struct JsFuncState {
     int loop_count;
     JsUpName *upnames;
     uint16_t upname_cap;
-    JsFinallyInfo finallys[JS_MAX_FINALLY];
-    int finally_count;
+    JsCleanup cleanups[JS_MAX_CLEANUPS];
+    int cleanup_count;
     int scope_depth; /* nesting of blocks/loops within this function */
     int pattern_depth; /* nesting of destructuring patterns being compiled */
     uint32_t last_line_pos;
 } JsFuncState;
+
+/* An assignment pattern's member target whose object (and computed key) were evaluated ahead
+ * into hidden locals (pre_member_begin) */
+typedef struct JsPreMember {
+    const JsAstNode *node;
+    uint16_t obj, key;
+} JsPreMember;
 
 typedef struct JsCompiler {
     JsContext *ctx;
@@ -106,6 +127,7 @@ typedef struct JsCompiler {
     /* The expression a destructuring pattern about to be compiled takes apart (`o.b` in
      * `const { a } = o.b`), for the error's wording; read and cleared by the pattern. */
     const JsAstNode *pattern_src;
+    JsPreMember pre_member;
     const char *err_msg;
     uint32_t err_pos;
     int func_depth;
@@ -760,7 +782,8 @@ static JsLoopInfo *loop_push(JsCompiler *cx, bool is_loop, const uint16_t *label
     l->entry_depth = fs->depth;
     l->continue_depth = fs->depth;
     l->continue_target = 0xFFFFFFFF;
-    l->finally_floor = fs->finally_count;
+    l->cleanup_floor = fs->cleanup_count;
+    l->continue_floor = fs->cleanup_count;
     l->loopvar_slot = -1;
     return l;
 }
@@ -814,20 +837,42 @@ static bool emit_pops_to(JsCompiler *cx, int to_depth) {
     return true;
 }
 
-/* Routes an exit through active finally subroutines [floor, finally_count). */
-static bool emit_finally_gosubs(JsCompiler *cx, int floor) {
+/* A GOSUB to a finally body not yet emitted, its operand added to PL */
+static bool emit_gosub(JsCompiler *cx, JsPatchList *pl) {
+    if (!emit_op(cx, JS_OP_GOSUB, 0)) /* GOSUB balances via RET_SUB */
+        return false;
+    uint32_t off = FN->code_len;
+    return emit_u32(cx, 0xFFFFFFFF) && patch_list_add(cx, pl, off);
+}
+
+/* Unwinds the cleanups [floor, cleanup_count) for an exit, innermost first. */
+static bool emit_cleanups(JsCompiler *cx, int floor) {
     JsFuncState *fs = cx->cur;
-    for (int i = fs->finally_count; i-- > floor;) {
-        if (!emit_op(cx, JS_OP_GOSUB, 0))
+    for (int i = fs->cleanup_count; i-- > floor;) {
+        JsCleanup *c = &fs->cleanups[i];
+        if (!emit_op(cx, JS_OP_TRY_POP, 0))
             return false;
-        uint32_t off = FN->code_len;
-        if (!emit_u32(cx, 0xFFFFFFFF))
+        if (c->kind == CLEANUP_ITER) {
+            if (!emit_op_u16(cx, JS_OP_ITER_CLOSE_LOCAL, c->iter_slot, 0))
+                return false;
+        } else if (c->has_finally && !emit_gosub(cx, &c->gosubs)) {
             return false;
-        if (!patch_list_add(cx, &fs->finallys[i].gosubs, off))
-            return false;
-        (void)emit_op; /* GOSUB balances via RET_SUB */
+        }
     }
     return true;
+}
+
+/* Pushes a cleanup (zeroed); NULL when they nest too deep */
+static JsCleanup *cleanup_push(JsCompiler *cx, uint32_t pos, uint8_t kind) {
+    JsFuncState *fs = cx->cur;
+    if (fs->cleanup_count >= JS_MAX_CLEANUPS) {
+        cerr(cx, pos, kind == CLEANUP_TRY ? "try/finally nested too deeply" : "for-of nested too deeply");
+        return NULL;
+    }
+    JsCleanup *c = &fs->cleanups[fs->cleanup_count++];
+    memset(c, 0, sizeof *c);
+    c->kind = kind;
+    return c;
 }
 
 /* ---- identifiers ---- */
@@ -1087,6 +1132,56 @@ static bool store_target(JsCompiler *cx, const JsAstNode *tgt, bool declaring) {
     return emit_op(cx, JS_OP_POP, -1);
 }
 
+/* An assignment element whose target (under a default) is a member expression has that target's
+ * object and computed key evaluated first, as the spec does (before the iterator steps, and
+ * before a default), into hidden locals that compile_pattern_store then stores through. *ACTIVE
+ * says whether it did; pre_member_end undoes it. */
+static bool pre_member_begin(JsCompiler *cx, const JsAstNode *el, bool declaring, JsScopeMark *sm,
+                             JsPreMember *saved, bool *active) {
+    *active = false;
+    const JsAstNode *mem = el->kind == JS_AST_DEFAULT ? el->a : el;
+    if (declaring || mem->kind != JS_AST_MEMBER)
+        return true;
+    *saved = cx->pre_member;
+    *sm = scope_enter(cx);
+    *active = true;
+    JsPreMember pm = {mem, 0, 0};
+    if (!declare_local(cx, NULL, 0, false, mem->pos, sm->local_count, &pm.obj) ||
+        !compile_expr(cx, mem->a) || !emit_op_u16(cx, JS_OP_SET_LOCAL, pm.obj, 0) ||
+        !emit_op(cx, JS_OP_POP, -1))
+        return false;
+    if (mem->flags & JS_F_COMPUTED) {
+        if (!declare_local(cx, NULL, 0, false, mem->pos, sm->local_count, &pm.key) ||
+            !compile_expr(cx, mem->b) || !emit_op_u16(cx, JS_OP_SET_LOCAL, pm.key, 0) ||
+            !emit_op(cx, JS_OP_POP, -1))
+            return false;
+    }
+    cx->pre_member = pm;
+    return true;
+}
+
+static bool pre_member_end(JsCompiler *cx, bool active, JsScopeMark sm, JsPreMember saved) {
+    if (!active)
+        return true;
+    cx->pre_member = saved;
+    return scope_leave(cx, sm);
+}
+
+/* Whether storing into an element of array pattern PAT can throw, which a declared name or a
+ * hole cannot */
+static bool pattern_may_throw(const JsAstNode *pat, bool declaring) {
+    for (uint32_t i = 0; i < pat->count; i++) {
+        const JsAstNode *el = pat->items[i];
+        if (el->kind == JS_AST_REST)
+            el = el->a;
+        if (el->kind == JS_AST_HOLE)
+            continue;
+        if (el->kind != JS_AST_IDENT || !declaring)
+            return true;
+    }
+    return false;
+}
+
 static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat,
                                   bool declaring) {
     const JsAstNode *src = cx->pattern_src; /* only the outermost pattern has one */
@@ -1099,6 +1194,24 @@ static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat,
     case JS_AST_MEMBER: {
         if (declaring)
             return cerr(cx, pat->pos, "invalid binding pattern");
+        if (cx->pre_member.node == pat) {
+            /* its object and key were evaluated already (pre_member_begin) */
+            JsPreMember pm = cx->pre_member;
+            cx->pre_member.node = NULL;
+            if (pat->flags & JS_F_COMPUTED) {
+                if (!emit_op_u16(cx, JS_OP_GET_LOCAL, pm.obj, +1) ||
+                    !emit_op_u16(cx, JS_OP_GET_LOCAL, pm.key, +1) || !emit_op(cx, JS_OP_ROT3, 0) ||
+                    !emit_op(cx, JS_OP_SET_PROP, -2))
+                    return false;
+            } else {
+                uint16_t c;
+                if (!atom_const(cx, pat->units, pat->len, pat->pos, &c) ||
+                    !emit_op_u16(cx, JS_OP_GET_LOCAL, pm.obj, +1) || !emit_op(cx, JS_OP_SWAP, 0) ||
+                    !emit_op_u16(cx, JS_OP_SET_PROP_ATOM, c, -1))
+                    return false;
+            }
+            return emit_op(cx, JS_OP_POP, -1);
+        }
         if (pat->flags & JS_F_COMPUTED) {
             if (!compile_expr(cx, pat->a) || !compile_expr(cx, pat->b))
                 return false;
@@ -1124,10 +1237,34 @@ static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat,
         note_text(cx, src, false);
         if (!emit_op(cx, JS_OP_ITER_NEW, +1))
             return false;
+        /* [it i]. A pattern that can throw part way (a default, a nested pattern, a store that
+         * can fail) is guarded: the throw closes the iterator, as IteratorClose does */
+        bool guard = pattern_may_throw(pat, declaring);
+        int depth = cx->cur->depth;
+        uint32_t handler = 0, end = 0;
+        if (guard && !emit_jump(cx, JS_OP_TRY_PUSH, 0, &handler))
+            return false;
         cx->cur->pattern_depth++;
         bool ok = compile_array_pattern_items(cx, pat, declaring);
         cx->cur->pattern_depth--;
-        return ok;
+        if (!ok)
+            return false;
+        if (guard && !emit_op(cx, JS_OP_TRY_POP, 0))
+            return false;
+        /* the pattern took what it needed: an iterator not yet done is closed */
+        if (!emit_op(cx, JS_OP_ITER_CLOSE, -2))
+            return false;
+        if (guard) {
+            if (!emit_jump(cx, JS_OP_JUMP, 0, &end))
+                return false;
+            set_depth(cx, depth + 1); /* [it i exc] */
+            patch_here(cx, handler);
+            if (!emit_op(cx, JS_OP_ITER_CLOSE_THROW, -2) || !emit_op(cx, JS_OP_THROW, -1))
+                return false;
+            set_depth(cx, depth - 2);
+            patch_here(cx, end);
+        }
+        return true;
     }
     case JS_AST_OBJECT_PATTERN: {
         cx->cur->pattern_depth++;
@@ -1146,25 +1283,27 @@ static bool compile_array_pattern_items(JsCompiler *cx, const JsAstNode *pat, bo
         /* stack [it i]: each element steps the iterator */
         for (; i < pat->count; i++) {
             const JsAstNode *el = pat->items[i];
-            if (el->kind == JS_AST_REST) {
-                /* rest: what is left, as a new array */
-                if (!emit_op(cx, JS_OP_ITER_REST, +1))
-                    return false;
-                if (!compile_pattern_store(cx, el->a, declaring))
-                    return false;
-                break;
-            }
-            if (!emit_op(cx, JS_OP_ITER_STEP, +1))
+            bool rest = el->kind == JS_AST_REST;
+            const JsAstNode *tgt = rest ? el->a : el;
+            JsScopeMark sm = {0, 0};
+            JsPreMember saved = {0};
+            bool pre = false;
+            if (tgt->kind != JS_AST_HOLE && !pre_member_begin(cx, tgt, declaring, &sm, &saved, &pre))
                 return false;
-            if (el->kind == JS_AST_HOLE) {
+            /* rest: what is left, as a new array */
+            if (!emit_op(cx, rest ? JS_OP_ITER_REST : JS_OP_ITER_STEP, +1))
+                return false;
+            if (tgt->kind == JS_AST_HOLE) {
                 if (!emit_op(cx, JS_OP_POP, -1))
                     return false;
                 continue;
             }
-            if (!compile_pattern_store(cx, el, declaring))
+            if (!compile_pattern_store(cx, tgt, declaring) || !pre_member_end(cx, pre, sm, saved))
                 return false;
+            if (rest)
+                break;
         }
-        return emit_op(cx, JS_OP_POP, -1) && emit_op(cx, JS_OP_POP, -1);
+        return true; /* [it i] left for the caller to close */
     }
 }
 
@@ -1205,7 +1344,12 @@ static bool compile_object_pattern_items(JsCompiler *cx, const JsAstNode *pat, b
                         return false;
                 }
             }
-            if (!compile_pattern_store(cx, prop->b, declaring))
+            /* the target before a default (reading the property runs no guest code here) */
+            JsScopeMark sm = {0, 0};
+            JsPreMember saved = {0};
+            bool pre = false;
+            if (!pre_member_begin(cx, prop->b, declaring, &sm, &saved, &pre) ||
+                !compile_pattern_store(cx, prop->b, declaring) || !pre_member_end(cx, pre, sm, saved))
                 return false;
         }
         return emit_op(cx, JS_OP_POP, -1);
@@ -2254,6 +2398,7 @@ static bool compile_loop_body(JsCompiler *cx, const JsAstNode *body) {
 
 static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const uint16_t *label,
                            uint32_t label_len) {
+    JsFuncState *fs = cx->cur;
     JsScopeMark m = scope_enter(cx);
     note_pos(cx, n->pos);
     if (!compile_expr(cx, n->b))
@@ -2261,12 +2406,31 @@ static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const uint16_t *l
     note_text(cx, n->b, false);
     if (!emit_op(cx, JS_OP_ITER_NEW, +1))
         return false;
+    /* [it i]; the iterator is also kept in a hidden local, where an exit that leaves the loop
+     * (break, a labelled continue, return) finds it to close it */
+    uint16_t iter_slot;
+    if (!declare_local(cx, NULL, 0, false, n->pos, m.local_count, &iter_slot) ||
+        !emit_op(cx, JS_OP_SWAP, 0) || !emit_op_u16(cx, JS_OP_SET_LOCAL, iter_slot, 0) ||
+        !emit_op(cx, JS_OP_SWAP, 0))
+        return false;
 
     JsLoopInfo *loop = loop_push(cx, true, label, label_len);
     if (!loop)
         return false;
-    loop->entry_depth = cx->cur->depth - 2;
-    loop->continue_depth = cx->cur->depth;
+    loop->entry_depth = fs->depth - 2;
+    loop->continue_depth = fs->depth;
+    int ci = fs->cleanup_count;
+    JsCleanup *cl = cleanup_push(cx, n->pos, CLEANUP_ITER);
+    if (!cl)
+        return false;
+    cl->iter_slot = iter_slot;
+    loop->continue_floor = ci + 1;
+
+    /* a throw out of the body (or its binding) closes the iterator; one from next() finds it
+     * done (ITER_NEXT marks it so) */
+    uint32_t handler;
+    if (!emit_jump(cx, JS_OP_TRY_PUSH, 0, &handler))
+        return false;
     uint32_t top = FN->code_len;
     loop->continue_target = top;
 
@@ -2275,7 +2439,7 @@ static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const uint16_t *l
         return false;
 
     JsScopeMark body_scope = scope_enter(cx);
-    loop->loopvar_slot = cx->cur->slot_count;
+    loop->loopvar_slot = fs->slot_count;
     if (n->flags & JS_F_DECL) {
         if (!pattern_declare(cx, n->a, (n->flags & JS_F_CONST) != 0, body_scope.local_count,
                              false) ||
@@ -2293,6 +2457,17 @@ static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const uint16_t *l
         return false;
     set_depth(cx, loop->entry_depth);
     patch_here(cx, done);
+    fs->cleanup_count = ci;
+    uint32_t end;
+    if (!emit_op(cx, JS_OP_TRY_POP, 0) || !emit_jump(cx, JS_OP_JUMP, 0, &end))
+        return false;
+    /* handler: [it i exc] */
+    set_depth(cx, loop->entry_depth + 3);
+    patch_here(cx, handler);
+    if (!emit_op(cx, JS_OP_ITER_CLOSE_THROW, -2) || !emit_op(cx, JS_OP_THROW, -1))
+        return false;
+    set_depth(cx, loop->entry_depth);
+    patch_here(cx, end);
     loop_pop_patch_breaks(cx, loop);
     return scope_leave(cx, m);
 }
@@ -2444,38 +2619,38 @@ static bool compile_try(JsCompiler *cx, const JsAstNode *n) {
     bool has_finally = n->d != NULL;
     int start_depth = fs->depth;
 
-    JsFinallyInfo *fin = NULL;
-    if (has_finally) {
-        if (fs->finally_count >= JS_MAX_FINALLY)
-            return cerr(cx, n->pos, "try/finally nested too deeply");
-        fin = &fs->finallys[fs->finally_count++];
-        memset(fin, 0, sizeof *fin);
-    }
+    /* the try block's handler, and the catch block's when a finally follows it */
+    int ci = fs->cleanup_count;
+    JsCleanup *cl = cleanup_push(cx, n->pos, CLEANUP_TRY);
+    if (!cl)
+        return false;
+    cl->has_finally = has_finally;
 
     uint32_t handler_patch;
     if (!emit_jump(cx, JS_OP_TRY_PUSH, 0, &handler_patch))
         return false;
     if (!compile_stmt(cx, n->a)) /* try block */
         return false;
-    if (!emit_op(cx, JS_OP_TRY_POP, 0))
-        return false;
-    if (has_finally && !emit_finally_gosubs(cx, fs->finally_count - 1))
+    if (!emit_cleanups(cx, ci)) /* TRY_POP, and the finally */
         return false;
     uint32_t end_normal;
     if (!emit_jump(cx, JS_OP_JUMP, 0, &end_normal))
         return false;
 
-    /* Handler: thrown value on stack. */
+    /* Handler: thrown value on stack; the unwinder has popped the handler. */
     set_depth(cx, start_depth + 1);
     patch_here(cx, handler_patch);
 
     JsPatchList catch_ends = {0};
     if (has_catch) {
         uint32_t inner_handler = 0;
-        bool guard_catch = has_finally;
-        if (guard_catch) {
+        if (has_finally) {
+            /* the catch block is guarded so that a throw from it runs the finally; the
+             * cleanup now stands for that handler */
             if (!emit_jump(cx, JS_OP_TRY_PUSH, 0, &inner_handler))
                 return false;
+        } else {
+            fs->cleanup_count = ci; /* nothing is installed while the catch block runs */
         }
         JsScopeMark cm = scope_enter(cx);
         if (n->b) { /* catch binding */
@@ -2490,15 +2665,13 @@ static bool compile_try(JsCompiler *cx, const JsAstNode *n) {
             return false;
         if (!scope_leave(cx, cm))
             return false;
-        if (guard_catch && !emit_op(cx, JS_OP_TRY_POP, 0))
-            return false;
-        if (has_finally && !emit_finally_gosubs(cx, fs->finally_count - 1))
+        if (has_finally && !emit_cleanups(cx, ci))
             return false;
         uint32_t ce;
         if (!emit_jump(cx, JS_OP_JUMP, 0, &ce) || !patch_list_add(cx, &catch_ends, ce))
             return false;
 
-        if (guard_catch) {
+        if (has_finally) {
             /* exception during catch: run finally, rethrow */
             set_depth(cx, start_depth + 1);
             patch_here(cx, inner_handler);
@@ -2506,19 +2679,17 @@ static bool compile_try(JsCompiler *cx, const JsAstNode *n) {
     }
 
     if (has_finally) {
+        /* the finally body isn't guarded by itself */
+        JsPatchList gosubs = fs->cleanups[ci].gosubs;
+        fs->cleanup_count = ci;
         /* rethrow path: value on stack, run finally, throw */
         set_depth(cx, start_depth + 1);
-        if (!emit_finally_gosubs(cx, fs->finally_count - 1) ||
-            !emit_op(cx, JS_OP_THROW, -1))
+        if (!emit_gosub(cx, &gosubs) || !emit_op(cx, JS_OP_THROW, -1))
             return false;
-    }
-
-    /* Emit finally body as a subroutine and patch all GOSUBs to it. */
-    if (has_finally) {
-        fs->finally_count--; /* finally body isn't guarded by itself */
+        /* Emit finally body as a subroutine and patch all GOSUBs to it. */
         uint32_t body = FN->code_len;
-        for (uint32_t i = 0; i < fin->gosubs.count; i++)
-            patch_at(cx, fin->gosubs.offs[i], body);
+        for (uint32_t i = 0; i < gosubs.count; i++)
+            patch_at(cx, gosubs.offs[i], body);
         set_depth(cx, start_depth + 1); /* return address occupies one slot */
         if (!compile_stmt(cx, n->d) || !emit_op(cx, JS_OP_RET_SUB, -1))
             return false;
@@ -2612,7 +2783,7 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
             return cerr(cx, n->pos, is_break ? "no matching loop or switch for 'break'"
                                              : "no matching loop for 'continue'");
         note_pos(cx, n->pos);
-        if (!emit_finally_gosubs(cx, l->finally_floor))
+        if (!emit_cleanups(cx, is_break ? l->cleanup_floor : l->continue_floor))
             return false;
         if (is_break) {
             if (!emit_pops_to(cx, l->entry_depth))
@@ -2651,7 +2822,7 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
         } else if (!emit_op(cx, JS_OP_UNDEFINED, +1)) {
             return false;
         }
-        if (!emit_finally_gosubs(cx, 0))
+        if (!emit_cleanups(cx, 0))
             return false;
         return emit_op(cx, JS_OP_RETURN, -1);
     case JS_AST_THROW:

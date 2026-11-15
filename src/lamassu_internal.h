@@ -571,6 +571,9 @@ typedef struct JsModError {
 typedef bool (*JsModuleCompileFn)(JsContext *ctx, JsModule *m, const uint16_t *source,
                                   size_t source_len, JsModError *err);
 
+/* JsContext.iter_protos: one prototype per iterator family (js_iter.h, JS_ITER_PROTO_*) */
+#define JS_ITER_PROTO_COUNT 7
+
 struct JsContext {
     /* The host's own pointer — see js_context_set_userdata. Never read,
      * freed or copied by the engine. */
@@ -614,10 +617,11 @@ struct JsContext {
     JsObject *date_proto;
     JsObject *map_proto;
     JsObject *set_proto;
-    /* %IteratorPrototype% and the Map, Set and RegExp String Iterator prototypes that chain to
-     * it (js_iter.h; indexed by JS_ITER_PROTO_*) */
+    /* %IteratorPrototype% (Iterator.prototype) and the Map, Set, RegExp String, Array and String
+     * Iterator, Iterator Helper and %WrapForValidIteratorPrototype% prototypes that chain to it
+     * (js_iter.h; indexed by JS_ITER_PROTO_*) */
     JsObject *iterator_proto;
-    JsObject *iter_protos[3];
+    JsObject *iter_protos[JS_ITER_PROTO_COUNT];
     JsObject *error_protos[JS_ERROR_KIND_COUNT]; /* Error.prototype and subclasses */
     /* persistent REPL lexical scope: top-level let/const/function bindings
      * that survive across evaluations. repl_scope holds values (TDZ sentinel

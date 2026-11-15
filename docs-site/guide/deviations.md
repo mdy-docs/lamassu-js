@@ -92,11 +92,19 @@ that's known to differ, so you're not surprised by one in production.
 
 ## Iteration
 
-- **Only the built-in iterables iterate** (strings, arrays, `Map`, `Set` and their iterators):
-  there is no `Symbol.iterator` for an object to define its own. See
+- **There is no `Symbol.iterator`**, so an object of a script's iterates only if it inherits from
+  `Iterator.prototype` (whose `[Symbol.iterator]` returns the object itself in V8): an iterable
+  that is not its own iterator (one whose `[Symbol.iterator]()` makes a fresh iterator each time)
+  cannot be written. `Iterator.from({ next() { ... } })` makes any object with `next` iterable. See
   [Built-ins → Iteration](/guide/builtins#iteration).
-- **No `Iterator` helpers**: the iterators' shared prototype has no `map`, `filter`, `take`,
-  `toArray` and the rest, and there is no `Iterator` global.
+- **`for...of`, spread and destructuring of an array or a string do not consult the
+  `Array Iterator` or `String Iterator` prototype**: a script that replaces their `next` (or adds a
+  `return`) changes what `[].values().next()` does, but not how `for...of` walks an array. (They do
+  read `next` from a `Map`, `Set` or other iterator object, as V8 does, so replacing it there takes
+  effect.)
+- **`Iterator.prototype.constructor` is a plain property**: in V8 it is an accessor whose setter
+  refuses an assignment to `Iterator.prototype.constructor` itself (there are no accessors here),
+  so that assignment succeeds here.
 
 ## Errors
 
@@ -118,8 +126,9 @@ that's known to differ, so you're not surprised by one in production.
   operand with no readable name shows its value (`undefined is not a function` for `(void 0)()`
   and `#<Object> is not iterable` for `[...{}]`, where V8 prints the expression,
   `{(intermediate value)}` for an object literal); an object named in a message is `#<Object>`
-  whatever its kind (V8 says `#<Map>`, `[object Date]`), except an array, a module namespace and an
-  iterator; and a duplicate label is not an error.
+  whatever its kind (V8 says `#<Map>`, `[object Date]`), except an array, a module namespace, an
+  iterator (`[object Map Iterator]`) and what inherits from `Iterator.prototype`
+  (`[object Object]`), as V8 names them; and a duplicate label is not an error.
 - **Out-of-memory errors may still be bare strings**: when the engine
   cannot allocate an Error object, it throws the message text instead so
   the failure is never lost.
