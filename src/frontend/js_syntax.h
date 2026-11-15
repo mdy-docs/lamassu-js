@@ -79,6 +79,12 @@ typedef struct JsToken {
             const uint16_t *units; /* ident/reserved/keyword name, string, template chunk */
             uint32_t len;
             bool cont; /* JS_T_TEMPLATE: chunk ends with "${" */
+            /* JS_T_TEMPLATE: the raw text (CR and CRLF made LF), and an escape that does not
+             * cook (an error untagged, undefined in a tagged template's strings) */
+            const uint16_t *raw;
+            uint32_t raw_len;
+            const char *bad_escape; /* its error, or NULL */
+            uint32_t bad_pos;
         } str;
         struct {
             const uint16_t *pattern;
@@ -134,6 +140,7 @@ typedef enum JsAstKind {
     JS_AST_COVER, /* transient: parenthesized list before arrow/expr decision */
     JS_AST_NEW_TARGET, /* `new.target` (only inside a function that is not an arrow, or its arrows) */
     JS_AST_IMPORT_META, /* `import.meta` */
+    JS_AST_TAGGED_TEMPLATE, /* a = tag, b = the TEMPLATE (its chunks carry raw text in units2) */
     /* patterns */
     JS_AST_ARRAY_PATTERN, JS_AST_OBJECT_PATTERN, JS_AST_REST, JS_AST_DEFAULT,
 } JsAstKind;
@@ -161,6 +168,7 @@ typedef enum JsAstKind {
 #define JS_F_COVER_TRAIL  0x02 /* COVER: trailing comma */
 #define JS_F_COVER_ASYNC  0x04 /* COVER: `async (...)` form */
 #define JS_F_PAREN        0x80 /* any expression: was parenthesized */
+#define JS_F_BAD_COOK     0x01 /* STRING (a template chunk): its escape does not cook: undefined */
 
 /*
  * Deliberately fat node (one struct, no unions): the AST is transient and

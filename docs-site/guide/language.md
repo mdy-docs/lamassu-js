@@ -82,8 +82,9 @@ is expected is V8's `SyntaxError: Keyword must not contain escaped characters`.
 
 ## Strings
 
-Template literals (including tagged-less interpolation and multi-line
-strings) are supported. Strings are UTF-16 internally, matching JS
+Template literals, multi-line strings and tagged templates (`` tag`a${x}b` `` calls
+`tag(strings, x)`: `strings` is frozen, the same object every time that site runs, with a frozen
+`raw`; an escape that does not cook is `undefined` in it, as in V8) are supported. Strings are UTF-16 internally, matching JS
 `.length`/indexing semantics exactly.
 
 ## Error handling

@@ -38,11 +38,10 @@ prototype in both engines (2026-11-15).
 
 ## Syntax V8 accepts that lamassu refuses
 
-Each is a compile error that names the feature (`SyntaxError: tagged templates are not
+Each is a compile error that names the feature (`SyntaxError: BigInt literals are not
 supported`), never a silent difference.
 
-**Not yet implemented:** tagged templates (`` tag`x${y}` ``), import attributes
-(`with { type: "json" }`), and `BigInt` literals.
+**Not yet implemented:** import attributes (`with { type: "json" }`) and `BigInt` literals.
 
 **Left out by design** (see [Supported syntax](/guide/language#explicit-non-goals)): `var`,
 `for...in`, `with`, classes (and with them private names, `#x`), getters and setters in object

@@ -98,8 +98,39 @@ static bool serialize_const(OutBuf *b, JsValue v, uint32_t depth) {
     } else if (js_value_is_cell(v) && js_value_cell(v)->kind == JS_KIND_FUNCTION) {
         out_u8(b, CTAG_FUNCTION);
         return serialize_fn(b, js_value_function(v), depth + 1);
+    } else if (js_is_object(v) && js_value_cell(v)->kind == JS_KIND_OBJECT &&
+               js_value_object(v)->obj_kind == JS_OBJ_ARRAY) {
+        /* a tagged template's strings: the cooked strings (undefined where an escape does not
+         * cook), then the raw ones */
+        JsObject *a = js_value_object(v);
+        bool found;
+        JsObject *raw = NULL;
+        for (uint32_t i = 0; i < a->props.used && !raw; i++) {
+            JsString *k = a->props.entries[i].key;
+            if (k && k != JS_MAP_TOMBSTONE && k->length == 3 && k->units[0] == 'r' && k->units[1] == 'a' &&
+                k->units[2] == 'w' && js_is_object(a->props.entries[i].value))
+                raw = js_value_object(a->props.entries[i].value);
+        }
+        (void)found;
+        if (!raw || raw->elem_count != a->elem_count) {
+            b->oom = true;
+            return false;
+        }
+        out_u8(b, CTAG_TEMPLATE);
+        out_u32(b, a->elem_count);
+        for (uint32_t i = 0; i < a->elem_count; i++) {
+            JsValue c = a->elems[i];
+            out_u8(b, js_is_string(c) ? 1 : 0);
+            if (js_is_string(c)) {
+                out_u32(b, js_value_string(c)->length);
+                out_units(b, js_value_string(c)->units, js_value_string(c)->length);
+            }
+            JsString *r = js_value_string(raw->elems[i]);
+            out_u32(b, r->length);
+            out_units(b, r->units, r->length);
+        }
     } else if (js_is_object(v) && js_value_cell(v)->kind == JS_KIND_OBJECT) {
-        out_u8(b, CTAG_IMPORT_META); /* the one object a compiler puts among the constants */
+        out_u8(b, CTAG_IMPORT_META); /* the only other object a compiler puts among constants */
     } else {
         /* objects/promises/closures/natives never appear as compiled consts */
         b->oom = true; /* reuse the error channel: aborts with a clean failure */

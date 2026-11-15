@@ -883,17 +883,25 @@ static JsAstNode *build_arrow(JsParser *p, JsAstNode *params_src, bool is_async,
 
 /* ---- primary / postfix ---- */
 
-static JsAstNode *parse_template(JsParser *p) {
+/* A template literal; TAGGED: its chunks keep their raw text, and one whose escape does not cook
+ * is marked (JS_F_BAD_COOK) rather than an error */
+static JsAstNode *parse_template_as(JsParser *p, bool tagged) {
     JsAstNode *tpl = new_node(p, JS_AST_TEMPLATE, TOK(p).pos);
     if (!tpl)
         return NULL;
     JsNodeVec parts = {0};
     for (;;) {
+        if (TOK(p).u.str.bad_escape && !tagged)
+            return perr(p, TOK(p).u.str.bad_pos, TOK(p).u.str.bad_escape);
         JsAstNode *chunk = new_node(p, JS_AST_STRING, TOK(p).pos);
         if (!chunk)
             return NULL;
         chunk->units = TOK(p).u.str.units;
         chunk->len = TOK(p).u.str.len;
+        chunk->units2 = TOK(p).u.str.raw;
+        chunk->len2 = TOK(p).u.str.raw_len;
+        if (TOK(p).u.str.bad_escape)
+            chunk->flags |= JS_F_BAD_COOK;
         bool cont = TOK(p).u.str.cont;
         if (!vec_push(p, &parts, chunk))
             return NULL;
@@ -916,6 +924,10 @@ static JsAstNode *parse_template(JsParser *p) {
         return NULL;
     vec_store(tpl, &parts);
     return tpl;
+}
+
+static JsAstNode *parse_template(JsParser *p) {
+    return parse_template_as(p, false);
 }
 
 static JsAstNode *parse_array_literal(JsParser *p) {
@@ -1312,6 +1324,16 @@ static JsAstNode *parse_new_callee(JsParser *p) {
             if (!m->b || !expect(p, JS_T_RBRACK, "expected ']'"))
                 return NULL;
             base = m;
+        } else if (k == JS_T_TEMPLATE) { /* a tagged template is a MemberExpression: new (F`x`) */
+            JsAstNode *tt = new_node(p, JS_AST_TAGGED_TEMPLATE, base->pos);
+            if (!tt)
+                return NULL;
+            tt->pos2 = TOK(p).pos;
+            tt->a = base;
+            tt->b = parse_template_as(p, true);
+            if (!tt->b)
+                return NULL;
+            base = tt;
         } else {
             return base;
         }
@@ -1443,7 +1465,19 @@ static JsAstNode *parse_call_member(JsParser *p) {
             call->count = args.count;
             base = call;
         } else if (k == JS_T_TEMPLATE) {
-            return perr_here(p, "tagged templates are not supported");
+            for (const JsAstNode *c = base; c && (c->kind == JS_AST_MEMBER || c->kind == JS_AST_CALL) &&
+                                            !(c->flags & JS_F_PAREN); c = c->a)
+                if (c->flags & JS_F_OPTIONAL)
+                    return perr_here(p, "Invalid tagged template on optional chain");
+            JsAstNode *tt = new_node(p, JS_AST_TAGGED_TEMPLATE, base->pos);
+            if (!tt)
+                return NULL;
+            tt->pos2 = TOK(p).pos;
+            tt->a = base;
+            tt->b = parse_template_as(p, true);
+            if (!tt->b)
+                return NULL;
+            base = tt;
         } else {
             return base;
         }

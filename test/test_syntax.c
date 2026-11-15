@@ -374,6 +374,12 @@ static void dump_node(Sb *sb, const JsAstNode *n) {
     case JS_AST_IMPORT_META:
         sb_printf(sb, "(import.meta)");
         break;
+    case JS_AST_TAGGED_TEMPLATE:
+        sb_printf(sb, "(tagged");
+        dump_child(sb, n->a);
+        dump_child(sb, n->b);
+        sb_printf(sb, ")");
+        break;
     case JS_AST_ARRAY:
     case JS_AST_ARRAY_PATTERN:
         sb_printf(sb, n->kind == JS_AST_ARRAY ? "(arr" : "(apat");
@@ -797,7 +803,8 @@ static void test_errors(void) {
     check_err("eval = 1;", "Unexpected eval or arguments in strict mode", -1);
     check_err("let eval = 1;", "Unexpected eval or arguments in strict mode", -1);
     check_err("o = {get x() { return 1; }};", "getter/setter properties are not supported", -1);
-    check_err("tag`x`;", "tagged templates are not supported", -1);
+    check_err("a?.b`x`;", "Invalid tagged template on optional chain", -1);
+    check_err("x = `\\unicode`;", "Invalid Unicode escape sequence", -1);
     check_err("if (x) import \"m\";", "Unexpected token 'import'", -1);
     check_err("x = import.metax;", "Unexpected identifier 'metax'", -1);
     check_err("p = import();", "import() takes 1 or 2 arguments", -1);

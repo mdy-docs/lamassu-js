@@ -563,8 +563,24 @@ static bool lex_template_chunk(JsLexer *lx, uint32_t err_from) {
 
     uint32_t raw_len = scan - lx->pos;
     uint16_t *buf = js_arena_alloc(lx->arena, (size_t)(raw_len + 2) * sizeof(uint16_t));
-    if (!buf)
+    uint16_t *raw = js_arena_alloc(lx->arena, (size_t)(raw_len + 1) * sizeof(uint16_t));
+    if (!buf || !raw)
         return lex_fail(lx, err_from, "out of memory");
+    uint32_t rn = 0;
+    for (uint32_t i = lx->pos; i < scan; i++) { /* raw: the source, CR and CRLF made LF */
+        uint16_t u = lx->src[i];
+        if (u == '\r') {
+            raw[rn++] = '\n';
+            if (i + 1 < scan && lx->src[i + 1] == '\n')
+                i++;
+        } else {
+            raw[rn++] = u;
+        }
+    }
+    lx->tok.u.str.raw = raw;
+    lx->tok.u.str.raw_len = rn;
+    lx->tok.u.str.bad_escape = NULL;
+    lx->tok.u.str.bad_pos = 0;
     uint32_t n = 0;
     for (;;) {
         uint16_t u = cur(lx);
@@ -579,9 +595,19 @@ static bool lex_template_chunk(JsLexer *lx, uint32_t err_from) {
             break;
         }
         if (u == '\\') {
-            uint32_t got;
-            if (!cook_escape(lx, buf + n, &got))
-                return false;
+            uint32_t got, bs = lx->pos;
+            if (!cook_escape(lx, buf + n, &got)) {
+                /* kept, not thrown: a tagged template's strings have undefined for it; the
+                 * parser raises it for an untagged one */
+                if (!lx->tok.u.str.bad_escape) {
+                    lx->tok.u.str.bad_escape = lx->err_msg;
+                    lx->tok.u.str.bad_pos = lx->err_pos;
+                }
+                lx->failed = false;
+                lx->err_msg = NULL;
+                lx->pos = bs + 2 <= scan ? bs + 2 : scan;
+                continue;
+            }
             n += got;
         } else if (u == '\r') { /* normalize CR / CRLF to LF */
             buf[n++] = '\n';

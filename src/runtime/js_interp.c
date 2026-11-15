@@ -4593,3 +4593,20 @@ bool js_has_property(JsContext *ctx, JsValue base, JsValue key, bool *out) {
         return fail_ascii(ctx, "TypeError: Cannot use 'in' operator to search for a key in a non-object");
     return st == JS_PROP_OK;
 }
+
+/* GetTemplateObject's object from COOKED (an array of strings, undefined where an escape does not
+ * cook) and RAW (an array of strings), both rooted by the caller: raw becomes COOKED's
+ * non-enumerable, read-only, non-configurable `raw`, and both are frozen. False on OOM. */
+bool js_template_object(JsContext *ctx, JsValue cooked, JsValue raw) {
+    static const uint16_t kraw[] = {'r', 'a', 'w'};
+    JsValue key = js_atom(ctx->vm, kraw, 3);
+    if (!js_is_string(key))
+        return false;
+    JsPropDesc d = {JS_DESC_VALUE | JS_DESC_WRITABLE | JS_DESC_ENUMERABLE | JS_DESC_CONFIGURABLE,
+                    false, false, false, raw};
+    if (!js_define_own_property(ctx, cooked, key, &d))
+        return false;
+    js_value_object(raw)->obj_flags |= JS_OBJ_SEALED | JS_OBJ_FROZEN;
+    js_value_object(cooked)->obj_flags |= JS_OBJ_SEALED | JS_OBJ_FROZEN;
+    return true;
+}

@@ -1850,6 +1850,72 @@ static bool compile_args(JsCompiler *cx, JsAstNode *const *args, uint32_t count,
     return true;
 }
 
+/* A tagged template's strings object (per site: one constant), from the TEMPLATE node TPL */
+static bool template_object_const(JsCompiler *cx, const JsAstNode *tpl, uint16_t *cidx) {
+    JsVm *vm = cx->vm;
+    uint32_t n = (tpl->count + 1) / 2;
+    JsObject *ca = js_array_new_cell(cx->ctx, n);
+    JsValue cooked = ca ? js_value_from_cell(&ca->gc) : js_undefined();
+    js_gc_protect(vm, &cooked);
+    JsObject *ra = ca ? js_array_new_cell(cx->ctx, n) : NULL;
+    JsValue raw = ra ? js_value_from_cell(&ra->gc) : js_undefined();
+    js_gc_protect(vm, &raw);
+    bool ok = ra != NULL;
+    for (uint32_t i = 0; ok && i < tpl->count; i += 2) {
+        const JsAstNode *chunk = tpl->items[i];
+        JsString *rs = js_string_cell_new(vm, chunk->units2, chunk->len2);
+        ok = rs && js_array_append(vm, js_value_object(raw), js_value_from_cell(&rs->gc));
+        if (!ok)
+            break;
+        JsValue cv = js_undefined();
+        if (!(chunk->flags & JS_F_BAD_COOK)) {
+            JsString *cs = js_string_cell_new(vm, chunk->units, chunk->len);
+            ok = cs != NULL;
+            cv = cs ? js_value_from_cell(&cs->gc) : cv;
+        }
+        ok = ok && js_array_append(vm, js_value_object(cooked), cv);
+    }
+    ok = ok && js_template_object(cx->ctx, cooked, raw) && const_add(cx, cooked, cidx);
+    js_gc_unprotect(vm, &raw);
+    js_gc_unprotect(vm, &cooked);
+    return ok ? true : cerr(cx, tpl->pos, "out of memory");
+}
+
+/* tag`a${x}b`: tag(strings, x), with `this` the tag's object for a member tag */
+static bool compile_tagged_template(JsCompiler *cx, const JsAstNode *n) {
+    const JsAstNode *callee = n->a, *tpl = n->b;
+    note_pos(cx, n->pos);
+    if (callee->kind == JS_AST_MEMBER) {
+        if (!compile_expr(cx, callee->a) || !emit_op(cx, JS_OP_DUP, +1))
+            return false;
+        if (callee->flags & JS_F_COMPUTED) {
+            if (!compile_expr(cx, callee->b) || !emit_op(cx, JS_OP_GET_PROP, -1))
+                return false;
+        } else {
+            uint16_t c;
+            if (!atom_const(cx, callee->units, callee->len, callee->pos, &c) ||
+                !emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0))
+                return false;
+        }
+        if (!emit_op(cx, JS_OP_SWAP, 0))
+            return false;
+    } else if (!compile_expr(cx, callee) || !emit_op(cx, JS_OP_UNDEFINED, +1)) {
+        return false;
+    }
+    uint16_t c;
+    if (!template_object_const(cx, tpl, &c) || !emit_op_u16(cx, JS_OP_CONST, c, +1))
+        return false;
+    uint32_t argc = 1;
+    for (uint32_t i = 1; i < tpl->count; i += 2, argc++)
+        if (!compile_expr(cx, tpl->items[i]))
+            return false;
+    if (argc > 255)
+        return cerr(cx, n->pos, "too many call arguments");
+    note_callee(cx, callee);
+    note_pos(cx, n->pos2 ? n->pos2 : n->pos);
+    return emit_op(cx, JS_OP_CALL, -(int)argc) && emit8(cx, (uint8_t)argc);
+}
+
 static bool compile_call(JsCompiler *cx, const JsAstNode *n) {
     const JsAstNode *callee = n->a;
     note_pos(cx, n->pos);
@@ -1994,6 +2060,8 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
         return emit_op(cx, (n->flags & JS_F_TRUE) ? JS_OP_TRUE : JS_OP_FALSE, +1);
     case JS_AST_THIS:
         return emit_op(cx, JS_OP_GET_THIS, +1);
+    case JS_AST_TAGGED_TEMPLATE:
+        return compile_tagged_template(cx, n);
     case JS_AST_IMPORT_META: {
         /* a pseudo-import the linker binds to the module's meta object */
         JsModule *mod = cx->module;

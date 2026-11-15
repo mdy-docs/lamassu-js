@@ -164,8 +164,8 @@ Array elements are a flat `JsValue` vector (no holes/sparse storage), so
 `String(x)` / `new String(x)` convert to a primitive string (there is no
 boxed `String` object — this engine has no boxed-primitive type at all).
 
-- **Statics**: `fromCharCode`, `fromCodePoint`, `raw` (`String.raw({ raw: [...] }, ...subs)`;
-  there are no tagged templates to call it from).
+- **Statics**: `fromCharCode`, `fromCodePoint`, `raw` (``String.raw`a\n${x}` ``, or
+  `String.raw({ raw: [...] }, ...subs)`).
 - **`String.prototype`**: `charAt`, `charCodeAt`, `codePointAt`, `at`,
   `indexOf`, `lastIndexOf`, `includes`, `startsWith`, `endsWith`, `slice`,
   `substring`, `substr`, `toUpperCase`, `toLowerCase` (full Unicode case mapping, as V8's),

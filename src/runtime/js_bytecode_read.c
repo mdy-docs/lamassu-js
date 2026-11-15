@@ -468,6 +468,39 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
                 fn->consts[i] = js_value_from_cell(&child->gc);
                 break;
             }
+            case CTAG_TEMPLATE: {
+                uint32_t n = in_u32(b);
+                if (b->bad || n > JSBC_MAX_CONSTS) {
+                    *err = "SyntaxError: bad template constant";
+                    goto done;
+                }
+                JsObject *ca = js_array_new_cell(ctx, n);
+                JsValue cooked = ca ? js_value_from_cell(&ca->gc) : js_undefined();
+                js_gc_protect(ctx->vm, &cooked);
+                JsObject *ra = ca ? js_array_new_cell(ctx, n) : NULL;
+                JsValue raw = ra ? js_value_from_cell(&ra->gc) : js_undefined();
+                js_gc_protect(ctx->vm, &raw);
+                bool tok = ra != NULL;
+                for (uint32_t k = 0; tok && k < n; k++) {
+                    uint8_t has = in_u8(b);
+                    JsValue cv = has ? load_string_const(ctx, b, err) : js_undefined();
+                    tok = !b->bad && has <= 1 && (!has || js_is_string(cv)) &&
+                          js_array_append(ctx->vm, js_value_object(cooked), cv);
+                    JsValue rv = tok ? load_string_const(ctx, b, err) : js_undefined();
+                    tok = tok && js_is_string(rv) && js_array_append(ctx->vm, js_value_object(raw), rv);
+                }
+                tok = tok && js_template_object(ctx, cooked, raw);
+                if (tok)
+                    fn->consts[i] = cooked;
+                js_gc_unprotect(ctx->vm, &raw);
+                js_gc_unprotect(ctx->vm, &cooked);
+                if (!tok) {
+                    if (!*err)
+                        *err = "SyntaxError: bad template constant";
+                    goto done;
+                }
+                break;
+            }
             case CTAG_IMPORT_META: {
                 if (!b->meta) {
                     JsValue mo = js_object_new(ctx);

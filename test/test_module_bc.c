@@ -277,6 +277,11 @@ static void test_graphs(void) {
     mods_reset();
     mod_add("main", "function f() { return import.meta; } export const r = [import.meta.url, f() === import.meta, Object.getPrototypeOf(import.meta)].join();");
     expect("main", "r", "main,true,");
+    mods_reset();
+    mod_add("main", "const tag = (s, ...v) => s.raw.join('|') + ':' + s.map(String).join('|') + ':' + v.join() + ':' + Object.isFrozen(s);"
+                    " const g = (s) => s; const f = () => tag`a${1}\\xg${2}`;"
+                    " export const r = f() + ':' + (g`q` !== g`q`) + ':' + String.raw`x\\ny`;");
+    expect("main", "r", "a|\\xg|:a|undefined|:1,2:true:true:x\\ny");
 
     /* live bindings: a counter mutated in the exporter is seen by the importer */
     mod_add("counter", "let n = 0; export function tick(){ return ++n; }");
