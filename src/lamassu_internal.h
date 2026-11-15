@@ -464,6 +464,8 @@ typedef struct JsModuleImport {
     JsString *imported_name; /* export name in source (NULL for ns/side) */
     uint8_t kind;            /* JsImportKind */
     JsModule *source;        /* resolved at link */
+    JsString *requested;     /* the name as this module imports it (link may follow re-exports
+                              * to another): for the missing-export error */
 } JsModuleImport;
 
 /*
@@ -522,6 +524,7 @@ struct JsModule {
      * and evaluation, which resumes it; NULL before and after. */
     JsFiber *fiber;
     bool env_ready;           /* instantiation ran (or this module has no body to run) */
+    bool imports_checked;     /* every name it imports or re-exports is provided */
 };
 
 /* Opaque host-provided module bytecode; bytes owned by the cell. */

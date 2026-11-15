@@ -810,14 +810,11 @@ static void test_errors(void) {
     check_err("p = import();", "import() takes 1 or 2 arguments", -1);
     check_err("p = import('a', 'b', 'c');", "import() takes 1 or 2 arguments", -1);
     check_err("p = import(...xs);", "spread is not allowed in import()", -1);
-    check_err("import { x } from 'm' with { type: 'json' };",
-              "import attributes are not supported", -1);
-    check_err("import d from 'm' assert { type: 'json' };",
-              "import attributes are not supported", -1);
-    check_err("export { x } from 'm' with { type: 'json' };",
-              "import attributes are not supported", -1);
-    check_err("export * from 'm' with { type: 'json' };",
-              "import attributes are not supported", -1);
+    check_err("import d from 'm' assert { type: 'json' };", "Unexpected identifier 'assert'", -1);
+    check_err("import d from 'm' with { type: 'json', type: 'json' };",
+              "Import attribute has duplicate key 'type'", -1);
+    check_err("import d from 'm' with { type: 1 };", "Unexpected number", -1);
+    check_err("export * from 'm' with { type };", "Unexpected token '}'", -1);
     check_err("x = '\\101';", "Octal escape sequences are not allowed in strict mode.", -1);
     check_err("x = debugger;", "Unexpected token 'debugger'", -1);
 }

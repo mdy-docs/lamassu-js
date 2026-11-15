@@ -229,6 +229,7 @@ bool      js_is_extensible(JsContext *ctx, JsValue v);
 bool      js_function_has_own_special(JsValue fn, bool name);
 bool      js_prevent_extensions(JsContext *ctx, JsValue v);
 bool      js_template_object(JsContext *ctx, JsValue cooked, JsValue raw);
+bool      js_json_parse_text(JsContext *ctx, JsValue text, JsValue *out); /* js_builtins.c */
 /* In a native: roots V until the native returns (false: no room, out of memory pending), and
  * js_op_to_string with the result kept so (a string V itself needs no keeping). */
 __attribute__((warn_unused_result))

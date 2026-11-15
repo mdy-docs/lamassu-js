@@ -2323,6 +2323,99 @@ static JsAstNode *parse_statement(JsParser *p) {
 
 /* ---- imports / exports ---- */
 
+/* `with { type: "json" }` after a module specifier: n->d becomes a STRING node holding the
+ * attributes as the module request carries them, each "\0key\0value", sorted by key (the
+ * compiler appends it to the specifier: a module and a JSON module of one specifier are two
+ * requests). Keys are identifier names or strings, values strings; a key may not repeat. */
+static bool parse_import_attributes(JsParser *p, JsAstNode *n) {
+    if (!advance(p) || !advance(p)) /* with { */
+        return false;
+    const uint16_t *keys[32], *vals[32];
+    uint32_t klen[32], vlen[32], count = 0;
+    while (TOK(p).kind != JS_T_RBRACE) {
+        JsToken *k = &TOK(p);
+        if (k->kind != JS_T_STR && k->kind != JS_T_IDENT && k->kind != JS_T_RESERVED &&
+            !(k->kind >= JS_T_AWAIT && k->kind <= JS_T_WHILE)) {
+            perr_here(p, unexpected_text(p));
+            return false;
+        }
+        if (count == 32) {
+            perr_here(p, "too many import attributes");
+            return false;
+        }
+        const uint16_t *ku = k->u.str.units;
+        uint32_t kl = k->u.str.len;
+        if (k->kind != JS_T_STR && k->kind != JS_T_IDENT && k->kind != JS_T_RESERVED) {
+            /* a keyword token: its text from the source */
+            ku = p->lx.src + k->pos;
+            kl = k->end - k->pos;
+        }
+        for (uint32_t i = 0; i < count; i++)
+            if (klen[i] == kl && !memcmp(keys[i], ku, kl * sizeof *ku)) {
+                p->err_msg = js_compile_error_fmt(p->arena->vm, "Import attribute has duplicate key '%U'", ku, kl);
+                p->err_pos = k->pos;
+                return false;
+            }
+        if (!advance(p) || !expect(p, JS_T_COLON, "expected ':'"))
+            return false;
+        if (TOK(p).kind != JS_T_STR) {
+            perr_here(p, unexpected_text(p));
+            return false;
+        }
+        keys[count] = ku;
+        klen[count] = kl;
+        vals[count] = TOK(p).u.str.units;
+        vlen[count] = TOK(p).u.str.len;
+        count++;
+        if (!advance(p))
+            return false;
+        if (TOK(p).kind == JS_T_COMMA) {
+            if (!advance(p))
+                return false;
+        } else if (TOK(p).kind != JS_T_RBRACE) {
+            perr_here(p, unexpected_text(p));
+            return false;
+        }
+    }
+    if (!advance(p)) /* } */
+        return false;
+    if (!count)
+        return true;
+    for (uint32_t i = 1; i < count; i++) /* sorted by key: one request however it is written */
+        for (uint32_t j = i; j > 0; j--) {
+            uint32_t m = klen[j] < klen[j - 1] ? klen[j] : klen[j - 1];
+            int c = memcmp(keys[j], keys[j - 1], m * sizeof(uint16_t));
+            if (c > 0 || (c == 0 && klen[j] >= klen[j - 1]))
+                break;
+            const uint16_t *tu = keys[j]; keys[j] = keys[j - 1]; keys[j - 1] = tu;
+            uint32_t tl = klen[j]; klen[j] = klen[j - 1]; klen[j - 1] = tl;
+            tu = vals[j]; vals[j] = vals[j - 1]; vals[j - 1] = tu;
+            tl = vlen[j]; vlen[j] = vlen[j - 1]; vlen[j - 1] = tl;
+        }
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < count; i++)
+        total += 2 + klen[i] + vlen[i];
+    uint16_t *enc = js_arena_alloc(p->arena, total * sizeof *enc);
+    JsAstNode *a = enc ? new_node(p, JS_AST_STRING, n->pos) : NULL;
+    if (!a) {
+        perr_here(p, "out of memory");
+        return false;
+    }
+    uint32_t o = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        enc[o++] = 0;
+        memcpy(enc + o, keys[i], klen[i] * sizeof *enc);
+        o += klen[i];
+        enc[o++] = 0;
+        memcpy(enc + o, vals[i], vlen[i] * sizeof *enc);
+        o += vlen[i];
+    }
+    a->units = enc;
+    a->len = total;
+    n->d = a;
+    return true;
+}
+
 static JsAstNode *parse_module_source(JsParser *p, JsAstNode *n) {
     if (TOK(p).kind != JS_T_STR)
         return perr_here(p, "expected module specifier string");
@@ -2330,13 +2423,10 @@ static JsAstNode *parse_module_source(JsParser *p, JsAstNode *n) {
     n->len = TOK(p).u.str.len;
     if (!advance(p))
         return NULL;
-    /* an attribute clause after the specifier gets a dedicated error, not
-     * the generic expected-';' fallthrough */
     JsToken *t = &TOK(p);
-    if (((t->kind == JS_T_RESERVED && units_is(t->u.str.units, t->u.str.len, "with")) ||
-         tok_is_name(t, "assert")) &&
-        peek(p).kind == JS_T_LBRACE)
-        return perr_here(p, "import attributes are not supported");
+    if (t->kind == JS_T_RESERVED && units_is(t->u.str.units, t->u.str.len, "with") &&
+        peek(p).kind == JS_T_LBRACE && !parse_import_attributes(p, n))
+        return NULL;
     if (!expect_semicolon(p))
         return NULL;
     return n;

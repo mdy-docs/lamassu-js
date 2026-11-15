@@ -41,7 +41,7 @@ prototype in both engines (2026-11-15).
 Each is a compile error that names the feature (`SyntaxError: BigInt literals are not
 supported`), never a silent difference.
 
-**Not yet implemented:** import attributes (`with { type: "json" }`) and `BigInt` literals.
+**Not yet implemented:** `BigInt` literals.
 
 **Left out by design** (see [Supported syntax](/guide/language#explicit-non-goals)): `var`,
 `for...in`, `with`, classes (and with them private names, `#x`), getters and setters in object
@@ -80,6 +80,8 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   property here where V8 has an accessor; it reads, writes and redefines as V8's does, but its
   descriptor has `value`/`writable` rather than `get`/`set`. The same goes for RegExp's legacy
   statics (`RegExp.$1`, `lastMatch`, `input`, ...).
+- **A module specifier may not contain U+0000** (`SyntaxError`, or a rejected `import()`): a
+  module request carries its import attributes after one.
 - **`Array.fromAsync` closes an iterator once.** When a value it awaits rejects, V8 calls the
   iterator's `return` twice; the spec's async-from-sync iterator closes it once, and so does
   lamassu. (There are no async iterables to give it: no symbols, no async generators.)

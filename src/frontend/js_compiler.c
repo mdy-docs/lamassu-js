@@ -2243,11 +2243,13 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
         note_pos(cx, n->pos);
         if (!compile_expr(cx, n->a))
             return false;
-        /* options argument: evaluated (after the specifier, per spec order)
-         * for side effects only, then discarded */
-        if (n->b && !(compile_expr(cx, n->b) && emit_op(cx, JS_OP_POP, -1)))
+        /* the options after the specifier, per spec order; the op takes the pair as one array
+         * (its helper reads `with`), so the dispatch loop's case is unchanged */
+        if (n->b ? !compile_expr(cx, n->b) : !emit_op(cx, JS_OP_UNDEFINED, +1))
             return false;
-        /* specifier in, promise out: net stack effect 0 */
+        if (!emit_op_u16(cx, JS_OP_NEW_ARRAY, 2, -1))
+            return false;
+        /* [specifier, options] in, promise out: net stack effect 0 */
         return emit_op(cx, JS_OP_DYNAMIC_IMPORT, 0);
     case JS_AST_REGEX: {
 #ifdef LAMASSU_HAS_REGEX
@@ -3222,6 +3224,7 @@ static JsModuleImport *mod_add_import(JsCompiler *cx, JsModule *m, JsString *spe
     imp->imported_name = imported;
     imp->kind = kind;
     imp->source = NULL;
+    imp->requested = NULL;
     m->import_count++;
     return imp;
 }
@@ -3397,13 +3400,32 @@ static bool exports_start_in_tdz(JsCompiler *cx, const JsAstNode *module, JsModu
     return true;
 }
 
+/* The module request of an import or re-export: its specifier, with the attributes the parser
+ * encoded after it (n->d) appended */
+static JsString *module_request(JsCompiler *cx, const JsAstNode *n) {
+    for (uint32_t i = 0; i < n->len; i++)
+        if (!n->units[i]) { /* it would read as the attributes the request carries after one */
+            cerr(cx, n->pos, "A module specifier may not contain a NUL character");
+            return NULL;
+        }
+    if (!n->d)
+        return intern_atom(cx, n->units, n->len);
+    uint32_t len = n->len + n->d->len;
+    uint16_t *u = js_arena_alloc(&cx->arena, (size_t)len * sizeof *u);
+    if (!u)
+        return NULL;
+    memcpy(u, n->units, n->len * sizeof *u);
+    memcpy(u + n->len, n->d->units, n->d->len * sizeof *u);
+    return intern_atom(cx, u, len);
+}
+
 static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mod) {
     uint32_t cap = 0;
     for (uint32_t i = 0; i < module->count; i++) {
         const JsAstNode *n = module->items[i];
         switch ((JsAstKind)n->kind) {
         case JS_AST_IMPORT: {
-            JsString *spec = intern_atom(cx, n->units, n->len);
+            JsString *spec = module_request(cx, n);
             if (!spec || !mod_add_dep(cx, mod, spec))
                 return cerr(cx, n->pos, "out of memory");
             for (uint32_t s = 0; s < n->count; s++) {
@@ -3438,7 +3460,7 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
             break;
         }
         case JS_AST_EXPORT_ALL: {
-            JsString *spec = intern_atom(cx, n->units, n->len);
+            JsString *spec = module_request(cx, n);
             if (!spec || !mod_add_dep(cx, mod, spec))
                 return cerr(cx, n->pos, "out of memory");
             if (n->len2) { /* export * as ns from 'm' */
@@ -3464,7 +3486,7 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
                         return false;
                 }
             } else if (n->len) { /* export { x as y } from 'm' (re-export) */
-                JsString *spec = intern_atom(cx, n->units, n->len);
+                JsString *spec = module_request(cx, n);
                 if (!spec || !mod_add_dep(cx, mod, spec))
                     return cerr(cx, n->pos, "out of memory");
                 for (uint32_t s = 0; s < n->count; s++) {

@@ -3832,6 +3832,11 @@ static bool json_parse(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     return true;
 }
 
+/* JSON.parse(TEXT) for the runtime (a JSON module): false with the error in *OUT */
+bool js_json_parse_text(JsContext *ctx, JsValue text, JsValue *out) {
+    return json_parse(ctx, js_undefined(), &text, 1, out);
+}
+
 /* JSON.rawJSON(text): a frozen, prototype-less object whose `rawJSON` is TEXT, which must be one
  * JSON primitive with nothing around it; JSON.stringify writes it as it is. V8's errors: "Invalid
  * value for JSON.rawJSON" when it is empty or something follows, else the parser's own. */

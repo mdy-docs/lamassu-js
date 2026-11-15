@@ -152,6 +152,15 @@ ns`) is sealed and read-only, and lists its exports in name order. See the
 [Deviations](/guide/deviations) page for the edge cases (snapshot vs. live
 re-exports).
 
+Import attributes are V8's syntax (`import data from './d.json' with { type: 'json' }`, the same
+on `export ... from` and in `import(spec, { with: { type: 'json' } })`; `assert` is gone, as in V8).
+`type: 'json'` makes a JSON module, as V8 does: the loader is asked for the specifier as usual,
+and the text it gives is parsed as `JSON.parse` would; the module's only export is `default`. A
+JSON module and a JS module of the same specifier are two modules. Another `type`, or another
+attribute on a static import, is a `TypeError` (Node's wording); `import()` drops attributes it
+does not know, as V8 does. A named import a module does not provide is V8's `SyntaxError: The
+requested module 'x' does not provide an export named 'y'`, before any module of the graph runs.
+
 `import.meta` is one object per module with no prototype, as V8 makes it. V8 leaves its
 properties to the host: here a module loaded through the module loader has `url`, its
 specifier; a unit compiled on its own (no loader) has none.

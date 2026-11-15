@@ -56,6 +56,8 @@ void js_gc_mark_module(JsVm *vm, JsModule *m) {
             js_gc_mark_cell(vm, &m->imports[i].imported_name->gc);
         if (m->imports[i].source)
             js_gc_mark_cell(vm, &m->imports[i].source->gc);
+        if (m->imports[i].requested)
+            js_gc_mark_cell(vm, &m->imports[i].requested->gc);
     }
     for (uint32_t i = 0; i < m->star_count; i++) {
         if (m->stars[i].specifier)
@@ -318,19 +320,46 @@ static JsModule *meta_module(JsContext *ctx, JsModule *m) {
  * that is the registry identity. NULL canonicalizer -> raw is canonical.
  * NULL on failure with *errmsg set (static ASCII).
  */
+/* The length of a module request's specifier: what comes before its import attributes, which
+ * the compiler appends as "\0key\0value" pairs (a module and a JSON module of one specifier are
+ * two requests, two records) */
+static uint32_t spec_len(const JsString *s) {
+    uint32_t n = 0;
+    while (n < s->length && s->units[n] != 0)
+        n++;
+    return n;
+}
+
 static JsString *canonicalize_spec(JsContext *ctx, JsModule *referrer, JsString *raw,
                                    const char **errmsg) {
     if (!ctx->canon)
         return raw;
     const uint16_t *out;
     size_t out_len;
-    if (!ctx->canon(ctx->loader_ud, raw->units, raw->length,
-                    referrer ? referrer->specifier->units : NULL,
-                    referrer ? referrer->specifier->length : 0, &out, &out_len)) {
+    uint32_t base = spec_len(raw), rlen = referrer ? spec_len(referrer->specifier) : 0;
+    if (!ctx->canon(ctx->loader_ud, raw->units, base, referrer ? referrer->specifier->units : NULL,
+                    rlen, &out, &out_len)) {
         *errmsg = "cannot resolve module specifier";
         return NULL;
     }
-    JsValue v = js_atom(ctx->vm, out, out_len);
+    JsValue v;
+    if (base == raw->length) {
+        v = js_atom(ctx->vm, out, out_len);
+    } else { /* the canonical specifier, its attributes after it again */
+        size_t total = out_len + (raw->length - base);
+        uint16_t *u = js_realloc_raw(ctx->vm, NULL, 0, total * sizeof *u);
+        if (!u) {
+            *errmsg = "out of memory";
+            return NULL;
+        }
+        memcpy(u, out, out_len * sizeof *u);
+        memcpy(u + out_len, raw->units + base, (raw->length - base) * sizeof *u);
+        JsValue rawv = js_value_from_cell(&raw->gc);
+        js_gc_protect(ctx->vm, &rawv);
+        v = js_atom(ctx->vm, u, total);
+        js_gc_unprotect(ctx->vm, &rawv);
+        js_realloc_raw(ctx->vm, u, total * sizeof *u, 0);
+    }
     if (!js_is_string(v)) {
         *errmsg = "out of memory";
         return NULL;
@@ -359,6 +388,72 @@ static void module_compile_fail(JsContext *ctx, JsModule *m, JsValue reason, uin
     ctx->error_trace_count = 1;
 }
 
+/* A module request with import attributes: `type: "json"` makes a JSON module (a synthetic module
+ * whose default export is the text the loader gave, parsed as JSON.parse does), as V8 does;
+ * any other attribute, or type, is refused with the TypeError Node gives. */
+static bool fetch_with_attributes(JsContext *ctx, JsModule *m, JsValue bound, JsValue resolved) {
+    JsString *spec = m->specifier;
+    uint32_t base = spec_len(spec), i = base;
+    JsValue rv = resolved;
+    js_gc_protect(ctx->vm, &rv);
+    bool json = false;
+    JsValue reason = js_undefined();
+    while (i < spec->length && js_is_undefined(reason)) { /* "\0key\0value" pairs */
+        uint32_t k0 = i + 1, k1 = k0;
+        while (k1 < spec->length && spec->units[k1] != 0)
+            k1++;
+        uint32_t v0 = k1 + 1, v1 = v0;
+        while (v1 < spec->length && spec->units[v1] != 0)
+            v1++;
+        static const uint16_t ktype[] = {'t', 'y', 'p', 'e'}, vjson[] = {'j', 's', 'o', 'n'};
+        bool is_type = k1 - k0 == 4 && !memcmp(spec->units + k0, ktype, sizeof ktype);
+        if (is_type && v1 - v0 == 4 && !memcmp(spec->units + v0, vjson, sizeof vjson)) {
+            json = true;
+        } else {
+            JsString *ks = js_string_cell_new(ctx->vm, spec->units + k0, k1 - k0);
+            JsValue kv = ks ? js_value_from_cell(&ks->gc) : js_undefined();
+            js_gc_protect(ctx->vm, &kv);
+            JsString *vs = ks ? js_string_cell_new(ctx->vm, spec->units + v0, v1 - v0) : NULL;
+            reason = vs ? js_error_fmt(ctx, "TypeError: Import attribute \"%S\" with value \"%S\" is not supported", ks, vs)
+                        : js_oom_value(ctx->vm);
+            js_gc_unprotect(ctx->vm, &kv);
+        }
+        i = v1;
+    }
+    if (js_is_undefined(reason) && json && !js_is_string(resolved)) {
+        JsString *bs = js_string_cell_new(ctx->vm, spec->units, base);
+        reason = bs ? js_error_fmt(ctx, "TypeError: Module \"%S\" is not of type \"json\"", bs)
+                    : js_oom_value(ctx->vm);
+    }
+    JsValue value = js_undefined();
+    js_gc_protect(ctx->vm, &value);
+    if (js_is_undefined(reason) && !js_json_parse_text(ctx, resolved, &value))
+        reason = value; /* JSON.parse's SyntaxError */
+    if (js_is_undefined(reason)) {
+        JsValue ns = js_object_new(ctx);
+        if (js_is_object(ns)) {
+            JsObject *o = js_value_object(ns);
+            o->proto = js_undefined();
+            if (js_object_set_ascii(ctx, o, "default", value)) {
+                o->obj_flags |= JS_OBJ_SEALED | JS_OBJ_NAMESPACE; /* a namespace: sealed, read-only */
+                m->exports = o;
+                m->synthetic = true;
+                m->status = JS_MOD_EVALUATED;
+                js_promise_fulfill(ctx, m->fetch_promise, bound);
+            } else {
+                reason = js_oom_value(ctx->vm);
+            }
+        } else {
+            reason = js_oom_value(ctx->vm);
+        }
+    }
+    if (!js_is_undefined(reason))
+        module_fetch_fail(ctx, m, reason, 0);
+    js_gc_unprotect(ctx->vm, &value);
+    js_gc_unprotect(ctx->vm, &rv);
+    return true;
+}
+
 static bool fetch_on_resolved(JsContext *ctx, JsValue bound, JsValue tv,
                               const JsValue *args, int argc, JsValue *r) {
     (void)tv;
@@ -366,6 +461,8 @@ static bool fetch_on_resolved(JsContext *ctx, JsValue bound, JsValue tv,
     JsModule *m = value_module(bound);
     JsValue resolved = argc > 0 ? args[0] : js_undefined();
 
+    if (spec_len(m->specifier) < m->specifier->length) /* import attributes */
+        return fetch_with_attributes(ctx, m, bound, resolved);
     if (js_is_string(resolved)) {
         JsString *src = js_value_string(resolved);
         /* Source needs a parser, which a runtime-only build does not link.
@@ -464,9 +561,10 @@ static JsValue fetch_module_async(JsContext *ctx, JsModule *referrer, JsString *
     /* m (and fp through it) is now rooted by the registry */
 
     m = value_module(mv);
-    JsValue loader_p = ctx->loader(ctx->loader_ud, ctx, spec->units, spec->length,
+    /* the loader is asked for the specifier; the attributes say what to make of its answer */
+    JsValue loader_p = ctx->loader(ctx->loader_ud, ctx, spec->units, spec_len(spec),
                                    referrer ? referrer->specifier->units : NULL,
-                                   referrer ? referrer->specifier->length : 0);
+                                   referrer ? spec_len(referrer->specifier) : 0);
     if (!js_is_promise(loader_p)) {
         module_fetch_fail(ctx, m, ascii_value(ctx, "module loader did not return a promise"), 0);
     } else if (!then_bound(ctx, loader_p, fetch_on_resolved, fetch_on_rejected, mv)) {
@@ -749,6 +847,8 @@ static bool link_module(JsContext *ctx, JsModule *m, JsModError *err) {
         if (m->imports[i].imported_name) {
             JsModule *rmod;
             JsString *rname;
+            if (!m->imports[i].requested)
+                m->imports[i].requested = m->imports[i].imported_name;
             resolve_export(src, m->imports[i].imported_name, &rmod, &rname, 0);
             m->imports[i].source = rmod;
             m->imports[i].imported_name = rname;
@@ -1043,6 +1143,68 @@ static bool root_on_eval_fail(JsContext *ctx, JsValue bound, JsValue tv,
     return true;
 }
 
+/* Whether M provides the export NAME (ResolveExport): its own (a local export is in its exports
+ * object once instantiated, a let/const one in the TDZ), a named or namespace re-export, or one an
+ * `export *` brings (never `default`) */
+static bool module_provides(JsModule *m, JsString *name, int depth) {
+    if (!m || depth > 64)
+        return false;
+    bool found = false;
+    if (m->exports)
+        js_map_get(&m->exports->props, name, &found);
+    if (found || m->synthetic)
+        return found;
+    static const uint16_t kdefault[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
+    bool is_default = name->length == 7 && !memcmp(name->units, kdefault, sizeof kdefault);
+    for (uint32_t i = 0; i < m->star_count; i++) {
+        JsStarExport *re = &m->stars[i];
+        if ((re->kind == JS_REEXP_NAMED || re->kind == JS_REEXP_NS) && re->exported == name)
+            return re->kind == JS_REEXP_NS || module_provides(re->source, re->imported, depth + 1);
+    }
+    for (uint32_t i = 0; !is_default && i < m->star_count; i++)
+        if (m->stars[i].kind == JS_REEXP_ALL && module_provides(m->stars[i].source, name, depth + 1))
+            return true;
+    return false;
+}
+
+/* V8's link-time SyntaxError for a name a module imports or re-exports that its source does not
+ * provide, checked once the graph is instantiated (no module code has run). False with *ERROR. */
+static bool check_imports(JsContext *ctx, JsModule *m, JsValue *error) {
+    if (m->imports_checked)
+        return true;
+    m->imports_checked = true;
+    for (uint32_t i = 0; i < m->dep_count; i++)
+        if (m->deps[i] && !check_imports(ctx, m->deps[i], error))
+            return false;
+    for (uint32_t i = 0; i < m->import_count + m->star_count; i++) {
+        JsString *spec, *name;
+        JsModule *src;
+        if (i < m->import_count) {
+            JsModuleImport *imp = &m->imports[i];
+            if (!imp->requested || imp->kind == JS_IMPORT_META)
+                continue;
+            spec = imp->specifier;
+            name = imp->requested;
+            src = dep_for_spec(m, spec);
+        } else {
+            JsStarExport *re = &m->stars[i - m->import_count];
+            if (re->kind != JS_REEXP_NAMED)
+                continue;
+            spec = re->specifier;
+            name = re->imported;
+            src = re->source;
+        }
+        if (!src || module_provides(src, name, 0))
+            continue;
+        JsString *shown = js_string_cell_new(ctx->vm, spec->units, spec_len(spec));
+        *error = shown ? js_error_fmt(ctx, "SyntaxError: The requested module '%S' does not provide an export named '%S'",
+                                      shown, name)
+                       : js_oom_value(ctx->vm);
+        return false;
+    }
+    return true;
+}
+
 /* graph fetched: run the synchronous instantiate/link, then evaluation */
 static void root_fetched(JsContext *ctx, JsValue bound, const JsValue *args, int argc, bool entry) {
     JsPromise *done = js_value_promise(bound);
@@ -1060,7 +1222,7 @@ static void root_fetched(JsContext *ctx, JsValue bound, const JsValue *args, int
     }
     JsValue ierr = js_undefined();
     js_gc_protect(ctx->vm, &ierr);
-    bool envs = init_environments(ctx, inst, &ierr);
+    bool envs = init_environments(ctx, inst, &ierr) && check_imports(ctx, inst, &ierr);
     if (!envs)
         js_promise_reject(ctx, done, ierr);
     js_gc_unprotect(ctx->vm, &ierr);
@@ -1147,6 +1309,83 @@ JsValue js_eval_entry(JsContext *ctx, const uint16_t *specifier, size_t spec_len
     return eval_root(ctx, specifier, spec_len, true);
 }
 
+/* import()'s options: the `with` attributes, appended to SPEC as the compiler appends a static
+ * import's ("\0key\0value", by key; only `type`, the one V8 hands its host). The new request in
+ * *OUT; false with the TypeError V8 gives in *ERR. SPEC and OPTS are rooted by the caller. */
+static bool request_with_options(JsContext *ctx, JsString *spec, JsValue opts, JsString **out, JsValue *err) {
+    *out = spec;
+    if (js_is_undefined(opts))
+        return true;
+    if (!js_is_object(opts) && !js_is_function(opts) && !js_is_promise(opts)) {
+        *err = js_error_fmt(ctx, "TypeError: The second argument to import() must be an object");
+        return false;
+    }
+    static const uint16_t kwith[] = {'w', 'i', 't', 'h'}, ktype[] = {'t', 'y', 'p', 'e'};
+    JsValue key = js_atom(ctx->vm, kwith, 4), with = js_undefined(), type = js_undefined();
+    if (!js_is_string(key) || !js_get_property(ctx, opts, key, &with)) {
+        *err = js_is_undefined(ctx->pending_error) ? js_oom_value(ctx->vm) : js_take_error(ctx);
+        return false;
+    }
+    if (js_is_undefined(with))
+        return true;
+    if (!js_is_object(with) && !js_is_function(with) && !js_is_promise(with)) {
+        *err = js_error_fmt(ctx, "TypeError: The 'with' option must be an object");
+        return false;
+    }
+    js_gc_protect(ctx->vm, &with);
+    /* every attribute must be a string; the ones the host does not know are dropped, as V8 does */
+    JsValue names = js_undefined();
+    bool ok = true;
+    if (js_is_object(with)) {
+        JsObject *w = js_value_object(with);
+        for (uint32_t i = 0; ok && i < w->props.used; i++) {
+            JsString *k = w->props.entries[i].key;
+            if (!k || k == JS_MAP_TOMBSTONE || js_prop_hidden_at(w, i))
+                continue;
+            JsValue v;
+            ok = js_get_property(ctx, with, js_value_from_cell(&k->gc), &v);
+            if (ok && !js_is_string(v)) {
+                *err = js_error_fmt(ctx, "TypeError: Import attribute value must be a string");
+                js_gc_unprotect(ctx->vm, &with);
+                return false;
+            }
+            if (ok && k->length == 4 && !memcmp(k->units, ktype, sizeof ktype))
+                type = v;
+        }
+    }
+    (void)names;
+    js_gc_unprotect(ctx->vm, &with);
+    if (!ok) {
+        *err = js_is_undefined(ctx->pending_error) ? js_oom_value(ctx->vm) : js_take_error(ctx);
+        return false;
+    }
+    if (js_is_undefined(type))
+        return true;
+    JsString *ts = js_value_string(type);
+    size_t total = (size_t)spec->length + 6 + ts->length;
+    uint16_t *u = js_realloc_raw(ctx->vm, NULL, 0, total * sizeof *u);
+    if (!u) {
+        *err = js_oom_value(ctx->vm);
+        return false;
+    }
+    memcpy(u, spec->units, spec->length * sizeof *u);
+    u[spec->length] = 0;
+    memcpy(u + spec->length + 1, ktype, sizeof ktype);
+    u[spec->length + 5] = 0;
+    memcpy(u + spec->length + 6, ts->units, ts->length * sizeof *u);
+    JsValue typev = type;
+    js_gc_protect(ctx->vm, &typev);
+    JsValue a = js_atom(ctx->vm, u, total);
+    js_gc_unprotect(ctx->vm, &typev);
+    js_realloc_raw(ctx->vm, u, total * sizeof *u, 0);
+    if (!js_is_string(a)) {
+        *err = js_oom_value(ctx->vm);
+        return false;
+    }
+    *out = js_value_string(a);
+    return true;
+}
+
 JsValue js_module_dynamic_import(JsContext *ctx, JsModule *referrer, JsValue specv) {
     JsVm *vm = ctx->vm;
     JsPromise *done = js_promise_alloc(ctx);
@@ -1155,11 +1394,21 @@ JsValue js_module_dynamic_import(JsContext *ctx, JsModule *referrer, JsValue spe
     JsValue donev = js_value_from_cell(&done->gc);
     js_gc_protect(vm, &donev);
 
+    /* the compiler hands [specifier, options] */
+    JsValue optsv = js_undefined();
+    if (js_is_object(specv) && js_value_object(specv)->obj_kind == JS_OBJ_ARRAY &&
+        js_value_object(specv)->elem_count == 2) {
+        optsv = js_value_object(specv)->elems[1];
+        specv = js_value_object(specv)->elems[0];
+    }
+    js_gc_protect(vm, &optsv);
+
     /* ToString + intern the specifier */
     js_gc_protect(vm, &specv);
     JsString *ss = js_op_to_string(ctx, specv); /* its toString may run, and throw */
     js_gc_unprotect(vm, &specv);
     if (!ss) {
+        js_gc_unprotect(vm, &optsv);
         js_promise_reject(ctx, js_value_promise(donev), js_take_error(ctx));
         js_gc_unprotect(vm, &donev);
         return donev;
@@ -1168,9 +1417,22 @@ JsValue js_module_dynamic_import(JsContext *ctx, JsModule *referrer, JsValue spe
     {
         JsValue ssv = js_value_from_cell(&ss->gc);
         js_gc_protect(vm, &ssv);
+        JsValue oerr = js_undefined();
+        bool nul = spec_len(ss) < ss->length;
+        if (nul || !request_with_options(ctx, ss, optsv, &ss, &oerr)) {
+            if (nul)
+                oerr = js_error_fmt(ctx, "TypeError: A module specifier may not contain a NUL character");
+            js_gc_unprotect(vm, &ssv);
+            js_gc_unprotect(vm, &optsv);
+            js_promise_reject(ctx, js_value_promise(donev), oerr);
+            js_gc_unprotect(vm, &donev);
+            return donev;
+        }
+        ssv = js_value_from_cell(&ss->gc);
         spec = js_intern_cell(vm, ss);
         js_gc_unprotect(vm, &ssv);
     }
+    js_gc_unprotect(vm, &optsv);
     if (!spec) {
         js_promise_reject(ctx, js_value_promise(donev), ascii_value(ctx, "out of memory"));
         js_gc_unprotect(vm, &donev);

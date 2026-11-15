@@ -1052,6 +1052,74 @@ static void test_declaration_rules(void) {
     }
     mods_reset();
 
+    /* import attributes: type json makes a JSON module (its default export the parsed text); the
+     * same specifier imported as JS is another module; other attributes are refused */
+    mod_add("data", "{\"a\": 1, \"b\": [true, null]}");
+    mod_add("both", "42");
+    eq_export("import d from 'data' with { type: 'json' }; import * as ns from 'data' with { 'type': \"json\" };"
+              "import j from 'both' with { type: 'json' }; import * as js from 'both';"
+              "export const out = [JSON.stringify(d), Object.keys(ns).join(), ns.default === d, j,"
+              "  Object.keys(js).length, Object.isSealed(ns)].join(' ');",
+              "out", "{\"a\":1,\"b\":[true,null]} default true 42 0 true");
+    mods_reset();
+    {
+        const char *cases[][2] = {
+            {"import d from 'data' with { type: 'css' }; export const x = 1;",
+             "TypeError: Import attribute \"type\" with value \"css\" is not supported"},
+            {"import d from 'data' with { foo: 'x' }; export const x = 1;",
+             "TypeError: Import attribute \"foo\" with value \"x\" is not supported"},
+            {"import d from 'data' with { type: 'json', type: 'json' }; export const x = 1;",
+             "SyntaxError: Import attribute has duplicate key 'type'"},
+            {"import d from 'bad' with { type: 'json' }; export const x = 1;", "SyntaxError: "},
+            {"import { a } from 'data' with { type: 'json' }; export const x = 1;",
+             "SyntaxError: The requested module 'data' does not provide an export named 'a'"},
+            {"import { nope } from 'lib'; export const x = 1;",
+             "SyntaxError: The requested module 'lib' does not provide an export named 'nope'"},
+            {"export { nope } from 'lib'; export const x = 1;",
+             "SyntaxError: The requested module 'lib' does not provide an export named 'nope'"},
+            {"import { default as d } from 'lib'; export const x = 1;",
+             "SyntaxError: The requested module 'lib' does not provide an export named 'default'"},
+            {"import d from 'data' assert { type: 'json' }; export const x = 1;",
+             "SyntaxError: Unexpected identifier 'assert'"},
+        };
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            mod_add("data", "{\"a\": 1}");
+            mod_add("bad", "{a: 1}");
+            mod_add("lib", "export function f() {} export const c = 1; export * from 'lib2';");
+            mod_add("lib2", "export default 1; export let z = 2;");
+            mod_add("main", cases[i][0]);
+            bool ok;
+            char *msg = eval_export_spec("main", "x", &ok);
+            check(!ok && strstr(msg, cases[i][1]) != NULL, cases[i][0]);
+            if (ok || !strstr(msg, cases[i][1]))
+                fprintf(stderr, "  got: %s\n", msg);
+            free(msg);
+            mods_reset();
+        }
+    }
+
+    /* import() with options: { with: { type: 'json' } } makes a JSON module; V8's TypeErrors */
+    mod_add("data", "{\"a\": [1, 2]}");
+    mod_add("lib", "export const v = 7;");
+    eq_export("const show = (p) => p.then((m) => JSON.stringify(m.default ?? m.v), (e) => e.constructor.name + ': ' + e.message);"
+              "export const out = (await Promise.all([show(import('data', { with: { type: 'json' } })),"
+              "  show(import('data', 1)), show(import('data', { with: 1 })), show(import('data', { with: { type: 1 } })),"
+              "  show(import('lib', {})), show(import('lib', undefined)), show(import('lib', null)),"
+              "  show(import('data', { with: { type: 'json', foo: 'x' } })), show(import('data', { with: { type: 'css' } })),"
+              "  show(import('a\\0b'))])).join(' | ');",
+              "out", "{\"a\":[1,2]} | TypeError: The second argument to import() must be an object | "
+                     "TypeError: The 'with' option must be an object | TypeError: Import attribute value must be a string | "
+                     "7 | 7 | TypeError: The second argument to import() must be an object | {\"a\":[1,2]} | "
+                     "TypeError: Import attribute \"type\" with value \"css\" is not supported | "
+                     "TypeError: A module specifier may not contain a NUL character");
+    mods_reset();
+
+    /* names provided through functions, let/const, `export *` (not its default), and a cycle */
+    mod_add("lib", "export function f() { return 'f'; } export const c = 1; export * from 'lib2';");
+    mod_add("lib2", "export default 1; export let z = 2; export * from 'lib';");
+    eq_export("import { f, c, z } from 'lib'; export const out = [f(), c, z].join();", "out", "f,1,2");
+    mods_reset();
+
     /* import.meta: one object per module, no prototype, its url the module's specifier */
     eq_export("function f() { return import.meta; } const g = () => import.meta;"
               "export const out = [import.meta.url, f() === import.meta, g() === import.meta,"
