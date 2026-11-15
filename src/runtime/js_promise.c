@@ -11,6 +11,7 @@
  * (js_gc_mark_jobs). Values held across an allocation or a js_call are kept
  * reachable by one of those, or protected explicitly.
  */
+#include "js_weak.h"
 #include "js_bytecode.h"
 #include "js_error.h"
 #include "lamassu_internal.h"
@@ -340,6 +341,7 @@ void js_run_jobs(JsContext *ctx) {
      * interpreter and throw on its first instruction, but a chain that
      * re-queues itself would still spin here allocating a fiber per turn.
      * Anything left queued stays queued, and js_has_pending_jobs reports it. */
+again:
     while (vm->jobs_head && !vm->interrupt) {
         JsJob *job = vm->jobs_head;
         vm->jobs_head = job->next;
@@ -357,6 +359,14 @@ void js_run_jobs(JsContext *ctx) {
             run_then_job(ctx, job);
         vm->running_job = job->next;
         job_recycle(vm, job);
+    }
+    if (!vm->running_job && !vm->interrupt) {
+        /* the queue is empty: the job is over. WeakRef targets kept for it may go now
+         * (ClearKeptObjects), and FinalizationRegistry callbacks run, as a task of their own
+         * would in V8, then whatever jobs they queued. */
+        js_weak_clear_kept(ctx);
+        if (vm->weak_cleanup_pending && js_weak_run_cleanups(ctx))
+            goto again;
     }
     /* Only at quiescence: trimming mid-drain would free nodes the very next
      * reaction wants back. */

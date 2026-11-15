@@ -23,6 +23,7 @@
 #include "lamassu_internal.h"
 #include "js_date.h"
 #include "js_mapobj.h"
+#include "js_weak.h"
 #include "js_setobj.h"
 #include "js_iter.h"
 #ifdef LAMASSU_HAS_REGEX
@@ -4612,6 +4613,12 @@ static const char *inherited_tag(const JsContext *ctx, JsValue p) {
            : o == ctx->promise_methods    ? "Promise"
            : o == ctx->math_obj           ? "Math"
            : o == ctx->json_obj           ? "JSON"
+           : o == ctx->map_proto          ? "Map"
+           : o == ctx->set_proto          ? "Set"
+           : o == ctx->weakmap_proto      ? "WeakMap"
+           : o == ctx->weakset_proto      ? "WeakSet"
+           : o == ctx->weakref_proto      ? "WeakRef"
+           : o == ctx->finreg_proto       ? "FinalizationRegistry"
            : o == ctx->iter_protos[JS_ITER_PROTO_MAP]    ? "Map Iterator"
            : o == ctx->iter_protos[JS_ITER_PROTO_SET]    ? "Set Iterator"
            : o == ctx->iter_protos[JS_ITER_PROTO_REGEXP] ? "RegExp String Iterator"
@@ -4655,6 +4662,10 @@ const char *js_to_string_tag(const JsContext *ctx, JsValue v) {
     case JS_OBJ_DATE: return "Date";
     case JS_OBJ_MAP: return "Map";
     case JS_OBJ_SET: return "Set";
+    case JS_OBJ_WEAKMAP: return "WeakMap";
+    case JS_OBJ_WEAKSET: return "WeakSet";
+    case JS_OBJ_WEAKREF: return "WeakRef";
+    case JS_OBJ_FINREG: return "FinalizationRegistry";
 #ifdef LAMASSU_HAS_REGEX
     case JS_OBJ_REGEXP: return "RegExp";
 #endif
@@ -6176,6 +6187,8 @@ bool js_builtins_init(JsContext *ctx) {
         return false;
 
     /* Set global + real Set.prototype (js_setobj.c) */
+    if (!js_weak_builtins_init(ctx))
+        return false;
     if (!js_setobj_builtins_init(ctx))
         return false;
 

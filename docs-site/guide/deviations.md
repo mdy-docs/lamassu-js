@@ -11,7 +11,6 @@ prototype in both engines (2026-11-15).
 
 **Not yet implemented** (nothing stands in the way; each is queued):
 
-- `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`.
 - `String.prototype.normalize` (needs the Unicode normalization tables).
 - `Array.fromAsync`.
 - `RegExp.prototype.compile` and the legacy `RegExp.$1`–`$9`, `lastMatch`, `input` (and the
@@ -63,8 +62,9 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   are no accessors). `toString` gives V8's tags
   (`Object.prototype.toString.call(x)` is `[object Array]`, `[object Error]`,
   `[object Null]`, `[object Math]`, `[object AsyncFunction]`, …), and what
-  inherits from `Math`, `JSON`, `Promise.prototype` or `AsyncFunction.prototype`
-  reports that tag, as V8's own `Symbol.toStringTag` makes it; there is no
+  inherits from `Math`, `JSON`, `Promise.prototype`, `AsyncFunction.prototype`, `Map.prototype`,
+  `Set.prototype` or the weak collections' prototypes reports that tag, as V8's own
+  `Symbol.toStringTag` makes it; there is no
   symbol to set another (there are no symbols). `Array.prototype` is a plain object here, not an
   array, so its tag is `[object Object]` (V8: `[object Array]`).
 - **`Object(primitiveValue)` returns the primitive unchanged** rather than
@@ -86,6 +86,12 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   **regexp's `lastIndex`** be made read-only (outside `freeze`). An error's **`stack`** is a data
   property here where V8 has an accessor; it reads, writes and redefines as V8's does, but its
   descriptor has `value`/`writable` rather than `get`/`set`.
+- **`FinalizationRegistry` callbacks run when the job queue empties.** The collector notes the
+  dead targets; their callbacks run from `js_run_jobs` once the microtask queue is empty (and any
+  jobs they queue run in the same drain), where V8 runs them as a task of their own. A callback
+  that throws is ignored and the others still run (V8 reports the error to the host). A host that
+  never drains the queue never sees them. When anything is collected is the collector's business,
+  in lamassu as in V8: a weak reference only says it *may* be.
   Enumerability is per property, though: what V8 makes non-enumerable (a builtin
   prototype's methods, a function's `prototype.constructor`, an error's `message`)
   is left out of `Object.keys`, JSON, spread and `Object.assign` here too, and
@@ -180,10 +186,10 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   disallowed as a lexically bound name` and `Invalid or unexpected token`); an
   operand with no readable name shows its value (`undefined is not a function` for `(void 0)()`
   and `#<Object> is not iterable` for `[...{}]`, where V8 prints the expression,
-  `{(intermediate value)}` for an object literal); an object named in a message is `#<Object>`
-  whatever its kind (V8 says `#<Map>`, `[object Date]`), except an array, a module namespace, an
-  iterator (`[object Map Iterator]`) and what inherits from `Iterator.prototype`
-  (`[object Object]`), as V8 names them; and a duplicate label is not an error.
+  `{(intermediate value)}` for an object literal); an object named in a message is named
+  by its constructor, as V8 names it (`#<Object>`, `#<Set>`, `#<Foo>`; `[object Object]` with no
+  prototype), and so are an array, a module namespace, an iterator (`[object Map Iterator]`) and
+  what inherits from `Iterator.prototype` (`[object Object]`); and a duplicate label is not an error.
 - **Out-of-memory errors may still be bare strings**: when the engine
   cannot allocate an Error object, it throws the message text instead so
   the failure is never lost.

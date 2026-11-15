@@ -269,6 +269,8 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->error_ctor = NULL;
     ctx->builtins_ready = false;
     ctx->math_obj = ctx->json_obj = NULL;
+    ctx->weakmap_proto = ctx->weakset_proto = ctx->weakref_proto = ctx->finreg_proto = NULL;
+    ctx->weak_kept = NULL;
     ctx->error_trace_count = 0;
     ctx->error_trace_value = js_undefined();
     ctx->pending_error = js_undefined();

@@ -104,6 +104,10 @@ typedef enum JsObjKind {
     JS_OBJ_ERROR = 6,  /* plain JsObject shape; see js_error.h */
     JS_OBJ_HOST = 7,   /* JsHostObject: an ordinary object owning a host pointer (lamassu.h) */
     JS_OBJ_ITER = 8,   /* JsIterObj (js_iter.h): a Map, Set or RegExp String Iterator */
+    JS_OBJ_WEAKMAP = 9, /* JsWeakObj (js_weak.h) */
+    JS_OBJ_WEAKSET = 10,
+    JS_OBJ_WEAKREF = 11,
+    JS_OBJ_FINREG = 12, /* a FinalizationRegistry */
 } JsObjKind;
 
 /* JsObject.obj_flags: extensibility, and whole-object integrity. Freezing or sealing sets a flag
@@ -688,6 +692,8 @@ struct JsContext {
     JsNative *error_ctor;     /* `Error`, for Error.stackTraceLimit; GC root */
     bool builtins_ready;      /* natives made from here on are the host's, not builtins */
     JsObject *math_obj, *json_obj; /* Math and JSON, whose toString tags are theirs; GC roots */
+    JsObject *weakmap_proto, *weakset_proto, *weakref_proto, *finreg_proto; /* GC roots */
+    JsObject *weak_kept; /* WeakRef targets kept alive to the end of the job (an array); GC root */
     /* What the last failed conversion threw (js_op_to_string and friends), until js_take_error
      * hands it on; undefined otherwise. GC root. */
     JsValue pending_error;
@@ -737,6 +743,8 @@ struct JsVm {
     /* Map and Set iterators not yet done, held weakly: a delete or clear moves their positions
      * (js_iter.h), and the collector drops the unmarked ones before it sweeps */
     struct JsIterObj *live_iters;
+    struct JsWeakObj *weak_list; /* every WeakMap, WeakSet, WeakRef, FinalizationRegistry (js_weak.h) */
+    bool weak_cleanup_pending;   /* a registry has held values waiting for its callback */
 
     JsAtomTable atoms;
     JsContext *contexts;

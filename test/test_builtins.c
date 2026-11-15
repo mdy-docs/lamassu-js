@@ -1370,6 +1370,125 @@ static void test_iterator_helpers(void) {
        "destr throw [\"d\",[\"ret\"]]\nMap() TypeError: Constructor Map requires 'new'\nSet() TypeError: Constructor Set requires 'new'");
 }
 
+
+/* Runs the modules STEPS in one VM, in turn, collecting and draining the job queue between them
+ * (where a host's event loop would let the collector run and FinalizationRegistry callbacks with
+ * it); returns the last one's result. */
+static char *run_steps(const char *const *steps, int n, bool stress) {
+    CountAlloc ca = {0, 0};
+    JsVmConfig cfg = {.realloc_fn = count_realloc, .alloc_ud = &ca, .gc_stress = stress};
+    JsVm *vm = js_vm_new(&cfg);
+    JsContext *ctx = js_context_new(vm);
+    char *out = NULL;
+    for (int i = 0; i < n; i++) {
+        size_t units = 0;
+        uint16_t *u = utf8_to_utf16(steps[i], strlen(steps[i]), &units);
+        const char *em;
+        uint32_t ep;
+        JsValue fn = js_compile_module(ctx, u, units, &em, &ep);
+        free(u);
+        if (!js_is_function(fn)) {
+            free(out);
+            out = strdup(em ? em : "compile error");
+            break;
+        }
+        js_gc_protect(vm, &fn);
+        JsValue p = js_run_module(ctx, fn);
+        js_gc_protect(vm, &p);
+        js_gc_collect(vm);
+        js_run_jobs(ctx);
+        JsValue res = js_promise_result(p);
+        js_gc_protect(vm, &res);
+        JsValue s = js_to_string(ctx, res);
+        size_t sl;
+        const uint16_t *su = js_string_units(s, &sl);
+        free(out);
+        out = su ? utf16_to_utf8(su, sl) : strdup("");
+        js_gc_unprotect(vm, &res);
+        js_gc_unprotect(vm, &p);
+        js_gc_unprotect(vm, &fn);
+    }
+    js_vm_free(vm);
+    if (ca.net_bytes != 0 || ca.live_allocs != 0) {
+        checks_failed++;
+        fprintf(stderr, "FAIL leak: %s (net=%ld allocs=%ld)\n", steps[0], ca.net_bytes, ca.live_allocs);
+    }
+    return out;
+}
+
+static void steps_eq(const char *const *steps, int n, const char *expected) {
+    for (int stress = 0; stress < 2; stress++) {
+        char *out = run_steps(steps, n, stress);
+        checks_run++;
+        if (!out || strcmp(out, expected) != 0) {
+            checks_failed++;
+            fprintf(stderr, "FAIL%s %s\n  expected: %s\n  actual:   %s\n", stress ? " (stress)" : "",
+                    steps[0], expected, out ? out : "(null)");
+        }
+        free(out);
+    }
+}
+
+/* What the collector does to WeakMap, WeakSet, WeakRef and FinalizationRegistry */
+static void test_weak(void) {
+    /* unreachable keys go, with their values; a reachable key keeps its value; dead targets'
+     * held values reach the callback, after the job */
+    const char *basic[] = {
+        "globalThis.log = []; globalThis.reg = new FinalizationRegistry(h => log.push(h));"
+        "(() => { const o = {}; reg.register(o, 'o'); globalThis.ref = new WeakRef(o);"
+        "  const k = {}; globalThis.keep = k; reg.register(k, 'k');"
+        "  globalThis.wm = new WeakMap([[o, { v: 1 }], [k, { v: 2 }]]);"
+        "  globalThis.vref = new WeakRef(wm.get(o)); globalThis.kref = new WeakRef(wm.get(k));"
+        "  globalThis.ws = new WeakSet([o, k]); })();"
+        "[ref.deref() !== undefined, log.length].join();",
+        "[ref.deref(), vref.deref(), kref.deref() === wm.get(keep), wm.get(keep).v, ws.has(keep),"
+        " log.join()].join();",
+    };
+    steps_eq(basic, 2, ",,true,2,true,o");
+    /* within one job a WeakRef's target stays (KeepDuringJob), even collecting at every step */
+    const char *kept[] = {"const r = new WeakRef({ a: 1 }); let s = 0; for (let i = 0; i < 50; i++) s += [i].length;"
+                          "r.deref().a + s;"};
+    steps_eq(kept, 1, "51");
+    /* an ephemeron: a value that refers to its own key does not keep it */
+    const char *cycle[] = {
+        "globalThis.wm = new WeakMap(); (() => { const o = {}; wm.set(o, { o }); globalThis.r = new WeakRef(o);"
+        "  const p = {}; const q = {}; wm.set(p, q); wm.set(q, p); globalThis.rp = new WeakRef(p); })(); 0;",
+        "[r.deref(), rp.deref()].join();",
+    };
+    steps_eq(cycle, 2, ",");
+    /* a chain through two maps lives as long as its first key does */
+    const char *chain[] = {
+        "const a = new WeakMap(), b = new WeakMap(); globalThis.k1 = {}; const k2 = {}; a.set(k1, k2);"
+        "b.set(k2, { deep: 7 }); globalThis.a = a; globalThis.b = b; 0;",
+        "b.get(a.get(k1)).deep;",
+    };
+    steps_eq(chain, 2, "7");
+    /* unregister: no callback; a callback that throws does not stop the others; one that queues a
+     * job has it run in the same drain */
+    const char *unreg[] = {
+        "globalThis.log = []; globalThis.tok = {};"
+        "globalThis.reg = new FinalizationRegistry(h => { log.push(h); if (h === 'boom') throw new Error('x');"
+        "  Promise.resolve().then(() => log.push('then ' + h)); });"
+        "(() => { reg.register({}, 'gone', tok); reg.register({}, 'boom'); reg.register({}, 'b'); })();"
+        "reg.unregister(tok);",
+        "log.slice().sort().join();",
+    };
+    steps_eq(unreg, 2, "b,boom,then b");
+    /* a token held only by the registry is weak: it goes, and unregistering is no longer possible */
+    const char *tokens[] = {
+        "globalThis.log = []; globalThis.keep = {}; globalThis.reg = new FinalizationRegistry(h => log.push(h));"
+        "(() => { reg.register(keep, 'kept', {}); })(); 0;",
+        "[reg.unregister({}), log.length].join();",
+    };
+    steps_eq(tokens, 2, "false,0");
+    /* the surface (constructors, methods, errors, lengths, tags), and naming a receiver by its
+     * constructor; expected values from Node */
+    eq_s("\"use strict\"; const out = []; const t = (s, f) => { let v; try { v = s + ' => ' + JSON.stringify(f()); } catch (e) { v = s + ' => ' + e.constructor.name + ': ' + e.message; } out.push(v); }; for (const C of [WeakMap, WeakSet, WeakRef, FinalizationRegistry]) t(C.name, () => [C.length, Object.getOwnPropertyNames(C.prototype).join(), Object.prototype.toString.call(C.prototype), typeof C]); t('wm key', () => new WeakMap().set(1, 2)); t('ws val', () => new WeakSet().add(1)); t('wr target', () => new WeakRef(1)); t('fr cb', () => new FinalizationRegistry(1)); t('fr target', () => new FinalizationRegistry(() => {}).register(1)); t('fr same', () => { const o = {}; new FinalizationRegistry(() => {}).register(o, o); }); t('fr token', () => new FinalizationRegistry(() => {}).register({}, 1, 2)); t('fr unreg bad', () => new FinalizationRegistry(() => {}).unregister(1)); t('no new', () => WeakMap()); t('no new ref', () => WeakRef({})); t('ctor iter', () => new WeakMap([[1, 2]])); t('ctor entry', () => new WeakMap([1])); t('misses', () => [new WeakMap().get(1), new WeakMap().has(1), new WeakMap().delete(1), new WeakSet().has(1), new WeakSet().delete(1)]); t('wm ops', () => { const k = {}; const m = new WeakMap([[k, 1]]); return [m.get(k), m.has(k), m.delete(k), m.has(k), m.set(k, 2) === m, m.get(k)]; }); t('ws ops', () => { const k = {}; const s = new WeakSet([k]); return [s.has(k), s.add(k) === s, s.delete(k), s.has(k)]; }); t('wr deref', () => { const k = {}; const r = new WeakRef(k); return r.deref() === k; }); t('recv', () => WeakMap.prototype.get.call({}, {})); t('recv ws', () => WeakMap.prototype.get.call(new WeakSet(), {})); t('recv ref', () => WeakRef.prototype.deref.call({})); t('recv fr', () => FinalizationRegistry.prototype.register.call({}, {})); t('unreg', () => { const r = new FinalizationRegistry(() => {}); const tok = {}; r.register({}, 1, tok); r.register({}, 2, tok); return [r.unregister(tok), r.unregister(tok), r.register({}, 1)]; }); t('goi', () => { const m = new WeakMap(); const k = {}; return [m.getOrInsert(k, 1), m.getOrInsert(k, 2), m.getOrInsertComputed({}, (x) => typeof x)]; }); t('goic bad', () => new WeakMap().getOrInsertComputed({}, 1)); t('goic badkey', () => new WeakMap().getOrInsertComputed(1, () => 1)); t('tags', () => [String(new WeakMap()), Object.prototype.toString.call(new WeakRef({})), Object.prototype.toString.call(new FinalizationRegistry(() => {}))]); t('fn keys', () => { const m = new WeakMap(); const f = function () {}; const p = Promise.resolve(); m.set(f, 1); m.set(p, 2); return [m.get(f), m.get(p)]; }); t('many', () => { const m = new WeakMap(); const ks = []; for (let i = 0; i < 1000; i++) { const k = {i}; ks.push(k); m.set(k, i); } for (let i = 0; i < 1000; i += 2) m.delete(ks[i]); let s = 0; for (const k of ks) s += m.has(k) ? m.get(k) : 0; return s; }); t('lengths', () => [WeakMap.prototype.set.length, WeakMap.prototype.getOrInsertComputed.length, FinalizationRegistry.prototype.register.length, FinalizationRegistry.prototype.unregister.length, WeakRef.prototype.deref.length, WeakSet.prototype.add.length]); t('instanceof', () => [new WeakMap() instanceof WeakMap, Object.getPrototypeOf(new WeakRef({})) === WeakRef.prototype, WeakMap.prototype.constructor === WeakMap]); t('expando', () => { const m = new WeakMap(); m.x = 1; return [m.x, Object.keys(m)]; }); t('json', () => JSON.stringify([new WeakMap(), new WeakSet()])); out.join(\"\\n\");",
+       "WeakMap => [0,\"constructor,delete,get,set,has,getOrInsert,getOrInsertComputed\",\"[object WeakMap]\",\"function\"]\nWeakSet => [0,\"constructor,delete,has,add\",\"[object WeakSet]\",\"function\"]\nWeakRef => [1,\"constructor,deref\",\"[object WeakRef]\",\"function\"]\nFinalizationRegistry => [1,\"constructor,register,unregister\",\"[object FinalizationRegistry]\",\"function\"]\nwm key => TypeError: Invalid value used as weak map key\nws val => TypeError: Invalid value used in weak set\nwr target => TypeError: WeakRef: invalid target\nfr cb => TypeError: FinalizationRegistry: cleanup must be callable\nfr target => TypeError: FinalizationRegistry.prototype.register: invalid target\nfr same => TypeError: FinalizationRegistry.prototype.register: target and holdings must not be same\nfr token => TypeError: Invalid unregisterToken ('2')\nfr unreg bad => TypeError: Invalid unregisterToken ('1')\nno new => TypeError: Constructor WeakMap requires 'new'\nno new ref => TypeError: Constructor WeakRef requires 'new'\nctor iter => TypeError: Invalid value used as weak map key\nctor entry => TypeError: Iterator value 1 is not an entry object\nmisses => [null,false,false,false,false]\nwm ops => [1,true,true,false,true,2]\nws ops => [true,true,true,false]\nwr deref => true\nrecv => TypeError: Method WeakMap.prototype.get called on incompatible receiver #<Object>\nrecv ws => TypeError: Method WeakMap.prototype.get called on incompatible receiver #<WeakSet>\nrecv ref => TypeError: Method WeakRef.prototype.deref called on incompatible receiver #<Object>\nrecv fr => TypeError: Method FinalizationRegistry.prototype.register called on incompatible receiver #<Object>\nunreg => [true,false,null]\ngoi => [1,1,\"object\"]\ngoic bad => TypeError: WeakMap.prototype.getOrInsertComputed is not a function\ngoic badkey => TypeError: Invalid value used as weak map key\ntags => [\"[object WeakMap]\",\"[object WeakRef]\",\"[object FinalizationRegistry]\"]\nfn keys => [1,2]\nmany => 250000\nlengths => [2,2,2,1,0,1]\ninstanceof => [true,true,true]\nexpando => [1,[\"x\"]]\njson => \"[{},{}]\"");
+    eq_s("\"use strict\"; const out = []; const t = (s, f) => { let v; try { v = s + ' => ' + JSON.stringify(f()); } catch (e) { v = s + ' => ' + e.constructor.name + ': ' + e.message; } out.push(v); }; t('recv set', () => Map.prototype.get.call(new Set(), 1)); t('tags', () => [Object.prototype.toString.call(Map.prototype), Object.prototype.toString.call(Object.create(Set.prototype)), Object.prototype.toString.call(Object.create(WeakMap.prototype))]); t('ctor name', () => { function Foo() {} const f = new Foo(); Object.freeze(f); f.x = 1; }); t('null proto', () => { const o = Object.freeze(Object.create(null)); o.x = 1; }); t('math', () => { delete Math.PI; }); out.join(\"\\n\");",
+       "recv set => TypeError: Method Map.prototype.get called on incompatible receiver #<Set>\ntags => [\"[object Map]\",\"[object Set]\",\"[object WeakMap]\"]\nctor name => TypeError: Cannot add property x, object is not extensible\nnull proto => TypeError: Cannot add property x, object is not extensible\nmath => TypeError: Cannot delete property 'PI' of #<Object>");
+}
+
 /* Object.defineProperty, defineProperties, getOwnPropertyDescriptor(s), preventExtensions,
  * isExtensible, isFrozen/isSealed property by property, read-only builtin constants and globals,
  * inherited read-only properties, Object.assign as [[Set]]. Expected values from Node. */
@@ -1435,6 +1554,7 @@ int main(void) {
     test_iterator_helpers();
     test_v8_methods();
     test_descriptors();
+    test_weak();
     test_stress();
     test_integration();
     if (checks_failed) {

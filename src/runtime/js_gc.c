@@ -4,6 +4,7 @@
 #include "js_mapobj.h"
 #include "js_setobj.h"
 #include "js_iter.h"
+#include "js_weak.h"
 #ifdef LAMASSU_HAS_REGEX
 #include "js_regexp.h"
 #endif
@@ -100,6 +101,8 @@ static void js_gc_trace(JsVm *vm) {
                 js_setobj_mark(vm, o);
             if (o->obj_kind == JS_OBJ_ITER)
                 js_iterobj_mark(vm, o);
+            if (o->obj_kind >= JS_OBJ_WEAKMAP && o->obj_kind <= JS_OBJ_FINREG)
+                js_weak_mark(vm, o);
             if (o->obj_kind == JS_OBJ_ERROR) {
                 JsErrorObject *e = (JsErrorObject *)o;
                 js_gc_mark_value(vm, e->stack);
@@ -236,6 +239,8 @@ void js_gc_free_cell(JsVm *vm, JsGcCell *c, bool remove_atoms) {
             size = js_setobj_release(vm, o);
         if (o->obj_kind == JS_OBJ_ITER)
             size = js_iterobj_release(vm, o);
+        if (o->obj_kind >= JS_OBJ_WEAKMAP && o->obj_kind <= JS_OBJ_FINREG)
+            size = js_weak_release(vm, o);
         if (o->obj_kind == JS_OBJ_HOST)
             size = js_host_object_release(vm, o);
         if (o->obj_kind == JS_OBJ_ERROR) {
@@ -372,6 +377,12 @@ void js_gc_collect(JsVm *vm) {
             js_gc_mark_cell(vm, &ctx->math_obj->gc);
         if (ctx->json_obj)
             js_gc_mark_cell(vm, &ctx->json_obj->gc);
+        JsObject *weak_protos[] = {ctx->weakmap_proto, ctx->weakset_proto, ctx->weakref_proto, ctx->finreg_proto};
+        for (int k = 0; k < 4; k++)
+            if (weak_protos[k])
+                js_gc_mark_cell(vm, &weak_protos[k]->gc);
+        if (ctx->weak_kept)
+            js_weak_mark_kept(vm, ctx->weak_kept);
         /* the natives running now: their receivers (the callee is on its caller's stack, or
          * held by the host) */
         for (const JsNativeAct *a = ctx->native_act; a; a = a->outer) {
@@ -383,6 +394,9 @@ void js_gc_collect(JsVm *vm) {
     }
     js_gc_mark_jobs(vm);
     js_gc_trace(vm);
+    /* a live weak map's value lives while its key does: mark, trace, until nothing changes */
+    while (!vm->mark_overflow && js_weak_ephemerons(vm))
+        js_gc_trace(vm);
 
     if (vm->mark_overflow) {
         for (JsGcCell *c = vm->cells; c; c = c->next)
@@ -394,6 +408,7 @@ void js_gc_collect(JsVm *vm) {
 
     /* the weak list of live collection iterators loses what is about to be swept */
     js_iter_prune(vm);
+    js_weak_prune(vm); /* and weak collections, refs and registries their dead entries */
 
     JsGcCell **link = &vm->cells;
     while (*link) {

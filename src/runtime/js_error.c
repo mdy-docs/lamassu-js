@@ -220,6 +220,8 @@ static void fb_function(JsContext *ctx, FmtBuf *b, JsValue v) {
         b->oom = true;
 }
 
+static const JsString *type_name_of(JsContext *ctx, JsValue recv, const char **fixed_out, bool frame);
+
 JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
     JsVm *vm = ctx->vm;
     /* First the arguments that need no allocation are copied out (text, strings), so the
@@ -312,8 +314,21 @@ JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
             } else if (inherits_iterator(ctx, v))
                 /* nor for what inherits Iterator.prototype (its constructor is an accessor) */
                 fb_ascii(b, "[object Object]", 15);
-            else
-                fb_ascii(b, "#<Object>", 9);
+            else {
+                /* #<Set>, #<F>: its constructor's name, as V8's GetConstructorName */
+                const char *fixed;
+                const JsString *n = type_name_of(ctx, v, &fixed, false);
+                if (!n && !fixed) {
+                    fb_ascii(b, "[object Object]", 15); /* no prototype */
+                } else {
+                    fb_ascii(b, "#<", 2);
+                    if (n)
+                        fb_piece(b, n->units, n->length);
+                    else
+                        fb_ascii(b, fixed, strlen(fixed));
+                    fb_ascii(b, ">", 1);
+                }
+            }
         } else if (js_is_promise(v)) {
             fb_ascii(b, "#<Promise>", 10);
         } else {
@@ -587,8 +602,11 @@ static JsObject *global_object(JsContext *ctx, const char *name) {
 /* V8's GetTypeName for a method call's receiver: a function's own name, else the receiver's
  * constructor's (a primitive's wrapper's; JSON and Math by their tags); NULL for an object with
  * no prototype. Allocates (the global lookups). */
-static const JsString *type_name(JsContext *ctx, JsValue recv, JsString **tmp) {
+/* The name V8 gives RECV's type (its constructor's name, as GetConstructorName): a name string the
+ * engine holds, or NULL with *FIXED a C string, or both NULL for none. Allocates nothing. */
+static const JsString *type_name_of(JsContext *ctx, JsValue recv, const char **fixed_out, bool frame) {
     const char *fixed = NULL;
+    *fixed_out = NULL;
     if (js_is_function(recv)) {
         const JsString *n = frame_function_name(recv);
         if (n)
@@ -608,9 +626,9 @@ static const JsString *type_name(JsContext *ctx, JsValue recv, JsString **tmp) {
             fixed = "Module";
         else if (o->obj_kind == JS_OBJ_ARRAY)
             fixed = "Array";
-        else if (o == global_object(ctx, "JSON"))
+        else if (frame && o == global_object(ctx, "JSON")) /* a stack frame's "JSON.parse" */
             fixed = "JSON";
-        else if (o == global_object(ctx, "Math"))
+        else if (frame && o == global_object(ctx, "Math"))
             fixed = "Math";
         else {
             JsValue cv;
@@ -627,8 +645,15 @@ static const JsString *type_name(JsContext *ctx, JsValue recv, JsString **tmp) {
                     : "Object";
         }
     }
-    if (!fixed)
-        return NULL;
+    *fixed_out = fixed;
+    return NULL;
+}
+
+static const JsString *type_name(JsContext *ctx, JsValue recv, JsString **tmp) {
+    const char *fixed;
+    const JsString *n = type_name_of(ctx, recv, &fixed, true);
+    if (n || !fixed)
+        return n;
     *tmp = js_ascii_cell(ctx->vm, fixed);
     return *tmp;
 }

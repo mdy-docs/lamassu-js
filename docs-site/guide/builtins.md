@@ -398,6 +398,25 @@ does).
   not, and `clear()` sends it back to the start of whatever is added next. A done iterator stays
   done.
 
+## `WeakMap` / `WeakSet` / `WeakRef` / `FinalizationRegistry`
+
+As in V8. Each needs `new`. A key, a target or an unregister token must be an object (a function
+or a promise counts): anything else is V8's `TypeError` (`Invalid value used as weak map key`,
+`Invalid value used in weak set`, `WeakRef: invalid target`, `Invalid unregisterToken ('1')`).
+
+- **`WeakMap.prototype`**: `get`, `set`, `has`, `delete`, `getOrInsert`, `getOrInsertComputed`;
+  `new WeakMap(iterable)` takes entries as `Map` does. A value lives while its key does and no
+  longer: a value that refers to its own key does not keep it (an ephemeron).
+- **`WeakSet.prototype`**: `add`, `has`, `delete`.
+- **`WeakRef.prototype.deref()`**: the target, or `undefined` once it has been collected. A target
+  stays alive to the end of the job that made the `WeakRef` or called `deref` (as V8's does), so
+  `deref()` twice in one job gives the same answer.
+- **`FinalizationRegistry(callback)`**: `register(target, held, token)` (`held` may not be the
+  target), `unregister(token)` (true when it removed any). After a target is collected,
+  `callback(held)` runs once the job queue is empty; see [Deviations](/guide/deviations).
+
+None is enumerable or has a size: there is no way to list what a weak collection holds.
+
 ## Iteration
 
 There is no `Symbol`, so what is iterable is the engine's own: strings (by code point), arrays,

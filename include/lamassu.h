@@ -432,7 +432,10 @@ JsValue js_promise_new(JsContext *ctx);          /* undefined on OOM */
 bool    js_resolve(JsContext *ctx, JsValue promise, JsValue value);
 bool    js_reject(JsContext *ctx, JsValue promise, JsValue reason);
 
-/* Runs queued microtasks (promise reactions, async resumptions) to quiescence. */
+/* Runs queued microtasks (promise reactions, async resumptions) to quiescence. Once the queue is
+ * empty it also ends the job for WeakRef (targets kept alive for it may be collected) and runs
+ * the FinalizationRegistry callbacks of targets the collector has found dead, then any jobs
+ * those queue. */
 void js_run_jobs(JsContext *ctx);
 bool js_has_pending_jobs(const JsContext *ctx);
 
