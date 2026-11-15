@@ -913,6 +913,8 @@ static bool coerce_regexp(JsContext *ctx, JsValue pv, const char *extra_flags,
 
 bool js_re_str_match(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                      JsValue *r) {
+    if (!js_str_this_check(ctx, tv, r))
+        return false;
     JsVm *vm = ctx->vm;
     JsString *s = js_op_to_string(ctx, tv);
     if (!s)
@@ -972,6 +974,8 @@ bool js_re_str_match(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
  * alone. Its matches are exec's results. */
 bool js_re_str_matchAll(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                         JsValue *r) {
+    if (!js_str_this_check(ctx, tv, r))
+        return false;
     JsVm *vm = ctx->vm;
     if (js_regexp_is(ARG(0)) && !((JsRegExp *)js_value_object(args[0]))->global)
         return re_throw(ctx, r, "TypeError: String.prototype.matchAll called with a non-global RegExp argument");
@@ -1018,6 +1022,8 @@ int js_re_iter_step(JsContext *ctx, JsValue rev, JsValue sv, uint32_t *pos, JsVa
 
 bool js_re_str_search(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                       JsValue *r) {
+    if (!js_str_this_check(ctx, tv, r))
+        return false;
     JsVm *vm = ctx->vm;
     JsString *s = js_op_to_string(ctx, tv);
     if (!s)
@@ -1398,6 +1404,75 @@ static bool def_method(JsContext *ctx, JsObject *table, const char *name,
     return js_is_function(nf) && js_object_set_ascii(ctx, table, name, nf);
 }
 
+/* RegExp.escape(s) (ES2025 22.2.5.1): S with every character a pattern could read as syntax
+ * escaped, and a leading digit or ASCII letter as \xHH */
+static bool re_escape_ws(uint32_t c) {
+    return c == 0x09 || c == 0x0B || c == 0x0C || c == 0x20 || c == 0xA0 || c == 0xFEFF ||
+           c == 0x1680 || (c >= 0x2000 && c <= 0x200A) || c == 0x202F || c == 0x205F || c == 0x3000 ||
+           c == 0x0A || c == 0x0D || c == 0x2028 || c == 0x2029;
+}
+
+static bool re_escape(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    JsValue v = argc > 0 ? args[0] : js_undefined();
+    if (!js_is_string(v)) {
+        *r = js_error_fmt(ctx, "TypeError: input argument must be a string");
+        return false;
+    }
+    const JsString *s = js_value_string(v);
+    uint16_t *buf = js_realloc_raw(ctx->vm, NULL, 0, (size_t)s->length * 12 + 1);
+    if (!buf && s->length)
+        return re_oom(ctx, r);
+    size_t n = 0;
+    static const char hex[] = "0123456789abcdef";
+    for (uint32_t i = 0; i < s->length; i++) {
+        uint32_t c = s->units[i];
+        bool lone = false;
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s->length && s->units[i + 1] >= 0xDC00 &&
+            s->units[i + 1] <= 0xDFFF) {
+            c = 0x10000 + ((c - 0xD800) << 10) + (s->units[i + 1] - 0xDC00);
+        } else if (c >= 0xD800 && c <= 0xDFFF) {
+            lone = true;
+        }
+        bool alnum = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        if (n == 0 && alnum) {
+            buf[n++] = '\\';
+            buf[n++] = 'x';
+            buf[n++] = (uint16_t)hex[c >> 4];
+            buf[n++] = (uint16_t)hex[c & 15];
+        } else if (c < 0x80 && strchr("^$\\.*+?()[]{}|/", (int)c) && c) {
+            buf[n++] = '\\';
+            buf[n++] = (uint16_t)c;
+        } else if (c >= 0x09 && c <= 0x0D) {
+            buf[n++] = '\\';
+            buf[n++] = (uint16_t)"tnvfr"[c - 0x09];
+        } else if ((c < 0x80 && c && strchr(",-=<>#&!%:;@~'`\"", (int)c)) || re_escape_ws(c) || lone) {
+            if (c <= 0xFF) {
+                buf[n++] = '\\';
+                buf[n++] = 'x';
+                buf[n++] = (uint16_t)hex[c >> 4];
+                buf[n++] = (uint16_t)hex[c & 15];
+            } else {
+                buf[n++] = '\\';
+                buf[n++] = 'u';
+                for (int sh = 12; sh >= 0; sh -= 4)
+                    buf[n++] = (uint16_t)hex[(c >> sh) & 15];
+            }
+        } else if (c > 0xFFFF) {
+            buf[n++] = s->units[i];
+            buf[n++] = s->units[++i];
+        } else {
+            buf[n++] = (uint16_t)c;
+        }
+    }
+    JsValue out = js_string_new(ctx->vm, buf, n);
+    js_realloc_raw(ctx->vm, buf, (size_t)s->length * 12 + 1, 0);
+    if (!js_is_string(out))
+        return re_oom(ctx, r);
+    *r = out;
+    return true;
+}
+
 bool js_regexp_builtins_init(JsContext *ctx) {
     /* RegExp.prototype: a real object, set before any regexp (literal or
      * constructed) exists — js_regexp_new reads ctx->regexp_proto — and
@@ -1416,7 +1491,11 @@ bool js_regexp_builtins_init(JsContext *ctx) {
         !js_object_set_ascii(ctx, ctx->globals, "RegExp", ctor))
         return false;
     js_native_builtin_ctor(ctor, ctx->regexp_proto);
-    return true;
+    JsValue st = js_object_new(ctx);
+    if (!js_is_object(st))
+        return false;
+    ((JsNative *)js_value_cell(ctor))->statics = js_value_object(st);
+    return def_method(ctx, js_value_object(st), "escape", re_escape);
 }
 
 #else /* !LAMASSU_HAS_REGEX: keep the translation unit non-empty */

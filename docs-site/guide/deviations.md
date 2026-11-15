@@ -4,12 +4,68 @@ lamassu-js aims to match Node closely enough for differential testing over
 the shared subset — not full spec conformance. This page tracks every place
 that's known to differ, so you're not surprised by one in production.
 
+## Built-ins V8 has that lamassu leaves out
+
+Checked against Node 26 by listing every own property of each global, constructor and
+prototype in both engines (2026-11-15).
+
+**Not yet implemented** (nothing stands in the way; each is queued):
+
+- `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`,
+  `getOwnPropertyDescriptors` for data properties (`value`, `writable`, `enumerable`,
+  `configurable`; accessor descriptors are out, below), and with them `Object.preventExtensions`
+  and `Object.isExtensible`: all need per-property `writable`/`configurable`, which integrity
+  (whole-object `freeze`/`seal`, below) does not have yet.
+- `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`.
+- `String.prototype.normalize` (needs the Unicode normalization tables).
+- `Array.fromAsync`.
+- `RegExp.prototype.compile` and the legacy `RegExp.$1`–`$9`, `lastMatch`, `input` (and the
+  rest) statics, V8's Annex B leftovers.
+- `BigInt` (a primitive type of its own, with `10n` literals; see the syntax below).
+
+**Left out by design:**
+
+- The locale methods (`localeCompare`, `toLocaleString` on numbers, dates and arrays,
+  `Object.prototype.toLocaleString`, `toLocaleDateString`, `toLocaleTimeString`,
+  `toLocaleUpperCase`, `toLocaleLowerCase`): V8 answers them from ICU through `Intl`, a non-goal.
+  `Object.prototype.toLocaleString` is left out with them: it would reach `toString` on a number
+  (`"1234.5"`) where V8 formats it (`"1,234.5"`), a silent difference.
+- Time zones: a `Date` is UTC (`getHours` is `getUTCHours`, `getTimezoneOffset` is `0`), as there
+  is no time zone database; V8 uses the host's zone.
+- `Object.getOwnPropertySymbols`, and everything else that takes or returns a symbol: there
+  are no symbols.
+- `__proto__`, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__`:
+  there are no accessors. For the same reason `size` (`Map`, `Set`) and `source`, `flags`,
+  `global` and the other flags (`RegExp`) are read from the instance rather than through an
+  accessor on the prototype, so they work as in V8 but
+  `Object.getOwnPropertyNames(Map.prototype)` does not list `size`.
+- `Function.prototype.constructor`, `arguments` and `caller`: see Functions, below.
+- `Error.prepareStackTrace`: see Errors, below.
+- `queueMicrotask` and `structuredClone` are the host's (HTML, Node), not V8's; an embedder adds
+  them as natives if it wants them.
+- `Reflect`, `Proxy`, `Symbol`, typed arrays, `ArrayBuffer`, `SharedArrayBuffer`,
+  `DataView`, `Atomics`, `Intl`: see [Supported syntax](/guide/language#explicit-non-goals).
+
+## Syntax V8 accepts that lamassu refuses
+
+Each is a compile error that names the feature (`SyntaxError: tagged templates are not
+supported`), never a silent difference.
+
+**Not yet implemented:** object rest in destructuring (`const { a, ...rest } = o`), tagged
+templates (`` tag`x${y}` ``), numeric separators (`1_000`), `new.target`, `debugger` (a no-op
+without a debugger attached), `import.meta`, import attributes (`with { type: "json" }`),
+unicode escapes in identifiers (`\u0061`), `delete a?.b`, and `BigInt` literals.
+
+**Left out by design** (see [Supported syntax](/guide/language#explicit-non-goals)): `var`,
+`for...in`, `with`, classes (and with them private names, `#x`), getters and setters in object
+literals, generators, sloppy mode, `eval` and the `Function` constructor.
+
 ## Objects
 
-- **`Object.prototype` only has three methods** — `hasOwnProperty`,
-  `toString`, `valueOf`. Real JS also has `isPrototypeOf`,
-  `propertyIsEnumerable`, `toLocaleString`, and the legacy `__proto__`
-  accessor; none of those are implemented. `toString` gives V8's tags
+- **`Object.prototype` has five methods** — `hasOwnProperty`, `isPrototypeOf`,
+  `propertyIsEnumerable`, `toString`, `valueOf`. V8 also has `toLocaleString` (left out with the
+  locale methods) and the legacy `__proto__`, `__defineGetter__` (and the rest) accessors (there
+  are no accessors). `toString` gives V8's tags
   (`Object.prototype.toString.call(x)` is `[object Array]`, `[object Error]`,
   `[object Null]`, `[object Math]`, `[object AsyncFunction]`, …), and what
   inherits from `Math`, `JSON`, `Promise.prototype` or `AsyncFunction.prototype`

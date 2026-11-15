@@ -217,6 +217,298 @@ static bool set_entries(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     return set_iterator(ctx, tv, r, JS_ITER_SET_ENTRIES);
 }
 
+/* ---- union, intersection, difference, symmetricDifference, isSubsetOf, isSupersetOf,
+ * isDisjointFrom (ES2025 24.2.4): the other set is anything with a numeric `size` and callable
+ * `has` and `keys` (a Set Record), read in that order ---- */
+
+static bool get_named(JsContext *ctx, JsValue o, const char *name, JsValue *out) {
+    JsString *k = js_ascii_cell(ctx->vm, name);
+    if (!k)
+        return (*out = js_oom_value(ctx->vm)), false;
+    if (!js_get_property(ctx, o, js_value_from_cell(&k->gc), out))
+        return (*out = js_take_error(ctx)), false;
+    return true;
+}
+
+typedef struct {
+    JsValue obj, has, keys; /* rooted by set_record_root */
+    double size;            /* an integer, or +Infinity */
+} SetRecord;
+
+static void set_record_root(JsVm *vm, SetRecord *rec, bool on) {
+    JsValue *vs[3] = {&rec->obj, &rec->has, &rec->keys};
+    for (int i = 0; i < 3; i++) {
+        if (on)
+            js_gc_protect(vm, vs[i]);
+        else
+            js_gc_unprotect(vm, vs[i]);
+    }
+}
+
+/* GetSetRecord(other); on success the record is rooted (set_record_root(.., false) releases it) */
+static bool get_set_record(JsContext *ctx, const char *method, JsValue other, SetRecord *rec, JsValue *r) {
+    if (!js_is_object(other) && !js_is_function(other) && !js_is_promise(other))
+        return (*r = js_error_fmt(ctx, "TypeError: Set.prototype.%s argument must be an object", method)), false;
+    rec->obj = other;
+    rec->has = rec->keys = js_undefined();
+    set_record_root(ctx->vm, rec, true);
+    JsValue raw;
+    double n;
+    bool ok = get_named(ctx, other, "size", &raw);
+    if (ok && !js_op_to_number(ctx, raw, &n))
+        { raw = js_take_error(ctx); ok = false; }
+    if (!ok) {
+        *r = raw;
+    } else if (n != n) {
+        *r = js_error_fmt(ctx, "TypeError: The .size property is NaN");
+        ok = false;
+    } else {
+        n = n == __builtin_inf() || n == -__builtin_inf() ? n : __builtin_trunc(n);
+        if (n < 0) {
+            *r = js_error_fmt(ctx, "RangeError: '%v' is an invalid size", js_number(n));
+            ok = false;
+        }
+        rec->size = n + 0.0;
+    }
+    if (ok && !get_named(ctx, other, "has", &rec->has))
+        { *r = rec->has; ok = false; }
+    if (ok && !js_is_function(rec->has))
+        { *r = js_error_fmt(ctx, "TypeError: string \"has\" is not a function"); ok = false; }
+    if (ok && !get_named(ctx, other, "keys", &rec->keys))
+        { *r = rec->keys; ok = false; }
+    if (ok && !js_is_function(rec->keys))
+        { *r = js_error_fmt(ctx, "TypeError: string \"keys\" is not a function"); ok = false; }
+    if (!ok)
+        set_record_root(ctx->vm, rec, false);
+    return ok;
+}
+
+/* GetIteratorFromMethod(other, keys) as a cursor over an Iterator Record; the caller roots
+ * cur->src */
+static bool set_record_keys(JsContext *ctx, SetRecord *rec, JsIterCursor *cur, JsValue *r) {
+    JsValue it, next;
+    if (!js_call(ctx, rec->keys, rec->obj, NULL, 0, &it))
+        return (*r = it), false;
+    if (!js_is_object(it) && !js_is_function(it) && !js_is_promise(it))
+        return (*r = js_error_fmt(ctx, "TypeError: Result of the keys method is not an object")), false;
+    js_gc_protect(ctx->vm, &it);
+    bool ok = get_named(ctx, it, "next", &next);
+    if (!ok)
+        *r = next;
+    else if (!js_is_function(next))
+        { *r = js_error_fmt(ctx, "TypeError: string \"next\" is not a function"); ok = false; }
+    if (ok) {
+        js_gc_protect(ctx->vm, &next);
+        cur->src = js_iterobj_new(ctx, JS_ITER_RECORD, it, next, 0);
+        cur->i = 0;
+        js_gc_unprotect(ctx->vm, &next);
+        if (js_is_undefined(cur->src))
+            { *r = js_oom_value(ctx->vm); ok = false; }
+    }
+    js_gc_unprotect(ctx->vm, &it);
+    return ok;
+}
+
+/* ToBoolean(Call(has, other, v)): 1 true, 0 false, -1 thrown (*r) */
+static int set_record_has(JsContext *ctx, SetRecord *rec, JsValue v, JsValue *r) {
+    JsValue res;
+    if (!js_call(ctx, rec->has, rec->obj, &v, 1, &res))
+        return (*r = res), -1;
+    return js_to_boolean(res) ? 1 : 0;
+}
+
+/* A copy of THIS's entries, as a new Set (rooted by the caller) */
+static bool set_copy(JsContext *ctx, JsSetObj *s, JsValue *out) {
+    if (!alloc_setobj(ctx, out))
+        return false;
+    JsSetObj *c = (JsSetObj *)js_value_object(*out);
+    for (uint32_t i = 0; i < s->count; i++)
+        if (!setobj_add(ctx->vm, c, s->items[i]))
+            return false;
+    return true;
+}
+
+typedef enum {
+    SETOP_UNION,
+    SETOP_INTERSECTION,
+    SETOP_DIFFERENCE,
+    SETOP_SYMDIFF,
+    SETOP_SUBSET,
+    SETOP_SUPERSET,
+    SETOP_DISJOINT,
+} SetOp;
+
+static const char *const setop_names[] = {"union", "intersection", "difference", "symmetricDifference",
+                                          "isSubsetOf", "isSupersetOf", "isDisjointFrom"};
+
+static bool set_op(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r, SetOp op) {
+    JsVm *vm = ctx->vm;
+    JsSetObj *s;
+    if (!this_set(ctx, tv, &s, r))
+        return false;
+    SetRecord rec;
+    if (!get_set_record(ctx, setop_names[op], ARG(0), &rec, r))
+        return false;
+    double this_size = s->count;
+    JsValue setv = tv, result = js_undefined(), v = js_undefined();
+    JsIterCursor cur = {js_undefined(), 0};
+    js_gc_protect(vm, &setv);
+    js_gc_protect(vm, &result);
+    js_gc_protect(vm, &v);
+    js_gc_protect(vm, &cur.src);
+    bool ok = true, answer = true, oom_hit = false;
+    /* the branch that walks THIS calls `has` per entry, live (what `has` adds is visited, what it
+     * deletes is not); the other walks the other set's keys */
+    bool walk_this = (op == SETOP_INTERSECTION || op == SETOP_DIFFERENCE || op == SETOP_DISJOINT)
+                         ? this_size <= rec.size
+                         : op == SETOP_SUBSET;
+    if (op == SETOP_SUBSET && this_size > rec.size) {
+        answer = false;
+        goto done;
+    }
+    if (op == SETOP_SUPERSET && this_size < rec.size) {
+        answer = false;
+        goto done;
+    }
+    if (op == SETOP_UNION || op == SETOP_DIFFERENCE || op == SETOP_SYMDIFF) {
+        if (!set_copy(ctx, s, &result)) {
+            oom_hit = true;
+            goto done;
+        }
+    } else if (op == SETOP_INTERSECTION) {
+        if (!alloc_setobj(ctx, &result)) {
+            oom_hit = true;
+            goto done;
+        }
+    }
+    if (walk_this && op == SETOP_DIFFERENCE) {
+        /* over the copy's entries as they were (only this loop changes the copy) */
+        JsSetObj *res = (JsSetObj *)js_value_object(result);
+        JsObject *snap = js_array_new_cell(ctx, res->count);
+        if (!snap) {
+            oom_hit = true;
+            goto done;
+        }
+        for (uint32_t i = 0; i < res->count; i++)
+            snap->elems[snap->elem_count++] = res->items[i];
+        v = js_value_from_cell(&snap->gc); /* rooted: the snapshot */
+        JsValue e;
+        for (uint32_t i = 0; ok && i < snap->elem_count; i++) {
+            e = snap->elems[i];
+            int in = set_record_has(ctx, &rec, e, r);
+            if (in < 0)
+                ok = false;
+            else if (in)
+                setobj_delete(vm, res, e);
+        }
+    } else if (walk_this) {
+        JsValue itv = js_iterobj_new(ctx, JS_ITER_SET_VALUES, setv, js_undefined(), 0);
+        if (js_is_undefined(itv)) {
+            oom_hit = true;
+            goto done;
+        }
+        cur.src = itv; /* rooted; a Set iterator is never closed */
+        JsIterObj *it = (JsIterObj *)js_value_object(itv);
+        int st;
+        while (ok && (st = js_iterobj_step(ctx, it, &v)) != 0) {
+            if (st < 0) {
+                *r = v;
+                ok = false;
+                break;
+            }
+            int in = set_record_has(ctx, &rec, v, r);
+            if (in < 0) {
+                ok = false;
+            } else if (op == SETOP_INTERSECTION) {
+                if (in && !setobj_add(vm, (JsSetObj *)js_value_object(result), v))
+                    oom_hit = true, ok = false;
+            } else if (op == SETOP_SUBSET ? !in : in) { /* subset: one missing; disjoint: one shared */
+                answer = false;
+                break;
+            }
+        }
+    } else {
+        if (!set_record_keys(ctx, &rec, &cur, r)) {
+            ok = false;
+            goto done;
+        }
+        int st;
+        while (ok && (st = js_iter_next(ctx, &cur, &v)) != 0) {
+            if (st < 0) {
+                *r = v;
+                ok = false;
+                break;
+            }
+            v = js_normalize_map_key(v); /* -0 is +0 */
+            bool in_this = setobj_find(s, v) >= 0;
+            JsSetObj *res = js_is_undefined(result) ? NULL : (JsSetObj *)js_value_object(result);
+            switch (op) {
+            case SETOP_UNION:
+                if (!setobj_add(vm, res, v))
+                    oom_hit = true, ok = false;
+                break;
+            case SETOP_INTERSECTION:
+                if (in_this && !setobj_add(vm, res, v))
+                    oom_hit = true, ok = false;
+                break;
+            case SETOP_DIFFERENCE:
+                setobj_delete(vm, res, v);
+                break;
+            case SETOP_SYMDIFF:
+                if (in_this)
+                    setobj_delete(vm, res, v);
+                else if (!setobj_add(vm, res, v))
+                    oom_hit = true, ok = false;
+                break;
+            default: /* superset: one this lacks; disjoint: one this has */
+                if (op == SETOP_SUPERSET ? !in_this : in_this) {
+                    answer = false;
+                    JsValue err;
+                    if (!js_iter_close(ctx, &cur, false, false, &err))
+                        { *r = err; ok = false; }
+                }
+                break;
+            }
+            if (!answer)
+                break;
+        }
+    }
+done:
+    js_gc_unprotect(vm, &cur.src);
+    js_gc_unprotect(vm, &v);
+    js_gc_unprotect(vm, &result);
+    js_gc_unprotect(vm, &setv);
+    set_record_root(vm, &rec, false);
+    if (oom_hit)
+        return nthrow(ctx, r, "out of memory");
+    if (!ok)
+        return false;
+    *r = op >= SETOP_SUBSET ? js_bool(answer) : result;
+    return true;
+}
+
+static bool set_union(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    return set_op(ctx, tv, args, argc, r, SETOP_UNION);
+}
+static bool set_intersection(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    return set_op(ctx, tv, args, argc, r, SETOP_INTERSECTION);
+}
+static bool set_difference(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    return set_op(ctx, tv, args, argc, r, SETOP_DIFFERENCE);
+}
+static bool set_symmetricDifference(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    return set_op(ctx, tv, args, argc, r, SETOP_SYMDIFF);
+}
+static bool set_isSubsetOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    return set_op(ctx, tv, args, argc, r, SETOP_SUBSET);
+}
+static bool set_isSupersetOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    return set_op(ctx, tv, args, argc, r, SETOP_SUPERSET);
+}
+static bool set_isDisjointFrom(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    return set_op(ctx, tv, args, argc, r, SETOP_DISJOINT);
+}
+
 /* ---- synthesized `size` (js_interp.c get_property) ---- */
 
 bool js_setobj_prop_get(JsObject *o, JsValue key, JsValue *out, bool *handled) {
@@ -271,6 +563,10 @@ bool js_setobj_builtins_init(JsContext *ctx) {
         {"add", set_add}, {"has", set_has}, {"delete", set_delete}, {"clear", set_clear},
         {"forEach", set_forEach},
         {"entries", set_entries},
+        {"union", set_union}, {"intersection", set_intersection},
+        {"difference", set_difference}, {"symmetricDifference", set_symmetricDifference},
+        {"isSubsetOf", set_isSubsetOf}, {"isSupersetOf", set_isSupersetOf},
+        {"isDisjointFrom", set_isDisjointFrom},
     };
     for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
         if (!def_method(ctx, ctx->set_proto, methods[i].name, methods[i].fn))

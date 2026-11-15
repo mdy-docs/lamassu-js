@@ -46,7 +46,9 @@ nothing to box it into.
 
 **Statics**: `keys`, `values`, `entries`, `assign`, `freeze`, `isFrozen`,
 `seal`, `isSealed`, `fromEntries`, `hasOwn`, `getOwnPropertyNames`, `getPrototypeOf`,
-`setPrototypeOf`, `create`.
+`setPrototypeOf`, `create`, `is` (SameValue: `NaN` is `NaN`, `0` is not `-0`), `groupBy(items,
+fn)` (a prototype-less object of arrays, keyed by what `fn(value, index)` returns as a property
+key; `items` any iterable, closed if `fn` throws).
 
 `Object.getOwnPropertyNames(o)` lists every own key, enumerable or not, in V8's order: a string's
 indices then `length` (a number or boolean has none); an array's indices, `length`, then its named
@@ -90,7 +92,10 @@ are no-ops on a primitive (which `isFrozen`/`isSealed` therefore report as
 frozen and sealed). Integrity is whole-object — there are no per-property
 attributes; see [Deviations](/guide/deviations).
 
-**`Object.prototype`**: `hasOwnProperty`, `toString` (`"[object Object]"`, and V8's tag for
+**`Object.prototype`**: `hasOwnProperty`, `isPrototypeOf` (`false` for a primitive argument),
+`propertyIsEnumerable` (an own key that enumeration lists: an array's or string's index, not
+`length`; not a builtin's methods or statics, a function's `name`/`length`/`prototype`, an error's
+`stack`), `toString` (`"[object Object]"`, and V8's tag for
 anything else: `Object.prototype.toString.call([])` is `"[object Array]"`, an error's
 `"[object Error]"`, `null`'s `"[object Null]"`),
 `valueOf` (returns the object itself; a `TypeError` on `null`/`undefined`). This is the root of *every*
@@ -115,13 +120,19 @@ array of that length; anything else behaves like `Array.of`.
 
 - **Statics**: `isArray`, `of`, `from` (any iterable, else an array-like's `[0, length)`; with
   `mapFn(value, index)` and its `thisArg`).
-- **`Array.prototype`**: `push`, `pop`, `shift`, `unshift`, `at`,
-  `indexOf`, `lastIndexOf`, `includes`, `slice`, `join`, `reverse`, `fill`,
-  `concat`, `map`, `filter`, `forEach`, `some`, `every`, `find`,
-  `findIndex`, `reduce`, `sort`, `flat`, `toString` (generic, as V8's: `this.join()` when `join`
-  is a function, else `Object.prototype.toString`), and `keys`, `values`, `entries`, which return
-  an `Array Iterator` ([Iteration](#iteration)) that reads the array live (an element pushed before
-  it reaches the end is visited) and works on any array-like, as V8's does.
+- **`Array.prototype`**: `push`, `pop`, `shift`, `unshift`, `splice`, `at`, `with`,
+  `indexOf`, `lastIndexOf`, `includes` (SameValueZero, so `[NaN].includes(NaN)`), `slice`, `join`,
+  `reverse`, `toReversed`, `fill`, `copyWithin`, `concat`, `map`, `filter`, `forEach`, `some`,
+  `every`, `find`, `findIndex`, `findLast`, `findLastIndex`, `reduce`, `reduceRight`, `sort`,
+  `toSorted`, `toSpliced`, `flat`, `flatMap`, `toString` (generic, as V8's: `this.join()` when
+  `join` is a function, else `Object.prototype.toString`), and `keys`, `values`, `entries`, which
+  return an `Array Iterator` ([Iteration](#iteration)) that reads the array live (an element
+  pushed before it reaches the end is visited) and works on any array-like, as V8's does.
+- The callback methods read the length once, as V8's do: an element the callback appends is not
+  visited, and one it removes is skipped (`find`, `findIndex`, `findLast` and `findLastIndex` see
+  `undefined` there; `map` leaves `undefined` where V8 leaves a hole). `splice` and `copyWithin`
+  move and delete as the spec does, so a sealed or frozen array refuses them at the same write
+  V8 does, with V8's message, and keeps the writes made before it.
 
 Array elements are a flat `JsValue` vector (no holes/sparse storage), so
 `arr.length = n` or `Array(n)` for a very large `n` throws
@@ -133,14 +144,20 @@ Array elements are a flat `JsValue` vector (no holes/sparse storage), so
 `String(x)` / `new String(x)` convert to a primitive string (there is no
 boxed `String` object — this engine has no boxed-primitive type at all).
 
-- **Statics**: `fromCharCode`, `fromCodePoint`.
+- **Statics**: `fromCharCode`, `fromCodePoint`, `raw` (`String.raw({ raw: [...] }, ...subs)`;
+  there are no tagged templates to call it from).
 - **`String.prototype`**: `charAt`, `charCodeAt`, `codePointAt`, `at`,
   `indexOf`, `lastIndexOf`, `includes`, `startsWith`, `endsWith`, `slice`,
   `substring`, `substr`, `toUpperCase`, `toLowerCase` (full Unicode case mapping, as V8's),
-  `trim`, `trimStart`, `trimEnd`, `repeat`, `padStart`, `padEnd`,
-  `replace`, `replaceAll`, `split`, `concat`, `toString`, `valueOf`, and,
+  `trim`, `trimStart`, `trimEnd` (and `trimLeft`/`trimRight`, the same two functions),
+  `repeat`, `padStart`, `padEnd`, `isWellFormed`, `toWellFormed` (each lone surrogate
+  U+FFFD), `replace`, `replaceAll`, `split`, `concat`, `toString`, `valueOf`, V8's legacy HTML
+  methods (`anchor`, `big`, `blink`, `bold`, `fixed`, `fontcolor`, `fontsize`, `italics`,
+  `link`, `small`, `strike`, `sub`, `sup`), and,
   when regex support is compiled in (the default): `match`, `matchAll` (a lazy
   `RegExp String Iterator`, one search per step, starting at the regexp's `lastIndex`), `search`.
+- Called on `undefined` or `null` (`String.prototype.trim.call(null)`), each throws V8's
+  `TypeError: String.prototype.trim called on null or undefined`.
 - **`replace`/`replaceAll` with a string pattern** take a replacement string
   (`$$`, `$&`, `` $` `` and `$'` expand; `$1` and `$<name>` stay literal, as
   there are no groups) or a function, called as `fn(match, position, string)`
@@ -154,7 +171,10 @@ boxed `String` object — this engine has no boxed-primitive type at all).
   `parseInt`, `parseFloat`.
 - **Constants**: `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `MAX_VALUE`,
   `MIN_VALUE`, `EPSILON`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`, `NaN`.
-- **`Number.prototype`**: `toFixed`, `toString`, `valueOf` (the same object `(5).constructor`
+- **`Number.prototype`**: `toFixed`, `toExponential`, `toPrecision`, `toString`, `valueOf`
+  (`toFixed`, `toExponential` and `toPrecision` from the double's exact decimal value, rounded
+  half up, as the spec and V8 have them: `(0.1).toFixed(20)` is `"0.10000000000000000555"`,
+  `(1.005).toFixed(2)` is `"1.00"`; the same object `(5).constructor`
   and `Object.getPrototypeOf(5)` lead to; likewise `String.prototype`). Their receiver must be a
   number (`Number.prototype.toString requires that 'this' be a Number`), as `String.prototype`'s
   `toString`/`valueOf` need a string; the prototypes themselves stand for `0` and `""`, as V8's
@@ -247,8 +267,9 @@ unlisted); deleting it and making it again gives an ordinary one.
 
 Constants: `PI`, `E`, `LN2`, `LN10`, `LOG2E`, `LOG10E`, `SQRT2`,
 `SQRT1_2`. Functions: `abs`, `floor`, `ceil`, `trunc`, `sign`, `sqrt`,
-`cbrt`, `exp`, `log`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`,
-`pow`, `min`, `max`, `hypot`, `fround`, `random`.
+`cbrt`, `exp`, `expm1`, `log`, `log1p`, `log2`, `log10`, `sin`, `cos`, `tan`, `asin`, `acos`,
+`atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `pow`, `min`, `max`, `hypot`,
+`fround`, `f16round`, `clz32`, `imul`, `random`.
 
 ## `JSON`
 
@@ -284,8 +305,8 @@ not the full parser for arbitrary date strings).
   `get`/`set` pair for `FullYear`, `Month`, `Date`, `Day` (get only),
   `Hours`, `Minutes`, `Seconds`, `Milliseconds` (each with a `UTC`-prefixed
   alias — this engine doesn't model timezones, so local and UTC accessors
-  return the same thing), `getTimezoneOffset` (`0`, or `NaN` for an invalid
-  date), `toISOString`,
+  return the same thing), `getYear`/`setYear` (V8's legacy two-digit years),
+  `getTimezoneOffset` (`0`, or `NaN` for an invalid date), `toISOString`,
   `toJSON`, `toString`, `toDateString`, `toTimeString`, `toUTCString` /
   `toGMTString`.
 
@@ -297,7 +318,9 @@ same signature and `Error.prototype` in their chain, and
 `new AggregateError(errors, message?, { cause }?)`, whose own `errors` is a new array of what
 `errors` iterates (see [Iteration](#iteration); anything else is V8's `TypeError`).
 Each subclass constructor's `[[Prototype]]` is `Error`, so `TypeError.captureStackTrace` is
-`Error.captureStackTrace`.
+`Error.captureStackTrace`. `Error.isError(v)` is whether `v` was made by an error constructor
+(an object that merely inherits from `Error.prototype` is not). Each error prototype has its own
+`name` and `message` (`""`).
 
 - **Instances**: own `message` (ToString of the argument; absent when the
   argument is `undefined`, inheriting `""`), own `cause` when the options
@@ -340,10 +363,16 @@ object with `0` and `1`). Both expose a synthesized `.size` property
 (not a regular own property; it shadows a same-named data property the way `RegExp.lastIndex`
 does).
 
-- **`Map.prototype`**: `set`, `get`, `has`, `delete`, `clear`, `forEach`,
-  `keys`, `values`, `entries`.
+- **`Map`**: `Map.groupBy(items, fn)` (a Map of arrays, keyed by what `fn(value, index)`
+  returns). **`Map.prototype`**: `set`, `get`, `has`, `delete`, `clear`, `forEach`,
+  `keys`, `values`, `entries`, `getOrInsert(key, value)`, `getOrInsertComputed(key, fn)`.
 - **`Set.prototype`**: `add`, `has`, `delete`, `clear`, `forEach`,
-  `values`, `keys` (the same function as `values`, per spec), `entries`.
+  `values`, `keys` (the same function as `values`, per spec), `entries`, and the set methods
+  `union`, `intersection`, `difference`, `symmetricDifference`, `isSubsetOf`, `isSupersetOf`,
+  `isDisjointFrom`. Their argument is anything with a numeric `size` and callable `has` and
+  `keys` (a `Set`, a `Map`, or an object of a script's), used as V8 uses it: `has` per entry or
+  `keys()` iterated depending on which set is smaller, and the iterator closed when the answer
+  comes early.
 - `keys`, `values` and `entries` return iterators (`Map Iterator`, `Set Iterator`) with `next()`,
   and `forEach` and `for...of` walk the collection the same way. They are live, as V8's are: an
   entry added before the iterator reaches the end is visited, one deleted before it is reached is
@@ -400,7 +429,9 @@ abstract: `new Iterator()` throws, as it does in V8 without a subclass (and ther
 `new Promise(executor)` — and, as a deliberate accommodation for this
 engine's subset, callable **without** `new` too.
 
-- **Statics**: `resolve`, `reject`, `all`, `race`, `allSettled`, `any`. The four combinators take
+- **Statics**: `resolve`, `reject`, `all`, `race`, `allSettled`, `any`, `try(fn, ...args)` (a
+  promise of `fn(...args)`, rejected with what it throws), `withResolvers()` (`{ promise,
+  resolve, reject }`). The four combinators take
   any iterable ([Iteration](#iteration)); given something else they return a
   promise rejected with V8's `TypeError`, as V8 does, rather than throwing. `Promise.any` rejects
   with an `AggregateError` (`All promises were rejected`) whose `errors` are the reasons in
@@ -420,7 +451,8 @@ ECMAScript-flavored, via the bundled
 engine. Regex literals and `new RegExp(pattern, flags)`, the `lastIndex`
 protocol, named capture groups, and `/d` (indices) all work.
 
-- **`RegExp.prototype`**: `exec`, `test`, `toString`.
+- **`RegExp.prototype`**: `exec`, `test`, `toString`. **`RegExp.escape(s)`** escapes what a
+  pattern could read as syntax, as V8 does (`RegExp.escape("a.b")` is `"\\x61\\.b"`).
 - Consumed by `String.prototype.match`/`matchAll`/`search`/`replace`/
   `replaceAll`/`split` when given a `RegExp` argument.
 - Catastrophic backtracking is bounded by an engine-side step budget — see
@@ -428,7 +460,8 @@ protocol, named capture groups, and `/d` (indices) all work.
 
 ## Global functions
 
-`parseInt`, `parseFloat`, `isNaN`, `isFinite`, and `encodeURI`, `encodeURIComponent`,
+`parseInt`, `parseFloat`, `isNaN`, `isFinite`, `escape`, `unescape` (V8's legacy
+percent-encoding), and `encodeURI`, `encodeURIComponent`,
 `decodeURI`, `decodeURIComponent` as V8 has them: UTF-8 percent-escapes, `decodeURI` leaving an
 escaped reserved character (`%2F`, `%23`, …) escaped, and a lone surrogate or a malformed or
 non-UTF-8 escape a `URIError: URI malformed`.

@@ -374,6 +374,14 @@ double js_k_acos(double x);
 double js_k_cbrt(double x);
 double js_k_log2(double x);
 double js_k_log10(double x);
+double js_k_expm1(double x);
+double js_k_log1p(double x);
+double js_k_sinh(double x);
+double js_k_cosh(double x);
+double js_k_tanh(double x);
+double js_k_asinh(double x);
+double js_k_acosh(double x);
+double js_k_atanh(double x);
 
 /* js_case.c — Unicode case conversion, over baru-re's UCD tables. `out` holds
  * three code points; the return is how many were written. `final_sigma` is
@@ -390,8 +398,16 @@ double  js_make_double(uint64_t mant, int exp10);
  * digits and an optional exponent, correctly rounded to the nearest double whatever its length. */
 double  js_k_decimal(const uint16_t *s, size_t n);
 double  js_units_to_number(const uint16_t *units, size_t len);
+/* A String.prototype method's RequireObjectCoercible(this): false with *result V8's TypeError
+ * ("String.prototype.trim called on null or undefined") for undefined or null (js_builtins.c) */
+bool js_str_this_check(JsContext *ctx, JsValue this_val, JsValue *result);
 int32_t js_to_int32(double d);
 uint32_t js_to_uint32(double d);
 JsString *js_number_to_string(JsVm *vm, double d);
+/* D finite and > 0. The shortest digits that read back as D (Number::toString's), and every digit
+ * of D's exact value (at most 767 significant), as ASCII into DIGITS without trailing zeros: the
+ * count, and the decimal exponent of the first digit in *E10. DIGITS holds 20 / 800. */
+int js_number_shortest(double d, char *digits, int *e10);
+int js_number_exact(double d, char *digits, int *e10);
 
 #endif /* JS_BYTECODE_H */

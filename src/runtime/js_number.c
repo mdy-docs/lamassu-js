@@ -379,6 +379,10 @@ static size_t format_digits(char *buf, size_t n, uint64_t D, int ndigits, int e1
  * The workaround it replaces was `ld -r -unexported_symbol`, which is ld64
  * only. That made macOS the one platform an embedder could do this on.
  */
+/* The shortest digits that read back as D (finite, > 0), the nearest of those: the digit count,
+ * the digits in *D_out and the exponent of the first in *e_out (js_dtoa, toExponential()). */
+static int shortest_digits(double d, uint64_t *D_out, int *e_out);
+
 static size_t js_dtoa(double d, char *buf) {
     size_t n = 0;
     if (d != d)
@@ -400,15 +404,33 @@ static size_t js_dtoa(double d, char *buf) {
     if (d < 9007199254740992.0 && d == (double)(uint64_t)d) {
         return put_u64(buf, n, (uint64_t)d);
     }
+    uint64_t D;
+    int e;
+    int nd = shortest_digits(d, &D, &e);
+    return format_digits(buf, n, D, nd, e);
+}
 
+static int shortest_digits(double d, uint64_t *D_out, int *e_out) {
+    if (d < 9007199254740992.0 && d == (double)(uint64_t)d) {
+        uint64_t v = (uint64_t)d;
+        int len = 1;
+        for (uint64_t t = v; t >= 10; t /= 10)
+            len++;
+        int nd = len;
+        while (v % 10 == 0) {
+            v /= 10;
+            nd--;
+        }
+        *D_out = v;
+        *e_out = len - 1;
+        return nd;
+    }
     union { double dd; uint64_t u; } orig;
     orig.dd = d;
 
     char digs[32];
     int e10;
     int nd = sci_digits(d, 26, digs, &e10);
-    if (!nd)
-        return put_ascii(buf, n, "NaN"); /* unreachable: snprintf of a finite double */
     /* An exact power of two sits at the edge of a binade: the gap to the next double below is half
      * the gap above, so the nearest p-digit decimal can fall outside the round-trip interval on the
      * narrow side while its neighbour fits on the wide side. That neighbour is the shortest form. */
@@ -430,15 +452,131 @@ static size_t js_dtoa(double d, char *buf) {
         else
             lo = mid + 1;
     }
-    {
-        int e;
-        uint64_t D;
-        if (shortest_at(d, digs, nd, e10, lo, binade_edge, orig.u, &D, &e))
-            return format_digits(buf, n, D, lo, e);
+    if (shortest_at(d, digs, nd, e10, lo, binade_edge, orig.u, D_out, e_out))
+        return lo;
+    *D_out = nearest_digits(d, digs, nd, e10, 17, e_out);
+    return 17;
+}
+
+int js_number_shortest(double d, char *digits, int *e10) {
+    uint64_t D;
+    int nd = shortest_digits(d, &D, e10);
+    for (int i = nd - 1; i >= 0; i--) {
+        digits[i] = (char)('0' + D % 10);
+        D /= 10;
     }
+    while (nd > 1 && digits[nd - 1] == '0')
+        nd--;
+    return nd;
+}
+
+/* ---- the exact decimal expansion of a double ---- */
+
+/* D (finite, > 0) = m * 2^e exactly; its digits are those of the integer part (m << e, or
+ * m >> -e) then of the fraction, each fraction digit the integer part of ten times what is left.
+ * A fraction of k bits ends after k digits. Little-endian 32-bit limbs; 2^1074 needs 34. */
+int js_number_exact(double d, char *digits, int *e10) {
+    union { double dd; uint64_t u; } b = {d};
+    int bexp = (int)((b.u >> 52) & 0x7ff);
+    uint64_t m = b.u & (((uint64_t)1 << 52) - 1);
     int e;
-    uint64_t D17 = nearest_digits(d, digs, nd, e10, 17, &e);
-    return format_digits(buf, n, D17, 17, e);
+    if (bexp == 0) {
+        e = -1074;
+    } else {
+        m |= (uint64_t)1 << 52;
+        e = bexp - 1075;
+    }
+    char tmp[1200];
+    int n = 0, point; /* point: digits before the decimal point */
+    if (e >= 0) {
+        uint32_t limb[40] = {0};
+        int nl = 2;
+        limb[0] = (uint32_t)m;
+        limb[1] = (uint32_t)(m >> 32);
+        for (int s = 0; s < e; s++) { /* shift left one bit at a time: e <= 971 */
+            uint32_t carry = 0;
+            for (int i = 0; i < nl; i++) {
+                uint32_t nc = limb[i] >> 31;
+                limb[i] = (limb[i] << 1) | carry;
+                carry = nc;
+            }
+            if (carry)
+                limb[nl++] = carry;
+        }
+        char rev[400];
+        int nr = 0;
+        while (nl > 0) {
+            uint64_t rem = 0;
+            for (int i = nl - 1; i >= 0; i--) {
+                uint64_t cur = (rem << 32) | limb[i];
+                limb[i] = (uint32_t)(cur / 1000000000u);
+                rem = cur % 1000000000u;
+            }
+            while (nl > 0 && limb[nl - 1] == 0)
+                nl--;
+            for (int k = 0; k < 9; k++) {
+                rev[nr++] = (char)('0' + rem % 10);
+                rem /= 10;
+            }
+        }
+        while (nr > 1 && rev[nr - 1] == '0')
+            nr--;
+        for (int i = nr - 1; i >= 0; i--)
+            tmp[n++] = rev[i];
+        point = n;
+    } else {
+        int k = -e;
+        uint64_t ip = k >= 64 ? 0 : m >> k;
+        if (ip) {
+            char rev[24];
+            int nr = 0;
+            for (; ip; ip /= 10)
+                rev[nr++] = (char)('0' + ip % 10);
+            while (nr)
+                tmp[n++] = rev[--nr];
+        }
+        point = n;
+        /* the fraction m mod 2^k, over 2^k */
+        uint32_t f[40] = {0};
+        int nl = (k + 31) / 32 + 1;
+        if (k >= 64) {
+            f[0] = (uint32_t)m;
+            f[1] = (uint32_t)(m >> 32);
+        } else {
+            uint64_t fr = m & ((((uint64_t)1) << k) - 1);
+            f[0] = (uint32_t)fr;
+            f[1] = (uint32_t)(fr >> 32);
+        }
+        int top = k / 32, topbit = k % 32; /* the digit is bits k and up */
+        for (int step = 0; step < k; step++) {
+            uint64_t carry = 0;
+            bool any = false;
+            for (int i = 0; i < nl; i++) {
+                uint64_t cur = (uint64_t)f[i] * 10 + carry;
+                f[i] = (uint32_t)cur;
+                carry = cur >> 32;
+            }
+            uint32_t dig = (uint32_t)((((uint64_t)f[top + 1] << 32) | f[top]) >> topbit);
+            f[top] &= topbit ? ((1u << topbit) - 1) : 0;
+            f[top + 1] = 0;
+            for (int i = 0; i <= top; i++)
+                any = any || f[i];
+            tmp[n++] = (char)('0' + dig);
+            if (!any)
+                break;
+        }
+    }
+    /* drop leading zeros (a value below one), then trailing ones */
+    int start = 0;
+    while (start < n - 1 && tmp[start] == '0')
+        start++;
+    int end = n;
+    while (end > start + 1 && tmp[end - 1] == '0')
+        end--;
+    for (int i = start; i < end; i++)
+        digits[i - start] = tmp[i];
+    *e10 = point - start - 1;
+    return end - start;
 }
 
 JsString *js_number_to_string(JsVm *vm, double d) {

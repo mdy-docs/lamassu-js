@@ -258,6 +258,11 @@ bool js_map_delete(JsMap *m, const JsString *key) {
     return true;
 }
 
+uint8_t js_map_get_attrs(const JsMap *m, const JsString *key) {
+    JsMapEntry *e = js_map_find(m, key);
+    return e ? JS_MAP_ATTRS(m)[e - m->entries] : 0;
+}
+
 bool js_map_add_attrs(JsMap *m, const JsString *key, uint8_t attrs) {
     JsMapEntry *e = js_map_find(m, key);
     if (!e)

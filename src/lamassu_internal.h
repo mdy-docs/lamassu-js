@@ -829,6 +829,8 @@ void    js_map_free(JsVm *vm, JsMap *m);
 void    js_map_sort_keys(JsMap *m); /* enumeration order; no allocation, so safe anywhere */
 /* Adds ATTRS (JS_ATTR_*) to KEY's entry; false when KEY is not in M */
 bool    js_map_add_attrs(JsMap *m, const JsString *key, uint8_t attrs);
+/* KEY's JS_ATTR_* byte; 0 when KEY is not in M */
+uint8_t js_map_get_attrs(const JsMap *m, const JsString *key);
 
 /* ---- strings / atoms (js_string.c) ---- */
 

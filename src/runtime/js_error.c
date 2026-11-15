@@ -1018,6 +1018,16 @@ static bool err_captureStackTrace(JsContext *ctx, JsValue tv, const JsValue *arg
 
 /* ---- registration ---- */
 
+/* Error.isError(v): whether V is an error object (made by an error constructor), whatever its
+ * prototype */
+static bool err_isError(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)ctx;
+    (void)tv;
+    JsValue v = argc > 0 ? args[0] : js_undefined();
+    *r = js_bool(js_is_object(v) && js_value_object(v)->obj_kind == JS_OBJ_ERROR);
+    return true;
+}
+
 bool js_error_builtins_init(JsContext *ctx) {
     JsVm *vm = ctx->vm;
     for (int k = 0; k < JS_ERROR_KIND_COUNT; k++) {
@@ -1035,10 +1045,11 @@ bool js_error_builtins_init(JsContext *ctx) {
         JsString *name = js_ascii_cell(vm, kind_names[k]);
         if (!name || !js_object_set_ascii(ctx, proto, "name", js_value_from_cell(&name->gc)))
             return false;
+        /* every error prototype has its own message, "", as in V8 */
+        JsString *empty = js_string_cell_new(vm, NULL, 0);
+        if (!empty || !js_object_set_ascii(ctx, proto, "message", js_value_from_cell(&empty->gc)))
+            return false;
         if (k == JS_ERROR_PLAIN) {
-            JsString *empty = js_string_cell_new(vm, NULL, 0);
-            if (!empty || !js_object_set_ascii(ctx, proto, "message", js_value_from_cell(&empty->gc)))
-                return false;
             JsValue ts = js_native_new(ctx, "toString", errp_toString, NULL);
             if (!js_is_function(ts) || !js_object_set_ascii(ctx, proto, "toString", ts))
                 return false;
@@ -1060,7 +1071,10 @@ bool js_error_builtins_init(JsContext *ctx) {
             if (!own)
                 return false;
             JsValue cst = js_native_new(ctx, "captureStackTrace", err_captureStackTrace, NULL);
-            if (!js_is_function(cst) || !js_object_set_hidden(ctx, own, "captureStackTrace", cst) ||
+            if (!js_is_function(cst) || !js_object_set_hidden(ctx, own, "captureStackTrace", cst))
+                return false;
+            JsValue ie = js_native_new(ctx, "isError", err_isError, NULL);
+            if (!js_is_function(ie) || !js_object_set_hidden(ctx, own, "isError", ie) ||
                 !js_object_set_ascii(ctx, own, "stackTraceLimit", js_number(10)))
                 return false;
         }

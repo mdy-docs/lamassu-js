@@ -277,6 +277,85 @@ size_t js_mapobj_release(JsVm *vm, JsObject *o) {
     return sizeof(JsMapObj);
 }
 
+/* ---- getOrInsert, getOrInsertComputed, Map.groupBy ---- */
+
+/* m.getOrInsert(key, value): the value under KEY, after setting it to VALUE if it had none */
+static bool map_getOrInsert(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    JsMapObj *m;
+    if (!this_map(ctx, tv, &m, r))
+        return false;
+    int64_t idx = mapobj_find(m, js_normalize_map_key(ARG(0)));
+    if (idx >= 0) {
+        *r = m->values[(uint32_t)idx];
+        return true;
+    }
+    if (!mapobj_set(ctx->vm, m, ARG(0), ARG(1)))
+        return nthrow(ctx, r, "out of memory");
+    *r = ARG(1);
+    return true;
+}
+
+/* m.getOrInsertComputed(key, callback): the value under KEY, or callback(key) set under it (over
+ * whatever the callback itself set there) */
+static bool map_getOrInsertComputed(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    JsMapObj *m;
+    if (!this_map(ctx, tv, &m, r))
+        return false;
+    if (!js_is_function(ARG(1)))
+        return nthrow(ctx, r, "TypeError: Map.prototype.getOrInsertComputed is not a function");
+    JsValue key = js_normalize_map_key(ARG(0));
+    int64_t idx = mapobj_find(m, key);
+    if (idx >= 0) {
+        *r = m->values[(uint32_t)idx];
+        return true;
+    }
+    JsValue mv = tv, val;
+    js_gc_protect(ctx->vm, &mv);
+    js_gc_protect(ctx->vm, &key);
+    bool ok = js_call(ctx, ARG(1), js_undefined(), &key, 1, &val);
+    if (ok && !mapobj_set(ctx->vm, m, key, val)) {
+        val = js_error_from_ascii(ctx, "out of memory");
+        ok = false;
+    }
+    js_gc_unprotect(ctx->vm, &key);
+    js_gc_unprotect(ctx->vm, &mv);
+    *r = val;
+    return ok;
+}
+
+/* Map.groupBy's ADD: the group array under KEY */
+static bool group_add_key(JsContext *ctx, JsValue groups, JsValue key, JsValue value) {
+    JsMapObj *m = (JsMapObj *)js_value_object(groups);
+    int64_t idx = mapobj_find(m, key);
+    if (idx < 0) {
+        js_gc_protect(ctx->vm, &value);
+        JsObject *a = js_array_new_cell(ctx, 1);
+        js_gc_unprotect(ctx->vm, &value);
+        if (!a || !mapobj_set(ctx->vm, m, key, js_value_from_cell(&a->gc)))
+            return false;
+        idx = (int64_t)m->count - 1;
+    }
+    return js_array_append(ctx->vm, js_value_object(m->values[(uint32_t)idx]), value);
+}
+
+/* Map.groupBy(items, callback): a Map of arrays, one per key */
+static bool map_groupBy(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    if (js_is_undefined(ARG(0)) || js_is_null(ARG(0)))
+        return nthrow(ctx, r, "TypeError: Map.groupBy called on null or undefined");
+    if (!js_is_function(ARG(1)))
+        return (*r = js_error_fmt(ctx, "TypeError: %v is not a function", ARG(1))), false;
+    JsValue mv;
+    if (!alloc_mapobj(ctx, &mv))
+        return nthrow(ctx, r, "out of memory");
+    js_gc_protect(ctx->vm, &mv);
+    bool ok = js_group_by(ctx, ARG(0), ARG(1), false, mv, group_add_key, r);
+    js_gc_unprotect(ctx->vm, &mv);
+    if (ok)
+        *r = mv;
+    return ok;
+}
+
 /* ---- registration ---- */
 
 static bool def_method(JsContext *ctx, JsObject *table, const char *name, JsNativeFn fn) {
@@ -302,6 +381,7 @@ bool js_mapobj_builtins_init(JsContext *ctx) {
         {"set", map_set}, {"get", map_get}, {"has", map_has}, {"delete", map_delete},
         {"clear", map_clear}, {"forEach", map_forEach},
         {"keys", map_keys}, {"values", map_values}, {"entries", map_entries},
+        {"getOrInsert", map_getOrInsert}, {"getOrInsertComputed", map_getOrInsertComputed},
     };
     for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
         if (!def_method(ctx, ctx->map_proto, methods[i].name, methods[i].fn))
@@ -312,6 +392,13 @@ bool js_mapobj_builtins_init(JsContext *ctx) {
     if (!js_is_function(ctor))
         return false;
     js_native_builtin_ctor(ctor, ctx->map_proto);
-    return js_object_set_ascii(ctx, ctx->map_proto, "constructor", ctor) &&
-        js_object_set_ascii(ctx, ctx->globals, "Map", ctor);
+    if (!js_object_set_ascii(ctx, ctx->map_proto, "constructor", ctor) ||
+        !js_object_set_ascii(ctx, ctx->globals, "Map", ctor))
+        return false;
+    /* statics: groupBy */
+    JsValue st = js_object_new(ctx);
+    if (!js_is_object(st))
+        return false;
+    ((JsNative *)js_value_cell(ctor))->statics = js_value_object(st);
+    return def_method(ctx, js_value_object(st), "groupBy", map_groupBy);
 }

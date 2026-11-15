@@ -175,4 +175,14 @@ bool js_collection_fill(JsContext *ctx, JsValue coll, JsValue iterable, bool pai
 /* The error a native throws for a value it cannot iterate, as V8 words it. */
 JsValue js_iter_not_iterable(JsContext *ctx, JsValue v);
 
+/* GroupBy (Object.groupBy, Map.groupBy): steps ITEMS (any iterable), calls CB(value, index) for
+ * each, converts the result to a property key (PROPERTY_KEYS) or makes -0 +0, and hands the key
+ * and value to ADD, which files the value under the key in GROUPS (rooted by the caller); a
+ * throw from CB or the key's conversion closes the iterator. ADD returns false only on OOM.
+ * The caller has checked that ITEMS is not null or undefined and CB is a function. False thrown,
+ * *r the error. */
+typedef bool (*JsGroupAdd)(JsContext *ctx, JsValue groups, JsValue key, JsValue value);
+bool js_group_by(JsContext *ctx, JsValue items, JsValue cb, bool property_keys, JsValue groups,
+                 JsGroupAdd add, JsValue *r);
+
 #endif /* JS_ITER_H */

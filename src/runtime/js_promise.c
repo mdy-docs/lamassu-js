@@ -909,6 +909,60 @@ static bool promise_ctor(JsContext *ctx, JsValue tv, const JsValue *args, int ar
     return true;
 }
 
+/* Promise.withResolvers(): { promise, resolve, reject }, the resolving functions those an
+ * executor would get */
+static bool ps_withResolvers(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    (void)args;
+    (void)argc;
+    JsValue pv = js_promise_new(ctx);
+    if (!js_is_promise(pv))
+        return nthrow(ctx, r, "out of memory");
+    js_gc_protect(ctx->vm, &pv);
+    JsValue resolve = js_bound_native_new(ctx, race_resolve, pv);
+    js_gc_protect(ctx->vm, &resolve);
+    JsValue reject = js_bound_native_new(ctx, race_reject, pv);
+    js_gc_protect(ctx->vm, &reject);
+    JsValue o = js_is_function(resolve) && js_is_function(reject) ? js_object_new(ctx) : js_undefined();
+    js_gc_protect(ctx->vm, &o); /* the property writes allocate */
+    bool ok = js_is_object(o);
+    if (ok) {
+        ((JsNative *)js_value_cell(resolve))->length = 1;
+        ((JsNative *)js_value_cell(reject))->length = 1;
+        JsObject *obj = js_value_object(o);
+        ok = js_object_set_ascii(ctx, obj, "promise", pv) && js_object_set_ascii(ctx, obj, "resolve", resolve) &&
+             js_object_set_ascii(ctx, obj, "reject", reject);
+    }
+    js_gc_unprotect(ctx->vm, &o);
+    js_gc_unprotect(ctx->vm, &reject);
+    js_gc_unprotect(ctx->vm, &resolve);
+    js_gc_unprotect(ctx->vm, &pv);
+    if (!ok)
+        return nthrow(ctx, r, "out of memory");
+    *r = o;
+    return true;
+}
+
+/* Promise.try(f, ...args): a promise resolved with f(...args), or rejected with what it threw
+ * (a non-function f is a rejection too, as V8) */
+static bool ps_try(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    JsPromise *p = js_promise_alloc(ctx);
+    if (!p)
+        return nthrow(ctx, r, "out of memory");
+    JsValue pv = js_value_from_cell(&p->gc), res;
+    js_gc_protect(ctx->vm, &pv);
+    if (!js_is_function(ARG(0)))
+        js_promise_reject(ctx, p, js_error_fmt(ctx, "TypeError: %t is not a function", ARG(0)));
+    else if (!js_call(ctx, ARG(0), js_undefined(), argc > 1 ? args + 1 : NULL, argc > 1 ? argc - 1 : 0, &res))
+        js_promise_reject(ctx, p, res);
+    else
+        js_promise_resolve_with(ctx, p, res);
+    js_gc_unprotect(ctx->vm, &pv);
+    *r = pv;
+    return true;
+}
+
 /* ---- registration ---- */
 
 static bool def_fn(JsContext *ctx, JsObject *o, const char *k, JsNativeFn fn) {
@@ -949,7 +1003,8 @@ bool js_promise_builtins_init(JsContext *ctx) {
     JsObject *st = native->statics;
     if (!def_fn(ctx, st, "resolve", ps_resolve) || !def_fn(ctx, st, "reject", ps_reject) ||
         !def_fn(ctx, st, "all", ps_all) || !def_fn(ctx, st, "race", ps_race) ||
-        !def_fn(ctx, st, "allSettled", ps_allSettled) || !def_fn(ctx, st, "any", ps_any))
+        !def_fn(ctx, st, "allSettled", ps_allSettled) || !def_fn(ctx, st, "any", ps_any) ||
+        !def_fn(ctx, st, "try", ps_try) || !def_fn(ctx, st, "withResolvers", ps_withResolvers))
         return false;
     return true;
 }

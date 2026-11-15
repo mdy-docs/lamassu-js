@@ -459,6 +459,7 @@ static bool set_field(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
         DateParts z = {1970, 0, 1, 4, 0, 0, 0, 0};
         p = z;
     }
+    bool invalid = d->time != d->time;
     double f[7] = {(double)p.year, (double)p.month, (double)p.day,
                   (double)p.hour, (double)p.minute, (double)p.second, (double)p.ms};
     int n = argc < maxn ? argc : maxn;
@@ -466,6 +467,12 @@ static bool set_field(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
         n = 1;
     for (int k = 0; k < n; k++)
         TO_NUM(f[start + k], ARG(k));
+    /* only setFullYear starts an invalid date from +0; the others leave it NaN (after converting
+     * their arguments), as the spec has them */
+    if (invalid && start != 0) {
+        *r = js_number(dnan());
+        return true;
+    }
     d->time = make_date(f[0], f[1], f[2], f[3], f[4], f[5], f[6], false);
     *r = js_number(d->time);
     return true;
@@ -475,6 +482,31 @@ static bool date_setFullYear(JsContext *ctx, JsValue tv, const JsValue *args, in
                              JsValue *r) {
     return set_field(ctx, tv, args, argc, r, 0, 3);
 }
+/* getYear / setYear (Annex B): the full year less 1900; setYear(y) sets 1900 + y for y in 0..99,
+ * the full year y otherwise (NaN makes the date invalid) */
+static bool date_getYear(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    if (!date_getFullYear(ctx, tv, args, argc, r))
+        return false;
+    *r = js_number(js_get_number(*r) - 1900);
+    return true;
+}
+
+static bool date_setYear(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    JsDateObject *d;
+    if (!this_date(ctx, tv, &d, r))
+        return false;
+    double y;
+    TO_NUM(y, ARG(0));
+    if (y != y) {
+        d->time = dnan();
+        *r = js_number(d->time);
+        return true;
+    }
+    double yi = y == __builtin_inf() || y == -__builtin_inf() ? y : __builtin_trunc(y);
+    JsValue full = js_number(yi >= 0 && yi <= 99 ? 1900 + yi : y);
+    return set_field(ctx, tv, &full, 1, r, 0, 1);
+}
+
 static bool date_setMonth(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                           JsValue *r) {
     return set_field(ctx, tv, args, argc, r, 1, 2);
@@ -726,6 +758,7 @@ bool js_date_builtins_init(JsContext *ctx) {
         {"getMilliseconds", date_getMilliseconds}, {"getUTCMilliseconds", date_getMilliseconds},
         {"getTimezoneOffset", date_getTimezoneOffset},
         {"setFullYear", date_setFullYear}, {"setUTCFullYear", date_setFullYear},
+        {"getYear", date_getYear}, {"setYear", date_setYear},
         {"setMonth", date_setMonth}, {"setUTCMonth", date_setMonth},
         {"setDate", date_setDate}, {"setUTCDate", date_setDate},
         {"setHours", date_setHours}, {"setUTCHours", date_setHours},

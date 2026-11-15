@@ -232,7 +232,21 @@ static long units_find(const uint16_t *hay, uint32_t hlen, const uint16_t *ndl,
  * String methods (this_val = a string; coerced via ToString otherwise)
  * ===================================================================== */
 
+/* RequireObjectCoercible(this), worded as V8 words it with the running method's name */
+bool js_str_this_check(JsContext *ctx, JsValue this_val, JsValue *result) {
+    if (!js_is_undefined(this_val) && !js_is_null(this_val))
+        return true;
+    const JsNativeAct *act = ctx->native_act;
+    if (act && act->nf && act->nf->name)
+        *result = js_error_fmt(ctx, "TypeError: String.prototype.%S called on null or undefined", act->nf->name);
+    else
+        *result = js_error_fmt(ctx, "TypeError: String.prototype method called on null or undefined");
+    return false;
+}
+
 static bool str_this(JsContext *ctx, JsValue this_val, JsString **out, JsValue *result) {
+    if (!js_str_this_check(ctx, this_val, result))
+        return false;
     JsString *s = js_native_string(ctx, this_val);
     if (!s)
         return oom(ctx, result);
@@ -588,6 +602,116 @@ static bool sm_trimEnd(JsContext *ctx, JsValue tv, const JsValue *a, int c, JsVa
     (void)a; (void)c; return sm_trim_impl(ctx, tv, r, false, true);
 }
 
+/* isWellFormed / toWellFormed: whether every surrogate is paired; the copy with each lone one
+ * replaced by U+FFFD */
+static bool lone_surrogate(const JsString *s, uint32_t i) {
+    uint16_t c = s->units[i];
+    if (c >= 0xD800 && c <= 0xDBFF)
+        return !(i + 1 < s->length && s->units[i + 1] >= 0xDC00 && s->units[i + 1] <= 0xDFFF);
+    if (c >= 0xDC00 && c <= 0xDFFF)
+        return !(i > 0 && s->units[i - 1] >= 0xD800 && s->units[i - 1] <= 0xDBFF);
+    return false;
+}
+
+static bool sm_isWellFormed(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args;
+    (void)argc;
+    JsString *s;
+    if (!str_this(ctx, tv, &s, r))
+        return false;
+    *r = js_bool(true);
+    for (uint32_t i = 0; i < s->length; i++)
+        if (lone_surrogate(s, i)) {
+            *r = js_bool(false);
+            break;
+        }
+    return true;
+}
+
+static bool sm_toWellFormed(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args;
+    (void)argc;
+    JsString *s;
+    if (!str_this(ctx, tv, &s, r))
+        return false;
+    uint32_t i = 0;
+    while (i < s->length && !lone_surrogate(s, i))
+        i++;
+    if (i == s->length) {
+        *r = js_value_from_cell(&s->gc);
+        return true;
+    }
+    StrBuf sb;
+    sb_init(&sb, ctx->vm);
+    sb_units(&sb, s->units, i);
+    for (; i < s->length; i++)
+        sb_unit(&sb, lone_surrogate(s, i) ? 0xFFFD : s->units[i]);
+    *r = sb_finish(&sb);
+    return js_is_undefined(*r) ? oom(ctx, r) : true;
+}
+
+/* The string HTML methods (Annex B CreateHTML): "<tag attr=\"value\">" + this + "</tag>", the
+ * value's quotes written &quot; */
+static bool create_html(JsContext *ctx, JsValue tv, JsValue *r, const char *tag, const char *attr, JsValue value) {
+    JsString *s;
+    if (!str_this(ctx, tv, &s, r))
+        return false;
+    JsString *v = NULL;
+    if (attr && !(v = arg_string(ctx, value)))
+        return oom(ctx, r);
+    StrBuf sb;
+    sb_init(&sb, ctx->vm);
+    sb_unit(&sb, '<');
+    for (const char *c = tag; *c; c++)
+        sb_unit(&sb, (uint16_t)*c);
+    if (attr) {
+        sb_unit(&sb, ' ');
+        for (const char *c = attr; *c; c++)
+            sb_unit(&sb, (uint16_t)*c);
+        sb_unit(&sb, '=');
+        sb_unit(&sb, '"');
+        for (uint32_t i = 0; i < v->length; i++) {
+            if (v->units[i] == '"') {
+                for (const char *c = "&quot;"; *c; c++)
+                    sb_unit(&sb, (uint16_t)*c);
+            } else {
+                sb_unit(&sb, v->units[i]);
+            }
+        }
+        sb_unit(&sb, '"');
+    }
+    sb_unit(&sb, '>');
+    sb_units(&sb, s->units, s->length);
+    sb_unit(&sb, '<');
+    sb_unit(&sb, '/');
+    for (const char *c = tag; *c; c++)
+        sb_unit(&sb, (uint16_t)*c);
+    sb_unit(&sb, '>');
+    *r = sb_finish(&sb);
+    return js_is_undefined(*r) ? oom(ctx, r) : true;
+}
+
+#define HTML_METHOD(fn, tag, attr)                                                    \
+    static bool fn(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) { \
+        (void)args;                                                                   \
+        (void)argc;                                                                   \
+        return create_html(ctx, tv, r, tag, attr, ARG(0));                            \
+    }
+HTML_METHOD(sm_anchor, "a", "name")
+HTML_METHOD(sm_big, "big", NULL)
+HTML_METHOD(sm_blink, "blink", NULL)
+HTML_METHOD(sm_bold, "b", NULL)
+HTML_METHOD(sm_fixed, "tt", NULL)
+HTML_METHOD(sm_fontcolor, "font", "color")
+HTML_METHOD(sm_fontsize, "font", "size")
+HTML_METHOD(sm_italics, "i", NULL)
+HTML_METHOD(sm_link, "a", "href")
+HTML_METHOD(sm_small, "small", NULL)
+HTML_METHOD(sm_strike, "strike", NULL)
+HTML_METHOD(sm_sub, "sub", NULL)
+HTML_METHOD(sm_sup, "sup", NULL)
+#undef HTML_METHOD
+
 static bool sm_repeat(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
@@ -702,6 +826,8 @@ static void append_replacement(StrBuf *sb, const JsString *rep, const JsString *
  * every match first, advancing by the pattern's length (1 for ""). */
 static bool sm_replace_impl(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                             JsValue *r, bool all) {
+    if (!js_str_this_check(ctx, tv, r))
+        return false;
 #ifdef LAMASSU_HAS_REGEX
     if (js_regexp_is(ARG(0)))
         return js_re_str_replace(ctx, tv, args, argc, r, all);
@@ -803,6 +929,8 @@ bool js_split_limit(JsContext *ctx, JsValue limit, uint32_t *lim) {
 }
 
 static bool sm_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    if (!js_str_this_check(ctx, tv, r))
+        return false;
 #ifdef LAMASSU_HAS_REGEX
     if (js_regexp_is(ARG(0)))
         return js_re_str_split(ctx, tv, args, argc, r);
@@ -958,7 +1086,8 @@ typedef enum {
     MUT_ADD,          /* push, unshift: new elements at the end */
     MUT_REMOVE_END,   /* pop: deletes the last element */
     MUT_REMOVE_FRONT, /* shift: moves the elements down, then deletes the last */
-    MUT_WRITE,        /* reverse, fill, sort: writes elements in place */
+    MUT_WRITE,        /* fill, copyWithin: writes elements in place */
+    MUT_REORDER,      /* reverse, sort: as MUT_WRITE, but fewer than two elements stay put */
 } ArrayMut;
 
 /* The refusal is worded as V8 words the first write such a method makes. */
@@ -991,7 +1120,8 @@ static bool array_this_mut(JsContext *ctx, JsValue tv, JsObject **out, JsValue *
         *r = js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of [object Array]", js_number(n - 1));
         return false;
     case MUT_WRITE:
-        if (!frozen || n == 0)
+    case MUT_REORDER:
+        if (!frozen || n == 0 || (how == MUT_REORDER && n < 2))
             return true;
         *r = js_error_fmt(ctx, read_only, "0");
         return false;
@@ -1097,12 +1227,24 @@ static bool am_indexOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     return true;
 }
 
+/* Array.prototype.lastIndexOf (23.1.3.20): the length, then fromIndex (default length - 1) */
 static bool am_lastIndexOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsObject *a;
     if (!array_this(ctx, tv, &a, r))
         return false;
-    for (uint32_t i = a->elem_count; i-- > 0;) {
-        if (js_strict_equals(a->elems[i], ARG(0))) {
+    uint32_t len = a->elem_count;
+    *r = js_number(-1);
+    if (len == 0)
+        return true;
+    double n = (double)len - 1;
+    if (argc > 1) {
+        TO_NUM(n, ARG(1));
+        n = to_int(n);
+    }
+    double k = n >= 0 ? (n < (double)len - 1 ? n : (double)len - 1) : (double)len + n;
+    for (; k >= 0; k--) {
+        uint32_t i = (uint32_t)k;
+        if (i < a->elem_count && js_strict_equals(a->elems[i], ARG(0))) {
             *r = js_number(i);
             return true;
         }
@@ -1111,17 +1253,34 @@ static bool am_lastIndexOf(JsContext *ctx, JsValue tv, const JsValue *args, int 
     return true;
 }
 
+/* SameValueZero: strict equality, except that NaN equals NaN */
+static bool same_value_zero(JsValue x, JsValue y) {
+    if (js_is_number(x) && js_is_number(y)) {
+        double dx = js_get_number(x), dy = js_get_number(y);
+        return dx == dy || (dx != dx && dy != dy);
+    }
+    return js_strict_equals(x, y);
+}
+
+/* Array.prototype.includes (23.1.3.16): SameValueZero from fromIndex; an index a valueOf removed
+ * reads undefined */
 static bool am_includes(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsObject *a;
     if (!array_this(ctx, tv, &a, r))
         return false;
-    for (uint32_t i = 0; i < a->elem_count; i++) {
-        if (js_strict_equals(a->elems[i], ARG(0))) {
+    uint32_t len = a->elem_count;
+    *r = js_bool(false);
+    if (len == 0)
+        return true;
+    double fd = 0;
+    if (argc > 1)
+        TO_NUM(fd, ARG(1));
+    for (uint32_t i = clamp_index(fd, len); i < len; i++) {
+        if (same_value_zero(i < a->elem_count ? a->elems[i] : js_undefined(), ARG(0))) {
             *r = js_bool(true);
             return true;
         }
     }
-    *r = js_bool(false);
     return true;
 }
 
@@ -1225,7 +1384,7 @@ static bool am_reverse(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     (void)args;
     (void)argc;
     JsObject *a;
-    if (!array_this_mut(ctx, tv, &a, r, MUT_WRITE))
+    if (!array_this_mut(ctx, tv, &a, r, MUT_REORDER))
         return false;
     uint32_t n = a->elem_count;
     for (uint32_t i = 0; i < n / 2; i++) {
@@ -1239,7 +1398,7 @@ static bool am_reverse(JsContext *ctx, JsValue tv, const JsValue *args, int argc
 
 static bool am_fill(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsObject *a;
-    if (!array_this_mut(ctx, tv, &a, r, MUT_WRITE))
+    if (!array_this(ctx, tv, &a, r))
         return false;
     uint32_t len = a->elem_count;
     double sd = 0, ed = len;
@@ -1247,11 +1406,12 @@ static bool am_fill(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
         TO_NUM(sd, ARG(1));
     if (argc > 2 && !js_is_undefined(ARG(2)))
         TO_NUM(ed, ARG(2));
-    /* a valueOf may have frozen or shortened it: check again, and write an index past the end as
-     * a property set would */
-    if (!array_this_mut(ctx, tv, &a, r, MUT_WRITE))
-        return false;
+    /* refused at the first write, as V8 (none for an empty range); a valueOf may have frozen or
+     * shortened it, and an index past the end is written as a property set would */
     uint32_t start = clamp_index(sd, len), end = clamp_index(ed, len);
+    if (start < end && (a->obj_flags & JS_OBJ_FROZEN))
+        return native_throw_fmt(ctx, r, "TypeError: Cannot assign to read only property '%v' of object '[object Array]'",
+                                js_number(start));
     for (uint32_t i = start; i < end; i++) {
         if (i < a->elem_count)
             a->elems[i] = ARG(0);
@@ -1337,8 +1497,17 @@ static bool array_iterate(JsContext *ctx, JsValue tv, const JsValue *args, int a
     case IT_FINDINDEX: result = js_number(-1); break;
     default: break;
     }
-    for (uint32_t i = 0; i < a->elem_count && ok; i++) {
-        JsValue elem = a->elems[i];
+    /* the length is read once, as V8: what the callback appends is not visited, and an index it
+     * removed is skipped (map leaves undefined there, V8 a hole) except by find and findIndex,
+     * which see undefined */
+    uint32_t len = a->elem_count;
+    for (uint32_t i = 0; i < len && ok; i++) {
+        if (i >= a->elem_count && kind != IT_FIND && kind != IT_FINDINDEX) {
+            if (kind == IT_MAP)
+                ok = js_array_append(ctx->vm, out, js_undefined());
+            continue;
+        }
+        JsValue elem = i < a->elem_count ? a->elems[i] : js_undefined();
         JsValue cbres;
         if (!call_cb(ctx, cb, thisArg, elem, i, arrv, &cbres)) {
             *r = cbres;
@@ -1359,25 +1528,25 @@ static bool array_iterate(JsContext *ctx, JsValue tv, const JsValue *args, int a
         case IT_SOME:
             if (js_to_boolean(cbres)) {
                 result = js_bool(true);
-                i = a->elem_count;
+                i = len;
             }
             break;
         case IT_EVERY:
             if (!js_to_boolean(cbres)) {
                 result = js_bool(false);
-                i = a->elem_count;
+                i = len;
             }
             break;
         case IT_FIND:
             if (js_to_boolean(cbres)) {
                 result = elem;
-                i = a->elem_count;
+                i = len;
             }
             break;
         case IT_FINDINDEX:
             if (js_to_boolean(cbres)) {
                 result = js_number(i);
-                i = a->elem_count;
+                i = len;
             }
             break;
         }
@@ -1461,7 +1630,7 @@ static bool am_reduce(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
 /* stable binary insertion sort; comparator optional */
 static bool am_sort(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsObject *a;
-    if (!array_this_mut(ctx, tv, &a, r, MUT_WRITE))
+    if (!array_this_mut(ctx, tv, &a, r, MUT_REORDER))
         return false;
     JsValue cmp = ARG(0);
     bool has_cmp = js_is_function(cmp);
@@ -1605,6 +1774,342 @@ static bool am_flat(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     if (!ok)
         return oom(ctx, r);
     *r = outv;
+    return true;
+}
+
+/* ---- findLast, findLastIndex, reduceRight, flatMap ---- */
+
+/* Array.prototype.findLast / findLastIndex (23.1.3.11-12): from the end, over the length read
+ * once; an index the predicate removed reads undefined */
+static bool find_last(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r,
+                      bool want_index) {
+    JsObject *a;
+    if (!array_this(ctx, tv, &a, r))
+        return false;
+    if (!js_is_function(ARG(0)))
+        return native_throw_fmt(ctx, r, "TypeError: %t is not a function", ARG(0));
+    JsValue cb = ARG(0), thisArg = ARG(1), arrv = tv;
+    js_gc_protect(ctx->vm, &arrv);
+    js_gc_protect(ctx->vm, &cb);
+    js_gc_protect(ctx->vm, &thisArg);
+    bool ok = true;
+    JsValue result = want_index ? js_number(-1) : js_undefined();
+    for (uint32_t k = a->elem_count; k-- > 0;) {
+        JsValue elem = k < a->elem_count ? a->elems[k] : js_undefined(), res;
+        if (!call_cb(ctx, cb, thisArg, elem, k, arrv, &res)) {
+            *r = res;
+            ok = false;
+            break;
+        }
+        if (js_to_boolean(res)) {
+            result = want_index ? js_number(k) : elem;
+            break;
+        }
+    }
+    js_gc_unprotect(ctx->vm, &thisArg);
+    js_gc_unprotect(ctx->vm, &cb);
+    js_gc_unprotect(ctx->vm, &arrv);
+    if (ok)
+        *r = result;
+    return ok;
+}
+
+static bool am_findLast(JsContext *ctx, JsValue tv, const JsValue *a, int c, JsValue *r) {
+    return find_last(ctx, tv, a, c, r, false);
+}
+static bool am_findLastIndex(JsContext *ctx, JsValue tv, const JsValue *a, int c, JsValue *r) {
+    return find_last(ctx, tv, a, c, r, true);
+}
+
+/* Array.prototype.reduceRight (23.1.3.25): from the end, skipping an index the callback removed */
+static bool am_reduceRight(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    JsObject *a;
+    if (!array_this(ctx, tv, &a, r))
+        return false;
+    if (!js_is_function(ARG(0)))
+        return native_throw_fmt(ctx, r, "TypeError: %t is not a function", ARG(0));
+    JsValue cb = ARG(0), arrv = tv, acc;
+    uint32_t k = a->elem_count;
+    if (argc > 1) {
+        acc = ARG(1);
+    } else {
+        if (k == 0)
+            return native_throw(ctx, r, "TypeError: Reduce of empty array with no initial value");
+        acc = a->elems[--k];
+    }
+    js_gc_protect(ctx->vm, &arrv);
+    js_gc_protect(ctx->vm, &cb);
+    js_gc_protect(ctx->vm, &acc);
+    bool ok = true;
+    while (k-- > 0) {
+        if (k >= a->elem_count)
+            continue;
+        JsValue argv[4] = {acc, a->elems[k], js_number(k), arrv}, res;
+        if (!js_call(ctx, cb, js_undefined(), argv, 4, &res)) {
+            *r = res;
+            ok = false;
+            break;
+        }
+        acc = res;
+    }
+    JsValue out = acc;
+    js_gc_unprotect(ctx->vm, &acc);
+    js_gc_unprotect(ctx->vm, &cb);
+    js_gc_unprotect(ctx->vm, &arrv);
+    if (ok)
+        *r = out;
+    return ok;
+}
+
+/* Array.prototype.flatMap (23.1.3.14): map, then flatten what the mapper returns one level (an
+ * array's elements; anything else as itself) */
+static bool am_flatMap(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    JsObject *a;
+    if (!array_this(ctx, tv, &a, r))
+        return false;
+    if (!js_is_function(ARG(0)))
+        return native_throw_fmt(ctx, r, "TypeError: %t is not a function", ARG(0));
+    JsObject *out = js_array_new_cell(ctx, 0);
+    if (!out)
+        return oom(ctx, r);
+    JsValue cb = ARG(0), thisArg = ARG(1), arrv = tv, outv = js_value_from_cell(&out->gc);
+    js_gc_protect(ctx->vm, &arrv);
+    js_gc_protect(ctx->vm, &cb);
+    js_gc_protect(ctx->vm, &thisArg);
+    js_gc_protect(ctx->vm, &outv);
+    bool ok = true, failed = false;
+    uint32_t len = a->elem_count;
+    for (uint32_t k = 0; k < len && ok; k++) {
+        if (k >= a->elem_count)
+            continue;
+        JsValue res;
+        if (!call_cb(ctx, cb, thisArg, a->elems[k], k, arrv, &res)) {
+            *r = res;
+            failed = true;
+            break;
+        }
+        if (js_is_object(res) && js_value_object(res)->obj_kind == JS_OBJ_ARRAY) {
+            JsObject *m = js_value_object(res);
+            for (uint32_t j = 0; j < m->elem_count && ok; j++)
+                ok = js_array_append(ctx->vm, out, m->elems[j]);
+        } else {
+            ok = js_array_append(ctx->vm, out, res);
+        }
+    }
+    js_gc_unprotect(ctx->vm, &outv);
+    js_gc_unprotect(ctx->vm, &thisArg);
+    js_gc_unprotect(ctx->vm, &cb);
+    js_gc_unprotect(ctx->vm, &arrv);
+    if (failed)
+        return false;
+    if (!ok)
+        return oom(ctx, r);
+    *r = outv;
+    return true;
+}
+
+/* ---- splice, copyWithin, toReversed, toSorted, toSpliced, with ---- */
+
+/* ToIntegerOrInfinity of an argument, then a relative index into [0, len] (-Infinity is 0) */
+static bool relative_index(JsContext *ctx, JsValue v, uint32_t len, uint32_t *out, JsValue *r) {
+    double d;
+    TO_NUM(d, v);
+    *out = clamp_index(d, len);
+    return true;
+}
+
+/* A count argument: ToIntegerOrInfinity clamped to [0, max] */
+static bool count_arg(JsContext *ctx, JsValue v, uint32_t max, uint32_t *out, JsValue *r) {
+    double d;
+    TO_NUM(d, v);
+    d = to_int(d);
+    *out = d <= 0 ? 0 : (d >= max ? max : (uint32_t)d);
+    return true;
+}
+
+/* The property writes of splice and copyWithin, refused as V8 refuses each on a sealed or frozen
+ * array (the array is left as the writes before it made it). Storage has no holes: deleting an
+ * index removes it only at the end, and an index past the end is written as a property set
+ * would. False with the error in *r, or OOM. */
+static bool arr_put(JsContext *ctx, JsObject *a, uint32_t i, JsValue v, JsValue *r) {
+    if (i >= a->elem_count) {
+        if (a->obj_flags)
+            return native_throw_fmt(ctx, r, "TypeError: Cannot add property %v, object is not extensible", js_number(i));
+        return js_array_set_index(ctx->vm, a, i, v) ? true : oom(ctx, r);
+    }
+    if (a->obj_flags & JS_OBJ_FROZEN)
+        return native_throw_fmt(ctx, r, "TypeError: Cannot assign to read only property '%v' of object '[object Array]'",
+                                js_number(i));
+    a->elems[i] = v;
+    return true;
+}
+
+static bool arr_delete(JsContext *ctx, JsObject *a, uint32_t i, JsValue *r) {
+    if (i >= a->elem_count)
+        return true;
+    if (a->obj_flags)
+        return native_throw_fmt(ctx, r, "TypeError: Cannot delete property '%v' of [object Array]", js_number(i));
+    if (i + 1 == a->elem_count)
+        a->elem_count--;
+    else
+        a->elems[i] = js_undefined();
+    return true;
+}
+
+/* Array.prototype.splice (23.1.3.31), step by step as the spec moves and deletes. */
+static bool am_splice(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    JsObject *a;
+    if (!array_this(ctx, tv, &a, r))
+        return false;
+    uint32_t len = a->elem_count, start = 0, del = 0;
+    if (argc > 0 && !relative_index(ctx, ARG(0), len, &start, r))
+        return false;
+    if (argc == 1)
+        del = len - start;
+    else if (argc > 1 && !count_arg(ctx, ARG(1), len - start, &del, r))
+        return false;
+    uint32_t items = argc > 2 ? (uint32_t)argc - 2 : 0;
+    JsObject *removed = js_array_new_cell(ctx, del);
+    if (!removed)
+        return oom(ctx, r);
+    for (uint32_t k = 0; k < del; k++) {
+        uint32_t from = start + k;
+        removed->elems[removed->elem_count++] = from < a->elem_count ? a->elems[from] : js_undefined();
+    }
+    JsValue removedv = js_value_from_cell(&removed->gc);
+    js_gc_protect(ctx->vm, &removedv);
+    bool ok = true;
+    if (items < del) {
+        for (uint32_t k = start; ok && k < len - del; k++) {
+            uint32_t from = k + del, to = k + items;
+            ok = from < a->elem_count ? arr_put(ctx, a, to, a->elems[from], r) : arr_delete(ctx, a, to, r);
+        }
+        for (uint32_t k = len; ok && k > len - del + items; k--)
+            ok = arr_delete(ctx, a, k - 1, r);
+    } else if (items > del) {
+        for (uint32_t k = len - del; ok && k > start; k--) {
+            uint32_t from = k + del - 1, to = k + items - 1;
+            ok = from < a->elem_count ? arr_put(ctx, a, to, a->elems[from], r) : arr_delete(ctx, a, to, r);
+        }
+    }
+    for (uint32_t i = 0; ok && i < items; i++)
+        ok = arr_put(ctx, a, start + i, args[2 + i], r);
+    /* the length is set last; frozen, it is read-only even when unchanged */
+    if (ok && (a->obj_flags & JS_OBJ_FROZEN))
+        ok = native_throw(ctx, r, "TypeError: Cannot assign to read only property 'length' of object '[object Array]'");
+    js_gc_unprotect(ctx->vm, &removedv);
+    if (ok)
+        *r = removedv;
+    return ok;
+}
+
+/* Array.prototype.copyWithin (23.1.3.4): backwards when the ranges overlap that way, as the spec */
+static bool am_copyWithin(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    JsObject *a;
+    if (!array_this(ctx, tv, &a, r))
+        return false;
+    uint32_t len = a->elem_count, to, from, fin = len;
+    if (!relative_index(ctx, ARG(0), len, &to, r) || !relative_index(ctx, ARG(1), len, &from, r))
+        return false;
+    if (argc > 2 && !js_is_undefined(ARG(2)) && !relative_index(ctx, ARG(2), len, &fin, r))
+        return false;
+    uint32_t count = fin > from ? fin - from : 0;
+    if (len - to < count)
+        count = len - to;
+    bool back = from < to && to < from + count;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t f = back ? from + count - 1 - i : from + i, t = back ? to + count - 1 - i : to + i;
+        bool ok = f < a->elem_count ? arr_put(ctx, a, t, a->elems[f], r) : arr_delete(ctx, a, t, r);
+        if (!ok)
+            return false;
+    }
+    *r = tv;
+    return true;
+}
+
+/* A copy of the first len elements (undefined where a valueOf removed one) */
+static JsObject *array_copy(JsContext *ctx, JsObject *a, uint32_t len) {
+    JsObject *out = js_array_new_cell(ctx, len);
+    if (!out)
+        return NULL;
+    for (uint32_t i = 0; i < len; i++)
+        out->elems[out->elem_count++] = i < a->elem_count ? a->elems[i] : js_undefined();
+    return out;
+}
+
+static bool am_toReversed(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args;
+    (void)argc;
+    JsObject *a;
+    if (!array_this(ctx, tv, &a, r))
+        return false;
+    uint32_t len = a->elem_count;
+    JsObject *out = js_array_new_cell(ctx, len);
+    if (!out)
+        return oom(ctx, r);
+    for (uint32_t i = 0; i < len; i++)
+        out->elems[out->elem_count++] = a->elems[len - 1 - i];
+    *r = js_value_from_cell(&out->gc);
+    return true;
+}
+
+static bool am_toSorted(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    JsObject *a;
+    if (!array_this(ctx, tv, &a, r))
+        return false;
+    JsValue cmp = ARG(0);
+    if (!js_is_undefined(cmp) && !js_is_function(cmp))
+        return native_throw_fmt(ctx, r, "TypeError: The comparison function must be either a function or undefined: %v", cmp);
+    JsObject *out = array_copy(ctx, a, a->elem_count);
+    if (!out)
+        return oom(ctx, r);
+    return am_sort(ctx, js_value_from_cell(&out->gc), args, argc > 1 ? 1 : argc, r);
+}
+
+static bool am_toSpliced(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    JsObject *a;
+    if (!array_this(ctx, tv, &a, r))
+        return false;
+    uint32_t len = a->elem_count, start = 0, skip = 0;
+    if (argc > 0 && !relative_index(ctx, ARG(0), len, &start, r))
+        return false;
+    if (argc == 1)
+        skip = len - start;
+    else if (argc > 1 && !count_arg(ctx, ARG(1), len - start, &skip, r))
+        return false;
+    uint32_t items = argc > 2 ? (uint32_t)argc - 2 : 0;
+    uint64_t nlen = (uint64_t)len - skip + items;
+    if (nlen > UINT32_MAX)
+        return native_throw(ctx, r, "RangeError: Invalid array length");
+    JsObject *out = js_array_new_cell(ctx, (uint32_t)nlen);
+    if (!out)
+        return oom(ctx, r);
+    for (uint32_t i = 0; i < start; i++)
+        out->elems[out->elem_count++] = i < a->elem_count ? a->elems[i] : js_undefined();
+    for (uint32_t i = 0; i < items; i++)
+        out->elems[out->elem_count++] = args[2 + i];
+    for (uint32_t i = start + skip; i < len; i++)
+        out->elems[out->elem_count++] = i < a->elem_count ? a->elems[i] : js_undefined();
+    *r = js_value_from_cell(&out->gc);
+    return true;
+}
+
+static bool am_with(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    JsObject *a;
+    if (!array_this(ctx, tv, &a, r))
+        return false;
+    uint32_t len = a->elem_count;
+    double rel;
+    TO_NUM(rel, ARG(0));
+    rel = to_int(rel);
+    double at = rel >= 0 ? rel : (double)len + rel;
+    if (at < 0 || at >= len)
+        return native_throw_fmt(ctx, r, "RangeError: Invalid index : %v", ARG(0));
+    JsObject *out = array_copy(ctx, a, len);
+    if (!out)
+        return oom(ctx, r);
+    out->elems[(uint32_t)at] = ARG(1);
+    *r = js_value_from_cell(&out->gc);
     return true;
 }
 
@@ -1766,6 +2271,48 @@ static bool nm_valueOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     return true;
 }
 
+/* ---- toFixed, toExponential, toPrecision: from the exact decimal value, rounded half up (of two
+ * equally near, the larger), as the spec and V8 have them ---- */
+
+/* The first KEEP (>= 1) digits of DIGS (N of them, zeros past the end) rounded half up by the
+ * next one. True when that carried out of the first (999.. became 1000..: OUT is "1" and zeros
+ * and the exponent grows by one). */
+static bool round_half_up(const char *digs, int n, int keep, char *out) {
+    for (int i = 0; i < keep; i++)
+        out[i] = i < n ? digs[i] : '0';
+    if (keep >= n || digs[keep] < '5')
+        return false;
+    int i = keep - 1;
+    while (i >= 0 && out[i] == '9')
+        out[i--] = '0';
+    if (i >= 0) {
+        out[i]++;
+        return false;
+    }
+    out[0] = '1';
+    return true;
+}
+
+static bool ascii_result(JsContext *ctx, const char *buf, JsValue *r) {
+    JsString *s = js_ascii_cell(ctx->vm, buf);
+    if (!s)
+        return oom(ctx, r);
+    *r = js_value_from_cell(&s->gc);
+    return true;
+}
+
+/* d.ddd e±x */
+static int put_exponential(char *buf, int bi, const char *digs, int nd, int e) {
+    buf[bi++] = digs[0];
+    if (nd > 1) {
+        buf[bi++] = '.';
+        for (int i = 1; i < nd; i++)
+            buf[bi++] = digs[i];
+    }
+    bi += snprintf(buf + bi, 16, "e%c%d", e < 0 ? '-' : '+', e < 0 ? -e : e);
+    return bi;
+}
+
 static bool nm_toFixed(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     NUMBER_THIS("toFixed");
     double x = js_get_number(tv);
@@ -1774,59 +2321,143 @@ static bool nm_toFixed(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     dd = to_int(dd);
     if (dd < 0 || dd > 100)
         return native_throw(ctx, r, "RangeError: toFixed() digits argument must be between 0 and 100");
-    int d = (int)dd;
-    /* x < 1e21 gives <=21 integer digits; plus up to 100 fraction digits, a
-     * sign, a '.', and a NUL. Size both scratch buffers for the worst case so
-     * neither the digit extraction nor the assembly can overrun. */
-    char buf[160];
-    if (x != x) {
-        *r = js_value_from_cell(&js_ascii_cell(ctx->vm, "NaN")->gc);
-        return true;
-    }
-    bool neg = x < 0;
-    if (neg)
-        x = -x;
-    if (x >= 1e21) {
-        JsString *s = js_number_to_string(ctx->vm, neg ? -x : x);
+    int f = (int)dd;
+    if (x != x || x >= 1e21 || x <= -1e21) {
+        JsString *s = js_number_to_string(ctx->vm, x);
         if (!s)
             return oom(ctx, r);
         *r = js_value_from_cell(&s->gc);
         return true;
     }
-    double scale = 1.0;
-    for (int i = 0; i < d; i++)
-        scale *= 10.0;
-    double scaled = __builtin_floor(x * scale + 0.5);
-    /* build digits of `scaled` (an integer) */
-    char digs[160];
-    int nd = 0;
-    if (scaled == 0)
-        digs[nd++] = '0';
-    while (scaled >= 1 && nd < (int)sizeof(digs) - 1) {
-        double q = __builtin_floor(scaled / 10.0);
-        int dig = (int)(scaled - q * 10.0);
-        digs[nd++] = (char)('0' + dig);
-        scaled = q;
-    }
-    while (nd <= d)
-        digs[nd++] = '0'; /* ensure enough digits for the fraction */
-    int bi = 0;
-    if (neg)
+    char buf[160], digs[800], n_digs[160];
+    int bi = 0, nn;
+    if (x < 0) {
         buf[bi++] = '-';
-    int int_digits = nd - d;
-    for (int i = 0; i < int_digits; i++)
-        buf[bi++] = digs[nd - 1 - i];
-    if (d > 0) {
-        buf[bi++] = '.';
-        for (int i = 0; i < d; i++)
-            buf[bi++] = digs[d - 1 - i];
+        x = -x;
+    }
+    /* n = x * 10^f rounded, as digits */
+    if (x == 0) {
+        n_digs[0] = '0';
+        nn = 1;
+    } else {
+        int e10;
+        int nd = js_number_exact(x, digs, &e10);
+        int keep = e10 + 1 + f; /* the digits at or above 10^-f */
+        if (keep <= 0) {
+            n_digs[0] = keep == 0 && digs[0] >= '5' ? '1' : '0';
+            nn = 1;
+        } else if (round_half_up(digs, nd, keep, n_digs)) {
+            n_digs[keep] = '0';
+            nn = keep + 1;
+        } else {
+            nn = keep;
+        }
+    }
+    /* at least f + 1 digits, then the point before the last f */
+    int pad = f + 1 > nn ? f + 1 - nn : 0, total = nn + pad;
+    for (int i = 0; i < total; i++) {
+        if (f > 0 && i == total - f)
+            buf[bi++] = '.';
+        buf[bi++] = i < pad ? '0' : n_digs[i - pad];
     }
     buf[bi] = 0;
-    JsString *s = js_ascii_cell(ctx->vm, buf);
-    if (!s)
-        return oom(ctx, r);
-    *r = js_value_from_cell(&s->gc);
-    return true;
+    return ascii_result(ctx, buf, r);
+}
+
+static bool nm_toExponential(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    NUMBER_THIS("toExponential");
+    double x = js_get_number(tv);
+    double dd;
+    TO_NUM(dd, ARG(0));
+    dd = to_int(dd);
+    if (x != x || x == __builtin_inf() || x == -__builtin_inf()) {
+        JsString *s = js_number_to_string(ctx->vm, x);
+        if (!s)
+            return oom(ctx, r);
+        *r = js_value_from_cell(&s->gc);
+        return true;
+    }
+    if (dd < 0 || dd > 100)
+        return native_throw(ctx, r, "RangeError: toExponential() argument must be between 0 and 100");
+    char buf[160], digs[800], out[110];
+    int bi = 0, nd, e = 0;
+    if (x < 0) {
+        buf[bi++] = '-';
+        x = -x;
+    }
+    bool shortest = js_is_undefined(ARG(0));
+    if (x == 0) {
+        nd = shortest ? 1 : (int)dd + 1;
+        for (int i = 0; i < nd; i++)
+            out[i] = '0';
+    } else if (shortest) {
+        nd = js_number_shortest(x, out, &e);
+    } else {
+        int n = js_number_exact(x, digs, &e);
+        nd = (int)dd + 1;
+        if (round_half_up(digs, n, nd, out))
+            e++;
+    }
+    bi = put_exponential(buf, bi, out, nd, e);
+    buf[bi] = 0;
+    return ascii_result(ctx, buf, r);
+}
+
+static bool nm_toPrecision(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    NUMBER_THIS("toPrecision");
+    double x = js_get_number(tv);
+    if (js_is_undefined(ARG(0))) {
+        JsString *s = js_number_to_string(ctx->vm, x);
+        if (!s)
+            return oom(ctx, r);
+        *r = js_value_from_cell(&s->gc);
+        return true;
+    }
+    double dd;
+    TO_NUM(dd, ARG(0));
+    dd = to_int(dd);
+    if (x != x || x == __builtin_inf() || x == -__builtin_inf()) {
+        JsString *s = js_number_to_string(ctx->vm, x);
+        if (!s)
+            return oom(ctx, r);
+        *r = js_value_from_cell(&s->gc);
+        return true;
+    }
+    if (dd < 1 || dd > 100)
+        return native_throw(ctx, r, "RangeError: toPrecision() argument must be between 1 and 100");
+    int p = (int)dd;
+    char buf[160], digs[800], out[110];
+    int bi = 0, e = 0;
+    if (x < 0) {
+        buf[bi++] = '-';
+        x = -x;
+    }
+    if (x == 0) {
+        for (int i = 0; i < p; i++)
+            out[i] = '0';
+    } else {
+        int n = js_number_exact(x, digs, &e);
+        if (round_half_up(digs, n, p, out))
+            e++;
+    }
+    if (e < -6 || e >= p) {
+        bi = put_exponential(buf, bi, out, p, e);
+    } else if (e >= 0) {
+        for (int i = 0; i < p; i++) {
+            buf[bi++] = out[i];
+            if (i == e && i < p - 1)
+                buf[bi++] = '.';
+        }
+    } else {
+        buf[bi++] = '0';
+        buf[bi++] = '.';
+        for (int i = 0; i < -(e + 1); i++)
+            buf[bi++] = '0';
+        for (int i = 0; i < p; i++)
+            buf[bi++] = out[i];
+    }
+    buf[bi] = 0;
+    return ascii_result(ctx, buf, r);
 }
 
 static bool nm_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
@@ -1900,6 +2531,43 @@ static double m_abs(double x) { return x < 0 ? -x : x; }
 static double m_fround(double x) { return (double)(float)x; }
 
 static double m_sign(double x) { return x != x ? x : (x > 0 ? 1 : (x < 0 ? -1 : x)); }
+
+/* Math.f16round: the nearest IEEE binary16 value, ties to even, as a double. Scaling by the
+ * half-precision quantum of x's binade is exact, so rint rounds once. */
+static double m_f16round(double x) {
+    double ax = x < 0 ? -x : x;
+    if (x != x || ax == 0 || ax == __builtin_inf())
+        return x;
+    double q;
+    if (ax < 0x1p-14) {
+        q = 0x1p-24; /* half subnormals */
+    } else {
+        union { double d; uint64_t u; } b = {ax};
+        int e = (int)((b.u >> 52) & 0x7ff) - 1023;
+        if (e > 15)
+            return x < 0 ? -__builtin_inf() : __builtin_inf();
+        b.u = (uint64_t)(e - 10 + 1023) << 52;
+        q = b.d;
+    }
+    double rv = __builtin_rint(ax / q) * q;
+    if (rv > 65504)
+        rv = __builtin_inf();
+    return x < 0 ? -rv : rv;
+}
+
+static double m_clz32(double x) {
+    uint32_t n = js_to_uint32(x);
+    return n ? (double)__builtin_clz(n) : 32;
+}
+
+static bool math_imul(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    double a, b;
+    TO_NUM(a, ARG(0));
+    TO_NUM(b, ARG(1));
+    *r = js_number((double)(int32_t)(js_to_uint32(a) * js_to_uint32(b)));
+    return true;
+}
 static bool math_min(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     /* every argument converts (a valueOf runs) even after a NaN, as V8 */
@@ -3725,6 +4393,136 @@ static bool objp_hasOwnProperty(JsContext *ctx, JsValue tv, const JsValue *args,
     return true;
 }
 
+/* o.propertyIsEnumerable(key): ToPropertyKey(key), then ToObject(this); an own property that
+ * enumeration lists (a string's or array's index, not its length; not a function's name, length
+ * or prototype, an error's stack, a regexp's lastIndex, or a builtin's hidden properties) */
+static bool objp_propertyIsEnumerable(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
+                                      JsValue *r) {
+    JsString *ks = js_native_string(ctx, ARG(0));
+    if (!ks)
+        return oom(ctx, r);
+    if (js_is_undefined(tv) || js_is_null(tv))
+        return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
+    bool found;
+    if (!value_has_own(ctx, tv, ks, &found))
+        return oom(ctx, r);
+    if (found) {
+        JsValue kv = js_value_from_cell(&ks->gc);
+        if (js_is_string(tv) || (js_is_object(tv) && js_value_object(tv)->obj_kind == JS_OBJ_ARRAY)) {
+            found = !str_is_ascii(kv, "length");
+        } else if (js_is_function(tv) && (str_is_ascii(kv, "name") || str_is_ascii(kv, "length") ||
+                                          str_is_ascii(kv, "prototype"))) {
+            found = false;
+        } else if (js_is_object(tv) && js_value_object(tv)->obj_kind == JS_OBJ_ERROR &&
+                   js_error_stack_has(js_value_object(tv), kv)) {
+            found = false;
+#ifdef LAMASSU_HAS_REGEX
+        } else if (js_is_object(tv) && js_value_object(tv)->obj_kind == JS_OBJ_REGEXP &&
+                   str_is_ascii(kv, "lastIndex")) {
+            found = false;
+#endif
+        } else {
+            JsString *ik = js_intern_cell(ctx->vm, ks);
+            if (!ik)
+                return oom(ctx, r);
+            JsObject *maps[2] = {NULL, NULL};
+            if (js_is_function(tv) || js_is_promise(tv)) {
+                maps[0] = js_cell_props(ctx, tv, false);
+                if (js_is_function(tv) && js_value_cell(tv)->kind == JS_KIND_NATIVE)
+                    maps[1] = ((JsNative *)js_value_cell(tv))->statics;
+            } else if (js_is_object(tv)) {
+                maps[0] = js_value_object(tv);
+            }
+            found = false;
+            for (int i = 0; i < 2; i++) {
+                bool has = false;
+                if (maps[i])
+                    (void)js_map_get(&maps[i]->props, ik, &has);
+                if (has) { /* a builtin's statics are not enumerable */
+                    found = i == 0 && !(js_map_get_attrs(&maps[i]->props, ik) & JS_ATTR_HIDDEN);
+                    break;
+                }
+            }
+        }
+    }
+    *r = js_bool(found);
+    return true;
+}
+
+/* o.isPrototypeOf(v): false for a primitive v (before this is checked, as V8), else whether this
+ * is on v's [[Prototype]] chain */
+static bool objp_isPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    JsValue v = ARG(0);
+    *r = js_bool(false);
+    if (!js_is_object(v) && !js_is_function(v) && !js_is_promise(v))
+        return true;
+    if (js_is_undefined(tv) || js_is_null(tv))
+        return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
+    for (JsValue p = js_get_proto(ctx, v); !js_is_undefined(p) && !js_is_null(p); p = js_get_proto(ctx, p)) {
+        if (p.bits == tv.bits) {
+            *r = js_bool(true);
+            break;
+        }
+    }
+    return true;
+}
+
+/* Object.groupBy's ADD: the group array under the property key KEY (a string) */
+static bool group_add_prop(JsContext *ctx, JsValue groups, JsValue key, JsValue value) {
+    JsVm *vm = ctx->vm;
+    JsObject *o = js_value_object(groups);
+    JsString *ik = js_intern_cell(vm, js_value_string(key)); /* key is rooted by the caller */
+    if (!ik)
+        return false;
+    bool found;
+    JsValue arr = js_map_get(&o->props, ik, &found);
+    if (!found) {
+        js_gc_protect(vm, &value);
+        JsObject *a = js_array_new_cell(ctx, 1);
+        js_gc_unprotect(vm, &value);
+        ik = a ? js_intern_cell(vm, js_value_string(key)) : NULL; /* the interned cell may have gone */
+        if (!a || !ik)
+            return false;
+        arr = js_value_from_cell(&a->gc);
+        if (!js_map_set(vm, &o->props, ik, arr))
+            return false;
+    }
+    return js_array_append(vm, js_value_object(arr), value);
+}
+
+/* Object.groupBy(items, callback): a prototype-less object of arrays, one per key */
+static bool obj_groupBy(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    if (js_is_undefined(ARG(0)) || js_is_null(ARG(0)))
+        return native_throw(ctx, r, "TypeError: Object.groupBy called on null or undefined");
+    if (!js_is_function(ARG(1)))
+        return native_throw_fmt(ctx, r, "TypeError: %v is not a function", ARG(1));
+    JsValue groups = js_object_new(ctx);
+    if (!js_is_object(groups))
+        return oom(ctx, r);
+    js_value_object(groups)->proto = js_undefined();
+    js_gc_protect(ctx->vm, &groups);
+    bool ok = js_group_by(ctx, ARG(0), ARG(1), true, groups, group_add_prop, r);
+    js_gc_unprotect(ctx->vm, &groups);
+    if (ok)
+        *r = groups;
+    return ok;
+}
+
+/* Object.is(a, b): SameValue (NaN is NaN; 0 is not -0) */
+static bool obj_is(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)ctx;
+    (void)tv;
+    JsValue x = ARG(0), y = ARG(1);
+    if (js_is_number(x) && js_is_number(y)) {
+        double dx = js_get_number(x), dy = js_get_number(y);
+        *r = js_bool(dx != dx ? dy != dy : (dx == dy && __builtin_signbit(dx) == __builtin_signbit(dy)));
+    } else {
+        *r = js_bool(js_strict_equals(x, y));
+    }
+    return true;
+}
+
 /* The tag V8 keeps as an own Symbol.toStringTag on a few builtin objects, which whatever inherits
  * from them reports too (there are no symbols here, so these are the only ones) */
 static const char *inherited_tag(const JsContext *ctx, JsValue p) {
@@ -4470,6 +5268,115 @@ static bool str_fromCharCode(JsContext *ctx, JsValue tv, const JsValue *args, in
     return js_is_undefined(*r) && argc ? oom(ctx, r) : true;
 }
 
+/* String.raw(template, ...subs): template.raw's pieces (read through its length) with the
+ * substitutions between them */
+static bool str_raw(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    JsVm *vm = ctx->vm;
+    JsValue cooked = ARG(0), raw = js_undefined(), lenv, piece = js_undefined();
+    if (js_is_undefined(cooked) || js_is_null(cooked))
+        return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
+    static const uint16_t kraw[] = {'r', 'a', 'w'}, klen[] = {'l', 'e', 'n', 'g', 't', 'h'};
+    JsValue key = js_atom(vm, kraw, 3);
+    if (!js_is_string(key) || !js_get_property(ctx, cooked, key, &raw))
+        return oom(ctx, r);
+    if (js_is_undefined(raw) || js_is_null(raw))
+        return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
+    js_gc_protect(vm, &raw);
+    js_gc_protect(vm, &piece);
+    double len = 0;
+    key = js_atom(vm, klen, 6);
+    bool ok = js_is_string(key) && js_get_property(ctx, raw, key, &lenv) && js_op_to_number(ctx, lenv, &len);
+    StrBuf sb;
+    sb_init(&sb, vm);
+    len = to_int(len);
+    for (double i = 0; ok && i < len; i++) {
+        char ib[24];
+        snprintf(ib, sizeof ib, "%.0f", i);
+        JsString *ik = js_ascii_cell(vm, ib);
+        ok = ik && js_get_property(ctx, raw, js_value_from_cell(&ik->gc), &piece);
+        JsString *ps = ok ? js_op_to_string(ctx, piece) : NULL;
+        if (!ps) {
+            ok = false;
+            break;
+        }
+        sb_units(&sb, ps->units, ps->length);
+        if (i + 1 < len && i + 1 < argc) {
+            JsString *sub = js_op_to_string(ctx, args[(int)i + 1]);
+            if (!sub) {
+                ok = false;
+                break;
+            }
+            sb_units(&sb, sub->units, sub->length);
+        }
+    }
+    js_gc_unprotect(vm, &piece);
+    js_gc_unprotect(vm, &raw);
+    if (!ok) {
+        sb_free(&sb);
+        return oom(ctx, r);
+    }
+    *r = sb_finish(&sb);
+    return js_is_undefined(*r) ? oom(ctx, r) : true;
+}
+
+/* escape / unescape (Annex B): %XX for a unit below 256 outside A-Z a-z 0-9 @*_+-./, %uXXXX above */
+static bool g_escape(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    JsString *s = arg_string(ctx, ARG(0));
+    if (!s)
+        return oom(ctx, r);
+    static const char hex[] = "0123456789ABCDEF";
+    StrBuf sb;
+    sb_init(&sb, ctx->vm);
+    for (uint32_t i = 0; i < s->length; i++) {
+        uint16_t c = s->units[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            (c < 128 && strchr("@*_+-./", c))) {
+            sb_unit(&sb, c);
+        } else if (c < 256) {
+            sb_unit(&sb, '%');
+            sb_unit(&sb, (uint16_t)hex[c >> 4]);
+            sb_unit(&sb, (uint16_t)hex[c & 15]);
+        } else {
+            sb_unit(&sb, '%');
+            sb_unit(&sb, 'u');
+            for (int sh = 12; sh >= 0; sh -= 4)
+                sb_unit(&sb, (uint16_t)hex[(c >> sh) & 15]);
+        }
+    }
+    *r = sb_finish(&sb);
+    return js_is_undefined(*r) ? oom(ctx, r) : true;
+}
+
+static int hexval(uint16_t c) {
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+static bool g_unescape(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    JsString *s = arg_string(ctx, ARG(0));
+    if (!s)
+        return oom(ctx, r);
+    StrBuf sb;
+    sb_init(&sb, ctx->vm);
+    for (uint32_t i = 0; i < s->length; i++) {
+        uint16_t c = s->units[i];
+        if (c == '%' && i + 5 < s->length && s->units[i + 1] == 'u' && hexval(s->units[i + 2]) >= 0 &&
+            hexval(s->units[i + 3]) >= 0 && hexval(s->units[i + 4]) >= 0 && hexval(s->units[i + 5]) >= 0) {
+            c = (uint16_t)(hexval(s->units[i + 2]) << 12 | hexval(s->units[i + 3]) << 8 |
+                           hexval(s->units[i + 4]) << 4 | hexval(s->units[i + 5]));
+            i += 5;
+        } else if (c == '%' && i + 2 < s->length && hexval(s->units[i + 1]) >= 0 && hexval(s->units[i + 2]) >= 0) {
+            c = (uint16_t)(hexval(s->units[i + 1]) << 4 | hexval(s->units[i + 2]));
+            i += 2;
+        }
+        sb_unit(&sb, c);
+    }
+    *r = sb_finish(&sb);
+    return js_is_undefined(*r) ? oom(ctx, r) : true;
+}
+
 static bool str_fromCodePoint(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     StrBuf sb;
@@ -4548,6 +5455,16 @@ MATH1(math_acos, js_k_acos)
 MATH1(math_atan, js_k_atan)
 MATH1(math_log2, js_k_log2)
 MATH1(math_log10, js_k_log10)
+MATH1(math_expm1, js_k_expm1)
+MATH1(math_log1p, js_k_log1p)
+MATH1(math_sinh, js_k_sinh)
+MATH1(math_cosh, js_k_cosh)
+MATH1(math_tanh, js_k_tanh)
+MATH1(math_asinh, js_k_asinh)
+MATH1(math_acosh, js_k_acosh)
+MATH1(math_atanh, js_k_atanh)
+MATH1(math_f16round, m_f16round)
+MATH1(math_clz32, m_clz32)
 #undef MATH1
 
 static bool math_round(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
@@ -4655,6 +5572,8 @@ bool js_builtins_init(JsContext *ctx) {
     ctx->object_proto = js_value_object(op);
     static const MethodDef object_proto_methods[] = {
         {"hasOwnProperty", objp_hasOwnProperty},
+        {"isPrototypeOf", objp_isPrototypeOf},
+        {"propertyIsEnumerable", objp_propertyIsEnumerable},
         {"toString", objp_toString},
         {"valueOf", objp_valueOf},
         {NULL, NULL}};
@@ -4718,6 +5637,11 @@ bool js_builtins_init(JsContext *ctx) {
         {"repeat", sm_repeat}, {"padStart", sm_padStart}, {"padEnd", sm_padEnd},
         {"replace", sm_replace}, {"replaceAll", sm_replaceAll}, {"split", sm_split},
         {"concat", sm_concat}, {"toString", sm_toString}, {"valueOf", sm_valueOf},
+        {"isWellFormed", sm_isWellFormed}, {"toWellFormed", sm_toWellFormed},
+        {"anchor", sm_anchor}, {"big", sm_big}, {"blink", sm_blink}, {"bold", sm_bold},
+        {"fixed", sm_fixed}, {"fontcolor", sm_fontcolor}, {"fontsize", sm_fontsize},
+        {"italics", sm_italics}, {"link", sm_link}, {"small", sm_small}, {"strike", sm_strike},
+        {"sub", sm_sub}, {"sup", sm_sup},
 #ifdef LAMASSU_HAS_REGEX
         {"match", js_re_str_match}, {"matchAll", js_re_str_matchAll},
         {"search", js_re_str_search},
@@ -4733,12 +5657,17 @@ bool js_builtins_init(JsContext *ctx) {
         {"findIndex", am_findIndex}, {"reduce", am_reduce}, {"sort", am_sort},
         {"flat", am_flat}, {"toString", am_toString}, {"keys", am_keys},
         {"values", am_values}, {"entries", am_entries},
+        {"findLast", am_findLast}, {"findLastIndex", am_findLastIndex},
+        {"reduceRight", am_reduceRight}, {"flatMap", am_flatMap}, {"splice", am_splice},
+        {"copyWithin", am_copyWithin}, {"toReversed", am_toReversed},
+        {"toSorted", am_toSorted}, {"toSpliced", am_toSpliced}, {"with", am_with},
         {NULL, NULL}};
     static const MethodDef function_methods[] = {
         {"apply", fm_apply}, {"bind", fm_bind}, {"call", fm_call}, {"toString", fm_toString},
         {NULL, NULL}};
     static const MethodDef number_methods[] = {
         {"toFixed", nm_toFixed}, {"toString", nm_toString}, {"valueOf", nm_valueOf},
+        {"toExponential", nm_toExponential}, {"toPrecision", nm_toPrecision},
         {NULL, NULL}};
     static const MethodDef boolean_methods[] = {
         {"toString", bm_toString}, {"valueOf", bm_valueOf},
@@ -4749,6 +5678,15 @@ bool js_builtins_init(JsContext *ctx) {
         !install_methods(ctx, ctx->boolean_methods, boolean_methods) ||
         !install_methods(ctx, ctx->function_methods, function_methods))
         return false;
+    /* trimLeft and trimRight are the very functions trimStart and trimEnd, as in V8 */
+    for (int i = 0; i < 2; i++) {
+        bool found = false;
+        JsString *k = js_ascii_cell(ctx->vm, i ? "trimEnd" : "trimStart");
+        k = k ? js_intern_cell(ctx->vm, k) : NULL;
+        JsValue fn = k ? js_map_get(&ctx->string_methods->props, k, &found) : js_undefined();
+        if (!found || !js_object_set_ascii(ctx, ctx->string_methods, i ? "trimRight" : "trimLeft", fn))
+            return false;
+    }
     /* call and apply have no frame of their own in a stack trace, as in V8 */
     for (const char *const *m = (const char *const[]){"call", "apply", NULL}; *m; m++) {
         JsString *k = js_ascii_cell(ctx->vm, *m);
@@ -4776,7 +5714,13 @@ bool js_builtins_init(JsContext *ctx) {
         !def_fn(ctx, math, "acos", math_acos) || !def_fn(ctx, math, "atan", math_atan) ||
         !def_fn(ctx, math, "atan2", math_atan2) || !def_fn(ctx, math, "pow", math_pow) ||
         !def_fn(ctx, math, "min", math_min) || !def_fn(ctx, math, "max", math_max) ||
-        !def_fn(ctx, math, "hypot", math_hypot) || !def_fn(ctx, math, "random", math_random))
+        !def_fn(ctx, math, "hypot", math_hypot) || !def_fn(ctx, math, "random", math_random) ||
+        !def_fn(ctx, math, "expm1", math_expm1) || !def_fn(ctx, math, "log1p", math_log1p) ||
+        !def_fn(ctx, math, "sinh", math_sinh) || !def_fn(ctx, math, "cosh", math_cosh) ||
+        !def_fn(ctx, math, "tanh", math_tanh) || !def_fn(ctx, math, "asinh", math_asinh) ||
+        !def_fn(ctx, math, "acosh", math_acosh) || !def_fn(ctx, math, "atanh", math_atanh) ||
+        !def_fn(ctx, math, "f16round", math_f16round) || !def_fn(ctx, math, "clz32", math_clz32) ||
+        !def_fn(ctx, math, "imul", math_imul))
         return false;
     if (!def_num(ctx, math, "PI", 3.141592653589793) ||
         !def_num(ctx, math, "E", 2.718281828459045) ||
@@ -4823,7 +5767,8 @@ bool js_builtins_init(JsContext *ctx) {
         !def_fn(ctx, object, "freeze", obj_freeze) || !def_fn(ctx, object, "isFrozen", obj_isFrozen) ||
         !def_fn(ctx, object, "seal", obj_seal) || !def_fn(ctx, object, "isSealed", obj_isSealed) ||
         !def_fn(ctx, object, "fromEntries", obj_fromEntries) ||
-        !def_fn(ctx, object, "hasOwn", obj_hasOwn) ||
+        !def_fn(ctx, object, "hasOwn", obj_hasOwn) || !def_fn(ctx, object, "is", obj_is) ||
+        !def_fn(ctx, object, "groupBy", obj_groupBy) ||
         !def_fn(ctx, object, "getOwnPropertyNames", obj_getOwnPropertyNames) ||
         !def_fn(ctx, object, "getPrototypeOf", obj_getPrototypeOf) ||
         !def_fn(ctx, object, "setPrototypeOf", obj_setPrototypeOf) ||
@@ -4878,7 +5823,7 @@ bool js_builtins_init(JsContext *ctx) {
     if (!stro)
         return false;
     if (!def_fn(ctx, stro, "fromCharCode", str_fromCharCode) ||
-        !def_fn(ctx, stro, "fromCodePoint", str_fromCodePoint))
+        !def_fn(ctx, stro, "fromCodePoint", str_fromCodePoint) || !def_fn(ctx, stro, "raw", str_raw))
         return false;
     if (!link_prototype(ctx, "Number", ctx->number_methods) ||
         !link_prototype(ctx, "String", ctx->string_methods))
@@ -4930,7 +5875,8 @@ bool js_builtins_init(JsContext *ctx) {
         !def_fn(ctx, ctx->globals, "encodeURI", g_encodeURI) ||
         !def_fn(ctx, ctx->globals, "encodeURIComponent", g_encodeURIComponent) ||
         !def_fn(ctx, ctx->globals, "decodeURI", g_decodeURI) ||
-        !def_fn(ctx, ctx->globals, "decodeURIComponent", g_decodeURIComponent))
+        !def_fn(ctx, ctx->globals, "decodeURIComponent", g_decodeURIComponent) ||
+        !def_fn(ctx, ctx->globals, "escape", g_escape) || !def_fn(ctx, ctx->globals, "unescape", g_unescape))
         return false;
     hide_builtin_keys(ctx);
     return true;

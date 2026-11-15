@@ -5,6 +5,7 @@
 #include "js_bytecode.h"
 #include "js_error.h"
 #include "js_iter.h"
+#include "js_valindex.h"
 #include "js_mapobj.h"
 #include "js_setobj.h"
 #ifdef LAMASSU_HAS_REGEX
@@ -1254,5 +1255,66 @@ bool js_iter_builtins_init(JsContext *ctx) {
              js_object_set_ascii(ctx, ctx->globals, "Iterator", ctor);
     }
     js_gc_unprotect(vm, &ctor);
+    return ok;
+}
+
+bool js_group_by(JsContext *ctx, JsValue items, JsValue cb, bool property_keys, JsValue groups,
+                 JsGroupAdd add, JsValue *r) {
+    JsVm *vm = ctx->vm;
+    JsIterCursor cur;
+    int open = js_iter_open(ctx, items, &cur);
+    if (open <= 0) {
+        *r = open < 0 ? js_oom_value(vm) : js_iter_not_iterable(ctx, items);
+        return false;
+    }
+    JsValue v = js_undefined(), key = js_undefined();
+    js_gc_protect(vm, &cur.src);
+    js_gc_protect(vm, &cb);
+    js_gc_protect(vm, &v);
+    js_gc_protect(vm, &key);
+    bool ok = true, thrown = false;
+    double k = 0;
+    int st;
+    while ((st = js_iter_next(ctx, &cur, &v)) != 0) {
+        if (st < 0) { /* its own next threw: nothing to close */
+            *r = v;
+            ok = false;
+            break;
+        }
+        JsValue argv[2] = {v, js_number(k)};
+        if (!js_call(ctx, cb, js_undefined(), argv, 2, &key)) {
+            *r = key;
+            thrown = true;
+            break;
+        }
+        if (property_keys) {
+            JsString *ks = js_op_to_string(ctx, key);
+            if (!ks) {
+                *r = js_take_error(ctx);
+                thrown = true;
+                break;
+            }
+            key = js_value_from_cell(&ks->gc);
+        } else {
+            key = js_normalize_map_key(key);
+        }
+        if (!add(ctx, groups, key, v)) {
+            *r = js_oom_value(vm);
+            ok = false;
+            break;
+        }
+        k++;
+    }
+    if (thrown) {
+        js_gc_protect(vm, r);
+        JsValue ignored;
+        (void)js_iter_close(ctx, &cur, true, false, &ignored);
+        js_gc_unprotect(vm, r);
+        ok = false;
+    }
+    js_gc_unprotect(vm, &key);
+    js_gc_unprotect(vm, &v);
+    js_gc_unprotect(vm, &cb);
+    js_gc_unprotect(vm, &cur.src);
     return ok;
 }
