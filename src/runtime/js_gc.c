@@ -5,6 +5,7 @@
 #include "js_setobj.h"
 #include "js_iter.h"
 #include "js_weak.h"
+#include "js_bigint.h"
 #ifdef LAMASSU_HAS_REGEX
 #include "js_regexp.h"
 #endif
@@ -65,8 +66,8 @@ void js_gc_mark_cell(JsVm *vm, JsGcCell *c) {
     if (!c || c->mark)
         return;
     c->mark = 1;
-    /* strings and bytecode buffers have no children */
-    if (c->kind != JS_KIND_STRING && c->kind != JS_KIND_BYTECODE)
+    /* strings, bytecode buffers and BigInts have no children */
+    if (c->kind != JS_KIND_STRING && c->kind != JS_KIND_BYTECODE && c->kind != JS_KIND_BIGINT)
         js_mark_push(vm, c);
 }
 
@@ -207,6 +208,7 @@ static void js_gc_trace(JsVm *vm) {
         }
         case JS_KIND_STRING:
         case JS_KIND_BYTECODE:
+        case JS_KIND_BIGINT:
             break;
         }
     }
@@ -299,6 +301,9 @@ void js_gc_free_cell(JsVm *vm, JsGcCell *c, bool remove_atoms) {
         js_module_free_cell(vm, (JsModule *)c);
         size = sizeof(JsModule);
         break;
+    case JS_KIND_BIGINT:
+        size = js_bigint_cell_size((JsBigInt *)c);
+        break;
     case JS_KIND_BYTECODE: {
         JsBytecode *bc = (JsBytecode *)c;
         size = sizeof *bc + bc->length;
@@ -326,6 +331,8 @@ void js_gc_collect(JsVm *vm) {
             js_gc_mark_cell(vm, &ctx->string_methods->gc);
         if (ctx->number_methods)
             js_gc_mark_cell(vm, &ctx->number_methods->gc);
+        if (ctx->bigint_methods)
+            js_gc_mark_cell(vm, &ctx->bigint_methods->gc);
         if (ctx->boolean_methods)
             js_gc_mark_cell(vm, &ctx->boolean_methods->gc);
         if (ctx->function_methods)

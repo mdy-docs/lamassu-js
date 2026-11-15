@@ -64,6 +64,7 @@ static const char *unexpected_text(JsParser *p) {
     case JS_T_IDENT:
         return js_compile_error_fmt(vm, "Unexpected identifier '%U'", t->u.str.units, t->u.str.len);
     case JS_T_NUM:
+    case JS_T_BIGINT:
         return "Unexpected number";
     case JS_T_STR:
         return "Unexpected string";
@@ -1105,6 +1106,13 @@ static JsAstNode *parse_primary(JsParser *p) {
         if (!n)
             return NULL;
         n->number = t->u.number;
+        return advance(p) ? n : NULL;
+    case JS_T_BIGINT:
+        n = new_node(p, JS_AST_BIGINT, t->pos);
+        if (!n)
+            return NULL;
+        n->units = t->u.str.units;
+        n->len = t->u.str.len;
         return advance(p) ? n : NULL;
     case JS_T_STR:
         n = new_node(p, JS_AST_STRING, t->pos);

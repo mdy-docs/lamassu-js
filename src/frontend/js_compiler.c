@@ -1,5 +1,6 @@
 #include <string.h>
 #include "js_compile.h"
+#include "js_bigint.h"
 #include "lamassu_compile.h"
 #ifdef LAMASSU_HAS_REGEX
 #include "js_regexp.h"
@@ -1681,20 +1682,18 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
 
 static bool compile_update(JsCompiler *cx, const JsAstNode *n) {
     const JsAstNode *t = n->a;
-    JsOp arith = n->op == JS_T_INC ? JS_OP_ADD : JS_OP_SUB;
+    uint8_t dec = n->op == JS_T_INC ? 0 : 1;
     bool prefix = (n->flags & JS_F_PREFIX) != 0;
     note_pos(cx, n->pos);
 
     if (t->kind == JS_AST_IDENT) {
-        if (!compile_ident_load(cx, t) || !emit_op(cx, JS_OP_POS, 0))
+        if (!compile_ident_load(cx, t))
             return false;
-        if (prefix)
-            return emit_number(cx, 1, n->pos) && emit_op(cx, arith, -1) &&
-                   compile_ident_store(cx, t);
-        if (!emit_op(cx, JS_OP_DUP, +1) || !emit_number(cx, 1, n->pos) ||
-            !emit_op(cx, arith, -1) || !compile_ident_store(cx, t))
-            return false;
-        return emit_op(cx, JS_OP_POP, -1);
+        if (prefix) /* [v] -> [v'] */
+            return emit_op(cx, JS_OP_UPDATE, 0) && emit8(cx, dec) && compile_ident_store(cx, t);
+        /* [v] -> [old new]; the new is stored, the old is the value */
+        return emit_op(cx, JS_OP_UPDATE_POST, +1) && emit8(cx, dec) && compile_ident_store(cx, t) &&
+               emit_op(cx, JS_OP_POP, -1);
     }
     if (t->kind != JS_AST_MEMBER)
         return cerr(cx, t->pos, "Invalid left-hand side expression in postfix operation");
@@ -1705,21 +1704,23 @@ static bool compile_update(JsCompiler *cx, const JsAstNode *n) {
         return false;
     if (computed) {
         if (!compile_expr(cx, t->a) || !compile_expr(cx, t->b) ||
-            !emit_op(cx, JS_OP_DUP2, +2) || !emit_op(cx, JS_OP_GET_PROP, -1) ||
-            !emit_op(cx, JS_OP_POS, 0))
+            !emit_op(cx, JS_OP_DUP2, +2) || !emit_op(cx, JS_OP_GET_PROP, -1))
             return false;
     } else {
         if (!compile_expr(cx, t->a) || !emit_op(cx, JS_OP_DUP, +1) ||
-            !emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0) || !emit_op(cx, JS_OP_POS, 0))
+            !emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0))
             return false;
     }
-    if (!prefix) {
-        uint16_t scratch;
-        if (!get_scratch(cx, &scratch) || !emit_op_u16(cx, JS_OP_SET_LOCAL, scratch, 0))
+    uint16_t scratch = 0;
+    if (prefix) {
+        if (!emit_op(cx, JS_OP_UPDATE, 0) || !emit8(cx, dec))
+            return false;
+    } else { /* [.. v] -> [.. old new] -> the old into the scratch slot -> [.. new] */
+        if (!emit_op(cx, JS_OP_UPDATE_POST, +1) || !emit8(cx, dec) || !emit_op(cx, JS_OP_SWAP, 0) ||
+            !get_scratch(cx, &scratch) || !emit_op_u16(cx, JS_OP_SET_LOCAL, scratch, 0) ||
+            !emit_op(cx, JS_OP_POP, -1))
             return false;
     }
-    if (!emit_number(cx, 1, n->pos) || !emit_op(cx, arith, -1))
-        return false;
     if (computed) {
         if (!emit_op(cx, JS_OP_SET_PROP, -2))
             return false;
@@ -1728,7 +1729,6 @@ static bool compile_update(JsCompiler *cx, const JsAstNode *n) {
             return false;
     }
     if (!prefix) {
-        uint16_t scratch;
         if (!get_scratch(cx, &scratch) || !emit_op(cx, JS_OP_POP, -1) ||
             !emit_op_u16(cx, JS_OP_GET_LOCAL, scratch, +1))
             return false;
@@ -2062,6 +2062,18 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
         return emit_op(cx, JS_OP_GET_THIS, +1);
     case JS_AST_TAGGED_TEMPLATE:
         return compile_tagged_template(cx, n);
+    case JS_AST_BIGINT: {
+        JsString *text = js_string_cell_new(cx->vm, n->units, n->len);
+        JsValue tv = text ? js_value_from_cell(&text->gc) : js_undefined();
+        js_gc_protect(cx->vm, &tv);
+        bool bad = false;
+        JsBigInt *b = text ? js_bigint_from_string(cx->ctx, text, &bad) : NULL;
+        js_gc_unprotect(cx->vm, &tv);
+        if (!b)
+            return cerr(cx, n->pos, bad ? "Invalid or unexpected token" : "out of memory");
+        uint16_t c;
+        return const_add(cx, js_value_from_cell(&b->gc), &c) && emit_op_u16(cx, JS_OP_CONST, c, +1);
+    }
     case JS_AST_IMPORT_META: {
         /* a pseudo-import the linker binds to the module's meta object */
         JsModule *mod = cx->module;

@@ -31,6 +31,7 @@ typedef enum JsGcKind {
     JS_KIND_PROMISE = 8,
     JS_KIND_MODULE = 9,
     JS_KIND_BYTECODE = 10, /* opaque module-bytecode buffer (js_bytecode_value) */
+    JS_KIND_BIGINT = 11,   /* a BigInt (js_bigint.h); no children */
 } JsGcKind;
 
 /* Every GC allocation starts with this header; cells live on vm->cells. */
@@ -622,6 +623,7 @@ struct JsContext {
      * X.prototype objects instead — see array_proto etc. below. */
     JsObject *string_methods;
     JsObject *number_methods;
+    JsObject *bigint_methods; /* BigInt.prototype; GC root */
     JsObject *boolean_methods; /* Boolean.prototype: toString, valueOf */
     JsObject *function_methods; /* call, for every function value (closures and natives) */
     struct JsNative *function_proto; /* Function.prototype itself, as V8 has it: a builtin
@@ -791,6 +793,7 @@ static inline JsValue js_value_from_cell(JsGcCell *c) {
     case JS_KIND_CLOSURE:
     case JS_KIND_NATIVE: tag = JS_TAG_FUNCTION; break;
     case JS_KIND_PROMISE: tag = JS_TAG_PROMISE; break;
+    case JS_KIND_BIGINT: tag = JS_TAG_BIGINT; break;
     default: tag = JS_TAG_OBJECT; break;
     }
     v.bits = tag | ((uint64_t)(uintptr_t)c & JS_PAYLOAD_MASK);
@@ -804,7 +807,7 @@ static inline JsGcCell *js_value_cell(JsValue v) {
 static inline bool js_value_is_cell(JsValue v) {
     uint64_t tag = v.bits & JS_TAG_MASK;
     return tag == JS_TAG_STRING || tag == JS_TAG_OBJECT || tag == JS_TAG_FUNCTION ||
-           tag == JS_TAG_PROMISE;
+           tag == JS_TAG_PROMISE || tag == JS_TAG_BIGINT;
 }
 
 static inline JsString *js_value_string(JsValue v) { return (JsString *)js_value_cell(v); }

@@ -17,7 +17,7 @@
 #ifndef JS_BCFORMAT_H
 #define JS_BCFORMAT_H
 
-#define JSBC_VERSION 17u /* 3: JS_FN_USES_ARGUMENTS function flag; 4: callee-name table after the line table;
+#define JSBC_VERSION 18u /* 3: JS_FN_USES_ARGUMENTS function flag; 4: callee-name table after the line table;
                            5: JS_OP_THROW_CONST_ASSIGN, and the name table also marks iteration,
                            destructuring and TDZ-able reads;
                            6: JS_OP_SET_LOCAL_CHECKED, JS_OP_SET_UPVAL_CHECKED, JS_OP_INIT_EXPORT,
@@ -40,7 +40,8 @@
                            16: JS_FN_NEW_TARGET function flag (new.target in the local after
                            `arguments`), JS_IMPORT_META import kind, CTAG_IMPORT_META and CTAG_TEMPLATE constants;
                            17: JS_OP_DYNAMIC_IMPORT takes [specifier, options], and a module request
-                           carries its import attributes after a 0 unit */
+                           carries its import attributes after a 0 unit; CTAG_BIGINT constants;
+                           18: JS_OP_UPDATE and JS_OP_UPDATE_POST for ++ and -- */
 #define JSBC_FLAG_HAS_REGEX 1u /* producer had regex enabled (informational) */
 
 /* Sanity caps: reject absurd sizes early (before allocating) rather than
@@ -67,6 +68,7 @@ enum {
     CTAG_IMPORT_META = 7, /* a unit's import.meta object (no module record): one per load */
     CTAG_TEMPLATE = 8,    /* a tagged template's strings: u32 n, then n x (u8 cooked?, [string],
                            * raw string) */
+    CTAG_BIGINT = 9,      /* u8 negative, u32 limb count, the limbs (u32, least significant first) */
 };
 
 #endif /* JS_BCFORMAT_H */

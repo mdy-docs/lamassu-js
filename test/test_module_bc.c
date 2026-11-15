@@ -282,6 +282,9 @@ static void test_graphs(void) {
                     " const g = (s) => s; const f = () => tag`a${1}\\xg${2}`;"
                     " export const r = f() + ':' + (g`q` !== g`q`) + ':' + String.raw`x\\ny`;");
     expect("main", "r", "a|\\xg|:a|undefined|:1,2:true:true:x\\ny");
+    mods_reset();
+    mod_add("main", "const big = 2n ** 100n; let i = 0n; i++; export const r = [big, -12345678901234567890n, 0n, i, typeof big].join();");
+    expect("main", "r", "1267650600228229401496703205376,-12345678901234567890,0,1,bigint");
 
     /* live bindings: a counter mutated in the exporter is seen by the importer */
     mod_add("counter", "let n = 0; export function tick(){ return ++n; }");

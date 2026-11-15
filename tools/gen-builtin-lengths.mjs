@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const globals = ['Math', 'JSON', 'Object', 'Array', 'Number', 'String', 'Boolean', 'Error', 'TypeError',
   'RangeError', 'ReferenceError', 'SyntaxError', 'Promise', 'RegExp', 'Date', 'Map', 'Set', 'parseInt',
-  'parseFloat', 'isNaN', 'isFinite', 'EvalError', 'URIError', 'AggregateError', 'encodeURI', 'encodeURIComponent', 'decodeURI', 'decodeURIComponent', 'Iterator', 'escape', 'unescape', 'WeakMap', 'WeakSet', 'WeakRef', 'FinalizationRegistry'];
+  'parseFloat', 'isNaN', 'isFinite', 'EvalError', 'URIError', 'AggregateError', 'encodeURI', 'encodeURIComponent', 'decodeURI', 'decodeURIComponent', 'Iterator', 'escape', 'unescape', 'WeakMap', 'WeakSet', 'WeakRef', 'FinalizationRegistry', 'BigInt'];
 const functionsOf = (o, owner, out) => {
   for (const k of Object.getOwnPropertyNames(o)) {
     const d = Object.getOwnPropertyDescriptor(o, k);
@@ -33,7 +33,7 @@ const instance = { Array: '[]', String: "''", Number: '0', Boolean: 'true', Prom
   RegExp: '/a/', Date: 'new Date(0)', Map: 'new Map()', Set: 'new Set()', Object: '({})',
   Error: "new Error('')", TypeError: "new TypeError('')", RangeError: "new RangeError('')",
   ReferenceError: "new ReferenceError('')", SyntaxError: "new SyntaxError('')", EvalError: "new EvalError('')", URIError: "new URIError('')", AggregateError: 'new AggregateError([])', Function: '(function () {})', Iterator: '[].values()', WeakMap: 'new WeakMap()',
-  WeakSet: 'new WeakSet()', WeakRef: 'new WeakRef({})', FinalizationRegistry: 'new FinalizationRegistry(() => {})' };
+  WeakSet: 'new WeakSet()', WeakRef: 'new WeakRef({})', FinalizationRegistry: 'new FinalizationRegistry(() => {})', BigInt: '1n' };
 let probe = 'const r = [];\nconst t = (i, f) => { try { if (typeof f() === "function") r.push(i); } catch (e) {} };\n';
 cand.forEach((e, i) => {
   const base = e.owner === '' ? 'globalThis'

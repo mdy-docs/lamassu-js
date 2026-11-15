@@ -278,6 +278,28 @@ are not enumerable (`Object.keys(Map.prototype)` and `Object.keys(globalThis)` a
 V8; ones a script adds are. Assigning one keeps it so (replacing `Map.prototype.get` leaves it
 unlisted); deleting it and making it again gives an ordinary one.
 
+## `BigInt`
+
+As in V8: a primitive of its own (`typeof 10n` is `"bigint"`), arbitrary precision (up to V8's
+2^30 bits: `RangeError: Maximum BigInt size exceeded`). Literals in every base (`10n`, `0xFFn`,
+`0b101n`, `1_000n`). Every operator: `+ - * / % **` (division truncates; `RangeError: Division by
+zero`, `Exponent must be positive`), `& | ^ ~ << >>` (as infinite two's complement; `>>>` is
+`TypeError: BigInts have no unsigned right shift, use >> instead`), unary `-`, `++`/`--`, while
+unary `+` is `TypeError: Cannot convert a BigInt value to a number`, and mixing a BigInt with a
+number is `TypeError: Cannot mix BigInt and other types, use explicit conversions` (`+` with a
+string concatenates). `==` and `<` compare a BigInt with a number or a numeric string by value
+(`1n == 1`, `2n > 1.5`); `===` does not (`1n === 1` is false); `0n` is falsy. As `Map`/`Set`
+keys, in `includes` and `Object.is`, equal BigInts are the same key.
+
+- **`BigInt(value)`**: a number must be an integer (`RangeError: The number 1.5 cannot be
+  converted to a BigInt because it is not an integer`); a string is parsed as V8 does (`0x`, `0o`,
+  `0b`, surrounding white space; `SyntaxError: Cannot convert x to a BigInt`); `new BigInt` is a
+  `TypeError`. **Statics**: `asIntN(bits, n)`, `asUintN(bits, n)`.
+- **`BigInt.prototype`**: `toString(radix)`, `valueOf` (`toLocaleString` is left out with the
+  locale methods).
+- `Number(n)` converts, rounding to nearest; `JSON.stringify` refuses one (`TypeError: Do not know
+  how to serialize a BigInt`) unless a `toJSON` says otherwise; `Math` functions refuse one.
+
 ## `Boolean`
 
 `Boolean(x)` converts to a primitive boolean.

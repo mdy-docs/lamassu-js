@@ -76,7 +76,8 @@ p.length(); // 5
 ## Numbers and names
 
 Numeric literals take separators between digits (`1_000_000`, `0xFF_FF`, `1_0.5e1_0`), refused
-where V8 refuses them (`1__0`, `1_`, `0_1`). Identifiers may be spelled with unicode escapes
+where V8 refuses them (`1__0`, `1_`, `0_1`). A trailing `n` makes a BigInt (`10n`, `0xFFn`; not
+`1.5n` or `1e3n`): see [Built-ins](/guide/builtins#bigint). Identifiers may be spelled with unicode escapes
 (`\u0061`, `\u{1d4b6}`), as property names too (`o.\u0069f`); an escaped keyword where a name
 is expected is V8's `SyntaxError: Keyword must not contain escaped characters`.
 

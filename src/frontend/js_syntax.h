@@ -66,6 +66,7 @@ typedef enum JsTokKind {
     JS_T_AMP_EQ, JS_T_BAR_EQ, JS_T_CARET_EQ,
     JS_T_ANDAND, JS_T_OROR, JS_T_ANDAND_EQ, JS_T_OROR_EQ,
     JS_T_NOT, JS_T_TILDE, JS_T_INC, JS_T_DEC,
+    JS_T_BIGINT, /* a BigInt literal: u.str its text, prefix kept, separators and `n` dropped */
 } JsTokKind;
 
 typedef struct JsToken {
@@ -141,6 +142,7 @@ typedef enum JsAstKind {
     JS_AST_NEW_TARGET, /* `new.target` (only inside a function that is not an arrow, or its arrows) */
     JS_AST_IMPORT_META, /* `import.meta` */
     JS_AST_TAGGED_TEMPLATE, /* a = tag, b = the TEMPLATE (its chunks carry raw text in units2) */
+    JS_AST_BIGINT, /* a BigInt literal: units its text (0x... as written) */
     /* patterns */
     JS_AST_ARRAY_PATTERN, JS_AST_OBJECT_PATTERN, JS_AST_REST, JS_AST_DEFAULT,
 } JsAstKind;

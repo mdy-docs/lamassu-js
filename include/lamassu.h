@@ -42,6 +42,7 @@ typedef struct JsValue {
 #define JS_TAG_OBJECT    UINT64_C(0xFFFB000000000000)
 #define JS_TAG_FUNCTION  UINT64_C(0xFFFC000000000000)
 #define JS_TAG_PROMISE   UINT64_C(0xFFFD000000000000)
+#define JS_TAG_BIGINT    UINT64_C(0xFFFE000000000000) /* a BigInt cell */
 #define JS_CANONICAL_NAN UINT64_C(0x7FF8000000000000)
 
 #define JS_SPECIAL_UNDEFINED (JS_TAG_SPECIAL | 0)
@@ -92,6 +93,7 @@ static inline bool js_is_string(JsValue v) { return (v.bits & JS_TAG_MASK) == JS
 static inline bool js_is_object(JsValue v) { return (v.bits & JS_TAG_MASK) == JS_TAG_OBJECT; }
 static inline bool js_is_function(JsValue v) { return (v.bits & JS_TAG_MASK) == JS_TAG_FUNCTION; }
 static inline bool js_is_promise(JsValue v) { return (v.bits & JS_TAG_MASK) == JS_TAG_PROMISE; }
+static inline bool js_is_bigint(JsValue v) { return (v.bits & JS_TAG_MASK) == JS_TAG_BIGINT; }
 
 /* Identity (same bits), not ===: two equal-content heap strings differ. */
 static inline bool js_same_value(JsValue a, JsValue b) { return a.bits == b.bits; }

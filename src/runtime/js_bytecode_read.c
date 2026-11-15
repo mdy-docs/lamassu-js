@@ -18,6 +18,7 @@
  * GET_IMPORT opcodes bound to a live JsModule that has no standalone meaning,
  * so those opcodes are rejected on load.
  */
+#include "js_bigint.h"
 #include "js_bcformat.h"
 #include "js_bytecode.h"
 #include "lamassu_internal.h"
@@ -136,6 +137,8 @@ const JsOpInfo js_op_info[JS_OP__COUNT] = {
     OP(JS_OP_ITER_CLOSE, OPF_NONE, CF_NEXT, -2, 2, 0),
     OP(JS_OP_ITER_CLOSE_THROW, OPF_NONE, CF_NEXT, -2, 3, 0),
     OP(JS_OP_ITER_CLOSE_LOCAL, OPF_LOCAL, CF_NEXT, 0, 0, 2),
+    OP(JS_OP_UPDATE, OPF_U8, CF_NEXT, 0, 1, 1),
+    OP(JS_OP_UPDATE_POST, OPF_U8, CF_NEXT, +1, 1, 1),
 };
 #undef OP
 
@@ -466,6 +469,30 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
                 if (!child)
                     goto done;
                 fn->consts[i] = js_value_from_cell(&child->gc);
+                break;
+            }
+            case CTAG_BIGINT: {
+                uint8_t neg = in_u8(b);
+                uint32_t n = in_u32(b);
+                if (b->bad || neg > 1 || n > (1u << 25) || b->p + (size_t)n * 4 > b->end) {
+                    *err = "SyntaxError: bad BigInt constant";
+                    goto done;
+                }
+                uint32_t *limbs = n ? js_realloc_raw(ctx->vm, NULL, 0, (size_t)n * sizeof *limbs) : NULL;
+                if (n && !limbs) {
+                    *err = "out of memory";
+                    goto done;
+                }
+                for (uint32_t k = 0; k < n; k++)
+                    limbs[k] = in_u32(b);
+                JsBigInt *bi = js_bigint_from_limbs(ctx, limbs, n, neg != 0);
+                if (limbs)
+                    js_realloc_raw(ctx->vm, limbs, (size_t)n * sizeof *limbs, 0);
+                if (!bi) {
+                    *err = "out of memory";
+                    goto done;
+                }
+                fn->consts[i] = js_value_from_cell(&bi->gc);
                 break;
             }
             case CTAG_TEMPLATE: {

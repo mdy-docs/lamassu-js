@@ -121,9 +121,14 @@ typedef enum JsOp {
     JS_OP_ITER_CLOSE,        /* it i -> */
     JS_OP_ITER_CLOSE_THROW,  /* it i exc -> exc */
     JS_OP_ITER_CLOSE_LOCAL,  /* u16 slot holding the iterator */
+    /* ++ and -- (u8: 0 increment, 1 decrement): ToNumeric of the value, then one added or taken
+     * away in its own type (1 or 1n). UPDATE: v -> v'. UPDATE_POST: v -> old new (old the
+     * ToNumeric of v, a postfix expression's value). */
+    JS_OP_UPDATE,
+    JS_OP_UPDATE_POST,
 } JsOp;
 
-#define JS_OP__COUNT (JS_OP_ITER_CLOSE_LOCAL + 1)
+#define JS_OP__COUNT (JS_OP_UPDATE_POST + 1)
 
 /*
  * Per-opcode metadata, the single source of truth the bytecode verifier

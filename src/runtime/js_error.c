@@ -316,6 +316,10 @@ JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
                 fb_ascii(b, "object", 6);
                 continue;
             }
+            if (js_is_bigint(v)) { /* V8 names the type alone */
+                fb_ascii(b, "bigint", 6);
+                continue;
+            }
             if (js_is_string(v)) {
                 JsString *s = js_value_string(v);
                 fb_ascii(b, "string \"", 8);

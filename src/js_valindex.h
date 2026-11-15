@@ -22,6 +22,7 @@
 #define JS_VALINDEX_H
 
 #include "lamassu_internal.h"
+#include "js_bigint.h"
 #include <string.h>
 
 /* SameValueZero: like ===, but NaN equals NaN and +0 equals -0; strings by
@@ -35,6 +36,8 @@ static inline bool js_same_value_zero(JsValue a, JsValue b) {
     }
     if (js_is_string(a) && js_is_string(b))
         return js_string_equals(a, b);
+    if (js_is_bigint(a) && js_is_bigint(b))
+        return js_bigint_equal(js_value_bigint(a), js_value_bigint(b));
     return js_same_value(a, b);
 }
 
@@ -59,6 +62,8 @@ static inline uint32_t js_value_hash(JsValue v) {
     }
     if (js_is_string(v))
         return js_value_string(v)->hash;
+    if (js_is_bigint(v))
+        return js_bigint_hash(js_value_bigint(v));
     uint64_t b = v.bits;
     return (uint32_t)(b ^ (b >> 32));
 }

@@ -24,6 +24,7 @@
 #include "js_date.h"
 #include "js_mapobj.h"
 #include "js_weak.h"
+#include "js_bigint.h"
 #include "js_setobj.h"
 #include "js_iter.h"
 #ifdef LAMASSU_HAS_REGEX
@@ -3033,7 +3034,7 @@ static bool json_prop(JsonS *s, JsValue holder, JsValue key, JsValue value, bool
     js_gc_protect(ctx->vm, &v);
     js_gc_protect(ctx->vm, &ks);
     bool ok = true;
-    if (js_is_object(v) || js_is_function(v) || js_is_promise(v)) {
+    if (js_is_object(v) || js_is_function(v) || js_is_promise(v) || js_is_bigint(v)) {
         JsValue tj = js_undefined();
         ok = js_get_property(ctx, v, s->to_json, &tj);
         if (ok && js_is_function(tj)) {
@@ -3080,6 +3081,8 @@ static bool json_prop(JsonS *s, JsValue holder, JsValue key, JsValue value, bool
                 else
                     s->sb.oom = true;
             }
+        } else if (js_is_bigint(v)) {
+            ok = json_fail_pending(ctx, js_error_fmt(ctx, "TypeError: Do not know how to serialize a BigInt"));
         } else if (json_is_raw(v)) {
             static const uint16_t kr[] = {'r', 'a', 'w', 'J', 'S', 'O', 'N'};
             JsValue rk = js_atom(ctx->vm, kr, 7), raw = js_undefined();
@@ -4657,6 +4660,7 @@ static const char *inherited_tag(const JsContext *ctx, JsValue p) {
            : o == ctx->json_obj           ? "JSON"
            : o == ctx->map_proto          ? "Map"
            : o == ctx->set_proto          ? "Set"
+           : o == ctx->bigint_methods     ? "BigInt"
            : o == ctx->weakmap_proto      ? "WeakMap"
            : o == ctx->weakset_proto      ? "WeakSet"
            : o == ctx->weakref_proto      ? "WeakRef"
@@ -4691,6 +4695,8 @@ const char *js_to_string_tag(const JsContext *ctx, JsValue v) {
         return "String";
     if (js_is_bool(v))
         return "Boolean";
+    if (js_is_bigint(v))
+        return "BigInt";
     if (js_is_function(v))
         return "Function";
     if (js_is_promise(v))
@@ -5594,8 +5600,15 @@ static bool g_String(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
 static bool g_Number(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     double d = 0;
-    if (argc > 0)
-        TO_NUM(d, ARG(0));
+    if (argc > 0) { /* ToNumeric: a BigInt converts, as Number() is the one place it may */
+        JsValue p;
+        if (!js_to_primitive(ctx, ARG(0), JS_HINT_NUMBER, &p))
+            return oom(ctx, r);
+        if (js_is_bigint(p))
+            d = js_bigint_to_double(js_value_bigint(p));
+        else
+            TO_NUM(d, p);
+    }
     *r = js_number(d);
     return true;
 }
@@ -6230,7 +6243,7 @@ bool js_builtins_init(JsContext *ctx) {
         return false;
 
     /* Set global + real Set.prototype (js_setobj.c) */
-    if (!js_weak_builtins_init(ctx))
+    if (!js_weak_builtins_init(ctx) || !js_bigint_builtins_init(ctx))
         return false;
     if (!js_setobj_builtins_init(ctx))
         return false;

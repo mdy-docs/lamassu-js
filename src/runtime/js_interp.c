@@ -1,3 +1,4 @@
+#include "js_bigint.h"
 #include <stddef.h>
 #include <string.h>
 #include "js_bytecode.h"
@@ -59,6 +60,8 @@ bool js_to_boolean(JsValue v) {
         return true;
     if (v.bits == JS_SPECIAL_FALSE || js_is_undefined(v) || js_is_null(v))
         return false;
+    if (JS_UNLIKELY(js_is_bigint(v)))
+        return !js_bigint_is_zero(js_value_bigint(v));
     return true; /* objects, functions */
 }
 
@@ -102,6 +105,8 @@ JsString *js_primitive_to_string(JsVm *vm, JsValue v) {
         return js_ascii_cell(vm, "true");
     if (v.bits == JS_SPECIAL_FALSE)
         return js_ascii_cell(vm, "false");
+    if (js_is_bigint(v))
+        return js_bigint_to_string(vm, js_value_bigint(v), 10);
     return js_ascii_cell(vm, "undefined");
 }
 
@@ -231,6 +236,10 @@ bool js_op_to_number(JsContext *ctx, JsValue v, double *out) {
         *out = __builtin_nan("");
         return false;
     }
+    if (js_is_bigint(p)) {
+        *out = __builtin_nan("");
+        return fail_ascii(ctx, "TypeError: Cannot convert a BigInt value to a number");
+    }
     *out = js_primitive_to_number(p);
     return true;
 }
@@ -240,7 +249,30 @@ bool js_strict_equals(JsValue a, JsValue b) {
         return js_get_number(a) == js_get_number(b);
     if (js_is_string(a) && js_is_string(b))
         return js_string_equals(a, b);
+    if (JS_UNLIKELY(js_is_bigint(a)) && js_is_bigint(b))
+        return js_bigint_equal(js_value_bigint(a), js_value_bigint(b));
     return a.bits == b.bits;
+}
+
+/* a BigInt against a number, string or boolean for == (A the BigInt): 1, 0 */
+static int bigint_loose_eq(JsContext *ctx, JsValue a, JsValue b) {
+    if (js_is_bool(b))
+        b = js_number(js_get_bool(b) ? 1 : 0);
+    if (js_is_number(b))
+        return js_bigint_cmp_double(js_value_bigint(a), js_get_number(b)) == 0;
+    if (js_is_string(b)) { /* StringToBigInt: no BigInt, not equal */
+        bool bad;
+        JsValue av = a;
+        js_gc_protect(ctx->vm, &av);
+        JsBigInt *n = js_bigint_from_string(ctx, js_value_string(b), &bad);
+        js_gc_unprotect(ctx->vm, &av);
+        if (!n) {
+            js_set_error(ctx, js_undefined()); /* only OOM is possible here; it reads as unequal */
+            return 0;
+        }
+        return js_bigint_equal(js_value_bigint(av), n);
+    }
+    return 0;
 }
 
 /* IsLooselyEqual (7.2.14). 1 or 0, or -1 when converting an object failed (error pending). */
@@ -257,6 +289,12 @@ __attribute__((noinline)) static int loose_eq_values(JsContext *ctx, JsValue a, 
         bool acell = is_object_type(a), bcell = is_object_type(b);
         if (acell && bcell)
             return a.bits == b.bits;
+        if (js_is_bigint(a) && js_is_bigint(b))
+            return js_bigint_equal(js_value_bigint(a), js_value_bigint(b));
+        if (js_is_bigint(a) && !bcell)
+            return bigint_loose_eq(ctx, a, b);
+        if (js_is_bigint(b) && !acell)
+            return bigint_loose_eq(ctx, b, a);
         if (js_is_bool(a)) {
             a = js_number(js_get_bool(a) ? 1 : 0);
             continue;
@@ -310,6 +348,25 @@ __attribute__((noinline)) static int js_compare_values(JsContext *ctx, JsValue a
                 return x->units[i] < y->units[i] ? -1 : 1;
         }
         return x->length == y->length ? 0 : (x->length < y->length ? -1 : 1);
+    }
+    if (js_is_bigint(a) || js_is_bigint(b)) { /* compared as mathematical values */
+        if (js_is_bigint(a) && js_is_bigint(b))
+            return js_bigint_cmp(js_value_bigint(a), js_value_bigint(b));
+        bool flip = !js_is_bigint(a);
+        JsValue big = flip ? b : a, other = flip ? a : b;
+        int c;
+        if (js_is_string(other)) { /* StringToBigInt; none: unordered */
+            bool bad;
+            js_gc_protect(ctx->vm, &big);
+            JsBigInt *n = js_bigint_from_string(ctx, js_value_string(other), &bad);
+            js_gc_unprotect(ctx->vm, &big);
+            if (!n)
+                return bad ? 2 : 3;
+            c = js_bigint_cmp(js_value_bigint(big), n);
+        } else {
+            c = js_bigint_cmp_double(js_value_bigint(big), js_primitive_to_number(other));
+        }
+        return c == 2 ? 2 : flip ? -c : c;
     }
     double da = js_primitive_to_number(a);
     double db = js_primitive_to_number(b);
@@ -616,7 +673,7 @@ JsValue js_get_proto(JsContext *ctx, JsValue v) {
         return ctx->function_proto ? js_value_from_cell(&ctx->function_proto->gc) : js_null();
     }
     JsObject *t = js_is_number(v) ? ctx->number_methods : js_is_string(v) ? ctx->string_methods
-                  : js_is_bool(v) ? ctx->boolean_methods : NULL;
+                  : js_is_bool(v) ? ctx->boolean_methods : js_is_bigint(v) ? ctx->bigint_methods : NULL;
     return t ? js_value_from_cell(&t->gc) : js_null();
 }
 
@@ -1140,6 +1197,8 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
     }
     if (js_is_bool(base))
         return proto_table_lookup(ctx, ctx->boolean_methods, key, out);
+    if (js_is_bigint(base))
+        return proto_table_lookup(ctx, ctx->bigint_methods, key, out);
     return JS_PROP_OK;
 }
 
@@ -1196,8 +1255,8 @@ static JsValue set_error(JsContext *ctx, const char *msg, JsValue base, JsValue 
         return js_error_fmt(ctx, "TypeError: Cannot set property %v of [object Object] which has only a getter", key);
 #endif
     if (msg == SET_PRIMITIVE)
-        return js_error_fmt(ctx, msg, key, js_is_string(base) ? "string"
-                                           : js_is_number(base) ? "number" : "boolean", base);
+        return js_error_fmt(ctx, msg, key, js_is_string(base) ? "string" : js_is_number(base) ? "number"
+                                           : js_is_bigint(base) ? "bigint" : "boolean", base);
     return js_error_from_ascii(ctx, msg);
 }
 
@@ -1605,25 +1664,116 @@ __attribute__((noinline)) static bool add_slow(JsContext *ctx, JsFiber *fb, uint
         fb->stack[fb->sp - 1] = js_value_from_cell(&r->gc);
         return true;
     }
+    if (JS_UNLIKELY(js_is_bigint(a) || js_is_bigint(b))) {
+        if (!js_is_bigint(a) || !js_is_bigint(b))
+            return fail_ascii(ctx, "TypeError: Cannot mix BigInt and other types, use explicit conversions");
+        JsBigInt *r = js_bigint_binary(ctx, JS_OP_ADD, js_value_bigint(a), js_value_bigint(b));
+        if (!r)
+            return js_is_undefined(ctx->pending_error) ? fail_oom(ctx) : false;
+        fb->sp--;
+        fb->stack[fb->sp - 1] = js_value_from_cell(&r->gc);
+        return true;
+    }
     double x = js_primitive_to_number(a) + js_primitive_to_number(b);
     fb->sp--;
     fb->stack[fb->sp - 1] = js_number(x);
     return true;
 }
 
-/* ToNumber of the top two operands, left first. */
-JS_COLD static bool number_operands(JsContext *ctx, JsFiber *fb, uint32_t ip,
-                                                      double *a, double *b) {
+/* ++ / -- on a value that is not a number: ToNumeric (an object's primitive, number hint), then
+ * one added or taken away in its own type; POST leaves the ToNumeric value under the result. */
+__attribute__((noinline)) static bool update_slow(JsContext *ctx, JsFiber *fb, uint32_t ip, bool post,
+                                                  uint8_t dec) {
     slow_path_at(fb, ip);
-    return js_op_to_number(ctx, fb->stack[fb->sp - 2], a) &&
-           js_op_to_number(ctx, fb->stack[fb->sp - 1], b);
+    JsValue v = fb->stack[fb->sp - 1];
+    if (is_object_type(v)) {
+        if (!js_to_primitive(ctx, v, JS_HINT_NUMBER, &v))
+            return false;
+        fb->stack[fb->sp - 1] = v; /* rooted there */
+    }
+    JsValue nv;
+    if (js_is_bigint(v)) {
+        JsBigInt one = {{0}, 1, 1, false};
+        JsBigInt *o1 = js_realloc_raw(ctx->vm, NULL, 0, sizeof one + sizeof(uint32_t));
+        if (!o1)
+            return fail_oom(ctx);
+        *o1 = one;
+        o1->d[0] = 1;
+        JsBigInt *r = js_bigint_binary(ctx, dec ? JS_OP_SUB : JS_OP_ADD, js_value_bigint(fb->stack[fb->sp - 1]), o1);
+        js_realloc_raw(ctx->vm, o1, sizeof one + sizeof(uint32_t), 0);
+        if (!r)
+            return js_is_undefined(ctx->pending_error) ? fail_oom(ctx) : false;
+        nv = js_value_from_cell(&r->gc);
+    } else {
+        double d = js_primitive_to_number(v);
+        fb->stack[fb->sp - 1] = js_number(d); /* the old value, ToNumeric */
+        nv = js_number(d + (dec ? -1.0 : 1.0));
+    }
+    if (post)
+        fb->stack[fb->sp++] = nv;
+    else
+        fb->stack[fb->sp - 1] = nv;
+    return true;
 }
 
-/* ToNumber of the top operand. */
-JS_COLD static bool number_operand(JsContext *ctx, JsFiber *fb, uint32_t ip,
+/* ToNumber of the top two operands, left first. */
+/* The operands of a binary arithmetic or bitwise op that are not both numbers: 1 with their
+ * ToNumber in *A and *B, 2 when the op was done here (BigInt operands: the result replaces them),
+ * 0 with the error pending. */
+JS_COLD static int number_operands(JsContext *ctx, JsFiber *fb, uint32_t ip,
+                                                      double *a, double *b) {
+    slow_path_at(fb, ip);
+    /* ToNumeric of each, left first (an object's primitive replaces it, rooted on the stack) */
+    for (uint32_t i = fb->sp - 2; i < fb->sp; i++) {
+        JsValue p;
+        if (is_object_type(fb->stack[i])) {
+            if (!js_to_primitive(ctx, fb->stack[i], JS_HINT_NUMBER, &p))
+                return 0;
+            fb->stack[i] = p;
+        }
+    }
+    JsValue x = fb->stack[fb->sp - 2], y = fb->stack[fb->sp - 1];
+    if (!js_is_bigint(x) && !js_is_bigint(y)) {
+        *a = js_primitive_to_number(x);
+        *b = js_primitive_to_number(y);
+        return 1;
+    }
+    if (!js_is_bigint(x) || !js_is_bigint(y))
+        return fail_ascii(ctx, "TypeError: Cannot mix BigInt and other types, use explicit conversions");
+    const JsFrame *fr = &fb->frames[fb->frame_count - 1];
+    uint8_t op = fr->closure->fn->code[ip - 1]; /* the op this is the slow path of */
+    JsBigInt *r = js_bigint_binary(ctx, op, js_value_bigint(x), js_value_bigint(y));
+    if (!r)
+        return js_is_undefined(ctx->pending_error) ? fail_oom(ctx) : 0;
+    fb->sp--;
+    fb->stack[fb->sp - 1] = js_value_from_cell(&r->gc);
+    return 2;
+}
+
+/* ToNumber of the top operand: 1, 2 when the op was done here (a BigInt), 0 with the error
+ * pending. */
+JS_COLD static int number_operand(JsContext *ctx, JsFiber *fb, uint32_t ip,
                                                      double *d) {
     slow_path_at(fb, ip);
-    return js_op_to_number(ctx, fb->stack[fb->sp - 1], d);
+    JsValue v = fb->stack[fb->sp - 1];
+    if (is_object_type(v)) {
+        if (!js_to_primitive(ctx, v, JS_HINT_NUMBER, &v))
+            return 0;
+        fb->stack[fb->sp - 1] = v;
+    }
+    if (!js_is_bigint(v)) {
+        *d = js_primitive_to_number(v);
+        return 1;
+    }
+    const JsFrame *fr = &fb->frames[fb->frame_count - 1];
+    uint8_t op = fr->closure->fn->code[ip - 1];
+    if (op == JS_OP_POS)
+        return fail_ascii(ctx, "TypeError: Cannot convert a BigInt value to a number");
+    JsBigInt *r = js_bigint_unary(ctx, op, js_value_bigint(v));
+    if (!r)
+        return js_is_undefined(ctx->pending_error) ? fail_oom(ctx) : 0;
+    fb->stack[fb->sp - 1] = js_value_from_cell(&r->gc);
+    return 2;
 }
 
 /* == on the top two operands: 1 or 0, or -1 with the error pending */
@@ -2882,8 +3032,13 @@ run:; /* (re)load the top frame */
                 if (js_is_number(PEEK(1)) && js_is_number(PEEK(0))) {
                     a = js_get_number(PEEK(1));
                     b = js_get_number(PEEK(0));
-                } else if (!number_operands(ctx, fb, ip, &a, &b)) {
-                    RT_THROW_PENDING();
+                } else {
+                    int k = number_operands(ctx, fb, ip, &a, &b);
+                    if (k != 1) {
+                        if (!k)
+                            RT_THROW_PENDING();
+                        break; /* done there (BigInt) */
+                    }
                 }
                 double r;
                 switch (op) {
@@ -2897,12 +3052,32 @@ run:; /* (re)load the top frame */
                 PEEK(0) = js_number(r);
                 break;
             }
+            case JS_OP_UPDATE: case JS_OP_UPDATE_POST: {
+                uint8_t dec = code[ip++];
+                JsValue v = PEEK(0);
+                if (js_is_number(v)) {
+                    JsValue nv = js_number(js_get_number(v) + (dec ? -1.0 : 1.0));
+                    if (op == JS_OP_UPDATE_POST)
+                        PUSH(nv);
+                    else
+                        PEEK(0) = nv;
+                    break;
+                }
+                if (!update_slow(ctx, fb, ip, op == JS_OP_UPDATE_POST, dec))
+                    RT_THROW_PENDING();
+                break;
+            }
             case JS_OP_NEG: case JS_OP_POS: case JS_OP_BITNOT: {
                 double d;
                 if (js_is_number(PEEK(0))) {
                     d = js_get_number(PEEK(0));
-                } else if (!number_operand(ctx, fb, ip, &d)) {
-                    RT_THROW_PENDING();
+                } else {
+                    int k = number_operand(ctx, fb, ip, &d);
+                    if (k != 1) {
+                        if (!k)
+                            RT_THROW_PENDING();
+                        break; /* done there (BigInt) */
+                    }
                 }
                 PEEK(0) = js_number(op == JS_OP_NEG ? -d : op == JS_OP_POS ? d : ~js_to_int32(d));
                 break;
@@ -2916,8 +3091,13 @@ run:; /* (re)load the top frame */
                 if (js_is_number(PEEK(1)) && js_is_number(PEEK(0))) {
                     da = js_get_number(PEEK(1));
                     db = js_get_number(PEEK(0));
-                } else if (!number_operands(ctx, fb, ip, &da, &db)) {
-                    RT_THROW_PENDING();
+                } else {
+                    int k = number_operands(ctx, fb, ip, &da, &db);
+                    if (k != 1) {
+                        if (!k)
+                            RT_THROW_PENDING();
+                        break; /* done there (BigInt) */
+                    }
                 }
                 fb->sp--;
                 double r;
@@ -3003,6 +3183,7 @@ run:; /* (re)load the top frame */
                 else if (js_is_bool(v)) t = "boolean";
                 else if (js_is_undefined(v)) t = "undefined";
                 else if (js_is_function(v)) t = "function";
+                else if (js_is_bigint(v)) t = "bigint";
                 else t = "object";
                 JsString *s = js_ascii_cell(vm, t);
                 if (!s)

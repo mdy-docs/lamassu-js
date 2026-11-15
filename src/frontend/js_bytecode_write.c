@@ -17,6 +17,7 @@
  * no standalone meaning, so it refuses a module fn (they go through
  * js_bc_serialize_module instead, which records the link metadata too).
  */
+#include "js_bigint.h"
 #include "js_bcformat.h"
 #include "js_compile.h"
 #include "lamassu_internal.h"
@@ -95,6 +96,13 @@ static bool serialize_const(OutBuf *b, JsValue v, uint32_t depth) {
         out_u8(b, CTAG_STRING);
         out_u32(b, s->length);
         out_units(b, s->units, s->length);
+    } else if (js_is_bigint(v)) {
+        const JsBigInt *bi = js_value_bigint(v);
+        out_u8(b, CTAG_BIGINT);
+        out_u8(b, bi->neg ? 1 : 0);
+        out_u32(b, bi->len);
+        for (uint32_t i = 0; i < bi->len; i++)
+            out_u32(b, bi->d[i]);
     } else if (js_value_is_cell(v) && js_value_cell(v)->kind == JS_KIND_FUNCTION) {
         out_u8(b, CTAG_FUNCTION);
         return serialize_fn(b, js_value_function(v), depth + 1);

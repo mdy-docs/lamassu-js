@@ -65,7 +65,7 @@ RUNTIME_SRC := src/runtime/js_vm.c src/runtime/js_gc.c src/runtime/js_string.c \
                src/runtime/js_case.c \
                src/runtime/js_module.c src/runtime/js_regexp.c \
                src/runtime/js_bytecode_read.c src/runtime/js_date.c \
-               src/runtime/js_mapobj.c src/runtime/js_setobj.c src/runtime/js_iter.c src/runtime/js_weak.c src/runtime/js_normalize.c \
+               src/runtime/js_mapobj.c src/runtime/js_setobj.c src/runtime/js_iter.c src/runtime/js_weak.c src/runtime/js_normalize.c src/runtime/js_bigint.c \
                src/runtime/js_error.c \
                src/runtime/fdlibm/scalbn.c src/runtime/fdlibm/rem_pio2_large.c src/runtime/fdlibm/rem_pio2.c \
                src/runtime/fdlibm/k_sin.c src/runtime/fdlibm/k_cos.c src/runtime/fdlibm/k_tan.c src/runtime/fdlibm/sin.c src/runtime/fdlibm/cos.c src/runtime/fdlibm/tan.c src/runtime/fdlibm/atan.c \

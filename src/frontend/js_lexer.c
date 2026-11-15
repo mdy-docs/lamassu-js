@@ -308,7 +308,7 @@ static bool lex_number(JsLexer *lx) {
                                     ? "Invalid or unexpected token"
                                     : "Decimals with leading zeros are not allowed in strict mode.");
             }
-            if (at(lx, i) == '_')
+            if (at(lx, i) == '_' || at(lx, i) == 'n')
                 return lex_fail(lx, start + i, "Invalid or unexpected token");
             return lex_fail(lx, start, "Octal literals are not allowed in strict mode.");
         }
@@ -389,8 +389,29 @@ static bool lex_number(JsLexer *lx) {
         }
     }
 
-    if (cur(lx) == 'n')
-        return lex_fail(lx, lx->pos, "BigInt literals are not supported");
+    if (cur(lx) == 'n') { /* a BigInt: an integer, so no point, no exponent */
+        for (uint32_t i = start; i < lx->pos; i++) {
+            uint16_t u = lx->src[i];
+            bool hex = lx->pos - start > 1 && (lx->src[start + 1] == 'x' || lx->src[start + 1] == 'X');
+            if (u == '.' || (!hex && (u == 'e' || u == 'E')))
+                return lex_fail(lx, start, "Invalid or unexpected token");
+        }
+        uint32_t n = lx->pos - start, k = 0;
+        uint16_t *text = js_arena_alloc(lx->arena, (n ? n : 1) * sizeof *text);
+        if (!text)
+            return lex_fail(lx, start, "out of memory");
+        for (uint32_t i = 0; i < n; i++)
+            if (lx->src[start + i] != '_')
+                text[k++] = lx->src[start + i];
+        lx->pos++; /* n */
+        if (is_id_start(cur(lx)) || is_digit(cur(lx)))
+            return lex_fail(lx, lx->pos, "Invalid or unexpected token");
+        lx->tok.kind = JS_T_BIGINT;
+        lx->tok.u.str.units = text;
+        lx->tok.u.str.len = k;
+        lx->tok.u.str.cont = false;
+        return true;
+    }
     if (is_id_start(cur(lx)) || is_digit(cur(lx)))
         return lex_fail(lx, lx->pos, "Invalid or unexpected token");
 

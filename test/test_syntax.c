@@ -374,6 +374,12 @@ static void dump_node(Sb *sb, const JsAstNode *n) {
     case JS_AST_IMPORT_META:
         sb_printf(sb, "(import.meta)");
         break;
+    case JS_AST_BIGINT:
+        sb_printf(sb, "%.*sn", 0, "");
+        for (uint32_t i = 0; i < n->len; i++)
+            sb_printf(sb, "%c", (char)n->units[i]);
+        sb_printf(sb, "n");
+        break;
     case JS_AST_TAGGED_TEMPLATE:
         sb_printf(sb, "(tagged");
         dump_child(sb, n->a);
@@ -799,7 +805,9 @@ static void test_errors(void) {
     check_err("x = \\ud835\\udcb6;", "Invalid or unexpected token", -1);
     check_err("\\u0061sync function f() {}", "Keyword must not contain escaped characters", 0);
     check_err("\\x = 1;", "Invalid or unexpected token", 0);
-    check_err("x = 5n;", "BigInt literals are not supported", -1);
+    check_err("x = 1.5n;", "Invalid or unexpected token", -1);
+    check_err("x = 01n;", "Invalid or unexpected token", -1);
+    check_err("x = 1n2;", "Invalid or unexpected token", -1);
     check_err("eval = 1;", "Unexpected eval or arguments in strict mode", -1);
     check_err("let eval = 1;", "Unexpected eval or arguments in strict mode", -1);
     check_err("o = {get x() { return 1; }};", "getter/setter properties are not supported", -1);

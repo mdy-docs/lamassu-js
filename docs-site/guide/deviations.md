@@ -7,13 +7,8 @@ that's known to differ, so you're not surprised by one in production.
 ## Built-ins V8 has that lamassu leaves out
 
 Checked against Node 26 by listing every own property of each global, constructor and
-prototype in both engines (2026-11-15).
-
-**Not yet implemented** (nothing stands in the way; each is queued):
-
-- `BigInt` (a primitive type of its own, with `10n` literals; see the syntax below).
-
-**Left out by design:**
+prototype in both engines (2026-11-15); what was missing then has since been added (2026-11-16),
+so everything left is left out by design:
 
 - The locale methods (`localeCompare`, `toLocaleString` on numbers, dates and arrays,
   `Object.prototype.toLocaleString`, `toLocaleDateString`, `toLocaleTimeString`,
@@ -38,12 +33,9 @@ prototype in both engines (2026-11-15).
 
 ## Syntax V8 accepts that lamassu refuses
 
-Each is a compile error that names the feature (`SyntaxError: BigInt literals are not
-supported`), never a silent difference.
-
-**Not yet implemented:** `BigInt` literals.
-
-**Left out by design** (see [Supported syntax](/guide/language#explicit-non-goals)): `var`,
+Each is a compile error that names the feature (`SyntaxError: classes are not supported`), never
+a silent difference. What was not yet implemented has been (2026-11-16); this is what is left out
+by design (see [Supported syntax](/guide/language#explicit-non-goals)): `var`,
 `for...in`, `with`, classes (and with them private names, `#x`), getters and setters in object
 literals, generators, sloppy mode, `eval` and the `Function` constructor.
 
