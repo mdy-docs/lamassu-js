@@ -4444,17 +4444,13 @@ bool js_define_own_property(JsContext *ctx, JsValue v, JsValue key, const JsProp
     bool ok = true;
     JsString *k = NULL;
     uint32_t idx;
+    if (kind == OWN_NONE && js_is_object(v) && js_value_object(v)->obj_kind == JS_OBJ_ARRAY &&
+        key_to_index(key, &idx)) { /* a new element */
+        ok = na ? define_fail(ctx, NO_ATTRS, key) : js_set_property(ctx, v, key, nv);
+        kind = OWN_STR_INDEX; /* done: the switch below has nothing to do */
+    }
     switch (kind) {
-    case OWN_NONE:
-        if (js_is_object(v) && js_value_object(v)->obj_kind == JS_OBJ_ARRAY && key_to_index(key, &idx)) {
-            if (na) {
-                ok = define_fail(ctx, NO_ATTRS, key);
-                break;
-            }
-            ok = js_set_property(ctx, v, key, nv);
-            break;
-        }
-        /* fall through: a new map property */
+    case OWN_NONE: /* a new map property */
     case OWN_MAP:
     case OWN_FN_NAME:
     case OWN_FN_LENGTH:
@@ -4508,9 +4504,8 @@ bool js_define_own_property(JsContext *ctx, JsValue v, JsValue key, const JsProp
         ok = k && js_error_stack_delete(ctx, o, key) && map_put(ctx, o, k, nv, na);
         break;
     }
-    case OWN_STR_INDEX:
-    case OWN_STR_LENGTH:
-        ok = define_fail(ctx, REDEFINE, key); /* unreachable: a string is not an object */
+    case OWN_STR_INDEX:  /* a new array element, written above */
+    case OWN_STR_LENGTH: /* unreachable: a string is not an object */
         break;
     }
     js_gc_unprotect(ctx->vm, &nv);
