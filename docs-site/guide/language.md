@@ -22,7 +22,7 @@ mode switch, and no `"use strict"` directive to write (it's already on).
 ## Control flow
 
 `if`/`else`, `for`, `while`, `do...while`, `for...of`, `switch` — all
-supported. `for...in` is **not** (a targeted parse error points you at
+supported. `debugger;` is a statement that does nothing (there is no debugger to stop in). `for...in` is **not** (a targeted parse error points you at
 `for...of`: `SyntaxError: for-in is not supported; use for-of`).
 
 ## Functions
@@ -69,6 +69,13 @@ Point.prototype.length = function () {
 const p = new Point(3, 4);
 p.length(); // 5
 ```
+
+## Numbers and names
+
+Numeric literals take separators between digits (`1_000_000`, `0xFF_FF`, `1_0.5e1_0`), refused
+where V8 refuses them (`1__0`, `1_`, `0_1`). Identifiers may be spelled with unicode escapes
+(`\u0061`, `\u{1d4b6}`), as property names too (`o.\u0069f`); an escaped keyword where a name
+is expected is V8's `SyntaxError: Keyword must not contain escaped characters`.
 
 ## Strings
 

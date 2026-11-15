@@ -245,7 +245,7 @@ static bool enter(JsParser *p) {
 static void leave(JsParser *p) { p->depth--; }
 
 static bool tok_is_name(const JsToken *t, const char *ascii) {
-    if (t->kind != JS_T_IDENT)
+    if (t->kind != JS_T_IDENT || t->escaped) /* an escaped word is never a contextual keyword */
         return false;
     for (uint32_t i = 0; i < t->u.str.len; i++) {
         if (ascii[i] == '\0' ||
@@ -273,16 +273,31 @@ static const char *reserved_message(const JsToken *t) {
     if (units_is(t->u.str.units, t->u.str.len, "with"))
         return "'with' is not allowed in strict mode";
     if (units_is(t->u.str.units, t->u.str.len, "debugger"))
-        return "'debugger' is not supported";
+        return "Unexpected token 'debugger'"; /* only a statement */
     return "reserved word cannot be used as an identifier";
 }
 
 /* Identifier node from the current token (consumes it). */
+static bool escaped_keyword(const JsToken *t) {
+    return t->kind == JS_T_IDENT && t->escaped && js_lexer_is_reserved_word(t->u.str.units, t->u.str.len);
+}
+
+/* An escaped `async` where it would start an async function: V8 refuses the escape there */
+static bool escaped_async_function(JsParser *p) {
+    const JsToken *t = &TOK(p);
+    if (t->kind != JS_T_IDENT || !t->escaped || !units_is(t->u.str.units, t->u.str.len, "async"))
+        return false;
+    JsToken nx = peek(p);
+    return nx.kind == JS_T_FUNCTION && !nx.newline_before;
+}
+
 static JsAstNode *parse_ident(JsParser *p, const char *msg) {
     if (TOK(p).kind == JS_T_RESERVED)
         return perr_here(p, reserved_message(&TOK(p)));
     if (TOK(p).kind != JS_T_IDENT)
         return perr_here(p, msg);
+    if (escaped_keyword(&TOK(p)))
+        return perr_here(p, "Keyword must not contain escaped characters");
     JsAstNode *n = new_node(p, JS_AST_IDENT, TOK(p).pos);
     if (!n)
         return NULL;
@@ -1127,6 +1142,8 @@ static JsAstNode *parse_primary(JsParser *p) {
     case JS_T_LPAREN:
         return parse_paren_cover(p, 0);
     case JS_T_IDENT: {
+        if (escaped_keyword(t) || escaped_async_function(p))
+            return perr_here(p, "Keyword must not contain escaped characters");
         if (tok_is_name(t, "async")) {
             JsToken nx = peek(p);
             uint32_t async_pos = t->pos;
@@ -2188,6 +2205,13 @@ static JsAstNode *parse_statement(JsParser *p) {
         result = perr(p, pos, "import/export is only allowed at the top level of a module");
         break;
     case JS_T_RESERVED:
+        if (units_is(t->u.str.units, t->u.str.len, "debugger")) {
+            /* a no-op: there is no debugger to stop in, as V8 has none without an inspector */
+            result = new_node(p, JS_AST_EMPTY, pos);
+            if (result && (!advance(p) || !expect_semicolon(p)))
+                result = NULL;
+            break;
+        }
         result = perr(p, pos, reserved_message(t));
         break;
     case JS_T_IDENT: {

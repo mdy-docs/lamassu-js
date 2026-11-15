@@ -72,6 +72,7 @@ typedef struct JsToken {
     JsTokKind kind;
     uint32_t pos, end; /* offsets in source units */
     bool newline_before;
+    bool escaped; /* JS_T_IDENT spelled with a \u escape: never a keyword or contextual keyword */
     union {
         double number;
         struct {
@@ -102,6 +103,9 @@ void js_lexer_init(JsLexer *lx, JsArena *arena, const uint16_t *src, size_t len)
 bool js_lexer_next(JsLexer *lx);
 bool js_lexer_rescan_regex(JsLexer *lx);    /* tok must be SLASH or SLASH_EQ */
 bool js_lexer_rescan_template(JsLexer *lx); /* tok must be RBRACE */
+/* Whether UNITS is a keyword or reserved word (what an escaped identifier may not spell where a
+ * binding or reference is expected) */
+bool js_lexer_is_reserved_word(const uint16_t *units, uint32_t len);
 
 void js_source_line_col(const uint16_t *src, size_t len, uint32_t pos,
                         uint32_t *line, uint32_t *col); /* 1-based */

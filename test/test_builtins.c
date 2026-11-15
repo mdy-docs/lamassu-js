@@ -1387,6 +1387,14 @@ static void test_regexp_legacy(void) {
        "Cannot assign to read only property 'x' of object '[object Date]'\nCannot assign to read only property 'x' of object '[object Date]'\nCannot assign to read only property 'x' of object '[object RegExp]'\nCannot assign to read only property 'x' of object 'Error: q'\nCannot assign to read only property 'x' of object 'TypeError: t'\nCannot assign to read only property 'x' of object '#<Set>'\nCannot assign to read only property 'x' of object '#<WeakMap>'\nCannot assign to read only property 'x' of object '[object Object]'\nCannot assign to read only property 'x' of object '[object Array]'\nCannot assign to read only property 'x' of object '#<Promise>'\nCannot assign to read only property 'x' of function 'function f() {}'\nCannot assign to read only property 'x' of object 'N: z'\nCannot assign to read only property 'x' of object 'Error'\nCannot assign to read only property 'x' of object '[object Map Iterator]'\nCannot assign to read only property 'x' of object '#<Q>'\nCannot assign to read only property 'x' of object 'm2'\nCannot assign to read only property 'x' of object 'Error'");
 }
 
+/* Numeric separators, `debugger` (a no-op), unicode escapes in identifiers */
+static void test_lexical(void) {
+    eq("[1_000, 0x1_F, 0b1_0, 0o1_7, 1_0.0_5, 1e1_0, .5_5, 9_007_199_254_740_993, 1_2_3_4_5_6_7_8_9_0_1_2_3_4_5_6_7_8_9_0_1].join();", "1000,31,2,15,10.05,10000000000,0.55,9007199254740992,123456789012345680000");
+    eq("let n = 0; debugger; if (n === 0) debugger\nn = 1; function f() { debugger; return n + 1; } f();", "2");
+    eq("let \\u0061 = 1; let b\\u0063 = 2; let \\u{64}e = 3; const o = { \\u0069f: 4, x\\u0079: 5 }; [a, bc, de, o.if, o.xy, o.\\u0069f, ({ k: 6 }).\\u006b].join();", "1,2,3,4,5,4,6");
+    eq("let \\u{1d4b6} = 7; \\u{1d4b6};", "7");
+}
+
 /* String.prototype.normalize; expected values from Node (every code point in all four forms, and
  * Unicode's NormalizationTest.txt, were checked against Node and pass; too big to keep here) */
 static void test_normalize(void) {
@@ -1584,6 +1592,7 @@ int main(void) {
     test_normalize();
     test_from_async();
     test_regexp_legacy();
+    test_lexical();
     test_stress();
     test_integration();
     if (checks_failed) {

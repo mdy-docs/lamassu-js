@@ -42,9 +42,8 @@ Each is a compile error that names the feature (`SyntaxError: tagged templates a
 supported`), never a silent difference.
 
 **Not yet implemented:** object rest in destructuring (`const { a, ...rest } = o`), tagged
-templates (`` tag`x${y}` ``), numeric separators (`1_000`), `new.target`, `debugger` (a no-op
-without a debugger attached), `import.meta`, import attributes (`with { type: "json" }`),
-unicode escapes in identifiers (`\u0061`), `delete a?.b`, and `BigInt` literals.
+templates (`` tag`x${y}` ``), `new.target`, `import.meta`, import attributes
+(`with { type: "json" }`), `delete a?.b`, and `BigInt` literals.
 
 **Left out by design** (see [Supported syntax](/guide/language#explicit-non-goals)): `var`,
 `for...in`, `with`, classes (and with them private names, `#x`), getters and setters in object

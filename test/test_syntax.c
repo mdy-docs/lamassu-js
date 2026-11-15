@@ -768,7 +768,25 @@ static void test_errors(void) {
     check_err("x = ({a = 1});", "shorthand property initializer", -1);
     check_err("0x;", "Invalid or unexpected token", 0);
     check_err("01;", "Octal literals are not allowed in strict mode.", 0);
-    check_err("1_000;", "numeric separators are not supported", -1);
+    /* numeric separators, refused as V8 refuses them */
+    check_err("1__0;", "Only one underscore is allowed as numeric separator", -1);
+    check_err("1_;", "Numeric separators are not allowed at the end of numeric literals", -1);
+    check_err("0_1;", "Numeric separator can not be used after leading 0.", -1);
+    check_err("1_.5;", "Numeric separators are not allowed at the end of numeric literals", -1);
+    check_err("1._5;", "Invalid or unexpected token", -1);
+    check_err("1e_5;", "Invalid or unexpected token", -1);
+    check_err("0x_1;", "Invalid or unexpected token", -1);
+    check_err("0x1__2;", "Only one underscore is allowed as numeric separator", -1);
+    check_err("08_1;", "Invalid or unexpected token", -1);
+    /* unicode escapes in identifiers */
+    check_err("\\u0069f (1) {}", "Keyword must not contain escaped characters", 0);
+    check_err("x = \\u0074rue;", "Keyword must not contain escaped characters", -1);
+    check_err("x = a\\u0020b;", "Invalid or unexpected token", -1);
+    check_err("x = a\\u;", "Invalid Unicode escape sequence", -1);
+    check_err("x = \\u{110000};", "Undefined Unicode code-point", -1);
+    check_err("x = \\ud835\\udcb6;", "Invalid or unexpected token", -1);
+    check_err("\\u0061sync function f() {}", "Keyword must not contain escaped characters", 0);
+    check_err("\\x = 1;", "Invalid or unexpected token", 0);
     check_err("x = 5n;", "BigInt literals are not supported", -1);
     check_err("eval = 1;", "Unexpected eval or arguments in strict mode", -1);
     check_err("let eval = 1;", "Unexpected eval or arguments in strict mode", -1);
@@ -788,7 +806,7 @@ static void test_errors(void) {
     check_err("export * from 'm' with { type: 'json' };",
               "import attributes are not supported", -1);
     check_err("x = '\\101';", "Octal escape sequences are not allowed in strict mode.", -1);
-    check_err("debugger;", "'debugger' is not supported", 0);
+    check_err("x = debugger;", "Unexpected token 'debugger'", -1);
 }
 
 static void test_depth_limit(void) {

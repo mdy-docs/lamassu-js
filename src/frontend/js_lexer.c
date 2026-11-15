@@ -132,6 +132,102 @@ static bool units_eq_ascii(const uint16_t *u, uint32_t len, const char *s) {
     return s[len] == '\0';
 }
 
+bool js_lexer_is_reserved_word(const uint16_t *units, uint32_t len) {
+    for (size_t i = 0; i < sizeof js_keywords / sizeof js_keywords[0]; i++)
+        if (units_eq_ascii(units, len, js_keywords[i].name))
+            return true;
+    for (size_t i = 0; i < sizeof js_reserved / sizeof js_reserved[0]; i++)
+        if (units_eq_ascii(units, len, js_reserved[i]))
+            return true;
+    return false;
+}
+
+/* A \u escape at *pos in an identifier: its code point (and *pos past it), or -1 */
+static int32_t ident_escape(const JsLexer *lx, uint32_t *pos) {
+    uint32_t p = *pos;
+    if (p + 1 >= lx->len || lx->src[p] != '\\' || lx->src[p + 1] != 'u')
+        return -1;
+    p += 2;
+    uint32_t cp = 0;
+    if (p < lx->len && lx->src[p] == '{') {
+        p++;
+        bool any = false;
+        while (p < lx->len && hex_val(lx->src[p]) >= 0) {
+            cp = cp * 16 + (uint32_t)hex_val(lx->src[p++]);
+            if (cp > 0x10FFFF)
+                return -2;
+            any = true;
+        }
+        if (!any || p >= lx->len || lx->src[p] != '}')
+            return -1;
+        p++;
+    } else {
+        for (int i = 0; i < 4; i++) {
+            if (p >= lx->len || hex_val(lx->src[p]) < 0)
+                return -1;
+            cp = cp * 16 + (uint32_t)hex_val(lx->src[p++]);
+        }
+    }
+    *pos = p;
+    return (int32_t)cp;
+}
+
+/* An identifier with \u escapes in it, from START: decoded into the arena. False with V8's error
+ * for an escape that is malformed or does not spell an identifier character. */
+static bool lex_escaped_ident(JsLexer *lx, uint32_t start) {
+    uint32_t n = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        uint16_t *out = NULL;
+        if (pass == 1 && !(out = js_arena_alloc(lx->arena, (n ? n : 1) * sizeof *out)))
+            return lex_fail(lx, start, "out of memory");
+        uint32_t p = start, k = 0;
+        bool first = true;
+        while (p < lx->len) {
+            uint16_t u = lx->src[p];
+            int32_t cp;
+            uint32_t at_pos = p;
+            if (u == '\\') {
+                cp = ident_escape(lx, &p);
+                if (cp < 0)
+                    return lex_fail(lx, at_pos, cp == -2 ? "Undefined Unicode code-point"
+                                                         : "Invalid Unicode escape sequence");
+                bool ok = !(cp >= 0xD800 && cp <= 0xDFFF) &&
+                          (cp > 0xFFFF || (first ? is_id_start((uint16_t)cp) : is_id_part((uint16_t)cp)));
+                if (!ok) /* well formed, but no identifier character */
+                    return lex_fail(lx, at_pos, "Invalid or unexpected token");
+            } else if (first ? is_id_start(u) : is_id_part(u)) {
+                cp = u;
+                p++;
+            } else {
+                break;
+            }
+            first = false;
+            if (cp > 0xFFFF) {
+                if (out) {
+                    out[k] = (uint16_t)(0xD800 + ((cp - 0x10000) >> 10));
+                    out[k + 1] = (uint16_t)(0xDC00 + ((cp - 0x10000) & 0x3FF));
+                }
+                k += 2;
+            } else {
+                if (out)
+                    out[k] = (uint16_t)cp;
+                k++;
+            }
+        }
+        if (pass == 0) {
+            n = k;
+        } else {
+            lx->pos = p;
+            lx->tok.kind = JS_T_IDENT; /* even when it spells a keyword: the parser decides */
+            lx->tok.escaped = true;
+            lx->tok.u.str.units = out;
+            lx->tok.u.str.len = n;
+            lx->tok.u.str.cont = false;
+        }
+    }
+    return true;
+}
+
 static void lex_ident(JsLexer *lx) {
     uint32_t start = lx->pos;
     while (lx->pos < lx->len && is_id_part(cur(lx)))
@@ -158,9 +254,23 @@ static void lex_ident(JsLexer *lx) {
 
 /* ---- numbers (double conversion shared via js_number.c) ---- */
 
+/* A numeric separator at lx->pos, inside a run of RADIX digits that has at least one digit: true
+ * (and stepped over) when a digit follows, else false with V8's error. */
+static bool lex_separator(JsLexer *lx, int radix) {
+    uint16_t next = at(lx, 1);
+    if (next == '_')
+        return lex_fail(lx, lx->pos + 1, "Only one underscore is allowed as numeric separator");
+    int d = hex_val(next);
+    if (d < 0 || d >= radix)
+        return lex_fail(lx, lx->pos, "Numeric separators are not allowed at the end of numeric literals");
+    lx->pos++;
+    return true;
+}
+
 static bool lex_number(JsLexer *lx) {
     uint32_t start = lx->pos;
     double value = 0.0;
+    bool separated = false;
 
     if (cur(lx) == '0' && (at(lx, 1) == 'x' || at(lx, 1) == 'X' ||
                            at(lx, 1) == 'o' || at(lx, 1) == 'O' ||
@@ -171,6 +281,11 @@ static bool lex_number(JsLexer *lx) {
         lx->pos += 2;
         bool any = false;
         for (;;) {
+            if (cur(lx) == '_' && any) {
+                if (!lex_separator(lx, radix))
+                    return false;
+                continue;
+            }
             int d = hex_val(cur(lx));
             if (d < 0 || d >= radix)
                 break;
@@ -186,13 +301,26 @@ static bool lex_number(JsLexer *lx) {
         bool dropped = false; /* digits past the 19th: the whole text decides the rounding */
         if (cur(lx) == '0' && is_digit(at(lx, 1))) {
             /* V8 names 08 and 09-style literals apart from octal-looking ones */
-            for (uint32_t i = 1; is_digit(at(lx, i)); i++) {
+            uint32_t i = 1;
+            for (; is_digit(at(lx, i)); i++) {
                 if (at(lx, i) >= '8')
-                    return lex_fail(lx, start, "Decimals with leading zeros are not allowed in strict mode.");
+                    return lex_fail(lx, start, at(lx, i + 1) == '_' || at(lx, i) == '_'
+                                    ? "Invalid or unexpected token"
+                                    : "Decimals with leading zeros are not allowed in strict mode.");
             }
+            if (at(lx, i) == '_')
+                return lex_fail(lx, start + i, "Invalid or unexpected token");
             return lex_fail(lx, start, "Octal literals are not allowed in strict mode.");
         }
-        while (is_digit(cur(lx))) {
+        if (cur(lx) == '0' && at(lx, 1) == '_')
+            return lex_fail(lx, lx->pos + 1, "Numeric separator can not be used after leading 0.");
+        while (is_digit(cur(lx)) || (cur(lx) == '_' && lx->pos > start)) {
+            if (cur(lx) == '_') {
+                if (!lex_separator(lx, 10))
+                    return false;
+                separated = true;
+                continue;
+            }
             if (digits < 19) {
                 mant = mant * 10 + (uint64_t)(cur(lx) - '0');
                 if (mant)
@@ -205,7 +333,14 @@ static bool lex_number(JsLexer *lx) {
         }
         if (cur(lx) == '.') {
             lx->pos++;
-            while (is_digit(cur(lx))) {
+            uint32_t frac_start = lx->pos;
+            while (is_digit(cur(lx)) || (cur(lx) == '_' && lx->pos > frac_start)) {
+                if (cur(lx) == '_') {
+                    if (!lex_separator(lx, 10))
+                        return false;
+                    separated = true;
+                    continue;
+                }
                 if (digits < 19) {
                     mant = mant * 10 + (uint64_t)(cur(lx) - '0');
                     if (mant)
@@ -226,7 +361,12 @@ static bool lex_number(JsLexer *lx) {
             }
             if (!is_digit(cur(lx)))
                 return lex_fail(lx, lx->pos, "Invalid or unexpected token");
-            while (is_digit(cur(lx))) {
+            while (is_digit(cur(lx)) || cur(lx) == '_') {
+                if (cur(lx) == '_') {
+                    if (!lex_separator(lx, 10))
+                        return false;
+                    continue;
+                }
                 if (exp_part < 100000)
                     exp_part = exp_part * 10 + (cur(lx) - '0');
                 lx->pos++;
@@ -234,12 +374,21 @@ static bool lex_number(JsLexer *lx) {
             if (neg)
                 exp_part = -exp_part;
         }
-        value = dropped ? js_k_decimal(lx->src + start, lx->pos - start)
-                        : js_make_double(mant, exp_part + exp_adjust);
+        if (dropped && separated) { /* the whole text decides: without its separators */
+            uint32_t n = lx->pos - start, k = 0;
+            uint16_t *clean = js_arena_alloc(lx->arena, n * sizeof *clean);
+            if (!clean)
+                return lex_fail(lx, start, "out of memory");
+            for (uint32_t i = 0; i < n; i++)
+                if (lx->src[start + i] != '_')
+                    clean[k++] = lx->src[start + i];
+            value = js_k_decimal(clean, k);
+        } else {
+            value = dropped ? js_k_decimal(lx->src + start, lx->pos - start)
+                            : js_make_double(mant, exp_part + exp_adjust);
+        }
     }
 
-    if (cur(lx) == '_')
-        return lex_fail(lx, lx->pos, "numeric separators are not supported");
     if (cur(lx) == 'n')
         return lex_fail(lx, lx->pos, "BigInt literals are not supported");
     if (is_id_start(cur(lx)) || is_digit(cur(lx)))
@@ -609,15 +758,25 @@ bool js_lexer_next(JsLexer *lx) {
         return false;
     lx->tok.newline_before = nl;
     lx->tok.pos = lx->pos;
+    lx->tok.escaped = false;
 
     bool ok;
     uint16_t u = cur(lx);
     if (lx->pos >= lx->len) {
         lx->tok.kind = JS_T_EOF;
         ok = true;
-    } else if (is_id_start(u)) {
-        lex_ident(lx);
-        ok = true;
+    } else if (u == '\\' && at(lx, 1) != 'u') {
+        ok = lex_fail(lx, lx->pos, "Invalid or unexpected token");
+    } else if (is_id_start(u) || u == '\\') {
+        uint32_t p = lx->pos;
+        while (p < lx->len && is_id_part(lx->src[p]))
+            p++;
+        if (p < lx->len && lx->src[p] == '\\') {
+            ok = lex_escaped_ident(lx, lx->pos);
+        } else {
+            lex_ident(lx);
+            ok = true;
+        }
     } else if (is_digit(u) || (u == '.' && is_digit(at(lx, 1)))) {
         ok = lex_number(lx);
     } else if (u == '"' || u == '\'') {
@@ -625,8 +784,6 @@ bool js_lexer_next(JsLexer *lx) {
     } else if (u == '`') {
         lx->pos++;
         ok = lex_template_chunk(lx, lx->tok.pos);
-    } else if (u == '\\') {
-        ok = lex_fail(lx, lx->pos, "unicode escapes in identifiers are not supported");
     } else {
         ok = lex_punct(lx);
     }
