@@ -175,14 +175,15 @@ bool js_object_set(JsVm *vm, JsValue obj, JsValue key, JsValue value) {
     JsObject *o = js_value_object(obj);
     if (o->obj_flags & (JS_OBJ_FROZEN | JS_OBJ_NAMESPACE))
         return false;
-    if (o->obj_flags & JS_OBJ_SEALED) {
+    if (o->obj_flags & (JS_OBJ_NO_ADD | JS_OBJ_ATTRS)) {
         bool found = false;
         JsString *ek = js_atoms_find(vm, js_value_string(key)->units,
                                      js_value_string(key)->length,
                                      js_value_string(key)->hash);
         if (ek)
             js_map_get(&o->props, ek, &found);
-        if (!found)
+        if (found ? (js_map_get_attrs(&o->props, ek) & JS_ATTR_READONLY) != 0
+                  : (o->obj_flags & JS_OBJ_NO_ADD) != 0)
             return false;
     }
     js_gc_maybe(vm); /* safe point: obj/key/value are caller-rooted */
@@ -195,12 +196,14 @@ bool js_object_set(JsVm *vm, JsValue obj, JsValue key, JsValue value) {
 bool js_object_delete(JsVm *vm, JsValue obj, JsValue key) {
     if (!js_is_object(obj))
         return false;
-    if (js_value_object(obj)->obj_flags)
-        return false;
+    JsObject *o = js_value_object(obj);
     JsString *k = js_object_key_lookup(vm, key);
     if (!k)
         return false;
-    JsObject *o = js_value_object(obj);
+    if (js_obj_attrs(o, js_map_get_attrs(&o->props, k)) & JS_ATTR_FIXED)
+        return false;
+    if (o->obj_flags & JS_OBJ_NAMESPACE)
+        return false;
     return js_map_delete(&o->props, k); /* made again, a hidden key enumerates */
 }
 
@@ -279,7 +282,7 @@ bool js_array_set(JsVm *vm, JsValue arr, uint32_t index, JsValue value) {
      * allows writing an element that already exists. */
     if (o->obj_flags & JS_OBJ_FROZEN)
         return false;
-    if ((o->obj_flags & JS_OBJ_SEALED) && index >= o->elem_count)
+    if ((o->obj_flags & JS_OBJ_NO_ADD) && index >= o->elem_count)
         return false;
     /* The same ceiling the interpreter puts on an index-assignment gap: every
      * slot up to `index` is materialized, so an unbounded index would be an
@@ -296,7 +299,7 @@ bool js_array_push(JsVm *vm, JsValue arr, JsValue value) {
     if (!js_is_array(arr))
         return false;
     JsObject *o = js_value_object(arr);
-    if (o->obj_flags & (JS_OBJ_FROZEN | JS_OBJ_SEALED))
+    if (o->obj_flags & JS_OBJ_NO_ADD)
         return false;
     return js_array_append(vm, o, value);
 }

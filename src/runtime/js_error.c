@@ -998,7 +998,7 @@ static bool err_captureStackTrace(JsContext *ctx, JsValue tv, const JsValue *arg
             return nthrow(ctx, r, "out of memory");
         return true;
     }
-    if (o->obj_flags)
+    if (o->obj_flags & JS_OBJ_NO_ADD)
         return (*r = js_error_fmt(ctx, "TypeError: Cannot define property stack, object is not extensible")), false;
     uint32_t limit;
     if (!stack_trace_limit(ctx, &limit))

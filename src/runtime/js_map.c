@@ -270,3 +270,17 @@ bool js_map_add_attrs(JsMap *m, const JsString *key, uint8_t attrs) {
     JS_MAP_ATTRS(m)[e - m->entries] |= attrs;
     return true;
 }
+
+bool js_map_put_attrs(JsMap *m, const JsString *key, uint8_t attrs) {
+    JsMapEntry *e = js_map_find(m, key);
+    if (!e)
+        return false;
+    JS_MAP_ATTRS(m)[e - m->entries] = attrs;
+    return true;
+}
+
+JsValue js_map_get_writable(const JsMap *m, const JsString *key, bool *found) {
+    JsMapEntry *e = js_map_find(m, key);
+    *found = e && !(JS_MAP_ATTRS(m)[e - m->entries] & JS_ATTR_READONLY);
+    return *found ? e->value : js_undefined();
+}

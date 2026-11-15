@@ -45,8 +45,9 @@ boxed-primitive type at all (see `String`/`Number` below), so there's
 nothing to box it into.
 
 **Statics**: `keys`, `values`, `entries`, `assign`, `freeze`, `isFrozen`,
-`seal`, `isSealed`, `fromEntries`, `hasOwn`, `getOwnPropertyNames`, `getPrototypeOf`,
-`setPrototypeOf`, `create`, `is` (SameValue: `NaN` is `NaN`, `0` is not `-0`), `groupBy(items,
+`seal`, `isSealed`, `preventExtensions`, `isExtensible`, `defineProperty`, `defineProperties`,
+`getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `fromEntries`, `hasOwn`,
+`getOwnPropertyNames`, `getPrototypeOf`, `setPrototypeOf`, `create`, `is` (SameValue: `NaN` is `NaN`, `0` is not `-0`), `groupBy(items,
 fn)` (a prototype-less object of arrays, keyed by what `fn(value, index)` returns as a property
 key; `items` any iterable, closed if `fn` throws).
 
@@ -68,10 +69,25 @@ included). A chain may not loop (`TypeError: Cyclic __proto__ value`), and a sea
 value keeps its prototype. `instanceof` and `Object.getPrototypeOf` follow such chains. A
 function from `bind` starts with its target's prototype.
 
-`Object.create(proto)` makes a plain object whose prototype is `proto` (an object, function or
-promise) or none (`null`); anything else is V8's `TypeError: Object prototype may only be an Object or null`. A
-second argument (property descriptors) is a `TypeError`: there are no property attributes to give
-the properties it describes.
+`Object.create(proto, props)` makes a plain object whose prototype is `proto` (an object, function
+or promise) or none (`null`); anything else is V8's `TypeError: Object prototype may only be an
+Object or null`. `props` describes its properties, as `Object.defineProperties` takes them.
+
+`Object.defineProperty(o, key, descriptor)` and `defineProperties` take data descriptors (`value`,
+`writable`, `enumerable`, `configurable`, each looked up through the prototype chain, as V8 reads
+them; a missing one is `false` on a new property and unchanged on an existing one) and validate
+them as V8 does (`TypeError: Cannot redefine property: x` for a change a non-configurable property
+refuses; `Cannot define property x, object is not extensible`). A `get` or `set` is a `TypeError`:
+there are no accessor properties. `getOwnPropertyDescriptor(o, key)` returns `{ value, writable,
+enumerable, configurable }` or `undefined`, and `getOwnPropertyDescriptors(o)` one for each key
+`getOwnPropertyNames` lists. Redefining a function's `name` or `length` works as in V8 (it is
+configurable); `prototype` can be given a value or made read-only. What lamassu cannot store
+(attributes on an array element, a read-only array `length` or regexp `lastIndex`) is a
+`TypeError`; see [Deviations](/guide/deviations).
+
+`Object.assign` writes each property with `[[Set]]`, as V8: onto a read-only property, a frozen or
+non-extensible object, or a module namespace it throws at the first write it cannot make, having
+made the ones before it.
 
 Own keys come out in the language's order everywhere — `keys`/`values`/
 `entries`, spread, `assign` and `JSON.stringify`: array-index names (`"0"`,
@@ -87,10 +103,13 @@ giving either a different prototype with `setPrototypeOf` (`#<Object> is not
 extensible`). Sealing
 fixes the shape while leaving existing properties writable, so
 `reverse`/`fill`/`sort` still work on a sealed array while
-`push`/`pop`/`shift`/`unshift` don't. Both return their argument, and both
-are no-ops on a primitive (which `isFrozen`/`isSealed` therefore report as
-frozen and sealed). Integrity is whole-object — there are no per-property
-attributes; see [Deviations](/guide/deviations).
+`push`/`pop`/`shift`/`unshift` don't. `preventExtensions` only stops new properties (an array
+can still `pop`, not `push`). All three return their argument and are no-ops on a primitive
+(which `isFrozen`/`isSealed` report as frozen and sealed, and `isExtensible` as not extensible).
+`isFrozen`/`isSealed` are V8's: an object made non-extensible whose properties are all
+non-configurable (and read-only) is sealed (frozen) however it got there, so an empty sealed
+object is frozen too. `Math.PI` and the other `Math` and `Number` constants, and the globals
+`undefined`, `NaN` and `Infinity`, are read-only and not configurable, as in V8.
 
 **`Object.prototype`**: `hasOwnProperty`, `isPrototypeOf` (`false` for a primitive argument),
 `propertyIsEnumerable` (an own key that enumeration lists: an array's or string's index, not

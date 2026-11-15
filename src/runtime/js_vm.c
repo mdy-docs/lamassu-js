@@ -197,7 +197,7 @@ size_t js_gc_live_cells(const JsVm *vm) {
 }
 
 static bool js_define_global(JsVm *vm, JsObject *globals, const char *name,
-                             JsValue v) {
+                             JsValue v, uint8_t attrs) {
     uint16_t units[16];
     size_t n = 0;
     while (name[n] && n < 16) {
@@ -207,7 +207,13 @@ static bool js_define_global(JsVm *vm, JsObject *globals, const char *name,
     JsValue key = js_atom(vm, units, n);
     if (!js_is_string(key))
         return false;
-    return js_map_set(vm, &globals->props, js_value_string(key), v);
+    if (!js_map_set(vm, &globals->props, js_value_string(key), v))
+        return false;
+    if (attrs) {
+        js_map_add_attrs(&globals->props, js_value_string(key), attrs);
+        globals->obj_flags |= JS_OBJ_ATTRS;
+    }
+    return true;
 }
 
 JsContext *js_context_new(JsVm *vm) {
@@ -285,11 +291,13 @@ JsContext *js_context_new(JsVm *vm) {
         vm->contexts->prev_link = &ctx->next;
     vm->contexts = ctx;
     /* Global constants (globals are rooted via the context now). */
-    if (!js_define_global(vm, ctx->globals, "undefined", js_undefined()) ||
-        !js_define_global(vm, ctx->globals, "NaN", js_number(__builtin_nan(""))) ||
-        !js_define_global(vm, ctx->globals, "Infinity", js_number(__builtin_inf())) ||
+    /* undefined, NaN and Infinity read-only and not configurable, as V8's */
+    const uint8_t fixed = JS_ATTR_READONLY | JS_ATTR_FIXED;
+    if (!js_define_global(vm, ctx->globals, "undefined", js_undefined(), fixed) ||
+        !js_define_global(vm, ctx->globals, "NaN", js_number(__builtin_nan("")), fixed) ||
+        !js_define_global(vm, ctx->globals, "Infinity", js_number(__builtin_inf()), fixed) ||
         !js_define_global(vm, ctx->globals, "globalThis",
-                          js_value_from_cell(&ctx->globals->gc))) {
+                          js_value_from_cell(&ctx->globals->gc), 0)) {
         js_context_free(ctx);
         return NULL;
     }

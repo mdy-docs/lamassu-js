@@ -87,7 +87,9 @@ typedef struct JsMap {
 /* Property attributes, one byte per JsMap entry; 0 is an ordinary data property (enumerable,
  * writable, configurable). Setting an existing key keeps them; deleting a key drops them, so a
  * key made again is ordinary. */
-#define JS_ATTR_HIDDEN 1u /* not enumerable: left out of Object.keys, JSON, spread, assign */
+#define JS_ATTR_HIDDEN 1u   /* not enumerable: left out of Object.keys, JSON, spread, assign */
+#define JS_ATTR_READONLY 2u /* not writable (Object.defineProperty); its object has JS_OBJ_ATTRS */
+#define JS_ATTR_FIXED 4u    /* not configurable: not deletable, attributes final; JS_OBJ_ATTRS too */
 #define JS_MAP_ATTRS(m) ((uint8_t *)((m)->entries + (m)->capacity))
 
 #define JS_MAP_TOMBSTONE ((JsString *)(uintptr_t)1)
@@ -104,16 +106,22 @@ typedef enum JsObjKind {
     JS_OBJ_ITER = 8,   /* JsIterObj (js_iter.h): a Map, Set or RegExp String Iterator */
 } JsObjKind;
 
-/* JsObject.obj_flags. Extensibility only — this engine has no per-property
- * attributes, so "frozen" is a whole-object state rather than every property
- * being individually non-writable. That matches what Object.freeze/seal
- * observably do to an ordinary object, which is all guest code can test. */
-#define JS_OBJ_SEALED 1u /* no adding, no deleting; existing props writable */
-#define JS_OBJ_FROZEN 2u /* sealed, and no writes either */
+/* JsObject.obj_flags: extensibility, and whole-object integrity. Freezing or sealing sets a flag
+ * that stands for every own property being read-only and not configurable (or only not
+ * configurable), elements included, rather than writing each property's attributes: the same
+ * thing to every observer, at no cost. Per-property attributes (Object.defineProperty) live in
+ * the property map's attribute bytes, and JS_OBJ_ATTRS says the object has some, so a write to
+ * an object with no flags at all still takes one branch. */
+#define JS_OBJ_SEALED 1u /* not extensible; every own property not configurable */
+#define JS_OBJ_FROZEN 2u /* sealed, and every own property read-only */
 /* A module namespace (a compiled module's exports object): sealed, and its properties
  * read-only to scripts (only the module's own export writes change them). A let/const export
  * holds JS_SPECIAL_TDZ until its declaration runs; every read of the object checks for it. */
 #define JS_OBJ_NAMESPACE 4u
+#define JS_OBJ_NOEXT 16u /* not extensible (Object.preventExtensions): no new properties */
+#define JS_OBJ_ATTRS 32u /* some own property is JS_ATTR_READONLY or JS_ATTR_FIXED */
+/* The flags that refuse a new property */
+#define JS_OBJ_NO_ADD (JS_OBJ_SEALED | JS_OBJ_FROZEN | JS_OBJ_NOEXT | JS_OBJ_NAMESPACE)
 #define JS_OBJ_RAW_JSON 8u /* made by JSON.rawJSON (always frozen too): JSON.stringify writes its rawJSON */
 
 /* JsErrorKind (lamassu.h) indexes JsContext.error_protos (js_error.c). */
@@ -177,6 +185,15 @@ typedef struct JsErrorObject {
  * non-enumerable one: an error's `message`, a prototype's `constructor`, a builtin's methods) */
 static inline bool js_prop_hidden_at(const JsObject *o, uint32_t i) {
     return o->props.entries && (JS_MAP_ATTRS(&o->props)[i] & JS_ATTR_HIDDEN);
+}
+
+/* A property's attributes A (its map byte) with O's integrity applied: what it is to a script */
+static inline uint8_t js_obj_attrs(const JsObject *o, uint8_t a) {
+    if (o->obj_flags & JS_OBJ_SEALED)
+        a |= JS_ATTR_FIXED;
+    if (o->obj_flags & JS_OBJ_FROZEN)
+        a |= JS_ATTR_READONLY | JS_ATTR_FIXED;
+    return a;
 }
 
 typedef struct JsHostObject {
@@ -311,7 +328,9 @@ typedef struct JsClosure {
     bool has_this;
     bool length_deleted; /* `delete f.length` ran: it reads 0 (Function.prototype's) */
     bool proto_made;     /* `prototype` holds the function's prototype (see js_is_constructor) */
+    bool proto_readonly; /* Object.defineProperty made `prototype` read-only (fits the padding) */
     uint16_t n_upvals;
+    bool name_deleted;   /* `delete f.name` ran: no own name (it reads Function.prototype's "") */
     /* A constructor's `prototype`: any value a script gives it. Made (an object whose hidden
      * `constructor` is the function) the first time it is read or `new` needs it. */
     JsValue prototype;
@@ -350,6 +369,8 @@ typedef struct JsNative {
     uint8_t length;      /* `length`: V8's for a builtin (js_builtin_lengths_apply), else 0 */
     uint8_t ctor;        /* JS_CTOR_*: whether and how `new` may call it */
     bool proto_made;     /* `prototype` holds it */
+    bool proto_readonly; /* Object.defineProperty made `prototype` read-only */
+    bool length_deleted; /* `delete f.length` ran: no own length (it reads 0) */
     struct JsNative *parent; /* its [[Prototype]] when that is another constructor (TypeError's
                               * is Error), whose statics it inherits; NULL: Function.prototype */
     JsValue own_proto;       /* its [[Prototype]] once a script has set one (proto_set), as
@@ -824,6 +845,8 @@ void js_gc_free_cell(JsVm *vm, JsGcCell *c, bool remove_atoms);
 void    js_map_init(JsMap *m);
 bool    js_map_set(JsVm *vm, JsMap *m, JsString *key, JsValue value);
 JsValue js_map_get(const JsMap *m, const JsString *key, bool *found);
+/* js_map_get, but *found is false for a JS_ATTR_READONLY entry too */
+JsValue js_map_get_writable(const JsMap *m, const JsString *key, bool *found);
 bool    js_map_delete(JsMap *m, const JsString *key);
 void    js_map_free(JsVm *vm, JsMap *m);
 void    js_map_sort_keys(JsMap *m); /* enumeration order; no allocation, so safe anywhere */
@@ -831,6 +854,8 @@ void    js_map_sort_keys(JsMap *m); /* enumeration order; no allocation, so safe
 bool    js_map_add_attrs(JsMap *m, const JsString *key, uint8_t attrs);
 /* KEY's JS_ATTR_* byte; 0 when KEY is not in M */
 uint8_t js_map_get_attrs(const JsMap *m, const JsString *key);
+/* Sets KEY's JS_ATTR_* byte to ATTRS; false when KEY is not in M */
+bool    js_map_put_attrs(JsMap *m, const JsString *key, uint8_t attrs);
 
 /* ---- strings / atoms (js_string.c) ---- */
 

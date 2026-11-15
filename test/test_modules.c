@@ -1063,7 +1063,7 @@ static void test_declaration_rules(void) {
                      "TypeError: Cannot delete property 'q' of [object Module]|true false|"
                      "TypeError: Cannot redefine property: fz|"
                      "TypeError: [object Module] is not extensible|"
-                     "TypeError: Cannot assign to read only property 'q' of object '[object Module]'|"
+                     "TypeError: Cannot assign to property 'q' of [object Module]|"
                      "fz,out,q");
 }
 

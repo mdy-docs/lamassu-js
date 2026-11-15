@@ -11,11 +11,6 @@ prototype in both engines (2026-11-15).
 
 **Not yet implemented** (nothing stands in the way; each is queued):
 
-- `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`,
-  `getOwnPropertyDescriptors` for data properties (`value`, `writable`, `enumerable`,
-  `configurable`; accessor descriptors are out, below), and with them `Object.preventExtensions`
-  and `Object.isExtensible`: all need per-property `writable`/`configurable`, which integrity
-  (whole-object `freeze`/`seal`, below) does not have yet.
 - `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`.
 - `String.prototype.normalize` (needs the Unicode normalization tables).
 - `Array.fromAsync`.
@@ -76,17 +71,21 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   boxing it into a wrapper object — this engine has no boxed-primitive type
   at all. `Object()`/`Object(null)`/`Object(undefined)` (a new empty
   object) and `Object(anObject)` (identity) both match spec.
-- **Integrity is whole-object, not per-property.** `Object.freeze` and
-  `Object.seal` are enforced — on property assignment, indexed array writes,
-  `length`, `delete`, the in-place array mutators (`push`/`pop`/`shift`/
-  `unshift`/`reverse`/`fill`/`sort`), and the host's `js_object_set` — and
-  because the engine is strict-mode throughout, a refused write throws a
-  `TypeError` rather than failing quietly. `Object.isFrozen` and
-  `Object.isSealed` report the state. What's missing is anything *finer*:
-  there are no per-property attributes here, so there is no
-  `writable`/`configurable` distinction and no `Object.defineProperty` to set
-  one. That covers everything guest code can observe of an ordinary frozen
-  object; it only differs if you were reaching for a partially frozen one.
+- **Property attributes are V8's, with three exceptions.** Every own property has V8's
+  `writable`, `enumerable` and `configurable`: `Object.defineProperty`,
+  `defineProperties` and `Object.create`'s second argument set them, `getOwnPropertyDescriptor(s)`
+  reports them (a function's `name` and `length`, a builtin's statics, `Math.PI` and the other
+  constants, `undefined`/`NaN`/`Infinity`, a string's characters, a regexp's `lastIndex`), and
+  `preventExtensions`, `freeze` and `seal` work with them as in V8: a read-only property refuses
+  assignment (also when it is inherited, as V8 refuses it in strict code), a non-configurable one
+  refuses `delete` and redefinition, and `isFrozen`/`isSealed` look at each property. The engine
+  is strict-mode throughout, so a refused write throws a `TypeError`. The exceptions, each a
+  `TypeError: Cannot redefine property` that says so: an **array element** cannot be made
+  read-only, non-enumerable or non-configurable (elements are a flat vector with no attribute
+  storage; a frozen or sealed array's elements are), nor can an **array's `length`** or a
+  **regexp's `lastIndex`** be made read-only (outside `freeze`). An error's **`stack`** is a data
+  property here where V8 has an accessor; it reads, writes and redefines as V8's does, but its
+  descriptor has `value`/`writable` rather than `get`/`set`.
   Enumerability is per property, though: what V8 makes non-enumerable (a builtin
   prototype's methods, a function's `prototype.constructor`, an error's `message`)
   is left out of `Object.keys`, JSON, spread and `Object.assign` here too, and

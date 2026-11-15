@@ -501,7 +501,9 @@ static JsValue construct_proto(JsContext *ctx, JsGcCell *c) {
  * function's */
 static bool prototype_read_only(JsContext *ctx, JsValue fn) {
     JsGcCell *c = js_value_cell(fn);
-    if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->ctor == JS_CTOR_FACTORY)
+    if (c->kind == JS_KIND_NATIVE && (((JsNative *)c)->ctor == JS_CTOR_FACTORY || ((JsNative *)c)->proto_readonly))
+        return true;
+    if (c->kind == JS_KIND_CLOSURE && ((JsClosure *)c)->proto_readonly)
         return true;
     JsObject *own = js_cell_props(ctx, fn, false);
     return own && (own->obj_flags & JS_OBJ_FROZEN);
@@ -622,7 +624,7 @@ int js_set_proto(JsContext *ctx, JsValue v, JsValue proto) {
     if (js_get_proto(ctx, v).bits == proto.bits)
         return 0; /* the same: allowed even when it is not extensible */
     JsObject *flags_of = js_is_object(v) ? js_value_object(v) : js_cell_props(ctx, v, false);
-    if (flags_of && (flags_of->obj_flags & (JS_OBJ_SEALED | JS_OBJ_FROZEN)))
+    if (flags_of && (flags_of->obj_flags & JS_OBJ_NO_ADD))
         return 1;
     for (JsValue p = proto; is_object_type(p); p = js_get_proto(ctx, p))
         if (p.bits == v.bits)
@@ -781,6 +783,14 @@ JS_COLD static JsPropStatus promise_set(JsContext *ctx, JsValue p, JsValue key, 
     return JS_PROP_OK;
 }
 
+/* The attributes of K (interned) among a builtin's own statics; 0 when it is not one */
+static uint8_t static_attrs(JsGcCell *c, JsString *k) {
+    if (c->kind != JS_KIND_NATIVE || !((JsNative *)c)->statics)
+        return 0;
+    JsObject *st = ((JsNative *)c)->statics;
+    return (st->obj_flags & JS_OBJ_ATTRS) ? js_map_get_attrs(&st->props, k) : 0;
+}
+
 /* Removes the interned key K from a builtin's own statics, if it is one: they and the
  * properties a script writes stay disjoint, so a static that is replaced or deleted is gone
  * (Object.getOwnPropertyNames lists each name once, as V8). Allocates nothing. */
@@ -788,6 +798,25 @@ JS_COLD static void drop_static(JsGcCell *c, JsString *k) {
     if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->statics)
         js_map_delete(&((JsNative *)c)->statics->props, k);
 }
+
+/* A function's `name` or `length` (KEY) as Object.defineProperty redefined it: kept among its own
+ * properties, where it shadows the one the function has by nature. True when there is one (its
+ * value in *OUT, unless OUT is NULL). Allocates nothing: KEY is an atom. */
+JS_NOINLINE static bool function_defined_special(JsContext *ctx, JsValue fn, JsValue key, JsValue *out) {
+    JsObject *own = js_cell_props(ctx, fn, false);
+    if (!own || !own->props.count)
+        return false;
+    JsString *k = js_value_string(key);
+    if (!k->interned && !(k = js_atoms_find(ctx->vm, k->units, k->length, k->hash)))
+        return false;
+    bool found;
+    JsValue v = js_map_get(&own->props, k, &found);
+    if (found && out)
+        *out = v;
+    return found;
+}
+
+static uint8_t own_prop_attrs(JsContext *ctx, JsObject *o, JsValue key);
 
 /* `delete fn[key]`, out of the dispatch loop: 0 done, 1 refused (*err the TypeError), 2 OOM.
  * name and length are configurable: deleting one leaves Function.prototype's, "" or 0. */
@@ -807,35 +836,54 @@ JS_COLD static int delete_function_prop(JsContext *ctx, JsValue fn, JsValue key,
     bool special = isfn && (is_name_key(key) || is_length_key(key));
     JsGcCell *fc0 = js_value_cell(fn);
     bool refused = isfn && has_own_prototype(fc0) && is_prototype_key(key); /* not configurable */
-    if (!refused && own && own->obj_flags) { /* sealed or frozen: only a property it has */
+    if (!refused && own && (own->obj_flags & (JS_OBJ_SEALED | JS_OBJ_FROZEN | JS_OBJ_ATTRS))) {
+        /* sealed, frozen or made not configurable: only a property it has */
         JsString *k = to_prop_key(ctx, key);
         if (!k)
             return 2;
-        bool found = special;
-        if (!found)
-            js_map_get(&own->props, k, &found);
+        bool found = false;
+        js_map_get(&own->props, k, &found);
+        uint8_t attrs = found ? js_map_get_attrs(&own->props, k) : 0;
+        found = found || special;
         if (!found && fc0->kind == JS_KIND_NATIVE && ((JsNative *)fc0)->statics)
             js_map_get(&((JsNative *)fc0)->statics->props, k, &found);
-        refused = found;
+        refused = found && (js_obj_attrs(own, attrs) & JS_ATTR_FIXED);
+    }
+    if (!refused && fc0->kind == JS_KIND_NATIVE && ((JsNative *)fc0)->statics &&
+        (((JsNative *)fc0)->statics->obj_flags & JS_OBJ_ATTRS)) {
+        JsString *k = to_prop_key(ctx, key);
+        if (!k)
+            return 2;
+        refused = (static_attrs(fc0, k) & JS_ATTR_FIXED) != 0;
     }
     if (refused) {
         *err = js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of %v", key, fn);
         return 1;
     }
     JsGcCell *fc = js_value_cell(fn);
+    if (special && own) { /* a name or length Object.defineProperty gave it goes too */
+        JsString *k = to_prop_key(ctx, key);
+        if (!k)
+            return 2;
+        js_map_delete(&own->props, k);
+    }
     if (special && is_length_key(key)) {
         if (fc->kind == JS_KIND_CLOSURE)
             ((JsClosure *)fc)->length_deleted = true;
-        else if (fc->kind == JS_KIND_NATIVE)
+        else if (fc->kind == JS_KIND_NATIVE) {
             ((JsNative *)fc)->length = 0;
+            ((JsNative *)fc)->length_deleted = true;
+        }
         return 0;
     }
     if (special) {
         JsString *empty = js_ascii_cell(ctx->vm, ""); /* fn is on the caller's stack: rooted */
         if (!empty)
             return 2;
-        if (fc->kind == JS_KIND_CLOSURE)
+        if (fc->kind == JS_KIND_CLOSURE) {
             ((JsClosure *)fc)->name = empty;
+            ((JsClosure *)fc)->name_deleted = true;
+        }
         else if (fc->kind == JS_KIND_NATIVE)
             ((JsNative *)fc)->name_deleted = true;
         return 0;
@@ -892,6 +940,20 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key, JsVa
 static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key, JsValue val,
                                  const char **errmsg);
 static JsPropStatus has_property(JsContext *ctx, JsValue base, JsValue key, bool *out);
+
+static JsValue set_error(JsContext *ctx, const char *msg, JsValue base, JsValue key);
+
+/* [[Set]] as an assignment does it, for natives: false with the TypeError pending when the write
+ * is refused, or on OOM. BASE, KEY and VAL are rooted by the caller. */
+bool js_set_property(JsContext *ctx, JsValue base, JsValue key, JsValue val) {
+    const char *msg = NULL;
+    JsPropStatus st = set_property(ctx, base, key, val, &msg);
+    if (st == JS_PROP_TYPE_ERROR) {
+        js_set_error(ctx, set_error(ctx, msg, base, key));
+        return false;
+    }
+    return st == JS_PROP_OK;
+}
 
 __attribute__((noinline)) static bool object_key(JsContext *ctx, JsValue key, JsValue *skey) {
     JsString *s = js_op_to_string(ctx, key);
@@ -1020,6 +1082,8 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
         JsGcCell *c = js_value_cell(base);
         if (has_own_prototype(c) && is_prototype_key(key))
             return function_prototype(ctx, c, out) ? JS_PROP_OK : JS_PROP_OOM;
+        if (JS_UNLIKELY(is_name_key(key) || is_length_key(key)) && function_defined_special(ctx, base, key, out))
+            return JS_PROP_OK;
         if (is_name_key(key)) {
             JsString *nm = js_function_name(base);
             if (!nm) {
@@ -1117,16 +1181,54 @@ static JsValue set_error(JsContext *ctx, const char *msg, JsValue base, JsValue 
     return js_error_from_ascii(ctx, msg);
 }
 
-static const char *write_blocked(JsContext *ctx, JsObject *o, JsValue key) {
-    if (!o->obj_flags)
-        return NULL; /* the overwhelmingly common case: one predictable branch */
+/* KEY's own attributes on O (a map property's byte; an array's elements and `length` have none),
+ * O's integrity applied. 0 when O does not have it. */
+static uint8_t own_prop_attrs(JsContext *ctx, JsObject *o, JsValue key) {
+    uint8_t a = 0;
+    if ((o->obj_flags & JS_OBJ_ATTRS) && js_is_string(key)) {
+        JsString *k = to_prop_key(ctx, key);
+        if (k)
+            a = js_map_get_attrs(&o->props, k);
+    }
+    return js_obj_attrs(o, a);
+}
+
+JS_NOINLINE static const char *write_blocked_slow(JsContext *ctx, JsObject *o, JsValue key) {
     if (o->obj_flags & JS_OBJ_NAMESPACE)
         return SET_NAMESPACE; /* a module's exports change only through its own bindings */
     if (!own_prop_present(ctx, o, key))
-        return SET_NOT_EXTENSIBLE; /* sealed or frozen: no new properties */
-    if (o->obj_flags & JS_OBJ_FROZEN)
+        return (o->obj_flags & JS_OBJ_NO_ADD) ? SET_NOT_EXTENSIBLE : NULL;
+    if (own_prop_attrs(ctx, o, key) & JS_ATTR_READONLY)
         return SET_READ_ONLY;
     return NULL;
+}
+
+static inline const char *write_blocked(JsContext *ctx, JsObject *o, JsValue key) {
+    if (!o->obj_flags)
+        return NULL; /* the overwhelmingly common case: one predictable branch */
+    return write_blocked_slow(ctx, o, key);
+}
+
+/* Whether a [[Set]] of KEY on O, which does not have it, finds it read-only further up O's
+ * chain (a frozen prototype's, or one Object.defineProperty made read-only), as V8 refuses that
+ * write in strict code. Only reached when some object on the chain has such a property. */
+JS_NOINLINE static bool inherited_read_only(JsContext *ctx, JsObject *o, JsValue key) {
+    if (own_prop_present(ctx, o, key))
+        return false;
+    for (JsValue p = o->proto; js_is_object(p); p = js_value_object(p)->proto) {
+        JsObject *po = js_value_object(p);
+        if (own_prop_present(ctx, po, key))
+            return (own_prop_attrs(ctx, po, key) & JS_ATTR_READONLY) != 0;
+    }
+    return false;
+}
+
+/* Whether some object on O's [[Prototype]] chain may have a read-only property: a few loads */
+static inline bool chain_may_be_read_only(const JsObject *o) {
+    for (JsValue p = o->proto; js_is_object(p); p = js_value_object(p)->proto)
+        if (JS_UNLIKELY(js_value_object(p)->obj_flags & (JS_OBJ_FROZEN | JS_OBJ_ATTRS)))
+            return true;
+    return false;
 }
 
 static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
@@ -1154,7 +1256,7 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
             }
             return JS_PROP_OK;
         }
-        if (is_name_key(key) || is_length_key(key)) {
+        if ((is_name_key(key) || is_length_key(key)) && !function_defined_special(ctx, base, key, NULL)) {
             *errmsg = SET_READ_ONLY;
             return JS_PROP_TYPE_ERROR;
         }
@@ -1170,6 +1272,10 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
         JsString *k = to_prop_key(ctx, key);
         if (!k)
             return JS_PROP_OOM;
+        if (JS_UNLIKELY(static_attrs(c, k) & JS_ATTR_READONLY)) { /* Number.EPSILON */
+            *errmsg = SET_READ_ONLY;
+            return JS_PROP_TYPE_ERROR;
+        }
         if (!js_map_set(vm, &own->props, k, val))
             return JS_PROP_OOM;
         drop_static(js_value_cell(base), k); /* the write replaces a builtin's static */
@@ -1201,6 +1307,10 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
             return JS_PROP_OK;
     }
 #endif
+    if (JS_UNLIKELY(chain_may_be_read_only(o)) && inherited_read_only(ctx, o, key)) {
+        *errmsg = SET_READ_ONLY;
+        return JS_PROP_TYPE_ERROR;
+    }
     if (o->obj_kind == JS_OBJ_ARRAY) {
         uint32_t idx;
         if (key_to_index(key, &idx)) {
@@ -1246,6 +1356,28 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
     if (!k)
         return JS_PROP_OOM;
     if (!js_map_set(vm, &o->props, k, val))
+        return JS_PROP_OOM;
+    return JS_PROP_OK;
+}
+
+/* An object literal's property, onto the fresh plain object BASE: CreateDataProperty, which looks
+ * at nothing on the prototype chain (a read-only inherited property does not stop it). The key
+ * converts as an assignment's does. BASE, KEY and VAL are the caller's, rooted. */
+JS_NOINLINE static JsPropStatus define_literal_prop(JsContext *ctx, JsValue base, JsValue key,
+                                                    JsValue val, const char **errmsg) {
+    if (JS_UNLIKELY(!js_is_object(base) || js_value_object(base)->obj_flags))
+        /* not a literal's fresh object (corrupt bytecode): an assignment */
+        return set_property(ctx, base, key, val, errmsg);
+    if (is_object_type(key)) {
+        JsValue sk;
+        if (!object_key(ctx, key, &sk))
+            return JS_PROP_OOM;
+        JsPropStatus st = define_literal_prop(ctx, base, sk, val, errmsg);
+        js_gc_unprotect(ctx->vm, &sk);
+        return st;
+    }
+    JsString *k = to_prop_key(ctx, key);
+    if (!k || !js_map_set(ctx->vm, &js_value_object(base)->props, k, val))
         return JS_PROP_OOM;
     return JS_PROP_OK;
 }
@@ -1605,7 +1737,8 @@ __attribute__((noinline)) static bool delete_object_prop(JsContext *ctx, JsObjec
     }
     if ((o->obj_kind == JS_OBJ_ARRAY && js_is_string(key) &&
          units_is_ascii_str(js_value_string(key), "length")) ||
-        (o->obj_flags && own_prop_present(ctx, o, key))) {
+        ((o->obj_flags & (JS_OBJ_SEALED | JS_OBJ_FROZEN | JS_OBJ_ATTRS)) &&
+         own_prop_present(ctx, o, key) && (own_prop_attrs(ctx, o, key) & JS_ATTR_FIXED))) {
         js_set_error(ctx, js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of %v", key, b));
         return false;
     }
@@ -1845,6 +1978,19 @@ static void fiber_throw_value(JsFiber *fb, JsValue error) {
     fb->error = error;
     fb->failed = true;
 }
+
+/* An assignment to the global NAME that js_map_get_writable refused: a ReferenceError when there
+ * is none, else it is read-only (undefined, NaN, Infinity, or one Object.defineProperty made so).
+ * The SET_GLOBAL case keeps the shape it had before read-only globals: the loop is sensitive. */
+JS_NOINLINE static void global_write_fail(JsContext *ctx, JsFiber *fb, JsString *name) {
+    bool found;
+    js_map_get(&ctx->globals->props, name, &found);
+    if (!found)
+        fiber_throw_name(ctx, fb, "ReferenceError: ", name, " is not defined");
+    else
+        fiber_throw_value(fb, js_error_fmt(ctx, "TypeError: Cannot assign to read only property '%S' of object '#<Object>'", name));
+}
+
 
 /* "<text><what>" with the instruction's recorded text (s.fillet, foo, a[0]), else with the value
  * as V8 shows it: "TypeError: o.f is not a function", "TypeError: 5 is not iterable". */
@@ -2123,11 +2269,13 @@ static JsClosure *closure_new(JsVm *vm, JsFunctionCell *fn) {
     cl->has_this = false;
     cl->prototype = js_undefined();
     cl->proto_made = false;
+    cl->proto_readonly = false;
     cl->props = NULL;
     cl->name = NULL;
     cl->own_proto = js_undefined();
     cl->proto_set = false;
     cl->length_deleted = false;
+    cl->name_deleted = false;
     cl->n_upvals = fn->n_upvals;
     for (uint16_t i = 0; i < fn->n_upvals; i++)
         cl->upvals[i] = NULL;
@@ -2192,9 +2340,11 @@ JsValue js_native_new(JsContext *ctx, const char *name, JsNativeFn fn, void *ud)
     nf->props = NULL;
     nf->prototype = js_undefined();
     nf->proto_made = false;
+    nf->proto_readonly = false;
     nf->bound = js_undefined();
     nf->is_bound = false;
     nf->name_deleted = false;
+    nf->length_deleted = false;
     nf->builtin = !ctx->builtins_ready;
     nf->ctor = nf->builtin ? JS_CTOR_NONE : JS_CTOR_ORDINARY;
     nf->length = 0;
@@ -2221,9 +2371,11 @@ JsValue js_bound_native_new(JsContext *ctx, JsBoundFn fn, JsValue bound) {
     nf->props = NULL;
     nf->prototype = js_undefined();
     nf->proto_made = false;
+    nf->proto_readonly = false;
     nf->bound = bound;
     nf->is_bound = true;
     nf->name_deleted = false;
+    nf->length_deleted = false;
     nf->builtin = !ctx->builtins_ready;
     nf->ctor = JS_CTOR_NONE;
     nf->length = 0;
@@ -2281,10 +2433,12 @@ bool js_register_native(JsContext *ctx, const uint16_t *name, size_t name_len,
     nf->props = NULL;
     nf->prototype = js_undefined();
     nf->proto_made = false;
+    nf->proto_readonly = false;
     nf->name = js_value_string(key);
     nf->bound = js_undefined();
     nf->is_bound = false;
     nf->name_deleted = false;
+    nf->length_deleted = false;
     nf->builtin = !ctx->builtins_ready;
     nf->ctor = nf->builtin ? JS_CTOR_NONE : JS_CTOR_ORDINARY;
     nf->length = 0;
@@ -2590,9 +2744,9 @@ run:; /* (re)load the top frame */
             case JS_OP_SET_GLOBAL: {
                 JsString *name = js_value_string(K[READ_U16()]);
                 bool found;
-                js_map_get(&ctx->globals->props, name, &found);
+                js_map_get_writable(&ctx->globals->props, name, &found);
                 if (!found) {
-                    fiber_throw_name(ctx, fb, "ReferenceError: ", name, " is not defined");
+                    global_write_fail(ctx, fb, name);
                     RT_RAISE();
                 }
                 if (!js_map_set(vm, &ctx->globals->props, name, PEEK(0)))
@@ -2992,7 +3146,7 @@ run:; /* (re)load the top frame */
             }
             case JS_OP_DEFINE_PROP: {
                 const char *msg;
-                JsPropStatus st = set_property(ctx, PEEK(2), PEEK(1), PEEK(0), &msg);
+                JsPropStatus st = define_literal_prop(ctx, PEEK(2), PEEK(1), PEEK(0), &msg);
                 if (st == JS_PROP_OOM)
                     RT_THROW("out of memory");
                 if (st == JS_PROP_TYPE_ERROR) {
@@ -4061,4 +4215,329 @@ __attribute__((noinline)) static JsPropStatus parent_ctor_lookup(JsContext *ctx,
             return proto_value_get(ctx, p->own_proto, key, out);
     }
     return proto_table_lookup(ctx, ctx->function_methods, key, out);
+}
+
+/* Whether FN (a function) still has the name (NAME) or length it has by nature: not deleted */
+bool js_function_has_own_special(JsValue fn, bool name) {
+    JsGcCell *c = js_value_cell(fn);
+    if (c->kind == JS_KIND_CLOSURE)
+        return name ? !((JsClosure *)c)->name_deleted : !((JsClosure *)c)->length_deleted;
+    if (c->kind == JS_KIND_NATIVE)
+        return name ? !((JsNative *)c)->name_deleted : !((JsNative *)c)->length_deleted;
+    return true;
+}
+
+/* ---- property descriptors (Object.defineProperty, Object.getOwnPropertyDescriptor) ----
+ *
+ * An own property lives in one of several places: the property map (with its attribute byte), an
+ * array's elements, or a property some kind of value has by nature (a function's name, length
+ * and prototype, a builtin's statics, an array's length, an error's stack, a regexp's lastIndex,
+ * a string's characters and length). own_prop_find says which, and with what attributes, the
+ * object's integrity applied; js_define_own_property validates a descriptor against that as the
+ * spec's ValidateAndApplyPropertyDescriptor does and writes the result where it belongs. */
+
+typedef enum {
+    OWN_NONE, OWN_MAP, OWN_ELEMENT, OWN_ARRAY_LENGTH, OWN_FN_NAME, OWN_FN_LENGTH, OWN_FN_PROTO,
+    OWN_STATIC, OWN_STR_INDEX, OWN_STR_LENGTH, OWN_ERROR_STACK, OWN_LAST_INDEX
+} OwnKind;
+
+/* The object whose map holds V's own properties: V, or a function's or promise's own-property
+ * object (made when CREATE; NULL when it has none, or on OOM when CREATE) */
+static JsObject *own_map_object(JsContext *ctx, JsValue v, bool create) {
+    if (js_is_object(v))
+        return js_value_object(v);
+    return js_cell_props(ctx, v, create);
+}
+
+/* Where V's own property KEY (a string) lives, with its attributes in *ATTRS and, for OWN_MAP and
+ * OWN_STATIC, the object holding it in *MO. Allocates nothing. */
+static OwnKind own_prop_find(JsContext *ctx, JsValue v, JsValue key, uint8_t *attrs, JsObject **mo) {
+    *attrs = 0;
+    *mo = NULL;
+    JsString *ks = js_value_string(key);
+    JsString *k = ks->interned ? ks : js_atoms_find(ctx->vm, ks->units, ks->length, ks->hash);
+    uint32_t idx;
+    if (js_is_string(v)) {
+        if (key_to_index(key, &idx) && idx < js_value_string(v)->length) {
+            *attrs = JS_ATTR_READONLY | JS_ATTR_FIXED;
+            return OWN_STR_INDEX;
+        }
+        if (units_is_ascii_str(ks, "length")) {
+            *attrs = JS_ATTR_READONLY | JS_ATTR_FIXED | JS_ATTR_HIDDEN;
+            return OWN_STR_LENGTH;
+        }
+        return OWN_NONE;
+    }
+    JsObject *o = own_map_object(ctx, v, false);
+    if (js_is_function(v)) {
+        JsGcCell *c = js_value_cell(v);
+        bool found = false;
+        if (o && k)
+            js_map_get(&o->props, k, &found);
+        if (found) {
+            *attrs = js_obj_attrs(o, js_map_get_attrs(&o->props, k));
+            *mo = o;
+            return OWN_MAP; /* a name or length Object.defineProperty gave it among them */
+        }
+        if ((is_name_key(key) || is_length_key(key)) && js_function_has_own_special(v, is_name_key(key))) {
+            uint8_t a = JS_ATTR_HIDDEN | JS_ATTR_READONLY;
+            *attrs = o ? js_obj_attrs(o, a) : a;
+            return is_name_key(key) ? OWN_FN_NAME : OWN_FN_LENGTH;
+        }
+        if (has_own_prototype(c) && is_prototype_key(key)) {
+            *attrs = JS_ATTR_HIDDEN | JS_ATTR_FIXED | (prototype_read_only(ctx, v) ? JS_ATTR_READONLY : 0);
+            return OWN_FN_PROTO;
+        }
+        if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->statics && k) {
+            JsObject *st = ((JsNative *)c)->statics;
+            js_map_get(&st->props, k, &found);
+            if (found) {
+                uint8_t a = js_map_get_attrs(&st->props, k) | JS_ATTR_HIDDEN; /* as a builtin's */
+                *attrs = o ? js_obj_attrs(o, a) : a;
+                *mo = st;
+                return OWN_STATIC;
+            }
+        }
+        return OWN_NONE;
+    }
+    if (!o)
+        return OWN_NONE; /* a number, boolean, or a promise with no own properties */
+    if (o->obj_kind == JS_OBJ_ARRAY) {
+        if (key_to_index(key, &idx) && idx < o->elem_count) {
+            *attrs = js_obj_attrs(o, 0);
+            return OWN_ELEMENT;
+        }
+        if (units_is_ascii_str(ks, "length")) {
+            *attrs = JS_ATTR_HIDDEN | JS_ATTR_FIXED | ((o->obj_flags & JS_OBJ_FROZEN) ? JS_ATTR_READONLY : 0);
+            return OWN_ARRAY_LENGTH;
+        }
+    }
+    if (o->obj_kind == JS_OBJ_ERROR && js_error_stack_has(o, key)) {
+        /* V8's accessor: writable even when the error is frozen */
+        *attrs = JS_ATTR_HIDDEN | ((o->obj_flags & (JS_OBJ_SEALED | JS_OBJ_FROZEN)) ? JS_ATTR_FIXED : 0);
+        return OWN_ERROR_STACK;
+    }
+#ifdef LAMASSU_HAS_REGEX
+    if (o->obj_kind == JS_OBJ_REGEXP && units_is_ascii_str(ks, "lastIndex")) {
+        *attrs = JS_ATTR_HIDDEN | JS_ATTR_FIXED | ((o->obj_flags & JS_OBJ_FROZEN) ? JS_ATTR_READONLY : 0);
+        return OWN_LAST_INDEX;
+    }
+#endif
+    bool found = false;
+    if (k)
+        js_map_get(&o->props, k, &found);
+    if (!found)
+        return OWN_NONE;
+    *attrs = js_obj_attrs(o, js_map_get_attrs(&o->props, k));
+    *mo = o;
+    return OWN_MAP;
+}
+
+int js_own_property(JsContext *ctx, JsValue v, JsValue key, JsValue *value, uint8_t *attrs) {
+    JsObject *mo;
+    *value = js_undefined();
+    if (own_prop_find(ctx, v, key, attrs, &mo) == OWN_NONE)
+        return 0;
+    if (!js_get_property(ctx, v, key, value))
+        return -1;
+    if (value->bits == JS_SPECIAL_TDZ) { /* a namespace's uninitialized export */
+        *value = js_undefined();
+        js_set_error(ctx, js_error_fmt(ctx, "ReferenceError: %v is not defined", key));
+        return -1;
+    }
+    return 1;
+}
+
+static bool same_value(JsValue x, JsValue y) {
+    if (js_is_number(x) && js_is_number(y)) {
+        double dx = js_get_number(x), dy = js_get_number(y);
+        return dx != dx ? dy != dy : (dx == dy && __builtin_signbit(dx) == __builtin_signbit(dy));
+    }
+    return js_strict_equals(x, y);
+}
+
+static bool define_fail(JsContext *ctx, const char *fmt, JsValue key) {
+    js_set_error(ctx, js_error_fmt(ctx, fmt, key));
+    return false;
+}
+
+static const char REDEFINE[] = "TypeError: Cannot redefine property: %v";
+/* What lamassu cannot store: attributes on the properties that have no attribute byte */
+static const char NO_ATTRS[] = "TypeError: Cannot redefine property: %v (an array element, an "
+                               "array's length and a regexp's lastIndex stay writable, and an "
+                               "element enumerable and configurable, in lamassu)";
+
+/* Writes VAL with ATTRS as KEY (interned) in O's map, marking O when the attributes need it */
+static bool map_put(JsContext *ctx, JsObject *o, JsString *k, JsValue val, uint8_t attrs) {
+    if (!js_map_set(ctx->vm, &o->props, k, val))
+        return false;
+    js_map_put_attrs(&o->props, k, attrs);
+    if (attrs & (JS_ATTR_READONLY | JS_ATTR_FIXED))
+        o->obj_flags |= JS_OBJ_ATTRS;
+    return true;
+}
+
+bool js_define_own_property(JsContext *ctx, JsValue v, JsValue key, const JsPropDesc *d) {
+    uint8_t cur;
+    JsObject *mo;
+    OwnKind kind = own_prop_find(ctx, v, key, &cur, &mo);
+    JsValue curval = js_undefined();
+    if (kind != OWN_NONE && kind != OWN_FN_PROTO && js_own_property(ctx, v, key, &curval, &cur) < 0)
+        return false;
+    if (kind == OWN_FN_PROTO && !function_prototype(ctx, js_value_cell(v), &curval))
+        return false;
+    js_gc_protect(ctx->vm, &curval);
+    uint8_t na;
+    JsValue nv;
+    if (kind == OWN_NONE) {
+        JsObject *o = own_map_object(ctx, v, false);
+        if (o && (o->obj_flags & JS_OBJ_NO_ADD)) {
+            js_gc_unprotect(ctx->vm, &curval);
+            return define_fail(ctx, "TypeError: Cannot define property %v, object is not extensible", key);
+        }
+        na = ((d->has & JS_DESC_ENUMERABLE) && d->enumerable ? 0 : JS_ATTR_HIDDEN) |
+             ((d->has & JS_DESC_WRITABLE) && d->writable ? 0 : JS_ATTR_READONLY) |
+             ((d->has & JS_DESC_CONFIGURABLE) && d->configurable ? 0 : JS_ATTR_FIXED);
+        nv = (d->has & JS_DESC_VALUE) ? d->value : js_undefined();
+    } else {
+        bool same = true;
+        if (cur & JS_ATTR_FIXED) {
+            bool bad = ((d->has & JS_DESC_CONFIGURABLE) && d->configurable) ||
+                       ((d->has & JS_DESC_ENUMERABLE) && d->enumerable == ((cur & JS_ATTR_HIDDEN) != 0));
+            if (!bad && (cur & JS_ATTR_READONLY))
+                bad = ((d->has & JS_DESC_WRITABLE) && d->writable) ||
+                      ((d->has & JS_DESC_VALUE) && !same_value(d->value, curval));
+            if (bad) {
+                js_gc_unprotect(ctx->vm, &curval);
+                return define_fail(ctx, REDEFINE, key);
+            }
+        }
+        na = cur;
+        if (d->has & JS_DESC_ENUMERABLE)
+            na = d->enumerable ? (na & ~JS_ATTR_HIDDEN) : (na | JS_ATTR_HIDDEN);
+        if (d->has & JS_DESC_WRITABLE)
+            na = d->writable ? (na & ~JS_ATTR_READONLY) : (na | JS_ATTR_READONLY);
+        if (d->has & JS_DESC_CONFIGURABLE)
+            na = d->configurable ? (na & ~JS_ATTR_FIXED) : (na | JS_ATTR_FIXED);
+        if (kind == OWN_ERROR_STACK && (d->has & (JS_DESC_VALUE | JS_DESC_WRITABLE))) {
+            /* V8's stack is an accessor: a data descriptor turns it into a data property, read-only
+             * unless the descriptor says writable, and not at all when it is not configurable */
+            if (cur & JS_ATTR_FIXED) {
+                js_gc_unprotect(ctx->vm, &curval);
+                return define_fail(ctx, REDEFINE, key);
+            }
+            if (!(d->has & JS_DESC_WRITABLE))
+                na |= JS_ATTR_READONLY;
+        }
+        nv = (d->has & JS_DESC_VALUE) ? d->value : curval;
+        same = na == cur && same_value(nv, curval);
+        if (same) { /* nothing changes: true wherever it lives, as V8 */
+            js_gc_unprotect(ctx->vm, &curval);
+            return true;
+        }
+        if (mo && (mo->obj_flags & JS_OBJ_NAMESPACE)) { /* a module's exports change only through it */
+            js_gc_unprotect(ctx->vm, &curval);
+            return define_fail(ctx, REDEFINE, key);
+        }
+    }
+    js_gc_protect(ctx->vm, &nv);
+    bool ok = true;
+    JsString *k = NULL;
+    uint32_t idx;
+    switch (kind) {
+    case OWN_NONE:
+        if (js_is_object(v) && js_value_object(v)->obj_kind == JS_OBJ_ARRAY && key_to_index(key, &idx)) {
+            if (na) {
+                ok = define_fail(ctx, NO_ATTRS, key);
+                break;
+            }
+            ok = js_set_property(ctx, v, key, nv);
+            break;
+        }
+        /* fall through: a new map property */
+    case OWN_MAP:
+    case OWN_FN_NAME:
+    case OWN_FN_LENGTH:
+    case OWN_STATIC: {
+        /* a function's name or length moves among its own properties, where it shadows the one
+         * it has by nature; a builtin's static likewise, as an assignment moves it */
+        JsObject *o = kind == OWN_MAP ? mo : own_map_object(ctx, v, true);
+        k = to_prop_key(ctx, key);
+        ok = o && k && map_put(ctx, o, k, nv, na & (JS_ATTR_HIDDEN | JS_ATTR_READONLY | JS_ATTR_FIXED));
+        if (ok && kind == OWN_STATIC)
+            drop_static(js_value_cell(v), k);
+        break;
+    }
+    case OWN_ELEMENT:
+        if (na != js_obj_attrs(js_value_object(v), 0)) {
+            ok = define_fail(ctx, NO_ATTRS, key);
+            break;
+        }
+        if (key_to_index(key, &idx))
+            js_value_object(v)->elems[idx] = nv;
+        break;
+    case OWN_ARRAY_LENGTH:
+    case OWN_LAST_INDEX:
+        if (na != cur) {
+            ok = define_fail(ctx, NO_ATTRS, key);
+            break;
+        }
+        ok = js_set_property(ctx, v, key, nv);
+        break;
+    case OWN_FN_PROTO: {
+        JsGcCell *c = js_value_cell(v);
+        if (c->kind == JS_KIND_CLOSURE) {
+            ((JsClosure *)c)->prototype = nv;
+            ((JsClosure *)c)->proto_made = true;
+            ((JsClosure *)c)->proto_readonly = (na & JS_ATTR_READONLY) != 0;
+        } else {
+            ((JsNative *)c)->prototype = nv;
+            ((JsNative *)c)->proto_made = true;
+            ((JsNative *)c)->proto_readonly = (na & JS_ATTR_READONLY) != 0;
+        }
+        break;
+    }
+    case OWN_ERROR_STACK: {
+        JsObject *o = js_value_object(v);
+        if ((na & ~JS_ATTR_FIXED) == JS_ATTR_HIDDEN && (na & JS_ATTR_FIXED) == (cur & JS_ATTR_FIXED)) {
+            ok = js_error_stack_set(ctx, o, key, nv);
+            break;
+        }
+        /* other attributes: an ordinary property from now on, as after `delete e.stack` */
+        k = to_prop_key(ctx, key);
+        ok = k && js_error_stack_delete(ctx, o, key) && map_put(ctx, o, k, nv, na);
+        break;
+    }
+    case OWN_STR_INDEX:
+    case OWN_STR_LENGTH:
+        ok = define_fail(ctx, REDEFINE, key); /* unreachable: a string is not an object */
+        break;
+    }
+    js_gc_unprotect(ctx->vm, &nv);
+    js_gc_unprotect(ctx->vm, &curval);
+    return ok;
+}
+
+/* Whether V (an object, function or promise) is extensible */
+bool js_is_extensible(JsContext *ctx, JsValue v) {
+    JsObject *o = own_map_object(ctx, v, false);
+    return !o || !(o->obj_flags & JS_OBJ_NO_ADD);
+}
+
+/* Object.preventExtensions(v): false on OOM */
+bool js_prevent_extensions(JsContext *ctx, JsValue v) {
+    JsObject *o = own_map_object(ctx, v, true);
+    if (!o)
+        return false;
+    o->obj_flags |= JS_OBJ_NOEXT;
+    return true;
+}
+
+/* `key in base` for natives (BASE an object, function or promise; KEY a string): false with an
+ * error pending on failure */
+bool js_has_property(JsContext *ctx, JsValue base, JsValue key, bool *out) {
+    JsPropStatus st = has_property(ctx, base, key, out);
+    if (st == JS_PROP_TYPE_ERROR)
+        return fail_ascii(ctx, "TypeError: Cannot use 'in' operator to search for a key in a non-object");
+    return st == JS_PROP_OK;
 }

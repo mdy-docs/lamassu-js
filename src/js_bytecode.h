@@ -207,6 +207,27 @@ bool      js_op_to_number(JsContext *ctx, JsValue v, double *out);
 JsValue   js_take_error(JsContext *ctx);
 /* base[key] as the language reads it (prototype chain, a primitive's methods); false: error pending */
 bool      js_get_property(JsContext *ctx, JsValue base, JsValue key, JsValue *out);
+bool      js_set_property(JsContext *ctx, JsValue base, JsValue key, JsValue val);
+/* A property descriptor (data properties only: there are no accessors). HAS says which fields
+ * the descriptor object named. */
+#define JS_DESC_VALUE 1u
+#define JS_DESC_WRITABLE 2u
+#define JS_DESC_ENUMERABLE 4u
+#define JS_DESC_CONFIGURABLE 8u
+typedef struct JsPropDesc {
+    uint8_t has;
+    bool writable, enumerable, configurable;
+    JsValue value;
+} JsPropDesc;
+/* V's own property KEY (a string; V not undefined or null): 1 with its value and JS_ATTR_* bits,
+ * 0 when it has none, -1 with an error pending */
+int       js_own_property(JsContext *ctx, JsValue v, JsValue key, JsValue *value, uint8_t *attrs);
+/* [[DefineOwnProperty]] on V (an object, function or promise): false with the TypeError pending */
+bool      js_define_own_property(JsContext *ctx, JsValue v, JsValue key, const JsPropDesc *d);
+bool      js_has_property(JsContext *ctx, JsValue base, JsValue key, bool *out);
+bool      js_is_extensible(JsContext *ctx, JsValue v);
+bool      js_function_has_own_special(JsValue fn, bool name);
+bool      js_prevent_extensions(JsContext *ctx, JsValue v);
 /* In a native: roots V until the native returns (false: no room, out of memory pending), and
  * js_op_to_string with the result kept so (a string V itself needs no keeping). */
 __attribute__((warn_unused_result))
