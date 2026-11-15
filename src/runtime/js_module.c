@@ -286,6 +286,31 @@ JsModule *js_module_alloc_placeholder(JsContext *ctx, JsString *specifier) {
     return m;
 }
 
+/* import.meta for M: an object with no prototype, as V8 makes it, whose `url` is M's specifier
+ * (the host's part: V8 leaves the properties to its embedder), held as the namespace of a
+ * synthetic module M's pseudo-import binds to. NULL on OOM. */
+static JsModule *meta_module(JsContext *ctx, JsModule *m) {
+    JsVm *vm = ctx->vm;
+    JsValue mv = js_value_from_cell(&m->gc);
+    js_gc_protect(vm, &mv);
+    JsModule *mm = js_module_alloc_placeholder(ctx, m->specifier);
+    JsValue mmv = mm ? js_value_from_cell(&mm->gc) : js_undefined();
+    js_gc_protect(vm, &mmv);
+    JsValue meta = mm ? js_object_new(ctx) : js_undefined();
+    bool ok = js_is_object(meta);
+    if (ok) {
+        js_value_object(meta)->proto = js_undefined();
+        mm->exports = js_value_object(meta);
+        mm->synthetic = true;
+        mm->status = JS_MOD_EVALUATED;
+        mm->env_ready = true;
+        ok = js_object_set_ascii(ctx, mm->exports, "url", js_value_from_cell(&m->specifier->gc));
+    }
+    js_gc_unprotect(vm, &mmv);
+    js_gc_unprotect(vm, &mv);
+    return ok ? mm : NULL;
+}
+
 /* ---- canonicalization ---- */
 
 /*
@@ -705,6 +730,14 @@ static bool link_module(JsContext *ctx, JsModule *m, JsModError *err) {
         m->stars[i].source = src;
     }
     for (uint32_t i = 0; i < m->import_count; i++) {
+        if (m->imports[i].kind == JS_IMPORT_META) {
+            if (!m->imports[i].source && !(m->imports[i].source = meta_module(ctx, m))) {
+                err->msg = "out of memory";
+                err->pos = 0;
+                return false;
+            }
+            continue;
+        }
         JsModule *src = dep_for_spec(m, m->imports[i].specifier);
         if (!src) {
             err->msg = "unresolved import";

@@ -455,6 +455,8 @@ typedef enum JsImportKind {
     JS_IMPORT_DEFAULT = 1, /* import d from */
     JS_IMPORT_NS = 2,      /* import * as ns */
     JS_IMPORT_SIDE = 3,    /* import 'm' (no bindings) */
+    JS_IMPORT_META = 4,    /* import.meta: IMPORT_NS of it pushes the module's meta object, which
+                            * linking makes (the namespace of a synthetic module) */
 } JsImportKind;
 
 typedef struct JsModuleImport {

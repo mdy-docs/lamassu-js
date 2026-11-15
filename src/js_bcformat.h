@@ -38,7 +38,7 @@
                            (for-of and destructuring close their iterator), and break, continue and
                            return pop the try handlers they leave;
                            16: JS_FN_NEW_TARGET function flag (new.target in the local after
-                           `arguments`) */
+                           `arguments`), JS_IMPORT_META import kind, CTAG_IMPORT_META constant */
 #define JSBC_FLAG_HAS_REGEX 1u /* producer had regex enabled (informational) */
 
 /* Sanity caps: reject absurd sizes early (before allocating) rather than
@@ -62,6 +62,7 @@ enum {
     CTAG_NUMBER = 4,
     CTAG_STRING = 5,
     CTAG_FUNCTION = 6,
+    CTAG_IMPORT_META = 7, /* a unit's import.meta object (no module record): one per load */
 };
 
 #endif /* JS_BCFORMAT_H */

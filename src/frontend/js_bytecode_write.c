@@ -98,6 +98,8 @@ static bool serialize_const(OutBuf *b, JsValue v, uint32_t depth) {
     } else if (js_value_is_cell(v) && js_value_cell(v)->kind == JS_KIND_FUNCTION) {
         out_u8(b, CTAG_FUNCTION);
         return serialize_fn(b, js_value_function(v), depth + 1);
+    } else if (js_is_object(v) && js_value_cell(v)->kind == JS_KIND_OBJECT) {
+        out_u8(b, CTAG_IMPORT_META); /* the one object a compiler puts among the constants */
     } else {
         /* objects/promises/closures/natives never appear as compiled consts */
         b->oom = true; /* reuse the error channel: aborts with a clean failure */

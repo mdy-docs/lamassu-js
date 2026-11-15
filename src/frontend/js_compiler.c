@@ -135,6 +135,7 @@ typedef struct JsCompiler {
     int expr_depth; /* compile_expr recursion; see JS_COMPILE_MAX_EXPR_DEPTH */
     /* module compilation (NULL if compiling a plain script) */
     JsModule *module;
+    JsObject *meta_obj; /* import.meta of a unit with no module record (a constant) */
     JsModBinding *mbind; /* top-level module bindings (exports/imports) */
     uint32_t mbind_count;
     /* the unit's source (the parser's buffer) and the root function, which holds the copy of
@@ -157,6 +158,9 @@ static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat, bool dec
 static bool compile_array_pattern_items(JsCompiler *cx, const JsAstNode *pat, bool declaring);
 static bool compile_object_pattern_items(JsCompiler *cx, const JsAstNode *pat, bool declaring,
                                          const JsAstNode *src, bool outer);
+static JsString *intern_atom(JsCompiler *cx, const uint16_t *u, uint32_t len);
+static JsModuleImport *mod_add_import(JsCompiler *cx, JsModule *m, JsString *spec,
+                                      JsString *imported, uint8_t kind);
 static bool compile_function(JsCompiler *cx, const JsAstNode *fnode);
 /* The hidden local a function keeps new.target in for its arrows: no identifier can name it */
 static const uint16_t new_target_name[] = {'%', 'n', 'e', 'w', '.', 't', 'a', 'r', 'g', 'e', 't'};
@@ -310,6 +314,9 @@ static void render_callee(CalleeBuf *b, const JsAstNode *n, int depth) {
         return;
     case JS_AST_NEW_TARGET:
         cb_ascii(b, "new.target");
+        return;
+    case JS_AST_IMPORT_META:
+        cb_ascii(b, "import.meta");
         return;
     case JS_AST_NULL_LIT:
         cb_ascii(b, "null");
@@ -1894,6 +1901,34 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
         return emit_op(cx, (n->flags & JS_F_TRUE) ? JS_OP_TRUE : JS_OP_FALSE, +1);
     case JS_AST_THIS:
         return emit_op(cx, JS_OP_GET_THIS, +1);
+    case JS_AST_IMPORT_META: {
+        /* a pseudo-import the linker binds to the module's meta object */
+        JsModule *mod = cx->module;
+        if (!mod) { /* a unit compiled without a module record: one object, among its constants */
+            if (!cx->meta_obj) {
+                JsValue mo = js_object_new(cx->ctx);
+                if (!js_is_object(mo))
+                    return cerr(cx, n->pos, "out of memory");
+                js_value_object(mo)->proto = js_undefined();
+                cx->meta_obj = js_value_object(mo);
+            }
+            uint16_t c;
+            return const_add(cx, js_value_from_cell(&cx->meta_obj->gc), &c) &&
+                   emit_op_u16(cx, JS_OP_CONST, c, +1);
+        }
+        uint32_t idx = 0;
+        while (idx < mod->import_count && mod->imports[idx].kind != JS_IMPORT_META)
+            idx++;
+        if (idx == mod->import_count) {
+            static const uint16_t meta_spec[] = {'i', 'm', 'p', 'o', 'r', 't', '.', 'm', 'e', 't', 'a'};
+            JsString *spec = intern_atom(cx, meta_spec, 11);
+            if (!spec || !mod_add_import(cx, mod, spec, NULL, JS_IMPORT_META))
+                return cerr(cx, n->pos, "out of memory");
+        }
+        if (idx > 0xFFFF)
+            return cerr(cx, n->pos, "too many imports");
+        return emit_op_u16(cx, JS_OP_IMPORT_NS, (uint16_t)idx, +1);
+    }
     case JS_AST_NEW_TARGET: {
         /* the hidden local the function keeps it in (frame_setup fills it); an arrow's is its
          * enclosing function's, reached as any captured variable is */

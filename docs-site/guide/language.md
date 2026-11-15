@@ -151,6 +151,10 @@ ns`) is sealed and read-only, and lists its exports in name order. See the
 [Deviations](/guide/deviations) page for the edge cases (snapshot vs. live
 re-exports).
 
+`import.meta` is one object per module with no prototype, as V8 makes it. V8 leaves its
+properties to the host: here a module loaded through the module loader has `url`, its
+specifier; a unit compiled on its own (no loader) has none.
+
 ## Regular expressions
 
 Supported, ECMAScript-flavored, via a dedicated backtracking VM

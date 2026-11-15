@@ -371,6 +371,9 @@ static void dump_node(Sb *sb, const JsAstNode *n) {
     case JS_AST_NEW_TARGET:
         sb_printf(sb, "(new.target)");
         break;
+    case JS_AST_IMPORT_META:
+        sb_printf(sb, "(import.meta)");
+        break;
     case JS_AST_ARRAY:
     case JS_AST_ARRAY_PATTERN:
         sb_printf(sb, n->kind == JS_AST_ARRAY ? "(arr" : "(apat");
@@ -796,7 +799,7 @@ static void test_errors(void) {
     check_err("o = {get x() { return 1; }};", "getter/setter properties are not supported", -1);
     check_err("tag`x`;", "tagged templates are not supported", -1);
     check_err("if (x) import \"m\";", "Unexpected token 'import'", -1);
-    check_err("x = import.meta;", "import.meta is not supported", -1);
+    check_err("x = import.metax;", "Unexpected identifier 'metax'", -1);
     check_err("p = import();", "import() takes 1 or 2 arguments", -1);
     check_err("p = import('a', 'b', 'c');", "import() takes 1 or 2 arguments", -1);
     check_err("p = import(...xs);", "spread is not allowed in import()", -1);

@@ -274,6 +274,9 @@ static void test_graphs(void) {
     mod_add("util", "export const g = 'hi'; export function up(s){ return s.toUpperCase(); }");
     mod_add("main", "import { g, up } from 'util'; export const r = up(g);");
     expect("main", "r", "HI");
+    mods_reset();
+    mod_add("main", "function f() { return import.meta; } export const r = [import.meta.url, f() === import.meta, Object.getPrototypeOf(import.meta)].join();");
+    expect("main", "r", "main,true,");
 
     /* live bindings: a counter mutated in the exporter is seen by the importer */
     mod_add("counter", "let n = 0; export function tick(){ return ++n; }");

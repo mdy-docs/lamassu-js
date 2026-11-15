@@ -1052,6 +1052,13 @@ static void test_declaration_rules(void) {
     }
     mods_reset();
 
+    /* import.meta: one object per module, no prototype, its url the module's specifier */
+    eq_export("function f() { return import.meta; } const g = () => import.meta;"
+              "export const out = [import.meta.url, f() === import.meta, g() === import.meta,"
+              "  Object.getPrototypeOf(import.meta), typeof import.meta].join();",
+              "out", "main,true,true,,object");
+    mods_reset();
+
     /* a namespace is sealed, its exports read-only, its keys in name order */
     eq_export("export let q = 4; export const fz = 1; import * as ns from 'main';" TRY_ALL
               "export let out; out = t([() => { ns.zz = 1; }, () => { ns.q = 1; }, () => { delete ns.q; },"

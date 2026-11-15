@@ -1192,8 +1192,17 @@ static JsAstNode *parse_primary(JsParser *p) {
         return perr_here(p, "'new' is not supported here");
     case JS_T_IMPORT: {
         JsToken nx = peek(p);
-        if (nx.kind == JS_T_DOT)
-            return perr_here(p, "import.meta is not supported");
+        if (nx.kind == JS_T_DOT) { /* import.meta */
+            uint32_t pos = t->pos;
+            if (!advance(p) || !advance(p))
+                return NULL;
+            if (TOK(p).kind != JS_T_IDENT || !tok_is_name(&TOK(p), "meta"))
+                return perr_here(p, unexpected_text(p));
+            JsAstNode *im = new_node(p, JS_AST_IMPORT_META, pos);
+            if (!im || !advance(p))
+                return NULL;
+            return im;
+        }
         if (nx.kind != JS_T_LPAREN)
             return perr_here(p, "'import' is only allowed at the top level of a module");
         /* dynamic import(specifier[, options]) — options is evaluated then

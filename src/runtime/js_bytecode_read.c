@@ -148,6 +148,7 @@ typedef struct {
     const uint8_t *end;
     bool bad;
     JsString *source; /* the root function's source text, which nested functions' ranges slice */
+    JsObject *meta;   /* the unit's import.meta object, made at its first CTAG_IMPORT_META */
 } InBuf;
 
 static uint8_t in_u8(InBuf *b) {
@@ -465,6 +466,19 @@ static JsFunctionCell *load_fn(JsContext *ctx, InBuf *b, uint32_t depth,
                 if (!child)
                     goto done;
                 fn->consts[i] = js_value_from_cell(&child->gc);
+                break;
+            }
+            case CTAG_IMPORT_META: {
+                if (!b->meta) {
+                    JsValue mo = js_object_new(ctx);
+                    if (!js_is_object(mo)) {
+                        *err = "out of memory";
+                        goto done;
+                    }
+                    js_value_object(mo)->proto = js_undefined(); /* no prototype, as V8's */
+                    b->meta = js_value_object(mo);
+                }
+                fn->consts[i] = js_value_from_cell(&b->meta->gc); /* reachable through fn now */
                 break;
             }
             default:
@@ -1067,7 +1081,7 @@ static int read_header(InBuf *b, const char **err) {
 }
 
 int js_bytecode_kind(const uint8_t *buf, size_t len) {
-    InBuf b = {buf, buf + len, false, NULL};
+    InBuf b = {buf, buf + len, false, NULL, NULL};
     const char *err = NULL;
     return read_header(&b, &err);
 }
@@ -1082,7 +1096,7 @@ JsValue js_bytecode_load(JsContext *ctx, const uint8_t *buf, size_t len,
         err_msg = &dummy;
     *err_msg = NULL;
 
-    InBuf b = {buf, buf + len, false, NULL};
+    InBuf b = {buf, buf + len, false, NULL, NULL};
     int kind = read_header(&b, err_msg);
     if (kind < 0)
         return js_undefined();
@@ -1161,7 +1175,7 @@ bool js_bc_load_module(JsContext *ctx, JsModule *m, const uint8_t *buf, size_t l
                        const char **err) {
     JsVm *vm = ctx->vm;
     *err = NULL;
-    InBuf b = {buf, buf + len, false, NULL};
+    InBuf b = {buf, buf + len, false, NULL, NULL};
     int kind = read_header(&b, err);
     if (kind < 0)
         return false;
@@ -1200,7 +1214,7 @@ bool js_bc_load_module(JsContext *ctx, JsModule *m, const uint8_t *buf, size_t l
         m->import_count = import_count;
         for (uint32_t i = 0; i < import_count; i++) {
             uint8_t ik = in_u8(&b);
-            if (b.bad || ik > JS_IMPORT_SIDE) {
+            if (b.bad || ik > JS_IMPORT_META) {
                 *err = "SyntaxError: bad import kind";
                 goto done;
             }
