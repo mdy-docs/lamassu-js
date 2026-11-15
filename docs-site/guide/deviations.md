@@ -41,9 +41,8 @@ prototype in both engines (2026-11-15).
 Each is a compile error that names the feature (`SyntaxError: tagged templates are not
 supported`), never a silent difference.
 
-**Not yet implemented:** object rest in destructuring (`const { a, ...rest } = o`), tagged
-templates (`` tag`x${y}` ``), import attributes (`with { type: "json" }`), and `BigInt`
-literals.
+**Not yet implemented:** tagged templates (`` tag`x${y}` ``), import attributes
+(`with { type: "json" }`), and `BigInt` literals.
 
 **Left out by design** (see [Supported syntax](/guide/language#explicit-non-goals)): `var`,
 `for...in`, `with`, classes (and with them private names, `#x`), getters and setters in object
@@ -182,7 +181,8 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   'const'`, `classes are not supported`) where V8 would compile the script;
   a few of V8's own quirks are not copied (in a module V8 reports `let let`
   and `let 1x` as `Unexpected strict mode reserved word`; lamassu says `let is
-  disallowed as a lexically bound name` and `Invalid or unexpected token`); an
+  disallowed as a lexically bound name` and `Invalid or unexpected token`; a destructured
+  parameter given `null` is `'object null'` in V8's message, `'null'` here); an
   operand with no readable name shows its value (`undefined is not a function` for `(void 0)()`
   and `#<Object> is not iterable` for `[...{}]`, where V8 prints the expression,
   `{(intermediate value)}` for an object literal); an object named in a message is named

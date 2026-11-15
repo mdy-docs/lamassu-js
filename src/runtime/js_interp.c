@@ -2250,7 +2250,14 @@ static void fiber_throw_read(JsContext *ctx, JsFiber *fb, const JsFunctionCell *
     uint32_t len;
     JsValue e;
     if (find_note(fn, ip, &u, &len)) {
-        if (len) {
+        if (len && u[0] == 0) { /* the whole value is named, no property (note_whole) */
+            JsVm *vm = ctx->vm;
+            JsString *src = len > 1 ? js_string_cell_new(vm, u + 1, len - 1) : NULL;
+            JsValue sv = src ? js_value_from_cell(&src->gc) : base;
+            js_gc_protect(vm, &sv);
+            e = js_error_fmt(ctx, "TypeError: Cannot destructure '%v' as it is %v.", sv, base);
+            js_gc_unprotect(vm, &sv);
+        } else if (len) {
             JsVm *vm = ctx->vm;
             JsString *src = js_string_cell_new(vm, u, len);
             JsValue sv = src ? js_value_from_cell(&src->gc) : js_undefined();

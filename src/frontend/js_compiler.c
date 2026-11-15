@@ -441,6 +441,27 @@ static void note_text(JsCompiler *cx, const JsAstNode *n, bool empty_ok) {
     note_units(cx, b.u, b.n);
 }
 
+/* As note_text for a destructuring's first read, where V8 names the whole value and no property
+ * ("Cannot destructure 'null' as it is null."): the text after a leading 0 unit, which marks it */
+static void note_whole(JsCompiler *cx, const JsAstNode *n) {
+    CalleeBuf b;
+    b.n = 0;
+    b.ok = true;
+    b.vm = cx->vm;
+    b.u[b.n++] = 0;
+    if (n) {
+        switch (n->kind) {
+        case JS_AST_IDENT: case JS_AST_MEMBER: case JS_AST_THIS: case JS_AST_CALL:
+        case JS_AST_NULL_LIT: case JS_AST_BOOL_LIT: case JS_AST_STRING: case JS_AST_NUMBER:
+            render_callee(&b, n, 0);
+            break;
+        default:
+            break;
+        }
+    }
+    note_units(cx, b.u, b.ok ? b.n : 1);
+}
+
 static void note_callee(JsCompiler *cx, const JsAstNode *callee) {
     note_text(cx, callee, false);
 }
@@ -1320,13 +1341,75 @@ static bool compile_array_pattern_items(JsCompiler *cx, const JsAstNode *pat, bo
     }
 }
 
+/* An object pattern's `...rest`, with the source on the stack: a new object with the source's own
+ * enumerable properties (as spread copies them) less the keys the pattern named before it
+ * (CopyDataProperties with those excluded), stored into the rest target. Computed keys were kept
+ * in KEY_SLOTS when they were read, converted once. */
+static bool compile_object_rest(JsCompiler *cx, const JsAstNode *pat, uint32_t rest_at, bool declaring,
+                                const uint16_t *key_slots, const JsAstNode *src, bool outer) {
+    const JsAstNode *rest = pat->items[rest_at];
+    if (rest_at == 0) {
+        /* nothing read before it: a null or undefined source fails here, as V8 has it */
+        static const uint16_t probe[] = {'v', 'a', 'l', 'u', 'e', 'O', 'f'};
+        uint16_t c;
+        if (!emit_op(cx, JS_OP_DUP, +1) || !atom_const(cx, probe, 7, rest->pos, &c))
+            return false;
+        if (outer)
+            note_whole(cx, src);
+        if (!emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0) || !emit_op(cx, JS_OP_POP, -1))
+            return false;
+    }
+    /* [src] -> [src copy] */
+    if (!emit_op(cx, JS_OP_DUP, +1) || !emit_op(cx, JS_OP_NEW_OBJECT, +1) || !emit_op(cx, JS_OP_SWAP, 0) ||
+        !emit_op(cx, JS_OP_OBJ_SPREAD, -1))
+        return false;
+    for (uint32_t i = 0, k = 0; i < rest_at; i++) {
+        const JsAstNode *prop = pat->items[i];
+        if (!emit_op(cx, JS_OP_DUP, +1))
+            return false;
+        if (prop->flags & JS_F_COMPUTED) {
+            if (!emit_op_u16(cx, JS_OP_GET_LOCAL, key_slots[k++], +1))
+                return false;
+        } else if (prop->a->kind == JS_AST_NUMBER) {
+            if (!emit_number(cx, prop->a->number, prop->a->pos))
+                return false;
+        } else if (!emit_string_const(cx, prop->a->units, prop->a->len, prop->a->pos)) {
+            return false;
+        }
+        if (!emit_op(cx, JS_OP_DELETE_PROP, -1) || !emit_op(cx, JS_OP_POP, -1))
+            return false;
+    }
+    JsScopeMark sm = {0, 0};
+    JsPreMember saved = {0};
+    bool pre = false;
+    return pre_member_begin(cx, rest->a, declaring, &sm, &saved, &pre) &&
+           compile_pattern_store(cx, rest->a, declaring) && pre_member_end(cx, pre, sm, saved);
+}
+
 static bool compile_object_pattern_items(JsCompiler *cx, const JsAstNode *pat, bool declaring,
                                          const JsAstNode *src, bool outer) {
     {
+        /* with a rest, each computed key is converted once and kept, to exclude it after */
+        bool has_rest = pat->count && pat->items[pat->count - 1]->kind == JS_AST_REST;
+        if (!pat->count) { /* `const {} = v` still requires an object-coercible v */
+            static const uint16_t probe[] = {'v', 'a', 'l', 'u', 'e', 'O', 'f'};
+            uint16_t c;
+            if (!emit_op(cx, JS_OP_DUP, +1) || !atom_const(cx, probe, 7, pat->pos, &c))
+                return false;
+            if (outer)
+                note_whole(cx, src);
+            if (!emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0) || !emit_op(cx, JS_OP_POP, -1))
+                return false;
+        }
+        uint16_t key_slots[64];
+        uint32_t n_keys = 0;
         for (uint32_t i = 0; i < pat->count; i++) {
             const JsAstNode *prop = pat->items[i];
-            if (prop->kind == JS_AST_REST)
-                return cerr(cx, prop->pos, "object rest in destructuring is not supported yet");
+            if (prop->kind == JS_AST_REST) {
+                if (!compile_object_rest(cx, pat, i, declaring, key_slots, src, outer))
+                    return false;
+                break;
+            }
             if (!emit_op(cx, JS_OP_DUP, +1))
                 return false;
             /* The first read is where a null or undefined source fails: its note (even an
@@ -1334,8 +1417,18 @@ static bool compile_object_pattern_items(JsCompiler *cx, const JsAstNode *pat, b
             if (prop->flags & JS_F_COMPUTED) {
                 if (!compile_expr(cx, prop->a))
                     return false;
+                if (has_rest) {
+                    if (n_keys == sizeof key_slots / sizeof key_slots[0])
+                        return cerr(cx, prop->pos, "too many computed keys before a rest");
+                    if (!declare_local(cx, NULL, 0, false, prop->pos, cx->cur->local_count,
+                                       &key_slots[n_keys]) ||
+                        !emit_op(cx, JS_OP_TO_STRING, 0) ||
+                        !emit_op_u16(cx, JS_OP_SET_LOCAL, key_slots[n_keys], 0))
+                        return false;
+                    n_keys++;
+                }
                 if (i == 0 && outer)
-                    note_text(cx, src, true);
+                    note_whole(cx, src); /* V8 names no computed key */
                 if (!emit_op(cx, JS_OP_GET_PROP, -1))
                     return false;
             } else {

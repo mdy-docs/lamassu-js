@@ -49,8 +49,8 @@ supported. `debugger;` is a statement that does nothing (there is no debugger to
 ## Objects, arrays, and constructors
 
 - Object and array literals, computed property names, shorthand properties,
-  spread (`{...obj}`, `[...arr]`), destructuring (including defaults and
-  nested patterns) in both declarations and assignments.
+  spread (`{...obj}`, `[...arr]`), destructuring (including defaults, nested patterns and a
+  rest, `[a, ...more]` and `{ a, ...others }`) in both declarations and assignments.
 - `new` works, with real prototype chains: `Ctor.prototype` is a genuine,
   script-visible object, an instance's `[[Prototype]]` is set to it at
   construction, and property lookup walks the chain — the same mechanism
