@@ -1371,6 +1371,16 @@ static void test_iterator_helpers(void) {
 }
 
 
+/* String.prototype.normalize; expected values from Node (every code point in all four forms, and
+ * Unicode's NormalizationTest.txt, were checked against Node and pass; too big to keep here) */
+static void test_normalize(void) {
+    /* the ranges with most of the decompositions, each code point and with two marks after it */
+    eq("const hash = (h, s) => { for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0; return h; }; let h = 0; for (const [a, b] of [[0, 0x3400], [0xAC00, 0xAD00], [0xF900, 0x10000], [0x1D100, 0x1D800], [0x2F800, 0x2FA20]]) for (let cp = a; cp < b; cp++) { const s = String.fromCodePoint(cp) + '̣́'; for (const f of ['NFC', 'NFD', 'NFKC', 'NFKD']) h = hash(h, s.normalize(f)); } String(h);",
+       "-1904547770");
+    eq_s("\"use strict\"; const out = []; const t = (s, f) => { let v; try { v = s + ' => ' + JSON.stringify(f()); } catch (e) { v = s + ' => ' + e.constructor.name + ': ' + e.message; } out.push(v); }; t('forms', () => ['ẛ̣', 'ﬁ', '각', '각', 'é', 'Å', 'Ω', 'x̣̂́', '\\uD800́', '́̀a', ''].map((s) => ['NFC', 'NFD', 'NFKC', 'NFKD'].map((f) => [...s.normalize(f)].map((c) => c.codePointAt(0).toString(16)).join(' ')))); t('default', () => ['é'.normalize() === 'é', 'é'.normalize(undefined) === 'é']); t('bad form', () => 'a'.normalize('nfc')); t('null form', () => 'a'.normalize(null)); t('obj form', () => 'é'.normalize({ toString() { return 'NFD'; } }).length); t('null this', () => String.prototype.normalize.call(null)); t('num this', () => String.prototype.normalize.call(123, 'NFKC')); t('same', () => { const s = 'plain ascii'; return s.normalize() === s; }); t('length', () => ''.normalize.length); t('long', () => ('ḍ̇'.repeat(500)).normalize('NFD').length); out.join(\"\\n\");",
+       "forms => [[\"1e9b 323\",\"17f 323 307\",\"1e69\",\"73 323 307\"],[\"fb01\",\"fb01\",\"66 69\",\"66 69\"],[\"ac01\",\"1100 1161 11a8\",\"ac01\",\"1100 1161 11a8\"],[\"ac01\",\"1100 1161 11a8\",\"ac01\",\"1100 1161 11a8\"],[\"e9\",\"65 301\",\"e9\",\"65 301\"],[\"c5\",\"41 30a\",\"c5\",\"41 30a\"],[\"3a9\",\"3a9\",\"3a9\",\"3a9\"],[\"78 323 302 301\",\"78 323 302 301\",\"78 323 302 301\",\"78 323 302 301\"],[\"d800 301\",\"d800 301\",\"d800 301\",\"d800 301\"],[\"301 300 61\",\"301 300 61\",\"301 300 61\",\"301 300 61\"],[\"\",\"\",\"\",\"\"]]\ndefault => [true,true]\nbad form => RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD.\nnull form => RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD.\nobj form => 2\nnull this => TypeError: String.prototype.normalize called on null or undefined\nnum this => \"123\"\nsame => true\nlength => 0\nlong => 1500");
+}
+
 /* Runs the modules STEPS in one VM, in turn, collecting and draining the job queue between them
  * (where a host's event loop would let the collector run and FinalizationRegistry callbacks with
  * it); returns the last one's result. */
@@ -1555,6 +1565,7 @@ int main(void) {
     test_v8_methods();
     test_descriptors();
     test_weak();
+    test_normalize();
     test_stress();
     test_integration();
     if (checks_failed) {

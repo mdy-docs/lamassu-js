@@ -170,7 +170,9 @@ boxed `String` object — this engine has no boxed-primitive type at all).
   `substring`, `substr`, `toUpperCase`, `toLowerCase` (full Unicode case mapping, as V8's),
   `trim`, `trimStart`, `trimEnd` (and `trimLeft`/`trimRight`, the same two functions),
   `repeat`, `padStart`, `padEnd`, `isWellFormed`, `toWellFormed` (each lone surrogate
-  U+FFFD), `replace`, `replaceAll`, `split`, `concat`, `toString`, `valueOf`, V8's legacy HTML
+  U+FFFD), `normalize` (`NFC`, the default, `NFD`, `NFKC`, `NFKD`, on Unicode 17.0's data as
+  V8's ICU has it; checked against V8 for every code point and against Unicode's
+  `NormalizationTest.txt`), `replace`, `replaceAll`, `split`, `concat`, `toString`, `valueOf`, V8's legacy HTML
   methods (`anchor`, `big`, `blink`, `bold`, `fixed`, `fontcolor`, `fontsize`, `italics`,
   `link`, `small`, `strike`, `sub`, `sup`), and,
   when regex support is compiled in (the default): `match`, `matchAll` (a lazy

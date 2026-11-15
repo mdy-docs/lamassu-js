@@ -157,6 +157,7 @@ static const JsBuiltinLength js_builtin_lengths[] = {
     {"String.prototype", "link", 1},
     {"String.prototype", "match", 1},
     {"String.prototype", "matchAll", 1},
+    {"String.prototype", "normalize", 0},
     {"String.prototype", "padEnd", 1},
     {"String.prototype", "padStart", 1},
     {"String.prototype", "repeat", 1},

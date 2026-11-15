@@ -651,6 +651,33 @@ static bool sm_toWellFormed(JsContext *ctx, JsValue tv, const JsValue *args, int
     return js_is_undefined(*r) ? oom(ctx, r) : true;
 }
 
+static bool str_is_ascii(JsValue key, const char *a);
+
+/* s.normalize(form): NFC (the default), NFD, NFKC or NFKD */
+static bool sm_normalize(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    JsString *s;
+    if (!str_this(ctx, tv, &s, r))
+        return false;
+    int form = JS_NF_NFC;
+    if (!js_is_undefined(ARG(0))) {
+        JsString *f = arg_string(ctx, ARG(0));
+        if (!f)
+            return oom(ctx, r);
+        static const char *const names[] = {"NFC", "NFD", "NFKC", "NFKD"};
+        form = -1;
+        for (int i = 0; i < 4; i++)
+            if (str_is_ascii(js_value_from_cell(&f->gc), names[i]))
+                form = i;
+        if (form < 0)
+            return native_throw(ctx, r, "RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD.");
+    }
+    JsString *n = js_normalize(ctx->vm, s, form);
+    if (!n)
+        return oom(ctx, r);
+    *r = js_value_from_cell(&n->gc);
+    return true;
+}
+
 /* The string HTML methods (Annex B CreateHTML): "<tag attr=\"value\">" + this + "</tag>", the
  * value's quotes written &quot; */
 static bool create_html(JsContext *ctx, JsValue tv, JsValue *r, const char *tag, const char *attr, JsValue value) {
@@ -5959,6 +5986,7 @@ bool js_builtins_init(JsContext *ctx) {
         {"replace", sm_replace}, {"replaceAll", sm_replaceAll}, {"split", sm_split},
         {"concat", sm_concat}, {"toString", sm_toString}, {"valueOf", sm_valueOf},
         {"isWellFormed", sm_isWellFormed}, {"toWellFormed", sm_toWellFormed},
+        {"normalize", sm_normalize},
         {"anchor", sm_anchor}, {"big", sm_big}, {"blink", sm_blink}, {"bold", sm_bold},
         {"fixed", sm_fixed}, {"fontcolor", sm_fontcolor}, {"fontsize", sm_fontsize},
         {"italics", sm_italics}, {"link", sm_link}, {"small", sm_small}, {"strike", sm_strike},

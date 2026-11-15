@@ -11,7 +11,6 @@ prototype in both engines (2026-11-15).
 
 **Not yet implemented** (nothing stands in the way; each is queued):
 
-- `String.prototype.normalize` (needs the Unicode normalization tables).
 - `Array.fromAsync`.
 - `RegExp.prototype.compile` and the legacy `RegExp.$1`–`$9`, `lastMatch`, `input` (and the
   rest) statics, V8's Annex B leftovers.

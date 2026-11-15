@@ -865,6 +865,12 @@ uint8_t js_map_get_attrs(const JsMap *m, const JsString *key);
 /* Sets KEY's JS_ATTR_* byte to ATTRS; false when KEY is not in M */
 bool    js_map_put_attrs(JsMap *m, const JsString *key, uint8_t attrs);
 
+/* ---- normalization (js_normalize.c) ---- */
+
+enum { JS_NF_NFC, JS_NF_NFD, JS_NF_NFKC, JS_NF_NFKD };
+/* S in normalization FORM (JS_NF_*): S itself when nothing changes, NULL on OOM */
+JsString *js_normalize(JsVm *vm, JsString *s, int form);
+
 /* ---- strings / atoms (js_string.c) ---- */
 
 uint32_t  js_units_hash(const uint16_t *units, size_t len, uint32_t seed);
