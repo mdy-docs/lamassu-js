@@ -313,9 +313,20 @@ static bool this_date(JsContext *ctx, JsValue tv, JsDateObject **out, JsValue *r
 
 /* ---- constructor + statics ---- */
 
+static bool date_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r);
+
 static bool g_Date(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     double time;
+    if (!js_native_is_construct_call(ctx)) { /* Date(...): the time now as a string, whatever it is given */
+        JsValue now;
+        if (!alloc_date(ctx, time_clip(host_now_ms()), &now))
+            return nthrow(ctx, r, "out of memory");
+        js_gc_protect(ctx->vm, &now);
+        bool ok = date_toString(ctx, now, NULL, 0, r);
+        js_gc_unprotect(ctx->vm, &now);
+        return ok;
+    }
     if (argc == 0) {
         time = time_clip(host_now_ms());
     } else if (argc == 1) {

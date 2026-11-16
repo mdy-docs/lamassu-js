@@ -342,7 +342,8 @@ Constants: `PI`, `E`, `LN2`, `LN10`, `LOG2E`, `LOG10E`, `SQRT2`,
 
 `new Date()`, `new Date(ms)`, `new Date(isoString)`,
 `new Date(year, month, day, hours, minutes, seconds, ms)` (the ES5 form —
-not the full parser for arbitrary date strings).
+not the full parser for arbitrary date strings). `Date()` without `new` is the time now as a
+string, whatever it is given.
 
 - **Statics**: `now`, `UTC`, `parse`.
 - **`Date.prototype`**: `getTime`/`setTime`, `valueOf`, the full

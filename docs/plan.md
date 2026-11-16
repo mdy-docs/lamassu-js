@@ -357,10 +357,10 @@ Tracked so differential testing against Node has a baseline.
   simplifications remain — `matchAll` returns an array rather than a lazy
   iterator (`for-of` behaves identically), and `split` ignores its `limit`
   argument (as the pre-existing string `split` already did).
-- **`Promise(executor)` is callable without `new`** (the subset's deliberate
-  accommodation), alongside real `new`/constructor-function support and
-  prototype chains ([[Prototype]] set by `new`, walked by property lookup,
-  inspectable via `Object.get/setPrototypeOf`) for everything else.
+- **`Promise(executor)` without `new` is V8's `TypeError`** (it was callable, an early
+  accommodation since withdrawn); constructor functions and prototype chains are real
+  ([[Prototype]] set by `new`, walked by property lookup, inspectable via
+  `Object.get/setPrototypeOf`).
 - **Unhandled promise rejections are silent** — tracked (`handled` flag) but
   not reported; a host hook can be added later.
 - **A top-level-await module awaiting a host promise** returns from

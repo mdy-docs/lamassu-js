@@ -296,14 +296,22 @@ static void test_promise_combinators(void) {
 }
 
 static void test_ctor_executor(void) {
-    eq("await Promise((res, rej) => res(99));", "99");
-    eq("await Promise((res, rej) => res('hello')).then(v => v + '!');", "hello!");
-    eq("await Promise((res, rej) => rej('bad')).catch(e => 'caught ' + e);", "caught bad");
-    eq("await Promise((res) => res(1)).then(v => v + 1).then(v => v + 1);", "3");
+    /* a constructor only, as in V8; the check comes before the executor's */
+    eq("try { Promise((res) => res(1)); } catch (e) { OUT = e instanceof TypeError ? e.message : 'other'; }",
+       "Promise constructor cannot be invoked without 'new'");
+    eq("try { Promise(); } catch (e) { OUT = e.message; }", "Promise constructor cannot be invoked without 'new'");
+    eq("try { Promise.call(Promise.resolve(1), () => {}); } catch (e) { OUT = e.message; }",
+       "Promise constructor cannot be invoked without 'new'");
+    eq("try { new Promise(); } catch (e) { OUT = e.message; }", "Promise resolver undefined is not a function");
+    eq("OUT = await new (Promise.bind(null, (res) => res(7)))();", "7");
+    eq("await new Promise((res, rej) => res(99));", "99");
+    eq("await new Promise((res, rej) => res('hello')).then(v => v + '!');", "hello!");
+    eq("await new Promise((res, rej) => rej('bad')).catch(e => 'caught ' + e);", "caught bad");
+    eq("await new Promise((res) => res(1)).then(v => v + 1).then(v => v + 1);", "3");
     /* executor that throws rejects the promise */
-    eq("await Promise(() => { throw 'oops'; }).catch(e => 'E:' + e);", "E:oops");
+    eq("await new Promise(() => { throw 'oops'; }).catch(e => 'E:' + e);", "E:oops");
     /* deferred resolve inside executor via host */
-    eq("let p = Promise((res) => { defer('later').then(res); }); OUT = await p;", "later");
+    eq("let p = new Promise((res) => { defer('later').then(res); }); OUT = await p;", "later");
 }
 
 static void test_ordering(void) {
@@ -322,7 +330,7 @@ static void test_ordering(void) {
        "123");
     /* multiple reactions attached to one *pending* promise fire in FIFO
        attachment order (regression: they used to fire LIFO). */
-    eq("let log = ''; let r; let p = Promise((res) => { r = res; });"
+    eq("let log = ''; let r; let p = new Promise((res) => { r = res; });"
        "p.then(() => log += 'a'); p.then(() => log += 'b'); p.then(() => log += 'c');"
        "r(1); await p; log;",
        "abc");

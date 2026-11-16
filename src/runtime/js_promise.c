@@ -1012,6 +1012,8 @@ static void run_thenable_job(JsContext *ctx, JsJob *job) {
 /* Callable Promise(executor) */
 static bool promise_ctor(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
+    if (!js_native_is_construct_call(ctx)) /* before the executor is looked at, as in V8 */
+        return nthrow(ctx, r, "TypeError: Promise constructor cannot be invoked without 'new'");
     if (!js_is_function(ARG(0)))
         return (*r = js_error_fmt(ctx, "TypeError: Promise resolver %v is not a function", ARG(0))), false;
     JsValue pv = js_promise_new(ctx);
@@ -1114,7 +1116,7 @@ bool js_promise_builtins_init(JsContext *ctx) {
         !def_fn(ctx, ctx->promise_methods, "finally", pm_finally))
         return false;
 
-    /* global callable Promise with statics */
+    /* the global Promise (a constructor only: a plain call throws) with its statics */
     JsValue ctor = js_native_new(ctx, "Promise", promise_ctor, NULL);
     if (!js_is_function(ctor))
         return false;

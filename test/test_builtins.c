@@ -658,6 +658,10 @@ static void test_date(void) {
     /* Date instances are ordinary objects: expandos, typeof, toJSON */
     eq("let d = new Date(0); d.custom = 42; d.custom;", "42");
     eq("typeof new Date();", "object");
+    /* without `new`: the time now as a string, whatever the arguments, as in V8 */
+    eq("typeof Date();", "string");
+    eq("Date(0) === new Date(0).toString();", "false");
+    eq("/^\\w{3} \\w{3} \\d{2} \\d{4} \\d{2}:\\d{2}:\\d{2} GMT[+-]\\d{4}/.test(Date(2000, 1));", "true");
     eq("new Date(0).toJSON();", "1970-01-01T00:00:00.000Z");
     eq("new Date('bad').toJSON();", "null");
     /* Date -> Date construction copies the time value */

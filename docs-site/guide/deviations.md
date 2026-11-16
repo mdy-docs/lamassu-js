@@ -211,9 +211,6 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
 
 ## Promises & async
 
-- **`Promise(executor)` is callable without `new`** — a deliberate
-  accommodation, alongside real `new`/constructor-function support and
-  prototype chains for everything else.
 - **Unhandled promise rejections are silent.** The engine tracks a
   `handled` flag internally but doesn't report unhandled rejections; a host
   hook could be added by an embedder that needs one.
