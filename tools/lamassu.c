@@ -448,6 +448,17 @@ static void set_root_dir(const char *file) {
         snprintf(g_root_dir, sizeof g_root_dir, ".");
 }
 
+/*
+ * A run that ends with its promise still pending: the module is waiting, at a top-level await,
+ * for something nothing is left to bring about (there is no event loop here; every job has
+ * run). Node says so and exits with 13, and so does this.
+ */
+#define EXIT_UNSETTLED 13
+static int unsettled(const char *file) {
+    fprintf(stderr, "%s: unsettled top-level await\n", file);
+    return EXIT_UNSETTLED;
+}
+
 /* Interactive REPL over one persistent context (top-level let/const/function
  * carry across lines through the lexical scope). */
 /*
@@ -724,7 +735,10 @@ static int run_bytecode(const char *path) {
         free(bytes); /* the loader re-reads the root from disk */
         JsValue pr = js_eval_module(ctx, spec, sn);
         js_gc_protect(vm, &pr);
-        if (js_promise_state(pr) != 1) {
+        if (js_promise_state(pr) == 0) {
+            js_gc_unprotect(vm, &pr);
+            status = unsettled(path);
+        } else if (js_promise_state(pr) != 1) {
             JsValue reason = js_promise_result(pr);
             fprintf(stderr, "%s: ", path);
             JsValue s = js_to_string(ctx, reason);
@@ -767,13 +781,15 @@ static int run_bytecode(const char *path) {
         arm_fuel(ctx);
         JsValue p = js_run_module(ctx, fn);
         int st = js_promise_state(p);
-        bool ok = st == 0 || st == 1;
+        bool ok = st == 1;
         JsValue result = js_promise_result(p);
         js_gc_protect(vm, &result);
         JsValue str = js_to_string(ctx, result);
         size_t slen;
         const uint16_t *su = js_string_units(str, &slen);
-        if (ok) {
+        if (st == 0) {
+            status = unsettled(path);
+        } else if (ok) {
             if (su)
                 print_utf16(stdout, su, slen);
             fputc('\n', stdout);
@@ -942,6 +958,8 @@ int main(int argc, char **argv) {
                 print_utf16(stderr, su, slen);
             fputc('\n', stderr);
             status = 1;
+        } else if (js_promise_state(p) == 0) {
+            status = unsettled(argv[1]);
         }
         js_gc_unprotect(vm, &p);
         g_entry_src = NULL;
@@ -955,13 +973,15 @@ int main(int argc, char **argv) {
         arm_fuel(ctx);
         JsValue p = js_run_module(ctx, fn);
         int st = js_promise_state(p);
-        bool ok = st == 0 || st == 1;
+        bool ok = st == 1;
         JsValue result = js_promise_result(p);
         js_gc_protect(vm, &result);
         JsValue str = js_to_string(ctx, result);
         size_t slen;
         const uint16_t *sunits = js_string_units(str, &slen);
-        if (ok) {
+        if (st == 0) {
+            status = unsettled(argv[1]);
+        } else if (ok) {
             if (sunits)
                 print_utf16(stdout, sunits, slen);
             fputc('\n', stdout);
