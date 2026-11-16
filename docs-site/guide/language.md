@@ -28,7 +28,7 @@ supported. `debugger;` is a statement that does nothing (there is no debugger to
 ## Functions
 
 - Regular functions, arrow functions, default parameters, rest parameters
-  (`...args`), spread in call arguments.
+  (`...args`, or a pattern: `...[first, second]`), spread in call arguments.
 - Closures and upvalues work as expected; the interpreter never uses the C
   stack for JS calls, so recursion depth is bounded and checked, not a
   segfault risk.
@@ -44,7 +44,8 @@ supported. `debugger;` is a statement that does nothing (there is no debugger to
 - `new.target` is the function when it was called with `new`, else `undefined` (an arrow sees
   its enclosing function's); outside a function it is V8's `SyntaxError: new.target expression
   is not allowed here`.
-- Duplicate parameter names are a compile error.
+- Duplicate parameter names are a `SyntaxError`, and so is a `let` or `const` of the body
+  that takes a parameter's name.
 
 ## Objects, arrays, and constructors
 

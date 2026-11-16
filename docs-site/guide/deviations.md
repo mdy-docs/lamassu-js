@@ -172,9 +172,7 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
 - **Messages follow V8's wording**, with these differences: an error about
   a feature lamassu leaves out says so (`'var' is not supported; use 'let' or
   'const'`, `classes are not supported`) where V8 would compile the script;
-  a few of V8's own quirks are not copied (in a module V8 reports `let let`
-  and `let 1x` as `Unexpected strict mode reserved word`; lamassu says `let is
-  disallowed as a lexically bound name` and `Invalid or unexpected token`; a destructured
+  one of V8's own quirks is not copied (a destructured
   parameter given `null` is `'object null'` in V8's message, `'null'` here); an
   operand with no readable name shows its value (`undefined is not a function` for `(void 0)()`
   and `#<Object> is not iterable` for `[...{}]`, where V8 prints the expression,
@@ -182,6 +180,24 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   by its constructor, as V8 names it (`#<Object>`, `#<Set>`, `#<Foo>`; `[object Object]` with no
   prototype), and so are an array, a module namespace, an iterator (`[object Map Iterator]`) and
   what inherits from `Iterator.prototype` (`[object Object]`).
+- **A `SyntaxError` is V8's, message and position**, including which error is reported when a
+  source has several (the earliest, as V8 chooses it: `({a = 1}); 1 +` is `Invalid shorthand
+  property initializer`) and where strict mode's octal errors land (at the end of the function
+  around them). The differences:
+  - A call as the target of an assignment, an update or a `for...of` (`f() = 1`, `f()++`,
+    `for (f() of xs)`) is the early `SyntaxError` the specification asks for (`Invalid left-hand
+    side in assignment` and its relatives). V8 compiles these, for old web pages, and throws a
+    `ReferenceError` when the statement runs.
+  - `for (a.async of xs)` is accepted, as the specification has it. V8 refuses it (`The left-hand
+    side of a for-of loop may not be 'async'`), meaning to refuse only `for (async of xs)`,
+    which lamassu refuses too.
+  - Redeclarations (`Identifier 'x' has already been declared`), duplicate parameter names and
+    invalid regular expression literals are found after the source has parsed. Alone in a
+    source they are reported as V8 reports them; in a source with another syntax error as well,
+    that other error is the one reported, even when it comes later (`let x; let x; 1 +` is
+    `Unexpected end of input` here, the redeclaration in V8).
+  - `([f(a.b = 1)]) => 1` is `Invalid destructuring assignment target`; V8 says `Illegal
+    property in declaration context`.
 - **Out-of-memory errors may still be bare strings**: when the engine
   cannot allocate an Error object, it throws the message text instead so
   the failure is never lost.

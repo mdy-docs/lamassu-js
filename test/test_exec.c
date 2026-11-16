@@ -1470,6 +1470,45 @@ static void test_error_stack(void) {
                   "TypeError: f(...) is not a function\n    at <anonymous>:1:36");
 }
 
+/* What the parser reads first as an expression and then as a pattern (the cover grammar), and
+ * the places `in` is and is not the operator in a `for` head: the values, where
+ * test_early_errors.c has the errors. Each result is node's. */
+static void test_cover_grammar(void) {
+    /* a rest parameter may be a pattern */
+    expect_result("function f(...[a = 5, b = a + 1]) { return a + ',' + b; } f() + ' ' + f(1) + ' ' + f(1, 9);",
+                  "5,6 1,2 1,9");
+    expect_result("const g = (...{length}) => length; g(1, 2, 3);", "3");
+    expect_result("function f(a, ...[b]) {} f.length;", "1");
+    expect_result("function f(...[a]) { return () => a; } f(7)();", "7");
+    expect_result("function f(...{0: a, length: n}) { return a + ':' + n; } f('x', 'y');", "x:2");
+    /* an object literal with a cover initializer, claimed by the pattern around it */
+    expect_result("let a, d; [{a = 1}, {d = 2}] = [{}, {}]; a + d;", "3");
+    expect_result("let a; ({a = 1} = {}); a;", "1");
+    expect_result("let a, s = ''; for ({a = 1} of [{}, {a: 4}]) s += a; s;", "14");
+    expect_result("let a, b; ({a = 1, ...b} = {c: 3}); a + JSON.stringify(b);", "1{\"c\":3}");
+    expect_result("const h = ({a = 1}, x = {b: 2}) => a + x.b; h({});", "3");
+    expect_result("let a, b; [a = {b = 2} = {}] = []; b + JSON.stringify(a);", "2{}");
+    expect_result("const f = async ({a = 1}, [b] = [2]) => a + b; await f({});", "3");
+    expect_result("let o = {}; for (o.x of [1, 2]) ; o.x;", "2");
+    /* a function inside a literal that may yet be a pattern has statements of its own */
+    expect_result("let x = [{}, function () { let a; { let a = 1; } return 3; }]; x[1]();", "3");
+    /* `in` in a `for` head: the operator again inside brackets of any kind, a function, a
+     * conditional's middle */
+    expect_result("let r; for (let x = ('a' in {a: 1}); !r; ) r = x; r;", "true");
+    expect_result("let r; for (let x = ['a' in {a: 1}]; !r; ) r = x; r[0];", "true");
+    expect_result("let r; for (let f = () => { return 'a' in {a: 1}; }; !r; ) r = f; r();", "true");
+    expect_result("let r; for (let x = {k: 'a' in {a: 1}}; !r; ) r = x; r.k;", "true");
+    expect_result("let r; for (let x = String('a' in {a: 1}); !r; ) r = x; r;", "true");
+    expect_result("let r; for (let x = `${'a' in {a: 1}}`; !r; ) r = x; r;", "true");
+    expect_result("let r; for (let x = true ? 'a' in {a: 1} : 0; !r; ) r = x; r;", "true");
+    expect_result("let r; for (let x = function (y = 'a' in {a: 1}) { return y; }; !r; ) r = x; r();", "true");
+    expect_result("let r = []; for (let x of [1, 2].map(v => v in [0, 0])) r.push(x); r.join();", "true,false");
+    /* names that are keywords only in places */
+    expect_result("let async = 5; let fn = async => async * 2; async + fn(4);", "13");
+    expect_result("let of = [1, 2], s = 0; for (let x of of) s += x; s;", "3");
+    expect_result("let k = 0; try { throw 1; } catch (e) { { let e = 2; k = e; } } k;", "2");
+}
+
 int main(void) {
     test_heap_limit_is_a_hard_cap();
     test_regex_memory_is_capped();
@@ -1477,6 +1516,7 @@ int main(void) {
     test_error_cause();
     test_oom_is_reported();
     test_arithmetic();
+    test_cover_grammar();
     test_strings();
     test_coercions_equality();
     test_bitwise();

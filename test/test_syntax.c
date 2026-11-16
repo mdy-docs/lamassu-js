@@ -770,6 +770,27 @@ static void test_errors(void) {
     check_err("let x = yield;", "reserved word", -1);
     check_err("for (let k in o) {}", "for-in is not supported", -1);
     check_err("for (k in o) {}", "for-in is not supported", -1);
+    /* `in` ends the first part of any `for` head: these were once read as classic loops (and
+     * the first of them never ended) */
+    check_err("for (let a = 1 in {};;) ;", "for-in is not supported", -1);
+    check_err("for (a in b;;) ;", "for-in is not supported", -1);
+    check_err("for (a = x => 1 in {};;) ;", "for-in is not supported", -1);
+    /* Where V8 leaves the specification, lamassu stays with it: a call as the target of an
+     * assignment is an early error (V8 compiles it and throws a ReferenceError when it runs),
+     * and `a.async` may head a for-of (V8 refuses it) */
+    check_err("a() = 2;", "Invalid left-hand side in assignment", 0);
+    check_err("++a();", "Invalid left-hand side expression in prefix operation", 2);
+    check_err("a()++;", "Invalid left-hand side expression in postfix operation", 0);
+    check_err("for (a() of []) ;", "Invalid left-hand side in for-loop", 5);
+    check_parses("for (a.async of []) ;");
+    /* strict mode's octal errors wait, as in V8, for the end of the function: an earlier
+     * error is reported first, and the last literal of a function is the one named */
+    check_err("08; 09;", "Decimals with leading zeros are not allowed in strict mode.", 4);
+    check_err("function f() { 010 } function g() { 09 }", "Octal literals are not allowed in strict mode.", 15);
+    check_err("let o = { m() { '\\1' } }; 09;", "Octal escape sequences are not allowed in strict mode.", 18);
+    check_err("`\\1`;", "Octal escape sequences are not allowed in template strings.", 2);
+    check_err("'\\8';", "\\8 and \\9 are not allowed in strict mode.", 1);
+    check_parses("f`\\1`;"); /* a tagged template keeps the raw text */
     check_err("new.target;", "new.target expression is not allowed here", -1);
     check_parses("x instanceof y;"); /* V8's operator, at the relational level */
     check_parses("a instanceof B === c in d;");

@@ -104,6 +104,10 @@ typedef struct JsLexer {
     bool failed;
     const char *err_msg;
     uint32_t err_pos;
+    /* What strict mode refuses in the token just read and V8 reports only where the function
+     * around it ends (an octal literal, an octal escape in a string): the parser's to raise */
+    const char *late_msg;
+    uint32_t late_pos, late_end;
 } JsLexer;
 
 void js_lexer_init(JsLexer *lx, JsArena *arena, const uint16_t *src, size_t len);
@@ -170,6 +174,7 @@ typedef enum JsAstKind {
 #define JS_F_COVER_TRAIL  0x02 /* COVER: trailing comma */
 #define JS_F_COVER_ASYNC  0x04 /* COVER: `async (...)` form */
 #define JS_F_PAREN        0x80 /* any expression: was parenthesized */
+#define JS_F_SPREAD_COMMA 0x01 /* SPREAD in an array or object literal: a comma follows it */
 #define JS_F_BAD_COOK     0x01 /* STRING (a template chunk): its escape does not cook: undefined */
 
 /*
@@ -185,6 +190,7 @@ struct JsAstNode {
     uint32_t pos;
     double number;
     const uint16_t *units;  uint32_t len;  /* name / string / label / source */
+    uint32_t paren_pos; /* with JS_F_PAREN: where its `(` is (an error about the whole expression) */
     const uint16_t *units2; uint32_t len2; /* second name (regex flags, spec local, export alias) */
     JsAstNode *a, *b, *c, *d;
     JsAstNode **items; uint32_t count;

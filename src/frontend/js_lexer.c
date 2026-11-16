@@ -3,7 +3,8 @@
 
 /*
  * UTF-16 lexer. Always strict / module goal: legacy octal literals and
- * escapes are errors, `await`/`let`/`yield` are always reserved. The
+ * escapes are errors (noted on the token, for the parser to raise where V8
+ * does), `await`/`let`/`yield` are always reserved. The
  * parser drives context-dependent rescans (regex vs division, template
  * continuations after `}`).
  */
@@ -14,6 +15,12 @@ static uint16_t cur(const JsLexer *lx) {
 
 static uint16_t at(const JsLexer *lx, uint32_t i) {
     return lx->pos + i < lx->len ? lx->src[lx->pos + i] : 0;
+}
+
+static void lex_late(JsLexer *lx, uint32_t pos, uint32_t end, const char *msg) {
+    lx->late_msg = msg; /* the last in a token is the one V8 keeps */
+    lx->late_pos = pos;
+    lx->late_end = end;
 }
 
 static bool lex_fail(JsLexer *lx, uint32_t pos, const char *msg) {
@@ -59,6 +66,8 @@ void js_lexer_init(JsLexer *lx, JsArena *arena, const uint16_t *src, size_t len)
     lx->failed = false;
     lx->err_msg = NULL;
     lx->err_pos = 0;
+    lx->late_msg = NULL;
+    lx->late_pos = lx->late_end = 0;
     lx->tok.kind = JS_T_EOF;
     lx->tok.pos = lx->tok.end = 0;
     lx->tok.newline_before = false;
@@ -142,11 +151,14 @@ bool js_lexer_is_reserved_word(const uint16_t *units, uint32_t len) {
     return false;
 }
 
-/* A \u escape at *pos in an identifier: its code point (and *pos past it), or -1 */
-static int32_t ident_escape(const JsLexer *lx, uint32_t *pos) {
+/* A \u escape at *pos in an identifier: its code point (and *pos past it); -1 when it is
+ * malformed (*BAD: where V8 points, the backslash, or in `\u{...}` the character that is no hex
+ * digit), -2 when it names no code point, -3 when the backslash starts no \u escape at all */
+static int32_t ident_escape(const JsLexer *lx, uint32_t *pos, uint32_t *bad) {
     uint32_t p = *pos;
+    *bad = p;
     if (p + 1 >= lx->len || lx->src[p] != '\\' || lx->src[p + 1] != 'u')
-        return -1;
+        return -3;
     p += 2;
     uint32_t cp = 0;
     if (p < lx->len && lx->src[p] == '{') {
@@ -158,8 +170,10 @@ static int32_t ident_escape(const JsLexer *lx, uint32_t *pos) {
                 return -2;
             any = true;
         }
-        if (!any || p >= lx->len || lx->src[p] != '}')
+        if (!any || p >= lx->len || lx->src[p] != '}') {
+            *bad = p;
             return -1;
+        }
         p++;
     } else {
         for (int i = 0; i < 4; i++) {
@@ -185,16 +199,18 @@ static bool lex_escaped_ident(JsLexer *lx, uint32_t start) {
         while (p < lx->len) {
             uint16_t u = lx->src[p];
             int32_t cp;
-            uint32_t at_pos = p;
+            uint32_t at_pos = p, bad;
             if (u == '\\') {
-                cp = ident_escape(lx, &p);
+                cp = ident_escape(lx, &p, &bad);
+                if (cp == -3) /* V8 points this one at the whole identifier */
+                    return lex_fail(lx, start, "Invalid or unexpected token");
                 if (cp < 0)
-                    return lex_fail(lx, at_pos, cp == -2 ? "Undefined Unicode code-point"
-                                                         : "Invalid Unicode escape sequence");
+                    return lex_fail(lx, cp == -2 ? at_pos : bad,
+                                    cp == -2 ? "Undefined Unicode code-point" : "Invalid Unicode escape sequence");
                 bool ok = !(cp >= 0xD800 && cp <= 0xDFFF) &&
                           (cp > 0xFFFF || (first ? is_id_start((uint16_t)cp) : is_id_part((uint16_t)cp)));
                 if (!ok) /* well formed, but no identifier character */
-                    return lex_fail(lx, at_pos, "Invalid or unexpected token");
+                    return lex_fail(lx, start, "Invalid or unexpected token");
             } else if (first ? is_id_start(u) : is_id_part(u)) {
                 cp = u;
                 p++;
@@ -218,7 +234,10 @@ static bool lex_escaped_ident(JsLexer *lx, uint32_t start) {
             n = k;
         } else {
             lx->pos = p;
-            lx->tok.kind = JS_T_IDENT; /* even when it spells a keyword: the parser decides */
+            /* an identifier even when it spells a keyword: the parser decides. `await` alone
+             * stays the word it spells, as in V8: an escaped one is refused only where it would
+             * be the operator, and is the reserved word everywhere else */
+            lx->tok.kind = units_eq_ascii(out, n, "await") ? JS_T_AWAIT : JS_T_IDENT;
             lx->tok.escaped = true;
             lx->tok.u.str.units = out;
             lx->tok.u.str.len = n;
@@ -270,7 +289,7 @@ static bool lex_separator(JsLexer *lx, int radix) {
 static bool lex_number(JsLexer *lx) {
     uint32_t start = lx->pos;
     double value = 0.0;
-    bool separated = false;
+    bool separated = false, leading = false;
 
     if (cur(lx) == '0' && (at(lx, 1) == 'x' || at(lx, 1) == 'X' ||
                            at(lx, 1) == 'o' || at(lx, 1) == 'O' ||
@@ -300,17 +319,27 @@ static bool lex_number(JsLexer *lx) {
         int digits = 0, exp_adjust = 0, exp_part = 0;
         bool dropped = false; /* digits past the 19th: the whole text decides the rounding */
         if (cur(lx) == '0' && is_digit(at(lx, 1))) {
-            /* V8 names 08 and 09-style literals apart from octal-looking ones */
+            /* Not strict mode's, but V8 reads them as the numbers they once were and reports
+             * them where the function ends, 08 and 09-style ones (decimal all the same) under
+             * another name than the octal-looking ones */
             uint32_t i = 1;
-            for (; is_digit(at(lx, i)); i++) {
+            for (; is_digit(at(lx, i)); i++)
                 if (at(lx, i) >= '8')
-                    return lex_fail(lx, start, at(lx, i + 1) == '_' || at(lx, i) == '_'
-                                    ? "Invalid or unexpected token"
-                                    : "Decimals with leading zeros are not allowed in strict mode.");
+                    leading = true;
+            if (at(lx, i) == '_' || at(lx, i) == 'n') /* V8's places for them */
+                return lex_fail(lx, leading && at(lx, i) == '_' ? start + i : start,
+                                "Invalid or unexpected token");
+            if (!leading) {
+                for (uint32_t k = 1; k < i; k++)
+                    value = value * 8 + (at(lx, k) - '0');
+                lx->pos = start + i;
+                if (is_id_start(cur(lx)) || is_digit(cur(lx)))
+                    return lex_fail(lx, start, "Invalid or unexpected token");
+                lex_late(lx, start, lx->pos, "Octal literals are not allowed in strict mode.");
+                lx->tok.kind = JS_T_NUM;
+                lx->tok.u.number = value;
+                return true;
             }
-            if (at(lx, i) == '_' || at(lx, i) == 'n')
-                return lex_fail(lx, start + i, "Invalid or unexpected token");
-            return lex_fail(lx, start, "Octal literals are not allowed in strict mode.");
         }
         if (cur(lx) == '0' && at(lx, 1) == '_')
             return lex_fail(lx, lx->pos + 1, "Numeric separator can not be used after leading 0.");
@@ -389,6 +418,11 @@ static bool lex_number(JsLexer *lx) {
         }
     }
 
+    if (leading) {
+        if (cur(lx) == 'n' || is_id_start(cur(lx)) || is_digit(cur(lx)))
+            return lex_fail(lx, start, "Invalid or unexpected token");
+        lex_late(lx, start, lx->pos, "Decimals with leading zeros are not allowed in strict mode.");
+    }
     if (cur(lx) == 'n') { /* a BigInt: an integer, so no point, no exponent */
         for (uint32_t i = start; i < lx->pos; i++) {
             uint16_t u = lx->src[i];
@@ -426,7 +460,7 @@ static bool lex_number(JsLexer *lx) {
  * Cooks one escape sequence at lx->pos (which points at the backslash)
  * into out/outlen. Returns false on error.
  */
-static bool cook_escape(JsLexer *lx, uint16_t *out, uint32_t *outlen) {
+static bool cook_escape(JsLexer *lx, uint16_t *out, uint32_t *outlen, bool in_template) {
     uint32_t bs = lx->pos;
     lx->pos++; /* backslash */
     uint16_t e = cur(lx);
@@ -439,6 +473,20 @@ static bool cook_escape(JsLexer *lx, uint16_t *out, uint32_t *outlen) {
         return true;
     }
     lx->pos++;
+    if (e >= '1' && e <= '9' ? true : e == '0' && is_digit(cur(lx))) {
+        /* An octal escape, or \8 and \9, which once stood for the digit. A template refuses
+         * them at once; in a string V8 goes on and reports them where the function ends. */
+        bool digit = e >= '8';
+        if (in_template)
+            return lex_fail(lx, digit ? bs : bs + 1,
+                            digit ? "\\8 and \\9 are not allowed in template strings."
+                                  : "Octal escape sequences are not allowed in template strings.");
+        lex_late(lx, digit ? bs : bs + 1, lx->pos,
+                 digit ? "\\8 and \\9 are not allowed in strict mode."
+                       : "Octal escape sequences are not allowed in strict mode.");
+        out[0] = e;
+        return true;
+    }
     switch (e) {
     case 'n': out[0] = '\n'; return true;
     case 't': out[0] = '\t'; return true;
@@ -447,13 +495,8 @@ static bool cook_escape(JsLexer *lx, uint16_t *out, uint32_t *outlen) {
     case 'f': out[0] = '\f'; return true;
     case 'v': out[0] = '\v'; return true;
     case '0':
-        if (is_digit(cur(lx)))
-            return lex_fail(lx, bs, "Octal escape sequences are not allowed in strict mode.");
         out[0] = 0;
         return true;
-    case '1': case '2': case '3': case '4':
-    case '5': case '6': case '7': case '8': case '9':
-        return lex_fail(lx, bs, "Octal escape sequences are not allowed in strict mode.");
     case 'x': {
         int h = hex_val(cur(lx)), l = hex_val(at(lx, 1));
         if (h < 0 || l < 0)
@@ -474,8 +517,8 @@ static bool cook_escape(JsLexer *lx, uint16_t *out, uint32_t *outlen) {
                 lx->pos++;
                 any = true;
             }
-            if (!any || cur(lx) != '}')
-                return lex_fail(lx, bs, "Invalid Unicode escape sequence");
+            if (!any || cur(lx) != '}') /* V8 points at the character that is no hex digit */
+                return lex_fail(lx, lx->pos, "Invalid Unicode escape sequence");
             lx->pos++;
             if (cp > 0xFFFF) {
                 cp -= 0x10000;
@@ -542,7 +585,7 @@ static bool lex_string(JsLexer *lx) {
     while (cur(lx) != quote) {
         if (cur(lx) == '\\') {
             uint32_t got;
-            if (!cook_escape(lx, buf + n, &got))
+            if (!cook_escape(lx, buf + n, &got, false))
                 return false;
             n += got;
         } else {
@@ -617,7 +660,7 @@ static bool lex_template_chunk(JsLexer *lx, uint32_t err_from) {
         }
         if (u == '\\') {
             uint32_t got, bs = lx->pos;
-            if (!cook_escape(lx, buf + n, &got)) {
+            if (!cook_escape(lx, buf + n, &got, true)) {
                 /* kept, not thrown: a tagged template's strings have undefined for it; the
                  * parser raises it for an untagged one */
                 if (!lx->tok.u.str.bad_escape) {
@@ -648,6 +691,7 @@ static bool lex_template_chunk(JsLexer *lx, uint32_t err_from) {
 
 bool js_lexer_rescan_template(JsLexer *lx) {
     /* Current token must be the '}' closing a ${...} substitution. */
+    lx->late_msg = NULL;
     lx->tok.pos = lx->tok.end; /* chunk starts right after '}' */
     lx->pos = lx->tok.end;
     if (!lex_template_chunk(lx, lx->tok.pos))
@@ -806,6 +850,7 @@ bool js_lexer_next(JsLexer *lx) {
     lx->tok.newline_before = nl;
     lx->tok.pos = lx->pos;
     lx->tok.escaped = false;
+    lx->late_msg = NULL;
 
     bool ok;
     uint16_t u = cur(lx);

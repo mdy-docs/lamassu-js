@@ -74,6 +74,8 @@ typedef struct JsLocalVar {
     bool pending;              /* let/const not yet initialized here: a read may hit the TDZ */
     bool tdz_anywhere;         /* let/const of a switch body: a later case can run without its
                                   declaration, so any access may hit the TDZ */
+    bool is_param;             /* a name the parameters bind: a `let` in the body may not take it */
+    uint32_t pos;              /* where it is declared */
 } JsLocalVar;
 
 typedef struct JsUpName {
@@ -126,6 +128,8 @@ typedef struct JsCompiler {
     JsFuncState *cur;
     bool repl;       /* REPL: top-level declarations join the lexical scope */
     bool decl_const; /* const-ness of the declaration currently being compiled */
+    bool binding_params; /* declaring a function's parameters */
+    bool body_lexical;   /* declaring a let/const of a function body's own block */
     /* The expression a destructuring pattern about to be compiled takes apart (`o.b` in
      * `const { a } = o.b`), for the error's wording; read and cleared by the pattern. */
     const JsAstNode *pattern_src;
@@ -593,11 +597,18 @@ static bool declare_local(JsCompiler *cx, const uint16_t *name, uint32_t len,
                           bool is_const, uint32_t pos, uint32_t scope_floor,
                           uint16_t *slot_out) {
     JsFuncState *fs = cx->cur;
-    for (uint32_t i = scope_floor; len && i < fs->local_count; i++) {
+    /* a function body's let/const also may not take a parameter's name, a scope out */
+    for (uint32_t i = cx->body_lexical ? 0 : scope_floor; len && i < fs->local_count; i++) {
+        if (i < scope_floor && !fs->locals[i].is_param)
+            continue;
         /* unnamed slots (destructuring parameters) never clash */
-        if (units_equal(fs->locals[i].name, fs->locals[i].len, name, len))
-            return cerr(cx, pos, js_compile_error_fmt(cx->vm, "Identifier '%U' has already been declared",
-                                                      name, len));
+        if (!units_equal(fs->locals[i].name, fs->locals[i].len, name, len))
+            continue;
+        if (cx->binding_params) /* V8 points at the second of the two */
+            return cerr(cx, pos > fs->locals[i].pos ? pos : fs->locals[i].pos,
+                        "Duplicate parameter name not allowed in this context");
+        return cerr(cx, pos, js_compile_error_fmt(cx->vm, "Identifier '%U' has already been declared",
+                                                  name, len));
     }
     if (fs->slot_count >= JS_MAX_LOCALS)
         return cerr(cx, pos, "too many local variables");
@@ -619,6 +630,8 @@ static bool declare_local(JsCompiler *cx, const uint16_t *name, uint32_t len,
     v->captured = false;
     v->pending = false;
     v->tdz_anywhere = false;
+    v->is_param = cx->binding_params;
+    v->pos = pos;
     if (fs->slot_count > fs->slot_max)
         fs->slot_max = fs->slot_count;
     if (slot_out)
@@ -777,11 +790,15 @@ static bool prescan_declarations(JsCompiler *cx, JsAstNode *const *stmts,
             continue;
         }
         if (s->kind == JS_AST_LET_DECL) {
-            for (uint32_t d = 0; d < s->count; d++) {
-                if (!pattern_declare(cx, s->items[d]->a, (s->flags & JS_F_CONST) != 0,
-                                     scope_floor, true))
-                    return false;
-            }
+            /* the body's own block (a function declaration there may take a parameter's name,
+             * as a `var` could) */
+            cx->body_lexical = !cx->cur->is_module && cx->cur->scope_depth == 1;
+            bool ok = true;
+            for (uint32_t d = 0; ok && d < s->count; d++)
+                ok = pattern_declare(cx, s->items[d]->a, (s->flags & JS_F_CONST) != 0, scope_floor, true);
+            cx->body_lexical = false;
+            if (!ok)
+                return false;
         } else if (s->kind == JS_AST_FUNC_DECL) {
             /* REPL top-level function -> persistent global (not a local) */
             if (is_repl_top(cx))
@@ -2308,32 +2325,38 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
 /* Binds parameters into locals; emits default/destructuring prologue. */
 static bool uses_new_target(const JsAstNode *n, int depth);
 
+static bool bind_params_inner(JsCompiler *cx, const JsAstNode *fnode, uint16_t *n_params,
+                              bool *has_rest);
+
 static bool bind_params(JsCompiler *cx, const JsAstNode *fnode, uint16_t *n_params,
                         bool *has_rest) {
+    bool ok = bind_params_inner(cx, fnode, n_params, has_rest);
+    cx->binding_params = false;
+    return ok;
+}
+
+static bool bind_params_inner(JsCompiler *cx, const JsAstNode *fnode, uint16_t *n_params,
+                              bool *has_rest) {
     JsFuncState *fs = cx->cur;
     uint32_t count = fnode->count;
     *has_rest = false;
     uint16_t np = 0;
 
-    /* Pass 1: one slot per positional parameter. */
+    /* Pass 1: one slot per positional parameter (the rest parameter, the last, included: the
+     * call fills its slot with the array). */
+    cx->binding_params = true;
     for (uint32_t i = 0; i < count; i++) {
         const JsAstNode *p = fnode->items[i];
+        const JsAstNode *name_node = p;
         if (p->kind == JS_AST_REST) {
             *has_rest = true;
-            if (p->a->kind != JS_AST_IDENT)
-                return cerr(cx, p->pos, "rest parameter must be a simple identifier");
-            uint16_t slot;
-            if (!declare_local(cx, p->a->units, p->a->len, false, p->pos, 0, &slot))
-                return false;
-            np++;
-            break;
-        }
-        const JsAstNode *name_node = p;
-        if (p->kind == JS_AST_DEFAULT)
             name_node = p->a;
+        } else if (p->kind == JS_AST_DEFAULT) {
+            name_node = p->a;
+        }
         if (name_node->kind == JS_AST_IDENT) {
             uint16_t slot;
-            if (!declare_local(cx, name_node->units, name_node->len, false, p->pos, 0, &slot))
+            if (!declare_local(cx, name_node->units, name_node->len, false, name_node->pos, 0, &slot))
                 return false;
         } else {
             /* anonymous slot for a destructuring parameter */
@@ -2344,6 +2367,7 @@ static bool bind_params(JsCompiler *cx, const JsAstNode *fnode, uint16_t *n_para
         np++;
     }
     *n_params = np;
+    cx->binding_params = false; /* the hidden locals that follow are no parameters */
 
     /* `arguments`: one hidden local directly after the params (slot == np),
      * declared before pattern names so default-value expressions can read
@@ -2373,16 +2397,16 @@ static bool bind_params(JsCompiler *cx, const JsAstNode *fnode, uint16_t *n_para
     }
 
     /* Pass 2: pre-declare names introduced by patterns (slots after params). */
+    cx->binding_params = true;
     for (uint32_t i = 0; i < count; i++) {
         const JsAstNode *p = fnode->items[i];
-        if (p->kind == JS_AST_REST)
-            continue;
-        const JsAstNode *target = p->kind == JS_AST_DEFAULT ? p->a : p;
+        const JsAstNode *target = p->kind == JS_AST_DEFAULT || p->kind == JS_AST_REST ? p->a : p;
         if (target->kind == JS_AST_ARRAY_PATTERN || target->kind == JS_AST_OBJECT_PATTERN) {
             if (!pattern_declare(cx, target, false, 0, false))
                 return false;
         }
     }
+    cx->binding_params = false;
 
     /* A named function expression sees its own name, as a constant holding the function, unless
      * a parameter has that name (and a declaration in the body shadows it, being a scope in). */
@@ -2400,9 +2424,7 @@ static bool bind_params(JsCompiler *cx, const JsAstNode *fnode, uint16_t *n_para
     /* Pass 3: prologue for defaults and destructuring. */
     for (uint32_t i = 0; i < count; i++) {
         const JsAstNode *p = fnode->items[i];
-        if (p->kind == JS_AST_REST)
-            continue;
-        const JsAstNode *target = p->kind == JS_AST_DEFAULT ? p->a : p;
+        const JsAstNode *target = p->kind == JS_AST_DEFAULT || p->kind == JS_AST_REST ? p->a : p;
         bool has_default = p->kind == JS_AST_DEFAULT;
         bool is_pattern = target->kind == JS_AST_ARRAY_PATTERN ||
                           target->kind == JS_AST_OBJECT_PATTERN;
@@ -2945,8 +2967,15 @@ static bool compile_try(JsCompiler *cx, const JsAstNode *n) {
             if (!emit_op(cx, JS_OP_POP, -1)) /* discard thrown value */
                 return false;
         }
-        if (!compile_stmt(cx, n->c))
+        /* the block's own declarations are in the parameter's scope: `catch (e) { let e; }`
+         * is a redeclaration */
+        if (!prescan_declarations(cx, n->c->items, n->c->count, cm.local_count) ||
+            !hoist_functions(cx, n->c->items, n->c->count))
             return false;
+        for (uint32_t i = 0; i < n->c->count; i++) {
+            if (!compile_stmt(cx, n->c->items[i]))
+                return false;
+        }
         if (!scope_leave(cx, cm))
             return false;
         if (has_finally && !emit_cleanups(cx, ci))
