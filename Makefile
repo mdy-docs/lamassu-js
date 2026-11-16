@@ -1,6 +1,6 @@
 # lamassu — frontend/runtime split build: native, WASI, and the npm package.
 #
-# make test               build and run unit tests (plain + ASan/UBSan)
+# make test               build and run unit tests (plain + ASan/UBSan), and the CLI's cases
 # make bench              build the CLI and run bench/*.js, reporting ops/sec
 # make pkg                build the npm package's wasm artifact (needs emcc);
 #                         this is what the docs site and its playground import
@@ -174,7 +174,7 @@ build/%_asan: test/%.c $(FRONTEND_LIB_A) $(RUNTIME_LIB_A)
 	  $(FRONTEND_LIB_A) $(RUNTIME_LIB_A) -o $@ $(LIBS)
 
 .PHONY: test
-test: $(TESTS) $(TESTS_ASAN)
+test: $(TESTS) $(TESTS_ASAN) cli-check cli-check-asan
 	@for t in $(TESTS) $(TESTS_ASAN); do echo "-- $$t"; ./$$t || exit 1; done
 
 # The same suites without the sanitized pair, for a toolchain that has no
@@ -183,7 +183,7 @@ test: $(TESTS) $(TESTS_ASAN)
 # they run clean -- so nothing that can build `test` should use it. Linux and
 # macOS both can, and do.
 .PHONY: test-plain
-test-plain: $(TESTS)
+test-plain: $(TESTS) cli-check
 	@for t in $(TESTS); do echo "-- $$t"; ./$$t || exit 1; done
 
 # ---- the lamassu CLI: compile + run a .js file ---------------------------
@@ -193,6 +193,19 @@ build/lamassu: tools/lamassu.c $(FRONTEND_LIB) $(RUNTIME_LIB)
 	@mkdir -p build
 	$(CC) $(WARNINGS) $(CFLAGS) $(INC) $(REGEX_FLAGS) tools/lamassu.c \
 	  $(FRONTEND_LIB) $(RUNTIME_LIB) -o $@ $(LIBS)
+build/lamassu_asan: tools/lamassu.c $(FRONTEND_LIB_A) $(RUNTIME_LIB_A)
+	@mkdir -p build
+	$(CC) $(WARNINGS) $(ASAN) $(INC) $(REGEX_FLAGS) tools/lamassu.c \
+	  $(FRONTEND_LIB_A) $(RUNTIME_LIB_A) -o $@ $(LIBS)
+
+# The tool itself, over test/cli/: what the unit tests cannot see is what it does with the files
+# it is given -- which module an import names, and how a run ends. Part of `test` (both builds)
+# and of `test-plain`.
+.PHONY: cli-check cli-check-asan
+cli-check: build/lamassu
+	@echo "-- test/cli (build/lamassu)"; sh test/cli/run.sh build/lamassu
+cli-check-asan: build/lamassu_asan
+	@echo "-- test/cli (build/lamassu_asan)"; sh test/cli/run.sh build/lamassu_asan
 
 # ---- the guard -----------------------------------------------------------
 #

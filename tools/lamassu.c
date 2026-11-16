@@ -4,6 +4,10 @@
  * Host-side tool: file I/O and UTF-8 <-> UTF-16 conversion live here, never
  * in the core. Prints the module's completion value (REPL-style), or a
  * diagnostic with line:col on error.
+ *
+ * A file that imports or exports is a module, named by its path, and what it
+ * imports are files: see the module loader below. Its completion value is not
+ * printed (a module has none to give).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,8 +17,7 @@
 #include "lamassu.h"
 #include "lamassu_compile.h"
 
-static uint8_t *read_file(const char *path, size_t *len_out) {
-    FILE *f = fopen(path, "rb");
+static uint8_t *read_open(FILE *f, size_t *len_out) {
     if (!f)
         return NULL;
     fseek(f, 0, SEEK_END);
@@ -37,6 +40,10 @@ static uint8_t *read_file(const char *path, size_t *len_out) {
     fclose(f);
     *len_out = (size_t)sz;
     return buf;
+}
+
+static uint8_t *read_file(const char *path, size_t *len_out) {
+    return read_open(fopen(path, "rb"), len_out);
 }
 
 /*
@@ -137,12 +144,233 @@ static void print_utf16(FILE *f, const uint16_t *units, size_t len) {
     }
 }
 
-/* ---- module loader (file-based, relative to the root file's dir) ---- */
+/* ---- module loader: a module is a file, and its specifier that file's path ---- */
 
-static char g_root_dir[1024];
-/* the entry file's pre-read source, served for the '<root>' specifier */
-static const uint16_t *g_root_src;
-static size_t g_root_src_len;
+/*
+ * A module's identity (its canonical specifier) is the full path of its file: the entry's from
+ * the command line and the directory the run starts in, an imported module's from the import
+ * and from the module that asked for it. So a file is one module however it is come to -- the
+ * entry imported back by a module it imports, "./a.js" and "./sub/../a.js" -- and "./x.js" in
+ * sub/m.js is sub/x.js.
+ *
+ *   ./x  ../x   beside the module that imports it; beside the entry, for an import() from an
+ *               entry that is run without the loader (see main)
+ *   /x          as written
+ *   x           beside the entry: there are no packages to look in
+ *
+ * "." and ".." are taken out of the path by name, and links are not followed (d8 does the
+ * same; Node follows them). A file name with no extension is given ".js".
+ */
+#define PATH_CAP 2048
+static uint16_t g_entry[PATH_CAP]; /* the entry's canonical specifier */
+static size_t g_entry_len;
+/* the entry's source, read before the run: what the loader answers for g_entry with */
+static const uint16_t *g_entry_src;
+static size_t g_entry_src_len;
+
+/*
+ * Where a path meets the system: the directory the run starts in, the entry's name as the
+ * command line has it, and opening a file. Each fills OUT (CAP units) and returns the length,
+ * 0 if it cannot. Windows names its files in UTF-16, as specifiers are, and separates with
+ * either slash; a path here has "/" only.
+ */
+#ifdef _WIN32
+#include <windows.h>
+
+static size_t path_slashes(uint16_t *out, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (out[i] == '\\')
+            out[i] = '/';
+    return n;
+}
+
+static size_t cwd_path(uint16_t *out, size_t cap) {
+    wchar_t w[PATH_CAP];
+    DWORD n = GetCurrentDirectoryW(PATH_CAP, w);
+    if (n == 0 || n >= PATH_CAP || n > cap)
+        return 0;
+    for (DWORD i = 0; i < n; i++)
+        out[i] = (uint16_t)w[i];
+    return path_slashes(out, n);
+}
+
+static size_t arg_path(const char *arg, uint16_t *out, size_t cap) {
+    wchar_t w[PATH_CAP];
+    int n = MultiByteToWideChar(CP_ACP, 0, arg, -1, w, PATH_CAP);
+    if (n <= 1 || (size_t)(n - 1) > cap)
+        return 0;
+    for (int i = 0; i < n - 1; i++)
+        out[i] = (uint16_t)w[i];
+    return path_slashes(out, (size_t)(n - 1));
+}
+
+static FILE *open_path(const uint16_t *path, size_t n) {
+    wchar_t w[PATH_CAP + 4];
+    if (n > PATH_CAP)
+        return NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (path[i] == 0)
+            return NULL;
+        w[i] = (wchar_t)path[i];
+    }
+    w[n] = 0;
+    return _wfopen(w, L"rb");
+}
+
+/* The length of the root PATH starts at: "/", "//" (a share), "C:/", "C:"; 0 if it is relative. */
+static size_t path_root(const uint16_t *path, size_t n) {
+    if (n && path[0] == '/')
+        return n > 1 && path[1] == '/' ? 2 : 1;
+    if (n > 1 && path[1] == ':' && ((path[0] | 0x20) >= 'a' && (path[0] | 0x20) <= 'z'))
+        return n > 2 && path[2] == '/' ? 3 : 2;
+    return 0;
+}
+#else
+#include <unistd.h>
+
+static size_t utf8_path(const char *bytes, uint16_t *out, size_t cap) {
+    size_t n;
+    uint16_t *u = utf8_to_utf16((const uint8_t *)bytes, strlen(bytes), &n);
+    if (!u || n > cap)
+        n = 0;
+    if (n)
+        memcpy(out, u, n * sizeof *u);
+    free(u);
+    return n;
+}
+
+static size_t cwd_path(uint16_t *out, size_t cap) {
+    char buf[4 * PATH_CAP];
+    return getcwd(buf, sizeof buf) ? utf8_path(buf, out, cap) : 0;
+}
+
+static size_t arg_path(const char *arg, uint16_t *out, size_t cap) {
+    return utf8_path(arg, out, cap);
+}
+
+/* The path as UTF-8. No file is named with a NUL or with half of a surrogate pair. */
+static FILE *open_path(const uint16_t *path, size_t n) {
+    char out[4 * PATH_CAP + 1];
+    size_t m = 0;
+    if (n > PATH_CAP)
+        return NULL;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t cp = path[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < n && path[i + 1] >= 0xDC00 &&
+            path[i + 1] <= 0xDFFF)
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (path[++i] - 0xDC00);
+        else if (cp == 0 || (cp >= 0xD800 && cp <= 0xDFFF))
+            return NULL;
+        if (cp < 0x80) {
+            out[m++] = (char)cp;
+        } else if (cp < 0x800) {
+            out[m++] = (char)(0xC0 | (cp >> 6));
+            out[m++] = (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out[m++] = (char)(0xE0 | (cp >> 12));
+            out[m++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[m++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            out[m++] = (char)(0xF0 | (cp >> 18));
+            out[m++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            out[m++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[m++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    out[m] = 0;
+    return fopen(out, "rb");
+}
+
+/* The length of the root PATH starts at, "/"; 0 if it is relative. */
+static size_t path_root(const uint16_t *path, size_t n) {
+    return n && path[0] == '/' ? 1 : 0;
+}
+#endif
+
+/* IN without its "." and empty segments, and without each ".." and the segment before it. False
+ * if the result has no room in OUT (PATH_CAP units) or names nothing. */
+static bool path_normalize(const uint16_t *in, size_t n, uint16_t *out, size_t *out_len) {
+    size_t root = path_root(in, n);
+    size_t m = root;
+    size_t fixed = root; /* out[0, fixed): the root or a leading "../..", which no ".." takes away */
+    memcpy(out, in, root * sizeof *in);
+    for (size_t i = root; i < n;) {
+        size_t start = i;
+        while (i < n && in[i] != '/')
+            i++;
+        size_t len = i - start;
+        if (i < n)
+            i++;
+        if (len == 0 || (len == 1 && in[start] == '.'))
+            continue;
+        bool up = len == 2 && in[start] == '.' && in[start + 1] == '.';
+        if (up && m > fixed) {
+            while (m > fixed && out[m - 1] != '/')
+                m--;
+            if (m > fixed)
+                m--;
+            continue;
+        }
+        if (up && root)
+            continue; /* above the root is the root */
+        if (m + len + 1 > PATH_CAP)
+            return false;
+        if (m > root && out[m - 1] != '/')
+            out[m++] = '/';
+        memcpy(out + m, in + start, len * sizeof *in);
+        m += len;
+        if (up)
+            fixed = m;
+    }
+    *out_len = m;
+    return m > root;
+}
+
+static bool file_canonicalize(void *ud, const uint16_t *spec, size_t n, const uint16_t *ref,
+                              size_t ref_len, const uint16_t **out, size_t *out_len) {
+    (void)ud;
+    static uint16_t joined[2 * PATH_CAP], canon[PATH_CAP + 3];
+    if (n > PATH_CAP)
+        return false;
+    size_t j = 0;
+    if (!path_root(spec, n)) {
+        bool relative = n && spec[0] == '.' &&
+                        (n == 1 || spec[1] == '/' || (spec[1] == '.' && (n == 2 || spec[2] == '/')));
+        const uint16_t *from = relative && ref_len ? ref : g_entry;
+        size_t from_len = relative && ref_len ? ref_len : g_entry_len;
+        for (size_t i = 0; i < from_len; i++)
+            if (from[i] == '/')
+                j = i + 1; /* its directory, with the slash */
+        if (j > PATH_CAP)
+            return false;
+        memcpy(joined, from, j * sizeof *from);
+    }
+    memcpy(joined + j, spec, n * sizeof *spec);
+    size_t m;
+    if (!path_normalize(joined, j + n, canon, &m))
+        return false;
+    /* ".js" for a name without an extension, unless it is the entry, which is the file named on
+     * the command line whatever it is called */
+    bool entry = m == g_entry_len && memcmp(canon, g_entry, m * sizeof *canon) == 0;
+    size_t base = m;
+    while (base && canon[base - 1] != '/')
+        base--;
+    size_t dot = m;
+    for (size_t i = base; i < m; i++)
+        if (canon[i] == '.')
+            dot = i;
+    bool has_ext = dot > base && dot + 1 < m;
+    if (!entry && !has_ext) {
+        if (m + 3 > PATH_CAP)
+            return false;
+        canon[m++] = '.';
+        canon[m++] = 'j';
+        canon[m++] = 's';
+    }
+    *out = canon;
+    *out_len = m;
+    return true;
+}
 
 static JsValue cli_fulfilled(JsContext *ctx, JsVm *vm, JsValue v) {
     js_gc_protect(vm, &v);
@@ -167,35 +395,17 @@ static JsValue cli_rejected(JsContext *ctx, JsVm *vm, const char *msg) {
     return p;
 }
 
+/* SPEC is canonical: the path of the file. */
 static JsValue file_loader(void *ud, JsContext *ctx, const uint16_t *spec, size_t spec_len,
                            const uint16_t *ref, size_t ref_len) {
     JsVm *vm = ud;
     (void)ref;
     (void)ref_len;
-    static const uint16_t rootspec[] = {'<', 'r', 'o', 'o', 't', '>'};
-    if (g_root_src && spec_len == 6 && memcmp(spec, rootspec, sizeof rootspec) == 0)
-        return cli_fulfilled(ctx, vm, js_atom(vm, g_root_src, g_root_src_len));
-    /* build path = root_dir/spec, appending .js if no extension */
-    char name[512];
-    size_t n = spec_len < 500 ? spec_len : 500;
-    for (size_t i = 0; i < n; i++)
-        name[i] = (char)(spec[i] < 128 ? spec[i] : '_');
-    name[n] = 0;
-    /* strip a leading ./ */
-    char *rel = name;
-    if (rel[0] == '.' && rel[1] == '/')
-        rel += 2;
-    char path[2048];
-    /* Append ".js" only when the file name has no extension of its own: "./m.mjs" and
-     * "./data.json" are taken as written, "./util" is "./util.js". */
-    const char *base = strrchr(rel, '/');
-    base = base ? base + 1 : rel;
-    const char *dot = strrchr(base, '.');
-    bool has_ext = dot && dot != base && dot[1];
-    snprintf(path, sizeof path, "%s/%s%s", g_root_dir, rel, has_ext ? "" : ".js");
-
+    if (g_entry_src && spec_len == g_entry_len &&
+        memcmp(spec, g_entry, spec_len * sizeof *spec) == 0)
+        return cli_fulfilled(ctx, vm, js_atom(vm, g_entry_src, g_entry_src_len));
     size_t bl;
-    uint8_t *bytes = read_file(path, &bl);
+    uint8_t *bytes = read_open(open_path(spec, spec_len), &bl);
     if (!bytes)
         return cli_rejected(ctx, vm, "module not found");
     size_t slen;
@@ -207,6 +417,27 @@ static JsValue file_loader(void *ud, JsContext *ctx, const uint16_t *spec, size_
     free(src);
     return cli_fulfilled(ctx, vm, v);
 }
+
+/* The entry's canonical specifier: the path on the command line, from the directory the run
+ * starts in. (Where that directory cannot be had, the path as it was given.) */
+static bool set_entry(const char *file) {
+    static uint16_t joined[2 * PATH_CAP + 1];
+    uint16_t arg[PATH_CAP];
+    size_t n = arg_path(file, arg, PATH_CAP);
+    if (!n)
+        return false;
+    size_t j = 0;
+    if (!path_root(arg, n)) {
+        j = cwd_path(joined, PATH_CAP);
+        if (j)
+            joined[j++] = '/';
+    }
+    memcpy(joined + j, arg, n * sizeof *arg);
+    return path_normalize(joined, j + n, g_entry, &g_entry_len);
+}
+
+/* the directory the bytecode loader reads from: the root file's */
+static char g_root_dir[1024];
 
 static void set_root_dir(const char *file) {
     snprintf(g_root_dir, sizeof g_root_dir, "%s", file);
@@ -671,8 +902,11 @@ int main(int argc, char **argv) {
 
     static const uint16_t print_name[] = {'p', 'r', 'i', 'n', 't'};
     js_register_native(ctx, print_name, 5, native_print, NULL);
-    set_root_dir(argv[1]);
-    js_set_module_loader(ctx, file_loader, NULL, vm);
+    if (!set_entry(argv[1])) {
+        fprintf(stderr, "lamassu: cannot read %s\n", argv[1]);
+        return 2;
+    }
+    js_set_module_loader(ctx, file_loader, file_canonicalize, vm);
     js_enable_source_modules(ctx);
 
     int status = 0;
@@ -683,13 +917,21 @@ int main(int argc, char **argv) {
                      strcmp(err_msg, JS_ERR_NEEDS_MODULE_LOADER) == 0;
 
     if (is_module) {
-        /* the file uses import/export: run it through the module pipeline
-         * (the loader serves this pre-read source for '<root>') */
-        g_root_src = src;
-        g_root_src_len = len;
-        static const uint16_t root_spec[] = {'<', 'r', 'o', 'o', 't', '>'};
+        /* The file uses import/export: it is run through the module pipeline, as the module its
+         * path names, so an import that comes back to it finds it there. The loader answers
+         * with the source read above. The specifier goes through the canonicalizer as any does:
+         * "./" and the file's name, beside the entry, is the entry. */
+        g_entry_src = src;
+        g_entry_src_len = len;
+        static uint16_t root_spec[PATH_CAP + 2];
+        size_t base = g_entry_len;
+        while (base && g_entry[base - 1] != '/')
+            base--;
+        root_spec[0] = '.';
+        root_spec[1] = '/';
+        memcpy(root_spec + 2, g_entry + base, (g_entry_len - base) * sizeof *g_entry);
         arm_fuel(ctx);
-        JsValue p = js_eval_module(ctx, root_spec, 6);
+        JsValue p = js_eval_module(ctx, root_spec, 2 + g_entry_len - base);
         js_gc_protect(vm, &p);
         if (js_promise_state(p) == 2) {
             JsValue str = js_to_string(ctx, js_promise_result(p));
@@ -702,7 +944,7 @@ int main(int argc, char **argv) {
             status = 1;
         }
         js_gc_unprotect(vm, &p);
-        g_root_src = NULL;
+        g_entry_src = NULL;
     } else if (!js_is_function(fn)) {
         uint32_t line, col;
         js_source_line_col(src, len, err_pos, &line, &col);
