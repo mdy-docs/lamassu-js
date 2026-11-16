@@ -23,6 +23,14 @@ typedef struct JsParser {
     int fn_nesting;  /* 0 = module top level */
     bool new_target_ok; /* inside a function that is not an arrow (an arrow inherits it) */
     int loop_depth, switch_depth;
+    /* The labels in scope in this function (label_base and up; an enclosing function's are below
+     * it and out of reach). The statement about to be parsed carries the top pending_labels of
+     * them, the top pending_own of those by a chain of labels alone: `a: b: for` gives the loop
+     * both as its own, `a: if (x) for` hands `a` down through the `if` and the loop does not own
+     * it. V8 keeps the same two sets (labels, own_labels) and words its errors from them. */
+    struct JsLabel *labels;
+    uint32_t label_count, label_cap, label_base;
+    uint32_t pending_labels, pending_own;
     /* pending {a = 1} cover-initializers awaiting pattern conversion */
     int cover_init_open;
     uint32_t cover_init_pos;
@@ -31,6 +39,17 @@ typedef struct JsParser {
     int pattern_depth; /* expr_to_pattern nesting: V8 words a bad target inside a pattern apart */
     uint32_t prev_end; /* end of the token before the current one: where a function's text ends */
 } JsParser;
+
+/* What a label names, for `continue`: nothing a `continue` can see (V8: "Undefined label"), a
+ * statement that is not a loop ("does not denote an iteration statement"), or a loop. `break`
+ * may name any of them. */
+enum { JS_LABEL_PLAIN, JS_LABEL_TARGET, JS_LABEL_LOOP };
+
+typedef struct JsLabel {
+    const uint16_t *units;
+    uint32_t len;
+    uint8_t kind;
+} JsLabel;
 
 typedef struct JsNodeVec {
     JsAstNode **items;
@@ -756,10 +775,15 @@ static JsAstNode *collapse_cover(JsParser *p, JsAstNode *cover) {
 typedef struct {
     bool in_function, fn_async, new_target_ok;
     int loop_depth, switch_depth;
+    uint32_t label_base;
 } JsSavedCtx;
 
 static JsSavedCtx ctx_enter_function(JsParser *p, bool is_async, bool arrow) {
-    JsSavedCtx s = {p->in_function, p->fn_async, p->new_target_ok, p->loop_depth, p->switch_depth};
+    JsSavedCtx s = {p->in_function, p->fn_async, p->new_target_ok, p->loop_depth, p->switch_depth,
+                    p->label_base};
+    p->label_base = p->label_count; /* a label does not reach into a function */
+    p->pending_labels = 0;
+    p->pending_own = 0;
     p->in_function = true;
     p->new_target_ok = p->new_target_ok || !arrow;
     p->fn_async = is_async;
@@ -776,6 +800,7 @@ static void ctx_leave_function(JsParser *p, JsSavedCtx s) {
     p->fn_nesting--;
     p->loop_depth = s.loop_depth;
     p->switch_depth = s.switch_depth;
+    p->label_base = s.label_base;
 }
 
 static JsAstNode *parse_params(JsParser *p, JsNodeVec *out) {
@@ -1798,6 +1823,43 @@ static JsAstNode *parse_expression(JsParser *p) {
 
 /* ---- statements ---- */
 
+static JsLabel *label_find(JsParser *p, const uint16_t *units, uint32_t len) {
+    for (uint32_t i = p->label_count; i-- > p->label_base;) {
+        JsLabel *l = &p->labels[i];
+        if (l->len == len && memcmp(l->units, units, (size_t)len * sizeof *units) == 0)
+            return l;
+    }
+    return NULL;
+}
+
+static bool label_push(JsParser *p, const uint16_t *units, uint32_t len, uint32_t pos) {
+    if (label_find(p, units, len)) {
+        perr(p, pos, js_compile_error_fmt(p->arena->vm, "Label '%U' has already been declared", units, len));
+        return false;
+    }
+    if (p->label_count == p->label_cap) {
+        uint32_t ncap = p->label_cap ? p->label_cap * 2 : 8;
+        JsLabel *nl = js_arena_alloc(p->arena, (size_t)ncap * sizeof *nl);
+        if (!nl) {
+            perr(p, pos, "out of memory");
+            return false;
+        }
+        if (p->label_count)
+            memcpy(nl, p->labels, p->label_count * sizeof *nl);
+        p->labels = nl;
+        p->label_cap = ncap;
+    }
+    p->labels[p->label_count++] = (JsLabel){units, len, JS_LABEL_PLAIN};
+    return true;
+}
+
+/* The statement being parsed carries the top `n` labels: say what they name. A loop is a
+ * `continue` target only for the top `own` of them. */
+static void labels_mark(JsParser *p, uint32_t n, uint32_t own, uint8_t kind) {
+    for (uint32_t i = 0; i < n; i++)
+        p->labels[p->label_count - 1 - i].kind = (kind == JS_LABEL_LOOP && i >= own) ? JS_LABEL_TARGET : kind;
+}
+
 static JsAstNode *parse_block(JsParser *p) {
     uint32_t pos = TOK(p).pos;
     if (!enter(p))
@@ -2093,9 +2155,14 @@ static JsAstNode *parse_statement(JsParser *p) {
     JsAstNode *result = NULL;
     JsToken *t = &TOK(p);
     uint32_t pos = t->pos;
+    /* the labels this statement carries (see JsParser.labels); a statement inside it has none */
+    uint32_t nlabels = p->pending_labels, own = p->pending_own;
+    p->pending_labels = 0;
+    p->pending_own = 0;
 
     switch (t->kind) {
     case JS_T_LBRACE:
+        labels_mark(p, nlabels, own, JS_LABEL_TARGET);
         result = parse_block(p);
         break;
     case JS_T_SEMI:
@@ -2115,11 +2182,15 @@ static JsAstNode *parse_statement(JsParser *p) {
         JsAstNode *test = parse_expression(p);
         if (!test || !expect(p, JS_T_RPAREN, "expected ')'"))
             break;
+        /* an `if` hands its labels to each branch, which does not own them */
+        p->pending_labels = nlabels;
         JsAstNode *cons = parse_statement(p);
         if (!cons)
             break;
         JsAstNode *alt = NULL;
         if (accept(p, JS_T_ELSE)) {
+            labels_mark(p, nlabels, 0, JS_LABEL_PLAIN);
+            p->pending_labels = nlabels;
             alt = parse_statement(p);
             if (!alt)
                 break;
@@ -2133,6 +2204,7 @@ static JsAstNode *parse_statement(JsParser *p) {
         break;
     }
     case JS_T_WHILE: {
+        labels_mark(p, nlabels, own, JS_LABEL_LOOP);
         if (!advance(p) || !expect(p, JS_T_LPAREN, "expected '(' after 'while'"))
             break;
         JsAstNode *test = parse_expression(p);
@@ -2149,6 +2221,7 @@ static JsAstNode *parse_statement(JsParser *p) {
         break;
     }
     case JS_T_DO: {
+        labels_mark(p, nlabels, own, JS_LABEL_LOOP);
         if (!advance(p))
             break;
         JsAstNode *body = parse_loop_body(p);
@@ -2171,12 +2244,15 @@ static JsAstNode *parse_statement(JsParser *p) {
         break;
     }
     case JS_T_FOR:
+        labels_mark(p, nlabels, own, JS_LABEL_LOOP);
         result = parse_for(p);
         break;
     case JS_T_SWITCH:
+        labels_mark(p, nlabels, own, JS_LABEL_TARGET);
         result = parse_switch(p);
         break;
     case JS_T_TRY:
+        labels_mark(p, nlabels, own, JS_LABEL_TARGET);
         result = parse_try(p);
         break;
     case JS_T_BREAK:
@@ -2190,6 +2266,17 @@ static JsAstNode *parse_statement(JsParser *p) {
         if (TOK(p).kind == JS_T_IDENT && !TOK(p).newline_before) {
             result->units = TOK(p).u.str.units;
             result->len = TOK(p).u.str.len;
+            const JsLabel *l = label_find(p, result->units, result->len);
+            const char *bad = NULL;
+            if (!l || (!is_break && l->kind == JS_LABEL_PLAIN))
+                bad = "Undefined label '%U'";
+            else if (!is_break && l->kind != JS_LABEL_LOOP)
+                bad = "Illegal continue statement: '%U' does not denote an iteration statement";
+            if (bad) {
+                result = perr(p, TOK(p).pos,
+                              js_compile_error_fmt(p->arena->vm, bad, result->units, result->len));
+                break;
+            }
             if (!advance(p)) {
                 result = NULL;
                 break;
@@ -2290,9 +2377,14 @@ static JsAstNode *parse_statement(JsParser *p) {
         }
         if (peek(p).kind == JS_T_COLON) {
             JsAstNode *label = parse_ident(p, "expected label");
-            if (!label || !advance(p)) /* skip ':' */
+            if (!label || !label_push(p, label->units, label->len, pos))
                 break;
+            if (!advance(p)) /* skip ':' */
+                break;
+            p->pending_labels = nlabels + 1;
+            p->pending_own = own + 1;
             JsAstNode *body = parse_statement(p);
+            p->label_count--;
             if (!body)
                 break;
             result = new_node(p, JS_AST_LABELED, pos);

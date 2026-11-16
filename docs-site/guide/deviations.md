@@ -181,7 +181,7 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   `{(intermediate value)}` for an object literal); an object named in a message is named
   by its constructor, as V8 names it (`#<Object>`, `#<Set>`, `#<Foo>`; `[object Object]` with no
   prototype), and so are an array, a module namespace, an iterator (`[object Map Iterator]`) and
-  what inherits from `Iterator.prototype` (`[object Object]`); and a duplicate label is not an error.
+  what inherits from `Iterator.prototype` (`[object Object]`).
 - **Out-of-memory errors may still be bare strings**: when the engine
   cannot allocate an Error object, it throws the message text instead so
   the failure is never lost.

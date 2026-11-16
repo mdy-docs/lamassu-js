@@ -263,6 +263,15 @@ static void test_control_flow(void) {
     expect_result("outer: { let done = false; for (let i = 0; i < 3; i++) {"
                   " for (let j = 0; j < 3; j++) { if (j == 1) continue; } } } 'ok';",
                   "ok");
+    /* every label of a chain names the same loop */
+    expect_result("let s = ''; a: b: c: for (let i = 0; i < 3; i++) { if (i === 1) continue b; s += i; } s;", "02");
+    expect_result("let s = ''; a: b: for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) {"
+                  " if (j === 1) continue a; if (i === 2) break b; s += i + '' + j + ' '; } } s;", "00 10 ");
+    expect_result("let s = ''; a: b: do { s += 'x'; continue a; } while (s.length < 3); s;", "xxx");
+    expect_result("let s = ''; a: b: for (const v of [1, 2, 3]) { if (v === 2) continue a; s += v; } s;", "13");
+    expect_result("let s = ''; a: b: { s += 1; break a; } s += 2; s;", "12");
+    expect_result("let s = ''; a: if (true) b: for (let i = 0; i < 3; i++) { if (i) break a; s += i; } s;", "0");
+    expect_result("let s = ''; a: try { break a; } finally { s += 'f'; } s;", "f");
     expect_result("let r = 0; outer: for (let i = 0; i < 5; i++) {"
                   " for (let j = 0; j < 5; j++) { if (i * j > 3) break outer; r++; } } r;",
                   "9");

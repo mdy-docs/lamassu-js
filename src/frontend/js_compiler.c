@@ -43,8 +43,8 @@ typedef struct JsPatchList {
 } JsPatchList;
 
 typedef struct JsLoopInfo {
-    const uint16_t *label;
-    uint32_t label_len;
+    const JsAstNode *labels;   /* the outermost of the statement's nlabels JS_AST_LABELED nodes */
+    uint32_t nlabels;          /* (`a: b: for` is one loop with two labels) */
     bool is_loop;
     bool is_label_only;
     int entry_depth;
@@ -802,8 +802,7 @@ static bool prescan_declarations(JsCompiler *cx, JsAstNode *const *stmts,
 
 /* ---- loops / finally exit ---- */
 
-static JsLoopInfo *loop_push(JsCompiler *cx, bool is_loop, const uint16_t *label,
-                             uint32_t label_len) {
+static JsLoopInfo *loop_push(JsCompiler *cx, bool is_loop, const JsAstNode *labels, uint32_t nlabels) {
     JsFuncState *fs = cx->cur;
     if (fs->loop_count >= JS_MAX_LOOPS) {
         cerr(cx, 0, "loops nested too deeply");
@@ -812,8 +811,8 @@ static JsLoopInfo *loop_push(JsCompiler *cx, bool is_loop, const uint16_t *label
     JsLoopInfo *l = &fs->loops[fs->loop_count++];
     memset(l, 0, sizeof *l);
     l->is_loop = is_loop;
-    l->label = label;
-    l->label_len = label_len;
+    l->labels = labels;
+    l->nlabels = nlabels;
     l->entry_depth = fs->depth;
     l->continue_depth = fs->depth;
     l->continue_target = 0xFFFFFFFF;
@@ -844,6 +843,15 @@ static void loop_pop_patch_breaks(JsCompiler *cx, JsLoopInfo *l) {
     cx->cur->loop_count--;
 }
 
+static bool loop_has_label(const JsLoopInfo *l, const uint16_t *label, uint32_t len) {
+    const JsAstNode *n = l->labels;
+    for (uint32_t i = 0; i < l->nlabels; i++, n = n->a) {
+        if (units_equal(n->units, n->len, label, len))
+            return true;
+    }
+    return false;
+}
+
 static JsLoopInfo *find_loop(JsCompiler *cx, const uint16_t *label, uint32_t len,
                              bool need_loop) {
     JsFuncState *fs = cx->cur;
@@ -856,7 +864,7 @@ static JsLoopInfo *find_loop(JsCompiler *cx, const uint16_t *label, uint32_t len
                 continue;
             return l;
         }
-        if (l->label && units_equal(l->label, l->label_len, label, len))
+        if (loop_has_label(l, label, len))
             return l;
     }
     return NULL;
@@ -2674,8 +2682,7 @@ static bool compile_loop_body(JsCompiler *cx, const JsAstNode *body) {
     return compile_stmt(cx, body);
 }
 
-static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const uint16_t *label,
-                           uint32_t label_len) {
+static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const JsAstNode *labels, uint32_t nlabels) {
     JsFuncState *fs = cx->cur;
     JsScopeMark m = scope_enter(cx);
     note_pos(cx, n->pos);
@@ -2692,7 +2699,7 @@ static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const uint16_t *l
         !emit_op(cx, JS_OP_SWAP, 0))
         return false;
 
-    JsLoopInfo *loop = loop_push(cx, true, label, label_len);
+    JsLoopInfo *loop = loop_push(cx, true, labels, nlabels);
     if (!loop)
         return false;
     loop->entry_depth = fs->depth - 2;
@@ -2750,8 +2757,7 @@ static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const uint16_t *l
     return scope_leave(cx, m);
 }
 
-static bool compile_for(JsCompiler *cx, const JsAstNode *n, const uint16_t *label,
-                        uint32_t label_len) {
+static bool compile_for(JsCompiler *cx, const JsAstNode *n, const JsAstNode *labels, uint32_t nlabels) {
     JsScopeMark m = scope_enter(cx);
     note_pos(cx, n->pos);
     bool has_let = n->a && n->a->kind == JS_AST_LET_DECL;
@@ -2769,7 +2775,7 @@ static bool compile_for(JsCompiler *cx, const JsAstNode *n, const uint16_t *labe
                 return false;
         }
     }
-    JsLoopInfo *loop = loop_push(cx, true, label, label_len);
+    JsLoopInfo *loop = loop_push(cx, true, labels, nlabels);
     if (!loop)
         return false;
     if (has_let)
@@ -2804,8 +2810,8 @@ static bool compile_for(JsCompiler *cx, const JsAstNode *n, const uint16_t *labe
 }
 
 static bool compile_while(JsCompiler *cx, const JsAstNode *n, bool is_do,
-                          const uint16_t *label, uint32_t label_len) {
-    JsLoopInfo *loop = loop_push(cx, true, label, label_len);
+                          const JsAstNode *labels, uint32_t nlabels) {
+    JsLoopInfo *loop = loop_push(cx, true, labels, nlabels);
     if (!loop)
         return false;
     note_pos(cx, n->pos);
@@ -2981,18 +2987,24 @@ static bool compile_try(JsCompiler *cx, const JsAstNode *n) {
 }
 
 static bool compile_stmt_labeled(JsCompiler *cx, const JsAstNode *n) {
+    /* every label of a chain names the one statement under it: `a: b: for (...) continue a;` */
     const JsAstNode *body = n->a;
+    uint32_t nlabels = 1;
+    while (body->kind == JS_AST_LABELED) {
+        body = body->a;
+        nlabels++;
+    }
     switch ((JsAstKind)body->kind) {
     case JS_AST_WHILE:
-        return compile_while(cx, body, false, n->units, n->len);
+        return compile_while(cx, body, false, n, nlabels);
     case JS_AST_DO_WHILE:
-        return compile_while(cx, body, true, n->units, n->len);
+        return compile_while(cx, body, true, n, nlabels);
     case JS_AST_FOR:
-        return compile_for(cx, body, n->units, n->len);
+        return compile_for(cx, body, n, nlabels);
     case JS_AST_FOR_OF:
-        return compile_for_of(cx, body, n->units, n->len);
+        return compile_for_of(cx, body, n, nlabels);
     default: {
-        JsLoopInfo *l = loop_push(cx, false, n->units, n->len);
+        JsLoopInfo *l = loop_push(cx, false, n, nlabels);
         if (!l)
             return false;
         l->is_label_only = true;

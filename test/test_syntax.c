@@ -825,6 +825,39 @@ static void test_errors(void) {
     check_err("export * from 'm' with { type };", "Unexpected token '}'", -1);
     check_err("x = '\\101';", "Octal escape sequences are not allowed in strict mode.", -1);
     check_err("x = debugger;", "Unexpected token 'debugger'", -1);
+    /* labels, as V8 reports them: at the label, by what the label names */
+    check_err("a: a: ;", "Label 'a' has already been declared", 3);
+    check_err("a: { a: ; }", "Label 'a' has already been declared", 5);
+    check_err("a: b: a: ;", "Label 'a' has already been declared", 6);
+    check_err("a: for (;;) { a: for (;;) break a; }", "Label 'a' has already been declared", 14);
+    check_err("a: if (1) a: ;", "Label 'a' has already been declared", 10);
+    check_err("a: do { a: ; } while (0)", "Label 'a' has already been declared", 8);
+    check_parses("a: ; a: ;");                      /* one after the other is not nesting */
+    check_parses("a: { (() => { a: ; })(); }");     /* nor is a function's own label */
+    check_parses("a: b: for (;;) { continue a; }"); /* every label of a chain is the loop's */
+    check_parses("a: b: c: while (1) { continue b; }");
+    check_parses("a: if (1) b: for (;;) { continue b; }");
+    check_parses("a: break a;");
+    check_parses("a: b: break a;");
+    check_parses("a: if (1) break a;");
+    check_err("a: { break  bb; }", "Undefined label 'bb'", 12);
+    check_err("break a;", "Undefined label 'a'", 6);
+    check_err("continue a;", "Undefined label 'a'", 9);
+    check_err("a: for (;;) { (() => { break a; })(); }", "Undefined label 'a'", -1);
+    check_err("a: for (;;) { const f = () => { continue a; }; }", "Undefined label 'a'", -1);
+    check_err("a: for (;;) { b: ; continue b; }", "Undefined label 'b'", -1);
+    check_err("x: { continue   x; }", "Illegal continue statement: 'x' does not denote an iteration statement", 16);
+    check_err("a: switch (1) { case 1: continue a; }", "'a' does not denote an iteration statement", -1);
+    check_err("a: try { continue a; } catch {}", "'a' does not denote an iteration statement", -1);
+    check_err("a: if (1) { continue a; }", "'a' does not denote an iteration statement", -1);
+    /* a loop under an `if` does not own the `if`'s label */
+    check_err("a: if (1) for (;;) continue a;", "'a' does not denote an iteration statement", -1);
+    /* V8 gives a label on a statement that cannot hold one no target at all */
+    check_err("a: continue a;", "Undefined label 'a'", -1);
+    check_err("a: if (1) continue a;", "Undefined label 'a'", -1);
+    check_err("a: if (1) ; else continue a;", "Undefined label 'a'", -1);
+    check_err("a: if (1) {} else continue a;", "Undefined label 'a'", -1);
+    check_err("a: for (;;) b: if (1) continue b;", "Undefined label 'b'", -1);
 }
 
 static void test_depth_limit(void) {
