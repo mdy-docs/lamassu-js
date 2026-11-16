@@ -5,6 +5,18 @@
 
 #include <stdlib.h>
 
+/* 1 in a build with the address sanitizer (the test builds), see js_context_new */
+#if defined(__SANITIZE_ADDRESS__)
+#define JS_POISON_NEW_CONTEXT 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define JS_POISON_NEW_CONTEXT 1
+#endif
+#endif
+#ifndef JS_POISON_NEW_CONTEXT
+#define JS_POISON_NEW_CONTEXT 0
+#endif
+
 static void *js_default_realloc(void *ud, void *ptr, size_t old_size, size_t new_size) {
     (void)ud;
     (void)old_size;
@@ -226,6 +238,13 @@ JsContext *js_context_new(JsVm *vm) {
     JsContext *ctx = js_realloc_raw(vm, NULL, 0, sizeof *ctx);
     if (!ctx)
         return NULL;
+#if JS_POISON_NEW_CONTEXT
+    /* Each field is set by its own line below, and the allocator hands back what it likes: zeroes
+     * on one platform, the last occupant's bytes on another. Under the address sanitizer the
+     * block starts as all ones, so a field without its line fails the tests everywhere, not on
+     * the one platform whose heap happened to hold the wrong thing. */
+    memset(ctx, 0xff, sizeof *ctx);
+#endif
     ctx->vm = vm;
     /* The host's, and nobody sets it but the host. */
     ctx->host_ud = NULL;
@@ -257,6 +276,9 @@ JsContext *js_context_new(JsVm *vm) {
      * here means a new field is a deliberate line, not a silent garbage read
      * — this one is dereferenced through, so it must be set before use. */
     ctx->compile_source = NULL;
+    ctx->entry_spec = NULL;
+    ctx->async_evaluations = 0;
+    ctx->eval_passes = 0;
     ctx->loader = NULL;
     ctx->canon = NULL;
     ctx->loader_ud = NULL;
