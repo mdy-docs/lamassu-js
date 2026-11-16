@@ -276,8 +276,10 @@ void js_resume_fiber(JsContext *ctx, JsFiber *fiber, JsValue value, bool is_thro
 
 /* A module body in two steps (js_interp.c), so a graph's functions all exist before any body
  * runs. js_module_instantiate_body runs the body up to JS_OP_MODULE_READY and returns its parked
- * fiber, or NULL with *error set; js_module_finish_body runs the rest and returns the completion
- * promise as js_run_module does (undefined on OOM). */
+ * fiber, or NULL with *error set; js_module_finish_body runs the rest, to its end or to a
+ * top-level await that waits, and returns the completion promise (undefined on OOM). Unlike
+ * js_run_module it runs no jobs: the modules of a graph run one after the other, as in V8, and
+ * the microtasks they queued after them. */
 JsFiber *js_module_instantiate_body(JsContext *ctx, JsFunctionCell *body, JsValue *error);
 JsValue js_module_finish_body(JsContext *ctx, JsFiber *fiber);
 

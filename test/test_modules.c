@@ -1217,6 +1217,578 @@ static void test_error_stack(void) {
               "    at main:1:159|Error: late\n    at a1 (main:1:279)\n    at async main:1:313");
 }
 
+/* ---- the order of evaluation: V8's, each case printed by Node 26 for the same files ---- */
+
+static char g_log[1024];
+
+/* p(x): x on the log */
+static bool native_p(JsContext *ctx, JsValue this_val, const JsValue *args, int argc,
+                     JsValue *result) {
+    (void)this_val;
+    char *s = value_to_cstr(ctx, argc > 0 ? args[0] : js_undefined());
+    size_t n = strlen(g_log);
+    snprintf(g_log + n, sizeof g_log - n, "%s%s", n ? "|" : "", s);
+    free(s);
+    *result = js_undefined();
+    return true;
+}
+
+static void log_open(TestVm *tv) {
+    static const uint16_t n_p[] = {'p'};
+    js_register_native(tv->ctx, n_p, 1, native_p, NULL);
+    g_log[0] = 0;
+}
+
+static void check_log(const char *label, const char *expected) {
+    checks_run++;
+    if (strcmp(g_log, expected) != 0) {
+        checks_failed++;
+        fprintf(stderr, "FAIL %s\n  expected: %s\n  actual:   %s\n", label, expected, g_log);
+    }
+}
+
+static JsValue eval_named(TestVm *tv, const char *spec) {
+    size_t n;
+    uint16_t *u = to_u16(spec, &n);
+    JsValue p = js_eval_module(tv->ctx, u, n);
+    free(u);
+    return p;
+}
+
+/* a promise the modules wait for and main opens, and the turns everything else needs to come
+ * to rest */
+#define GATES \
+    "const settle = async () => { for (let i = 0; i < 60; i++) await 0; };" \
+    "globalThis.gate = new Promise((r) => { globalThis.open = r; });"
+
+typedef struct {
+    const char *name;
+    struct {
+        const char *name, *src;
+    } files[8];
+    const char *expected;
+} EvalCase;
+
+static const EvalCase k_eval_cases[] = {
+    /* no job runs between two module bodies */
+    {"micro",
+     {
+         {"a", "Promise.resolve().then(() => p('a micro')); p('a');"},
+         {"b", "p('b');"},
+         {"main", "import './a'; import './b'; p('main');"},
+     },
+     "a|b|main|a micro"},
+    /* a module with a top-level await beside one without */
+    {"sib",
+     {
+         {"t", "p('t1'); await 0; p('t2'); await 0; p('t3');"},
+         {"s", "Promise.resolve().then(() => p('s micro')); p('s');"},
+         {"main", "import './t'; import './s'; p('main');"},
+     },
+     "t1|s|t2|s micro|t3|main"},
+    /* modules waiting for one top-level await, and one that does not wait */
+    {"sib2",
+     {
+         {"t", "p('t1'); await 0; p('t2');"},
+         {"x", "import './t'; p('x');"},
+         {"y", "import './t'; p('y1'); await 0; p('y2');"},
+         {"z", "p('z');"},
+         {"w", "import './t'; p('w');"},
+         {"main", "import './x'; import './y'; import './z'; import './w'; p('main');"},
+     },
+     "t1|z|t2|x|y1|w|y2|main"},
+    /* an async module that reaches no await still takes a turn */
+    {"noawait",
+     {
+         {"t", "p('t1'); if (!p) await 0; p('t2');"},
+         {"s", "Promise.resolve().then(() => p('s micro')); p('s');"},
+         {"m2", "import './t'; import './s'; p('m2');"},
+         {"main", "import './m2'; p('main');"},
+     },
+     "t1|t2|s|m2|main|s micro"},
+    /* waiting modules run in the order their evaluation was started */
+    {"order",
+     {
+         {"t", "p('t1'); await 0; p('t2');"},
+         {"p1", "import './t'; p('p1a'); await 0; p('p1b');"},
+         {"p2", "import './t'; p('p2');"},
+         {"p3", "import './p1'; import './p2'; p('p3');"},
+         {"q", "p('q');"},
+         {"main", "import './p3'; import './p2'; import './q'; import './p1'; p('main');"},
+     },
+     "t1|q|t2|p1a|p2|p1b|p3|main"},
+    /* top-level awaits at two depths of one graph */
+    {"deep",
+     {
+         {"a", "p('a1'); await 0; p('a2');"},
+         {"b", "import './a'; p('b');"},
+         {"c", "import './b'; p('c1'); await 0; p('c2');"},
+         {"d", "import './c'; import './a'; p('d');"},
+         {"e", "p('e');"},
+         {"main", "import './d'; import './e'; import './b'; p('main');"},
+     },
+     "a1|e|a2|b|c1|c2|d|main"},
+    /* five modules waiting for one, some with awaits of their own */
+    {"fan2",
+     {
+         {"t", "p('t1'); await globalThis.gate; p('t2');"},
+         {"a", "import './t'; p('a1'); await 0; p('a2');"},
+         {"b", "import './t'; p('b');"},
+         {"c", "import './a'; import './b'; p('c1'); await 0; p('c2');"},
+         {"d", "import './t'; Promise.resolve().then(() => p('d micro')); p('d');"},
+         {"main",
+          GATES
+          "const all = []; for (const n of ['d', 'c', 'b', 'a']) { all.push(import('./' + n + "
+          "'')); await settle(); } p('open'); open(); await Promise.all(all); p('main');"},
+     },
+     "t1|open|t2|d|a1|b|d micro|a2|c1|c2|main"},
+    /* a second importer of a module parked on a top-level await waits for it */
+    {"tla2",
+     {
+         {"x", "export const one = 1;"},
+         {"t", "const ns = await import('./x'); await globalThis.gate; export const v = ns.one;"},
+         {"u", "import { v } from './t'; export const got = v;"},
+         {"main",
+          GATES
+          "const a = import('./t'); await settle(); const b = import('./u').then(ns => p('u: ' + "
+          "ns.got), e => p('u failed: ' + e.message)); await settle(); p('open'); open(); await "
+          "a; await b; p('main');"},
+     },
+     "open|u: 1|main"},
+    /* two imports of one waiting module: one evaluation, one namespace */
+    {"twice",
+     {
+         {"t", "p('t1'); await globalThis.gate; export const v = 3; p('t2');"},
+         {"main",
+          GATES
+          "const a = import('./t').then(ns => (p('a ' + ns.v), ns)); await settle(); const b = "
+          "import('./t').then(ns => (p('b ' + ns.v), ns)); await settle(); p('open'); open(); "
+          "p((await a) === (await b));"},
+     },
+     "t1|open|t2|a 3|b 3|true"},
+    /* a later graph over a waiting module: its other modules run at once, the rest when it is
+     * done */
+    {"wait2",
+     {
+         {"t", "p('t1'); await globalThis.gate; export const v = 9; p('t2');"},
+         {"free", "p('free');"},
+         {"u",
+          "import './free'; import { v } from './t'; Promise.resolve().then(() => p('u micro')); "
+          "p('u ' + v);"},
+         {"w", "import { v } from './t'; p('w1 ' + v); await 0; p('w2');"},
+         {"top", "import './u'; import './w'; p('top');"},
+         {"main",
+          GATES
+          "const a = import('./t'); await settle(); const b = import('./top'); await settle(); "
+          "p('open'); open(); await b; p((await a).v); p('main');"},
+     },
+     "t1|free|open|t2|u 9|w1 9|u micro|w2|top|9|main"},
+    /* a second importer of a cycle whose root is waiting waits for the root */
+    {"cyc",
+     {
+         {"t", "import './s'; p('t1'); await globalThis.gate; export const v = 1; p('t2');"},
+         {"s", "import { v } from './t'; export const get = () => v; p('s');"},
+         {"u", "import { get } from './s'; p('u ' + get());"},
+         {"main",
+          GATES
+          "const a = import('./t'); await settle(); const b = import('./u').then(() => p('u "
+          "ok'), e => p('u failed: ' + e.message)); await settle(); p('open'); open(); await a; "
+          "await b; p('main');"},
+     },
+     "s|t1|open|t2|u 1|u ok|main"},
+    /* a cycle with a top-level await, imported at three of its members */
+    {"cyctla",
+     {
+         {"a", "import './b'; p('a');"},
+         {"b", "import './a'; p('b1'); await globalThis.gate; p('b2');"},
+         {"c", "import './a'; p('c');"},
+         {"main",
+          GATES
+          "const x = import('./a').then(() => p('a done')); await settle(); const y = "
+          "import('./c').then(() => p('c done')); await settle(); const z = "
+          "import('./b').then(() => p('b done')); await settle(); p('open'); open(); await x; "
+          "await y; await z; p('main');"},
+     },
+     "b1|open|b2|a|c|a done|b done|c done|main"},
+    /* a cycle imported from outside, then at a member, while its root waits */
+    {"cycwait",
+     {
+         {"t", "import './s'; p('t1'); await globalThis.gate; export const v = 7; p('t2');"},
+         {"s", "import { v } from './t'; export const get = () => v; p('s');"},
+         {"m2", "import './t'; p('m2');"},
+         {"main",
+          GATES
+          "const a = import('./m2').then(() => p('m2 done')); await settle(); const b = "
+          "import('./s').then(ns => p('s done ' + ns.get()), e => p('s failed ' + e.message)); "
+          "await settle(); p('open'); open(); await a; await b;"},
+     },
+     "s|t1|open|t2|m2|s done 7|m2 done"},
+    /* the same, the member first */
+    {"cycwait2",
+     {
+         {"t", "import './s'; p('t1'); await globalThis.gate; export const v = 7; p('t2');"},
+         {"s", "import { v } from './t'; export const get = () => v; p('s');"},
+         {"m2", "import './t'; p('m2');"},
+         {"main",
+          GATES
+          "const b = import('./s').then(ns => p('s done ' + ns.get()), e => p('s failed ' + "
+          "e.message)); await settle(); const a = import('./m2').then(() => p('m2 done')); await "
+          "settle(); const c = import('./t').then(ns => p('t done ' + ns.v)); await settle(); "
+          "p('open'); open(); await a; await b; await c;"},
+     },
+     "t1|open|t2|s|m2|s done 7|t done 7|m2 done"},
+    /* a graph over a module that failed: what is before it runs, and the error is the same
+     * object */
+    {"err1",
+     {
+         {"bad", "p('bad runs'); throw new Error('bad');"},
+         {"first", "p('first runs');"},
+         {"both", "import './first'; import './bad'; p('both runs');"},
+         {"main",
+          "try { await import('./bad'); } catch (e) { p('1: ' + e.message); }\ntry { await "
+          "import('./both'); } catch (e) { p('2: ' + e.message); }\ntry { await import('./both'); "
+          "} catch (e) { p('3: ' + e.message); }\nconst e1 = await import('./both').catch(e => "
+          "e), e2 = await import('./bad').catch(e => e); p(e1 === e2);"},
+     },
+     "bad runs|1: bad|first runs|2: bad|3: bad|true"},
+    /* the failed module deep in the graph: the modules after it do not run, and can run later */
+    {"err2",
+     {
+         {"bad", "p('bad runs'); throw new Error('bad');"},
+         {"first", "p('first runs');"},
+         {"last", "p('last runs');"},
+         {"mid", "import './bad'; p('mid runs');"},
+         {"both", "import './first'; import './mid'; import './last'; p('both runs');"},
+         {"main",
+          "try { await import('./both'); } catch (e) { p('1: ' + e.message); }\ntry { await "
+          "import('./mid'); } catch (e) { p('2: ' + e.message); }\ntry { await import('./last'); "
+          "p('last ok'); } catch (e) { p('3: ' + e.message); }\ntry { await import('./both'); } "
+          "catch (e) { p('4: ' + e.message); }"},
+     },
+     "first runs|bad runs|1: bad|2: bad|last runs|last ok|4: bad"},
+    /* the failed module after a top-level await in the same graph */
+    {"err3",
+     {
+         {"bad", "p('bad runs'); throw new Error('bad');"},
+         {"t", "p('t1'); await 0; p('t2');"},
+         {"first", "import './t'; p('first');"},
+         {"g", "import './first'; import './bad'; p('g runs');"},
+         {"main",
+          "await import('./bad').catch(e => p('1: ' + e.message)); await import('./g').catch(e "
+          "=> p('2: ' + e.message)); await import('./first').then(() => p('first ok')); await "
+          "import('./g').catch(e => p('3: ' + e.message));"},
+     },
+     "bad runs|1: bad|t1|t2|first|2: bad|first ok|3: bad"},
+    /* a module with a top-level await that throws before it */
+    {"throwfirst",
+     {
+         {"t", "p('t1'); if (p) throw new Error('t early'); await 0;"},
+         {"s", "p('s');"},
+         {"m2", "import './t'; import './s'; p('m2');"},
+         {"main",
+          "await import('./m2').catch(e => p('1: ' + e.message)); await import('./s').then(() => "
+          "p('s ok'));"},
+     },
+     "t1|s|1: t early|s ok"},
+    /* a rejection after a top-level await reaches every module waiting above it */
+    {"asyncerr",
+     {
+         {"t", "p('t1'); await globalThis.gate; p('t2'); throw new Error('t failed');"},
+         {"par", "import './t'; p('par');"},
+         {"gp", "import './par'; p('gp');"},
+         {"main",
+          GATES
+          "const a = import('./gp').catch(e => p('a: ' + e.message)); await settle(); const b = "
+          "import('./t').catch(e => p('b: ' + e.message)); await settle(); const c = "
+          "import('./par').catch(e => p('c: ' + e.message)); await settle(); p('open'); open(); "
+          "await a; await b; await c;\nawait import('./par').catch(e => p('again: ' + "
+          "e.message));\nconst x = await import('./gp').catch(e => e), y = await "
+          "import('./t').catch(e => e); p(x === y);"},
+     },
+     "t1|open|t2|b: t failed|c: t failed|a: t failed|again: t failed|true"},
+    /* a body that throws beside a waiting module: the waiting module still completes */
+    {"syncerr",
+     {
+         {"t", "p('t1'); await globalThis.gate; p('t2'); export const v = 5;"},
+         {"bad", "p('bad runs'); throw new Error('bad');"},
+         {"m2", "import './t'; import './bad'; p('m2 runs');"},
+         {"m3", "import { v } from './t'; p('m3 ' + v);"},
+         {"main",
+          GATES
+          "const a = import('./m2').catch(e => p('m2: ' + e.message)); await settle(); const b = "
+          "import('./m3').then(() => p('m3 ok'), e => p('m3: ' + e.message)); await settle(); "
+          "p('open'); open(); await a; await b; await import('./t'); p('t ok'); await "
+          "import('./m2').catch(e => p('m2 again: ' + e.message));"},
+     },
+     "t1|bad runs|m2: bad|open|t2|m3 5|m3 ok|t ok|m2 again: bad"},
+    /* the order a rejection reaches four importers in */
+    {"rejorder",
+     {
+         {"t", "p('t1'); await globalThis.gate; throw new Error('boom');"},
+         {"a", "import './t'; p('a');"},
+         {"b", "import './t'; p('b');"},
+         {"c", "import './a'; p('c');"},
+         {"main",
+          GATES
+          "const w = n => import('./' + n + '').then(() => p(n + ' ok'), e => p(n + ': ' + "
+          "e.message)); const all = []; for (const n of ['c', 'b', 'a', 't']) { all.push(w(n)); "
+          "await settle(); } p('open'); open(); await Promise.all(all);"},
+     },
+     "t1|open|t: boom|a: boom|c: boom|b: boom"},
+    /* a cycle over a module that throws: every member has the error */
+    {"cycerr",
+     {
+         {"a", "import './b'; p('a');"},
+         {"b", "import './a'; import './c'; p('b');"},
+         {"c", "p('c'); throw new Error('c failed');"},
+         {"main",
+          "await import('./a').catch(e => p('1: ' + e.message)); await import('./b').catch(e => "
+          "p('2: ' + e.message)); await import('./c').catch(e => p('3: ' + e.message));"},
+     },
+     "c|1: c failed|2: c failed|3: c failed"},
+    /* a cycle whose root failed after its await, imported at another member (V8 aborts here:
+     * what ECMA-262 says, the root's error) */
+    {"cycerr2",
+     {
+         {"t", "import './s'; p('t1'); await 0; throw new Error('t failed');"},
+         {"s", "import './t'; p('s');"},
+         {"m2", "import './t'; p('m2');"},
+         {"main",
+          "await import('./m2').catch(e => p('1: ' + e.message)); await import('./s').then(() => "
+          "p('s ok'), e => p('2: ' + e.message)); await import('./t').then(() => p('t ok'), e => "
+          "p('3: ' + e.message));"},
+     },
+     "s|t1|1: t failed|2: t failed|3: t failed"},
+};
+
+static void test_evaluation_order(void) {
+    for (size_t c = 0; c < sizeof k_eval_cases / sizeof k_eval_cases[0]; c++) {
+        const EvalCase *ec = &k_eval_cases[c];
+        mods_reset();
+        for (int i = 0; i < 8 && ec->files[i].name; i++)
+            mod_add(ec->files[i].name, ec->files[i].src);
+        TestVm tv;
+        tv_open(&tv, canonicalize);
+        log_open(&tv);
+        JsValue p = eval_named(&tv, "main");
+        js_gc_protect(tv.vm, &p);
+        while (js_has_pending_jobs(tv.ctx))
+            js_run_jobs(tv.ctx);
+        char label[96];
+        snprintf(label, sizeof label, "evaluation order: %s", ec->name);
+        check_log(label, ec->expected);
+        check(js_promise_state(p) == 1, label);
+        js_gc_unprotect(tv.vm, &p);
+        tv_close(&tv, label);
+    }
+    mods_reset();
+}
+
+/* The same through the host's calls, a turn of the host between them: a module that failed is in
+ * a later graph, and a module waiting for the host is imported again. */
+static void test_evaluation_across_turns(void) {
+    /* the graph over a failed module runs what comes before it, and fails with its error */
+    mods_reset();
+    mod_add("bad", "p('bad'); throw new Error('boom');");
+    mod_add("first", "p('first');");
+    mod_add("last", "p('last');");
+    mod_add("both", "import 'first'; import 'bad'; import 'last'; p('both');");
+    {
+        TestVm tv;
+        tv_open(&tv, NULL);
+        log_open(&tv);
+        JsValue p1 = eval_named(&tv, "bad");
+        js_gc_protect(tv.vm, &p1);
+        JsValue p2 = eval_named(&tv, "both");
+        js_gc_protect(tv.vm, &p2);
+        JsValue p3 = eval_named(&tv, "both");
+        js_gc_protect(tv.vm, &p3);
+        check_log("failed module: the modules before it ran once, it and the rest did not",
+                  "bad|first");
+        check(js_promise_state(p1) == 2 && js_promise_state(p2) == 2 && js_promise_state(p3) == 2,
+              "failed module: each graph over it is rejected");
+        check(js_promise_result(p1).bits == js_promise_result(p2).bits &&
+                  js_promise_result(p2).bits == js_promise_result(p3).bits,
+              "failed module: with the one error object");
+        JsValue p4 = eval_named(&tv, "last");
+        js_gc_protect(tv.vm, &p4);
+        check(js_promise_state(p4) == 1, "failed module: a module after it in the graph is sound");
+        check_log("failed module: and runs when it is asked for", "bad|first|last");
+        js_gc_unprotect(tv.vm, &p4);
+        js_gc_unprotect(tv.vm, &p3);
+        js_gc_unprotect(tv.vm, &p2);
+        js_gc_unprotect(tv.vm, &p1);
+        tv_close(&tv, "failed module in a later graph");
+    }
+
+    /* a module waiting for the host: its importers wait with it, whenever they come */
+    for (int reject = 0; reject < 2; reject++) {
+        mods_reset();
+        mod_add("slow", "p('slow1'); export const v = await defer('late'); p('slow2');");
+        mod_add("u", "import { v } from 'slow'; p('u ' + v); export const got = v;");
+        TestVm tv;
+        tv_open(&tv, NULL);
+        log_open(&tv);
+        static const uint16_t n_defer[] = {'d', 'e', 'f', 'e', 'r'};
+        static const uint16_t n_slow[] = {'s', 'l', 'o', 'w'};
+        js_register_native(tv.ctx, n_defer, 5, native_defer, NULL);
+        g_defer_count = 0;
+        g_defer_promise = js_undefined();
+        g_defer_value = js_undefined();
+        js_gc_protect(tv.vm, &g_defer_promise);
+        js_gc_protect(tv.vm, &g_defer_value);
+        JsValue p1 = eval_named(&tv, "slow");
+        js_gc_protect(tv.vm, &p1);
+        check(js_promise_state(p1) == 0 && !js_has_pending_jobs(tv.ctx),
+              "waiting module: pending, and nothing left to run");
+        JsValue p2 = eval_named(&tv, "u");
+        js_gc_protect(tv.vm, &p2);
+        JsValue p3 = eval_named(&tv, "slow");
+        js_gc_protect(tv.vm, &p3);
+        check(js_promise_state(p2) == 0 && js_promise_state(p3) == 0 &&
+                  !js_has_pending_jobs(tv.ctx),
+              "waiting module: a second importer and a second import of it wait");
+        check_log("waiting module: the importer's body has not run", "slow1");
+        check(g_defer_count == 1, "waiting module: its body ran once");
+        check(!js_context_evict_module(tv.ctx, n_slow, 4),
+              "waiting module: cannot be evicted while it waits");
+        js_gc_collect(tv.vm);
+        if (reject)
+            js_reject(tv.ctx, g_defer_promise, g_defer_value);
+        else
+            js_resolve(tv.ctx, g_defer_promise, g_defer_value);
+        js_run_jobs(tv.ctx);
+        int want = reject ? 2 : 1;
+        check(js_promise_state(p1) == want && js_promise_state(p2) == want &&
+                  js_promise_state(p3) == want,
+              "waiting module: all three settle with it");
+        if (reject) {
+            check_log("waiting module rejected: neither body went on", "slow1");
+            check(js_promise_result(p1).bits == g_defer_value.bits &&
+                      js_promise_result(p2).bits == g_defer_value.bits &&
+                      js_promise_result(p3).bits == g_defer_value.bits,
+                  "waiting module rejected: the reason reaches every importer");
+            JsValue p4 = eval_named(&tv, "u");
+            js_gc_protect(tv.vm, &p4);
+            check(js_promise_state(p4) == 2 && js_promise_result(p4).bits == g_defer_value.bits,
+                  "waiting module rejected: and a later import of its importer");
+            js_gc_unprotect(tv.vm, &p4);
+        } else {
+            check_log("waiting module: then its importer ran", "slow1|slow2|u late");
+            check(js_promise_result(p1).bits == js_promise_result(p3).bits,
+                  "waiting module: one namespace for both imports");
+            char *got = export_to_cstr(tv.ctx, tv.vm, js_promise_result(p2), "got");
+            check(strcmp(got, "late") == 0, "waiting module: the importer saw the awaited value");
+            free(got);
+            check(js_context_evict_module(tv.ctx, n_slow, 4),
+                  "waiting module: can be evicted once it is done");
+        }
+        js_gc_unprotect(tv.vm, &p3);
+        js_gc_unprotect(tv.vm, &p2);
+        js_gc_unprotect(tv.vm, &p1);
+        js_gc_unprotect(tv.vm, &g_defer_value);
+        js_gc_unprotect(tv.vm, &g_defer_promise);
+        tv_close(&tv, reject ? "waiting module rejected" : "waiting module");
+    }
+    mods_reset();
+}
+
+/* drain(): the host runs the job queue from inside a native, in the middle of a module body. V8
+ * has no such state (its embedders do not run microtasks under an evaluation), so what is checked
+ * is that every body still runs once, in an order that respects the imports. */
+static bool native_drain(JsContext *ctx, JsValue this_val, const JsValue *args, int argc,
+                         JsValue *result) {
+    (void)this_val;
+    (void)args;
+    (void)argc;
+    js_run_jobs(ctx);
+    *result = js_undefined();
+    return true;
+}
+
+static int log_count(const char *entry) {
+    int n = 0;
+    size_t el = strlen(entry);
+    for (const char *s = g_log; *s;) {
+        const char *e = strchr(s, '|');
+        size_t l = e ? (size_t)(e - s) : strlen(s);
+        if (l == el && memcmp(s, entry, el) == 0)
+            n++;
+        s += l + (e ? 1 : 0);
+    }
+    return n;
+}
+
+static void drain_case(const char *label, const char *expected) {
+    TestVm tv;
+    tv_open(&tv, NULL);
+    log_open(&tv);
+    static const uint16_t n_drain[] = {'d', 'r', 'a', 'i', 'n'};
+    js_register_native(tv.ctx, n_drain, 5, native_drain, NULL);
+    JsValue p = eval_named(&tv, "main");
+    js_gc_protect(tv.vm, &p);
+    while (js_has_pending_jobs(tv.ctx))
+        js_run_jobs(tv.ctx);
+    check(js_promise_state(p) == 1, label);
+    check_log(label, expected);
+    js_gc_unprotect(tv.vm, &p);
+    tv_close(&tv, label);
+    mods_reset();
+}
+
+static void test_jobs_inside_a_body(void) {
+    /* a module the walk is waiting on finishes inside the drain: its importer runs when the
+     * walk gets back to it */
+    mods_reset();
+    mod_add("t", "p('t1'); await 0; p('t2');");
+    mod_add("a", "drain(); p('a');");
+    mod_add("main", "import 't'; import 'a'; p('main');");
+    drain_case("jobs inside a body: a waiting dependency completes", "t1|t2|a|main");
+
+    /* and fails inside the drain */
+    mods_reset();
+    mod_add("t", "p('t1'); await 0; throw new Error('late');");
+    mod_add("a", "drain(); p('a');");
+    mod_add("mid", "import 't'; import 'a'; p('mid');");
+    mod_add("main", "p(await import('mid').then(() => 'mid ok', (e) => 'mid: ' + e.message));");
+    drain_case("jobs inside a body: a waiting dependency fails", "t1|a|mid: late");
+
+    /* import() of a module on the path, and of one the walk has not reached, from a job: the
+     * first is given its namespace as it is, main's bindings not yet initialized */
+    mods_reset();
+    mod_add("a", "import('main').then((ns) => p('main ns ' + typeof ns.f), (e) => p('failed'));"
+                 "import('b').then((ns) => p('b ns ' + ns.k), (e) => p('failed'));"
+                 "drain(); p('a');");
+    mod_add("b", "export const k = 'kb'; p('b');");
+    mod_add("main", "import 'a'; import 'b'; export function f() {} p('main');");
+    {
+        TestVm tv;
+        tv_open(&tv, NULL);
+        log_open(&tv);
+        static const uint16_t n_drain[] = {'d', 'r', 'a', 'i', 'n'};
+        js_register_native(tv.ctx, n_drain, 5, native_drain, NULL);
+        JsValue p = eval_named(&tv, "main");
+        js_gc_protect(tv.vm, &p);
+        while (js_has_pending_jobs(tv.ctx))
+            js_run_jobs(tv.ctx);
+        check(js_promise_state(p) == 1, "jobs inside a body: import() from a job, root fulfilled");
+        check(log_count("a") == 1 && log_count("b") == 1 && log_count("main") == 1 &&
+                  log_count("b ns kb") == 1 && log_count("main ns function") == 1 &&
+                  log_count("failed") == 0,
+              "jobs inside a body: import() from a job, every body once");
+        js_gc_unprotect(tv.vm, &p);
+        tv_close(&tv, "jobs inside a body: import() from a job");
+    }
+
+    /* a graph that fails inside the drain, over the module that is draining */
+    mods_reset();
+    mod_add("x", "import 'main'; p('x'); throw new Error('boom');");
+    mod_add("a", "import('x').catch((e) => p('x: ' + e.message)); drain(); p('a');");
+    mod_add("main", "import 'a'; p('main');");
+    drain_case("jobs inside a body: another graph fails over this one", "x|x: boom|a|main");
+    mods_reset();
+}
+
 int main(void) {
     test_basic_exports();
     test_imports();
@@ -1244,6 +1816,9 @@ int main(void) {
     test_declaration_rules();
     test_functions_at_instantiation();
     test_error_stack();
+    test_evaluation_order();
+    test_evaluation_across_turns();
+    test_jobs_inside_a_body();
     /* parked bodies, cycles and top-level await again with the collector running at every
      * safe point: the rooting of a fiber between instantiation and evaluation */
     g_gc_stress = true;
@@ -1252,6 +1827,9 @@ int main(void) {
     test_tla_dep_cross_turn();
     test_functions_at_instantiation();
     test_error_stack();
+    test_evaluation_order();
+    test_evaluation_across_turns();
+    test_jobs_inside_a_body();
     g_gc_stress = false;
     mods_reset();
     if (checks_failed) {

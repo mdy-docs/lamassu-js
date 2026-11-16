@@ -247,18 +247,16 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   loader from one of several hundred. A chain of re-exports (`export * from`,
   `export { a } from`) is followed at any length; V8 follows one of 10 000 modules and crashes
   on one of 20 000.
-- **A graph with a module that failed before is refused before any of it runs** (not yet
-  fixed). A module whose evaluation threw keeps its error, in lamassu as in V8, and importing a
-  graph it is part of fails with that error. V8 first runs the modules of the graph that come
-  before it; lamassu runs none of them.
-- **A module waiting on a top-level `await` counts as evaluated for a second importer** (not yet
-  fixed). While a module's body is parked on an `await`, a graph imported meanwhile that depends
-  on it (through an `import()` made in between) runs without waiting for it, as the modules of
-  a cycle do: a binding the first has not initialised yet is a `ReferenceError`. V8 makes the
-  second graph wait for the first.
-- **Module evaluation drains the whole microtask queue** after each module
-  body runs — there's no cross-module async evaluation ordering beyond
-  plain dependency order.
+- **A cycle whose first module failed after a top-level `await`, imported again at another of
+  its modules, is rejected with that module's error**, as ECMA-262 has it. V8 stops the process
+  there (a failed check in `SourceTextModule::Evaluate`; Node 26.3 aborts on it). Everywhere else
+  the evaluation of a graph is V8's, step for step: the order the bodies run in, no job between
+  two of them, the modules that wait for a top-level `await` and the order they go on in, and
+  the error a failed module gives every later graph, after the modules before it have run.
+- **What `import()` settles after the evaluation is done is the host's.** lamassu takes the one
+  job the specification gives it; Node's loader takes several more, so a reaction to an
+  `import()` can come before a module body that Node would run first, when both follow the
+  same top-level `await`. The order of the module bodies themselves is the same.
 
 ## Not a deviation, but easy to trip on
 

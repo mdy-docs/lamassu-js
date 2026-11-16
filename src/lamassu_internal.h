@@ -528,9 +528,12 @@ typedef enum JsModuleStatus {
     JS_MOD_UNLINKED = 1,
     JS_MOD_LINKING = 2,
     JS_MOD_LINKED = 3,
-    JS_MOD_EVALUATING = 4,
-    JS_MOD_EVALUATED = 5,
-    JS_MOD_ERRORED = 6,
+    JS_MOD_EVALUATING = 4,       /* on the path, or in an open component, of an evaluation */
+    JS_MOD_EVALUATING_ASYNC = 5, /* waiting for a top-level await, its own or a dependency's */
+    JS_MOD_EVALUATED = 6,
+    JS_MOD_ERRORED = 7,          /* its evaluation threw eval_error (V8's kErrored): it loads and
+                                    links as any other module, and throws again where it is run */
+    JS_MOD_LOAD_FAILED = 8,      /* the loader or the compiler refused it, with eval_error */
 } JsModuleStatus;
 
 struct JsModule {
@@ -568,6 +571,18 @@ struct JsModule {
     bool ns_wanted;           /* somebody takes its namespace (import *, export * as, import()) */
     bool fetch_mark;          /* visited by the walk that is gathering them */
     uint32_t dfs_index, dfs_ancestor;
+    /* Evaluation, as V8's SourceTextModule does it (js_module.c, "evaluate") */
+    bool exec_mark;             /* a dependency's end made it ready to run, and it has not yet */
+    uint32_t eval_pass;         /* the evaluation whose stack it is on; 0: none */
+    uint32_t pending_async_deps; /* the dependencies it waits for */
+    uint64_t async_ordinal;     /* 0: nothing of it waits; 1: what waited is done; from 2: its
+                                   turn among the modules that wait (V8's async evaluation ordinal) */
+    JsPromise *top_capability;  /* what evaluating it from the top came to (kept on its cycle
+                                   root, for a module of a cycle); NULL: never asked */
+    JsModule *cycle_root;       /* the module its strongly connected component closed at; NULL
+                                   until it has */
+    JsModule **async_parents;   /* the modules that wait for it, an entry for each time they do */
+    uint32_t async_parent_count, async_parent_cap;
     JsExportBinding *bindings; /* the exported names that are another binding */
     uint32_t binding_count, binding_cap;
     uint32_t binding_committed; /* [0, this) are in `exports` and mirrored */
@@ -730,6 +745,8 @@ struct JsContext {
     /* While js_eval_entry starts its graph: the canonical root specifier, so the root's record is
      * made as an entry (JsModule.entry). NULL otherwise. */
     JsString *entry_spec;
+    uint64_t async_evaluations; /* the modules that have waited so far (JsModule.async_ordinal) */
+    uint32_t eval_passes;       /* the evaluations so far (JsModule.eval_pass) */
     JsFiber *fiber;     /* current/last fiber; GC root */
     uint64_t fuel;      /* budget armed by js_context_set_fuel; 0 = unlimited */
     /* What remains of `fuel` for the current turn — the top-level run PLUS the

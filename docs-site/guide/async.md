@@ -95,3 +95,8 @@ if a top-level-await module is still pending when the host's run call
 returns, the host is responsible for settling whatever it's waiting on and
 draining jobs — the module's completion becomes observable once that
 happens, driven by the microtask queue rather than a return value.
+
+A module that is waiting this way is not done for anything else either: a
+graph imported meanwhile that depends on it (a second `js_eval_module`, or an
+`import()`) waits for it too, and is rejected with its error if it fails.
+While it waits it cannot be evicted.

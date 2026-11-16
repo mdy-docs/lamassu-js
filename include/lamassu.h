@@ -517,7 +517,8 @@ JsValue js_eval_entry(JsContext *ctx, const uint16_t *specifier, size_t spec_len
  * sources evicts it first; otherwise js_eval_module hands back the cached
  * graph. Evicting a module also evicts every module that imports it
  * (transitively), since their bindings point into it. A module still loading,
- * linking or evaluating cannot be evicted (false). Closures created by the old
+ * linking or evaluating (waiting for a top-level await, its own or one below
+ * it, included) cannot be evicted (false). Closures created by the old
  * graph keep working: they keep their module alive on their own.
  */
 size_t  js_context_module_count(const JsContext *ctx);

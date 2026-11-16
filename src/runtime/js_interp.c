@@ -4256,17 +4256,13 @@ JsValue js_module_finish_body(JsContext *ctx, JsFiber *fb) {
     fb->fuel = fiber_start_fuel(ctx);
     JsValue out;
     if (fb->is_async) {
-        /* TLA module: as js_run_module — the promise may still be pending, the suspended fiber
-         * kept alive by its AWAIT reaction */
+        /* top-level await: the promise may still be pending, the suspended fiber kept alive by
+         * its AWAIT reaction */
         fb->result_promise = p;
         advance_fiber(ctx, fb, &out);
-        js_run_jobs(ctx);
     } else {
-        /* sync module: run to completion, drain the microtasks it scheduled, settle */
+        /* run to completion and settle */
         JsRunStatus st = advance_fiber(ctx, fb, &out);
-        js_gc_protect(vm, &out);
-        js_run_jobs(ctx);
-        js_gc_unprotect(vm, &out);
         if (st == JS_RUN_DONE)
             js_promise_fulfill(ctx, js_value_promise(pv), out);
         else

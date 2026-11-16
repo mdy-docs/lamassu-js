@@ -16,10 +16,10 @@
  * asynchronously (a shared-counter graph load — cycle-proof because each
  * module is counted once, not awaited per-subtree), and only when every
  * transitive dependency has arrived does it run the synchronous
- * prepare and link. Evaluation is promise-chained (deps strictly
- * left-to-right, as the spec requires) so a top-level-await body that
- * suspends on a host promise keeps the whole graph's completion pending
- * until it genuinely finishes.
+ * prepare and link. Evaluation is V8's (see "evaluate"): the bodies run in
+ * one walk, dependencies first and left to right, and a body that suspends
+ * at a top-level await holds back the modules that import it, not its
+ * siblings, and keeps the graph's completion pending until it has finished.
  *
  * No walk over a graph recurses on the C stack: each keeps its path in the
  * heap, and the ones along imports stop at JS_MAX_MODULE_DEPTH modules with
@@ -59,6 +59,12 @@ void js_gc_mark_module(JsVm *vm, JsModule *m) {
         js_gc_mark_cell(vm, &m->fiber->gc);
     js_gc_mark_value(vm, m->eval_error);
     js_gc_mark_value(vm, m->returned);
+    if (m->top_capability)
+        js_gc_mark_cell(vm, &m->top_capability->gc);
+    if (m->cycle_root)
+        js_gc_mark_cell(vm, &m->cycle_root->gc);
+    for (uint32_t i = 0; i < m->async_parent_count; i++)
+        js_gc_mark_cell(vm, &m->async_parents[i]->gc);
     for (uint32_t i = 0; i < m->import_count; i++) {
         if (m->imports[i].specifier)
             js_gc_mark_cell(vm, &m->imports[i].specifier->gc);
@@ -108,6 +114,7 @@ void js_module_free_cell(JsVm *vm, JsModule *m) {
     js_realloc_raw(vm, m->deps, (size_t)m->dep_count * sizeof(JsModule *), 0);
     js_realloc_raw(vm, m->bindings, (size_t)m->binding_cap * sizeof(JsExportBinding), 0);
     js_realloc_raw(vm, m->mirrors, (size_t)m->mirror_cap * sizeof(JsExportMirror), 0);
+    js_realloc_raw(vm, m->async_parents, (size_t)m->async_parent_cap * sizeof(JsModule *), 0);
     js_map_free(vm, &m->bound);
     js_map_free(vm, &m->mirrored);
 }
@@ -281,8 +288,15 @@ bool js_context_evict_module(JsContext *ctx, const uint16_t *specifier, size_t s
     /* nothing in flight may go */
     for (uint32_t i = 0; i < n; i++)
         if (mark[i]) {
-            uint8_t st = ctx->modules[i]->status;
-            if (st == JS_MOD_FETCHING || st == JS_MOD_LINKING || st == JS_MOD_EVALUATING) { js_realloc_raw(ctx->vm, mark, n ? n : 1, 0); return false; }
+            const JsModule *m = ctx->modules[i];
+            uint8_t st = m->status;
+            /* a module on an evaluation's stack, or in the list of those about to run, may have
+             * failed already (ERRORED) and is still held there */
+            if (st == JS_MOD_FETCHING || st == JS_MOD_LINKING || st == JS_MOD_EVALUATING ||
+                st == JS_MOD_EVALUATING_ASYNC || m->eval_pass || m->exec_mark) {
+                js_realloc_raw(ctx->vm, mark, n ? n : 1, 0);
+                return false;
+            }
         }
     uint32_t kept = 0;
     for (uint32_t i = 0; i < n; i++) {
@@ -474,7 +488,7 @@ static JsString *canonicalize_spec(JsContext *ctx, JsModule *referrer, JsString 
 
 /* Marks m failed and rejects its fetch promise (double-settle no-ops). */
 static void module_fetch_fail(JsContext *ctx, JsModule *m, JsValue reason, uint32_t pos) {
-    m->status = JS_MOD_ERRORED;
+    m->status = JS_MOD_LOAD_FAILED;
     m->eval_error = reason;
     ctx->error_pos = pos;
     ctx->error_trace_count = 0; /* a load failure has no frames; see module_compile_fail */
@@ -639,8 +653,10 @@ static JsValue fetch_module_async(JsContext *ctx, JsModule *referrer, JsString *
     if (existing) {
         if (existing->status == JS_MOD_FETCHING)
             return js_value_from_cell(&existing->fetch_promise->gc);
-        if (existing->status == JS_MOD_ERRORED)
+        if (existing->status == JS_MOD_LOAD_FAILED)
             return settled_promise(ctx, false, existing->eval_error);
+        /* one whose evaluation threw is there, as V8 has it: the graph loads and links, and
+         * the error is thrown again where the module would run (eval_required) */
         return settled_promise(ctx, true, module_value(existing));
     }
     if (!ctx->loader)
@@ -905,7 +921,7 @@ static bool prepare_module(JsContext *ctx, JsModule *m, JsModError *err) {
             err->msg = "internal error: dependency was not fetched";
             return false;
         }
-        if (dep->status == JS_MOD_ERRORED) {
+        if (dep->status == JS_MOD_LOAD_FAILED) {
             err->msg = "dependency failed to load";
             return false;
         }
@@ -1561,7 +1577,7 @@ static bool module_ready(LinkPass *lp, JsModule *m) {
     if (m->body && !m->synthetic && m->status == JS_MOD_LINKED && !m->fiber) {
         JsFiber *fb = js_module_instantiate_body(ctx, m->body, lp->error);
         if (!fb) {
-            m->status = JS_MOD_ERRORED;
+            m->status = JS_MOD_LOAD_FAILED; /* it cannot be made: OOM, or the frame limit */
             m->eval_error = *lp->error;
             return false;
         }
@@ -1716,247 +1732,483 @@ static bool link_graph(JsContext *ctx, JsModule *root, JsValue *error) {
     return ok;
 }
 
-/* ---- evaluate (promise-chained; deps strictly left-to-right) ---- */
+/* ---- evaluate (V8's SourceTextModule::Evaluate and what follows it) ---- */
 
 /*
- * A module's evaluation is a state object: { module, index: the dependency it is at, promise:
- * what its evaluation comes to, parent: the state of the module the walk came from, depth: how
- * many modules that path has }. V8's InnerModuleEvaluation recurses from a module into its
- * dependencies; eval_walk goes the same way along the states, so the path is in the heap (see
- * Walk) and a top-level await anywhere leaves nothing on the C stack to come back to.
+ * A graph's bodies run in one walk, depth first and each module after its dependencies, with no
+ * job run between two of them: the microtasks they queue run after the last. A module with a
+ * top-level await (and so every module that imports one, however far up) does not hold the walk:
+ * its body runs to its first await that waits, or is put off until the dependencies it waits for
+ * are done (pending_async_deps, and it is one of their async_parents), and the walk goes on with
+ * its siblings. When the body of a module that waited ends, the modules that waited for nothing
+ * else run, in the order the walk met them (async_ordinal), and so on up to the root; when it
+ * throws, every module that waited for it has failed with the same error.
+ *
+ * A module of a cycle is done when the module its cycle closed at is (cycle_root), so that is
+ * what a later importer of any of them waits for. What evaluating a module from the top comes to
+ * is one promise per module (top_capability), fulfilled with undefined: a second import of a
+ * module that is still waiting gets the same promise, not a namespace whose bindings are not
+ * there yet. A module whose evaluation threw throws the same error again wherever a later graph
+ * comes to run it, after the modules before it have run.
+ *
+ * V8 recurses from a module into its dependencies (InnerModuleEvaluation); the path is in the
+ * heap here (see Walk), with Tarjan's stack next to it as in finish_link.
+ *
+ * One state V8 cannot be in: a native called by a module's body may run the jobs (js_run_jobs),
+ * and so another evaluation inside the walk. A module on another evaluation's path is then
+ * passed as one of a cycle is, a module on a path that a job fails makes its walk fail when it
+ * is back at it, and one that a job frees of what it waited for runs when its walk leaves it.
  */
 
-static void eval_walk(JsContext *ctx, JsValue basev);
+typedef struct EvalPass {
+    JsContext *ctx;
+    Walk walk;
+    JsModule **stack; /* Tarjan's: the modules whose component is still open */
+    uint32_t depth, cap;
+    uint32_t next_index;
+    uint32_t id;
+    JsValue *error;
+} EvalPass;
 
-static void eval_fail_state(JsContext *ctx, JsObject *state, JsValue reason) {
-    /* Root reason across the mstate_get allocations below; it is usually a
-     * fresh string held only in this frame until stored/rejected. */
-    js_gc_protect(ctx->vm, &reason);
-    JsModule *m = value_module(mstate_get(ctx, state, "module"));
+static void async_fulfilled(JsContext *ctx, JsModule *m);
+static void async_rejected(JsContext *ctx, JsModule *m, JsValue err);
+
+static bool module_has_tla(const JsModule *m) {
+    return m->body && !m->synthetic && (m->body->fn_flags & JS_FN_ASYNC) != 0;
+}
+
+static void async_parents_free(JsVm *vm, JsModule *m) {
+    js_realloc_raw(vm, m->async_parents, (size_t)m->async_parent_cap * sizeof(JsModule *), 0);
+    m->async_parents = NULL;
+    m->async_parent_count = m->async_parent_cap = 0;
+}
+
+/* V8's RecordError: M's evaluation threw ERR, and nothing of its body is left to run. */
+static void record_error(JsModule *m, JsValue err) {
     m->status = JS_MOD_ERRORED;
-    m->eval_error = reason;
-    JsValue pv = mstate_get(ctx, state, "promise");
-    if (js_is_promise(pv))
-        js_promise_reject(ctx, js_value_promise(pv), reason);
-    js_gc_unprotect(ctx->vm, &reason);
+    m->eval_error = err;
+    m->fiber = NULL;
 }
 
-/* The dependency a module waited for is evaluated: its evaluation goes on past it. */
-static bool eval_on_dep_done(JsContext *ctx, JsValue bound, JsValue tv,
-                             const JsValue *args, int argc, JsValue *r) {
+/* M's evaluation is done, and so whatever of it waited. */
+static void module_done(JsContext *ctx, JsModule *m) {
+    if (m->async_ordinal)
+        m->async_ordinal = 1;
+    if (m->status == JS_MOD_EVALUATING_ASYNC)
+        m->status = JS_MOD_EVALUATED;
+    if (m->top_capability)
+        js_promise_fulfill(ctx, m->top_capability, js_undefined());
+}
+
+/* V8's ExecuteModule for a module without a top-level await: its body runs to its end. False
+ * with *ERROR when it throws. */
+static bool execute_sync(JsContext *ctx, JsModule *m, JsValue *error) {
+    refresh_synthetic(ctx, m); /* what it re-exports of the host's objects, as they are now */
+    JsFiber *fb = m->fiber;    /* parked at the end of its instantiation (module_ready) */
+    if (!fb)
+        return true;
+    m->fiber = NULL; /* the fiber roots itself while it runs */
+    JsValue bp = js_module_finish_body(ctx, fb);
+    int st = js_promise_state(bp);
+    if (st == 1) {
+        if (m->entry)
+            m->returned = js_promise_result(bp);
+        return true;
+    }
+    *error = st == 2 ? js_promise_result(bp) : ascii_value(ctx, "out of memory");
+    return false;
+}
+
+static bool async_on_fulfilled(JsContext *ctx, JsValue bound, JsValue tv,
+                               const JsValue *args, int argc, JsValue *r) {
     (void)tv;
-    (void)args;
-    (void)argc;
     *r = js_undefined();
-    eval_walk(ctx, bound);
+    JsModule *m = value_module(bound);
+    if (m->entry && argc > 0 && m->status != JS_MOD_ERRORED)
+        m->returned = args[0];
+    async_fulfilled(ctx, m);
     return true;
 }
 
-static bool eval_on_fail(JsContext *ctx, JsValue bound, JsValue tv,
-                         const JsValue *args, int argc, JsValue *r) {
-    (void)tv;
-    *r = js_undefined();
-    eval_fail_state(ctx, js_value_object(bound), argc > 0 ? args[0] : js_undefined());
-    return true;
-}
-
-static bool eval_on_body_done(JsContext *ctx, JsValue bound, JsValue tv,
+static bool async_on_rejected(JsContext *ctx, JsValue bound, JsValue tv,
                               const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     *r = js_undefined();
-    JsObject *state = js_value_object(bound);
-    JsModule *m = value_module(mstate_get(ctx, state, "module"));
-    m->status = JS_MOD_EVALUATED;
-    if (m->entry && argc > 0)
-        m->returned = args[0];
-    JsValue pv = mstate_get(ctx, state, "promise");
-    if (js_is_promise(pv))
-        js_promise_fulfill(ctx, js_value_promise(pv), module_value(m));
+    async_rejected(ctx, value_module(bound), argc > 0 ? args[0] : js_undefined());
     return true;
 }
 
-/* The state of M's evaluation, which the walk comes to from the state PARENTV (undefined: M is
- * where it starts) as the DEPTH-th module of its path. Undefined on OOM. */
-static JsValue eval_state_new(JsContext *ctx, JsModule *m, JsValue parentv, uint32_t depth) {
+/* V8's ExecuteAsyncModule: the body of a module with a top-level await runs as far as it goes
+ * now, and async_fulfilled or async_rejected takes it from where it ends, a job later even when
+ * that is at once. False on OOM, and then nothing will. */
+static bool execute_async(JsContext *ctx, JsModule *m) {
     JsVm *vm = ctx->vm;
     JsValue mv = module_value(m);
     js_gc_protect(vm, &mv);
-    js_gc_protect(vm, &parentv);
-    JsValue statev = js_object_new(ctx);
-    js_gc_protect(vm, &statev);
-    JsPromise *ep = js_promise_alloc(ctx);
-    JsValue epv = ep ? js_value_from_cell(&ep->gc) : js_undefined();
-    js_gc_protect(vm, &epv);
-    bool ok = js_is_object(statev) && ep != NULL;
-    if (ok) {
-        JsObject *state = js_value_object(statev);
-        ok = mstate_set(ctx, state, "module", mv) &&
-             mstate_set(ctx, state, "index", js_number(0)) &&
-             mstate_set(ctx, state, "promise", epv) &&
-             mstate_set(ctx, state, "parent", parentv) &&
-             mstate_set(ctx, state, "depth", js_number((double)depth));
-    }
-    js_gc_unprotect(vm, &epv);
-    js_gc_unprotect(vm, &statev);
-    js_gc_unprotect(vm, &parentv);
-    js_gc_unprotect(vm, &mv);
-    return ok ? statev : js_undefined();
-}
-
-/*
- * The dependencies of the state's module are evaluated: its body runs, to its end (and the
- * state's promise is settled) or to a top-level await that waits for the host, and then the
- * promise settles when the body's own (js_run_module) does.
- */
-static void eval_body(JsContext *ctx, JsValue statev) {
-    JsObject *state = js_value_object(statev);
-    JsModule *m = value_module(mstate_get(ctx, state, "module"));
-    if (!m)
-        return; /* the key could not be made: OOM */
-    refresh_synthetic(ctx, m); /* what it re-exports of the host's objects, as they are now */
-
-    /* the body parked at the end of its instantiation (init_environments): run the rest */
+    refresh_synthetic(ctx, m);
+    JsFiber *fb = m->fiber;
     JsValue bp;
-    if (m->fiber) {
-        JsFiber *fb = m->fiber;
+    if (fb) {
         m->fiber = NULL; /* the fiber roots itself while it runs, and its promise after */
         bp = js_module_finish_body(ctx, fb);
     } else {
-        bp = js_run_module(ctx, js_value_from_cell(&m->body->gc));
+        bp = settled_promise(ctx, true, js_undefined());
     }
-    int st = js_promise_state(bp);
-    if (st == 1) {
-        m->status = JS_MOD_EVALUATED;
-        if (m->entry)
-            m->returned = js_promise_result(bp);
-        JsValue pv = mstate_get(ctx, state, "promise");
-        if (js_is_promise(pv))
-            js_promise_fulfill(ctx, js_value_promise(pv), module_value(m));
-        return;
-    }
-    if (st == 2) {
-        eval_fail_state(ctx, state, js_promise_result(bp));
-        return;
-    }
-    if (st < 0) {
-        eval_fail_state(ctx, state, ascii_value(ctx, "out of memory"));
-        return;
-    }
-    /* body suspended on top-level await: finish when it settles */
-    if (!then_bound(ctx, bp, eval_on_body_done, eval_on_fail, statev))
-        eval_fail_state(ctx, state, ascii_value(ctx, "out of memory"));
+    bool ok = js_is_promise(bp) && then_bound(ctx, bp, async_on_fulfilled, async_on_rejected, mv);
+    js_gc_unprotect(vm, &mv);
+    return ok;
 }
 
-/*
- * Takes the evaluation of the state BASEV as far as it goes now: the dependencies of its module
- * from state.index, in order and each with its own first, then its body. A dependency that is
- * evaluated, or being evaluated (a cycle: its bindings are there, their values maybe not yet),
- * is passed; one that failed fails the module with its error; one that would be the path's
- * JS_MAX_MODULE_DEPTH + 1st fails it with V8's RangeError; any other gets a state and the walk
- * goes down to it. When a state is done the walk goes back up: a dependency evaluated lets its
- * parent go on; one that failed fails the parent; one that waits (a top-level await in it or
- * below it) makes the parent wait for it, and so every state up to BASEV, which each come back
- * here as the base of a walk of their own when their dependency settles. A graph without a
- * pending top-level await is evaluated within one call.
- */
-static void eval_walk(JsContext *ctx, JsValue basev) {
-    JsVm *vm = ctx->vm;
-    JsValue cur = basev;        /* the state the walk is at */
-    JsValue was = js_undefined(); /* the promise of the one it came back from */
-    js_gc_protect(vm, &basev);
-    js_gc_protect(vm, &cur);
-    js_gc_protect(vm, &was);
-    for (;;) {
-        JsObject *state = js_value_object(cur);
-        JsModule *m = value_module(mstate_get(ctx, state, "module"));
-        if (!m)
-            break; /* the key could not be made: OOM */
-        uint32_t i = (uint32_t)js_primitive_to_number(mstate_get(ctx, state, "index"));
-        uint32_t depth = (uint32_t)js_primitive_to_number(mstate_get(ctx, state, "depth"));
-        JsModule *next = NULL;
-        bool failed = false;
-        for (; i < m->dep_count && !next && !failed; i++) {
-            JsModule *dep = m->deps[i];
-            if (!dep || dep->status == JS_MOD_EVALUATED || dep->status == JS_MOD_EVALUATING)
-                continue;
-            if (dep->status == JS_MOD_ERRORED) {
-                eval_fail_state(ctx, state, dep->eval_error);
-                failed = true;
-            } else if (depth >= JS_MAX_MODULE_DEPTH) {
-                eval_fail_state(ctx, state, ascii_value(ctx, k_too_deep));
-                failed = true;
+/* M waits for REQUIRED. False on OOM. */
+static bool add_async_parent(JsVm *vm, JsModule *required, JsModule *m) {
+    if (required->async_parent_count == required->async_parent_cap) {
+        uint32_t ncap = required->async_parent_cap ? required->async_parent_cap * 2 : 4;
+        JsModule **na = js_realloc_raw(vm, required->async_parents,
+                                       (size_t)required->async_parent_cap * sizeof(JsModule *),
+                                       (size_t)ncap * sizeof(JsModule *));
+        if (!na)
+            return false;
+        required->async_parents = na;
+        required->async_parent_cap = ncap;
+    }
+    required->async_parents[required->async_parent_count++] = m;
+    m->pending_async_deps++;
+    return true;
+}
+
+static bool eval_oom(EvalPass *ep) {
+    *ep->error = ascii_value(ep->ctx, "out of memory");
+    return false;
+}
+
+/* eval_enter: the walk comes to M, which joins the path and Tarjan's stack. */
+static bool eval_enter(EvalPass *ep, JsModule *m) {
+    JsVm *vm = ep->ctx->vm;
+    if (ep->walk.depth == JS_MAX_MODULE_DEPTH) {
+        *ep->error = ascii_value(ep->ctx, k_too_deep);
+        return false;
+    }
+    if (ep->depth == ep->cap) {
+        uint32_t ncap = ep->cap ? ep->cap * 2 : 16;
+        JsModule **na = js_realloc_raw(vm, ep->stack, (size_t)ep->cap * sizeof(JsModule *),
+                                       (size_t)ncap * sizeof(JsModule *));
+        if (!na)
+            return eval_oom(ep);
+        ep->stack = na;
+        ep->cap = ncap;
+    }
+    if (!walk_push(vm, &ep->walk, m))
+        return eval_oom(ep);
+    ep->stack[ep->depth++] = m;
+    m->status = JS_MOD_EVALUATING;
+    m->eval_pass = ep->id;
+    m->dfs_index = m->dfs_ancestor = ep->next_index++;
+    m->pending_async_deps = 0;
+    return true;
+}
+
+/* M requires DEP, which the walk has been to, now or before. False with *ep->error when that
+ * makes M fail. */
+static bool eval_required(EvalPass *ep, JsModule *m, JsModule *dep) {
+    if (dep->status == JS_MOD_EVALUATING) {
+        /* of the path, or of a component still open; one of another evaluation's is passed */
+        if (dep->eval_pass == ep->id && dep->dfs_ancestor < m->dfs_ancestor)
+            m->dfs_ancestor = dep->dfs_ancestor;
+    } else if (dep->status == JS_MOD_EVALUATING_ASYNC || dep->status == JS_MOD_EVALUATED) {
+        if (dep->cycle_root)
+            dep = dep->cycle_root;
+    } else if (dep->status != JS_MOD_ERRORED) {
+        return true; /* nothing to run or to wait for */
+    }
+    if (dep->status == JS_MOD_ERRORED) {
+        *ep->error = dep->eval_error;
+        return false;
+    }
+    if (dep->async_ordinal >= 2 && !add_async_parent(ep->ctx->vm, dep, m))
+        return eval_oom(ep);
+    return true;
+}
+
+/* eval_leave: M's dependencies have run or wait, and now M runs, or waits for them. */
+static bool eval_leave(EvalPass *ep, JsModule *m) {
+    JsContext *ctx = ep->ctx;
+    if (m->pending_async_deps > 0 || module_has_tla(m)) {
+        m->async_ordinal = 2 + ctx->async_evaluations++;
+        if (m->pending_async_deps == 0 && !execute_async(ctx, m))
+            return eval_oom(ep);
+    } else if (!execute_sync(ctx, m, ep->error)) {
+        return false;
+    }
+    if (m->dfs_ancestor == m->dfs_index) { /* its component closes here */
+        JsModule *a;
+        do {
+            a = ep->stack[--ep->depth];
+            a->eval_pass = 0;
+            a->cycle_root = m;
+            if (a->status == JS_MOD_EVALUATING)
+                a->status = a->async_ordinal >= 2 ? JS_MOD_EVALUATING_ASYNC : JS_MOD_EVALUATED;
+        } while (a != m);
+    }
+    return true;
+}
+
+/* V8's InnerModuleEvaluation of ROOT, which is linked and no more. False with *ep->error: the
+ * caller fails the modules still on the stack (evaluate). */
+static bool inner_evaluation(EvalPass *ep, JsModule *root) {
+    if (!eval_enter(ep, root))
+        return false;
+    while (ep->walk.depth) {
+        WalkFrame *f = &ep->walk.frames[ep->walk.depth - 1];
+        JsModule *m = f->m, *next = NULL;
+        if (m->status != JS_MOD_EVALUATING) { /* a job failed it while a body below it ran */
+            *ep->error = m->eval_error;
+            return false;
+        }
+        while (f->i < m->dep_count && !next) {
+            JsModule *dep = m->deps[f->i];
+            if (dep && dep->status == JS_MOD_LINKED) {
+                next = dep; /* f->i stays: back from it, M requires it as it then is */
             } else {
-                next = dep;
+                f->i++;
+                if (dep && !eval_required(ep, m, dep))
+                    return false;
             }
         }
         if (next) {
-            /* the index stays at the dependency: evaluated, it is passed when the walk is back */
-            mstate_set(ctx, state, "index", js_number((double)(i - 1)));
-            JsValue childv = eval_state_new(ctx, next, cur, depth + 1);
-            if (!js_is_undefined(childv)) {
-                next->status = JS_MOD_EVALUATING;
-                cur = childv;
+            if (!eval_enter(ep, next))
+                return false;
+            continue;
+        }
+        if (!eval_leave(ep, m))
+            return false;
+        ep->walk.depth--;
+    }
+    return true;
+}
+
+/* The modules a dependency's end made ready to run. */
+typedef struct ExecList {
+    JsModule **v;
+    uint32_t count, cap;
+} ExecList;
+
+/* V8's GatherAvailableAncestors, a module at a time: the modules that waited for FROM wait for
+ * one dependency less, and those that wait for none join the list. */
+static void gather_parents(JsContext *ctx, JsModule *from, ExecList *l) {
+    JsVm *vm = ctx->vm;
+    for (uint32_t i = from->async_parent_count; i-- > 0;) {
+        JsModule *p = from->async_parents[i];
+        if (p->status == JS_MOD_EVALUATING && p->async_ordinal == 0) {
+            /* on the path of a walk (a native of a body ran this job): it runs when the walk
+             * leaves it */
+            if (p->pending_async_deps)
+                p->pending_async_deps--;
+            continue;
+        }
+        if (p->exec_mark || p->status == JS_MOD_ERRORED ||
+            (p->cycle_root && p->cycle_root->status == JS_MOD_ERRORED) ||
+            (!p->cycle_root && p->status != JS_MOD_EVALUATING))
+            continue;
+        if (!p->pending_async_deps || --p->pending_async_deps)
+            continue;
+        if (l->count == l->cap) {
+            uint32_t ncap = l->cap ? l->cap * 2 : 8;
+            JsModule **na = js_realloc_raw(vm, l->v, (size_t)l->cap * sizeof(JsModule *),
+                                           (size_t)ncap * sizeof(JsModule *));
+            if (!na) {
+                async_rejected(ctx, p, ascii_value(ctx, "out of memory"));
                 continue;
             }
-            eval_fail_state(ctx, state, ascii_value(ctx, "out of memory"));
-            failed = true;
+            l->v = na;
+            l->cap = ncap;
         }
-        if (!failed) {
-            mstate_set(ctx, state, "index", js_number((double)i));
-            eval_body(ctx, cur);
-        }
-        /* this state is done, failed, or waiting: back up, as far as there is something to do */
-        bool on = false;
-        while (!on && js_value_object(cur) != js_value_object(basev)) {
-            state = js_value_object(cur);
-            was = mstate_get(ctx, state, "promise");
-            JsValue parentv = mstate_get(ctx, state, "parent");
-            if (!js_is_object(parentv))
-                break; /* the key could not be made: OOM */
-            cur = parentv;
-            JsObject *parent = js_value_object(cur);
-            int st = js_promise_state(was);
-            if (st == 1)
-                on = true;
-            else if (st == 2)
-                eval_fail_state(ctx, parent, js_promise_result(was));
-            else if (st < 0 || !then_bound(ctx, was, eval_on_dep_done, eval_on_fail, cur))
-                eval_fail_state(ctx, parent, ascii_value(ctx, "out of memory"));
-        }
-        if (!on)
-            break;
+        p->exec_mark = true;
+        l->v[l->count++] = p;
     }
-    js_gc_unprotect(vm, &was);
-    js_gc_unprotect(vm, &cur);
-    js_gc_unprotect(vm, &basev);
+    async_parents_free(vm, from);
+}
+
+/* The list in the order its modules began to wait (heapsort: the engine has no libc). */
+static void exec_list_sort(ExecList *l) {
+    JsModule **v = l->v;
+    uint32_t n = l->count;
+    for (uint32_t start = n / 2; start-- > 0;) {
+        for (uint32_t root = start;;) {
+            uint32_t c = 2 * root + 1;
+            if (c >= n)
+                break;
+            if (c + 1 < n && v[c + 1]->async_ordinal > v[c]->async_ordinal)
+                c++;
+            if (v[root]->async_ordinal >= v[c]->async_ordinal)
+                break;
+            JsModule *t = v[root];
+            v[root] = v[c];
+            v[c] = t;
+            root = c;
+        }
+    }
+    for (uint32_t end = n; end-- > 1;) {
+        JsModule *t = v[0];
+        v[0] = v[end];
+        v[end] = t;
+        for (uint32_t root = 0;;) {
+            uint32_t c = 2 * root + 1;
+            if (c >= end)
+                break;
+            if (c + 1 < end && v[c + 1]->async_ordinal > v[c]->async_ordinal)
+                c++;
+            if (v[root]->async_ordinal >= v[c]->async_ordinal)
+                break;
+            JsModule *u = v[root];
+            v[root] = v[c];
+            v[c] = u;
+            root = c;
+        }
+    }
+}
+
+/* V8's AsyncModuleExecutionFulfilled: the body of M, which waited, has ended. */
+static void async_fulfilled(JsContext *ctx, JsModule *m) {
+    JsVm *vm = ctx->vm;
+    if (m->status == JS_MOD_ERRORED)
+        return;
+    JsValue mv = module_value(m);
+    js_gc_protect(vm, &mv);
+    module_done(ctx, m);
+
+    /* a module that waits for none of its dependencies any more runs now; one without a
+     * top-level await is then done too, and the modules that waited for it are looked at with it */
+    ExecList l = {NULL, 0, 0};
+    gather_parents(ctx, m, &l);
+    for (uint32_t i = 0; i < l.count; i++)
+        if (!module_has_tla(l.v[i]))
+            gather_parents(ctx, l.v[i], &l);
+    exec_list_sort(&l);
+
+    JsValue err = js_undefined();
+    js_gc_protect(vm, &err);
+    for (uint32_t i = 0; i < l.count; i++) {
+        JsModule *x = l.v[i];
+        x->exec_mark = false; /* until here it could not be evicted */
+        if (x->status == JS_MOD_ERRORED)
+            continue; /* one that ran before it in this list threw */
+        if (module_has_tla(x)) {
+            if (!execute_async(ctx, x))
+                async_rejected(ctx, x, ascii_value(ctx, "out of memory"));
+        } else if (!execute_sync(ctx, x, &err)) {
+            async_rejected(ctx, x, err);
+        } else {
+            module_done(ctx, x);
+        }
+    }
+    js_gc_unprotect(vm, &err);
+    js_realloc_raw(vm, l.v, (size_t)l.cap * sizeof(JsModule *), 0);
+    js_gc_unprotect(vm, &mv);
+}
+
+/* V8's AsyncModuleExecutionRejected: M, which waited, threw ERR, or a dependency it waited for
+ * did; so have the modules that wait for M, and theirs (V8 recurses; the path is a Walk). */
+static void async_rejected(JsContext *ctx, JsModule *m, JsValue err) {
+    JsVm *vm = ctx->vm;
+    js_gc_protect(vm, &err);
+    Walk w = {NULL, 0, 0};
+    JsModule *next = m;
+    for (;;) {
+        if (next) {
+            JsModule *x = next;
+            next = NULL;
+            if (x->status != JS_MOD_ERRORED) {
+                record_error(x, err);
+                if (x->async_ordinal)
+                    x->async_ordinal = 1;
+                if (x->top_capability)
+                    js_promise_reject(ctx, x->top_capability, err);
+                if (!walk_push(vm, &w, x))
+                    break; /* OOM: the modules that wait for it go on waiting */
+            }
+        }
+        if (!w.depth)
+            break;
+        WalkFrame *f = &w.frames[w.depth - 1];
+        if (f->i < f->m->async_parent_count) {
+            next = f->m->async_parents[f->i++];
+        } else {
+            async_parents_free(vm, f->m);
+            w.depth--;
+        }
+    }
+    walk_free(vm, &w);
+    js_gc_unprotect(vm, &err);
 }
 
 /*
- * Promise for m's evaluation: fulfills with the module once its deps (in
- * order) and its own body have run to true completion; rejects with the
- * thrown error. A module already EVALUATING yields an immediately-fulfilled
- * promise — the spec's cycle semantics (bindings visible, values maybe not
- * yet); as today, that also means a second concurrent evaluation of the
- * same module doesn't wait for the first.
+ * V8's Module::Evaluate: the promise of M's evaluation from the top, fulfilled with undefined
+ * once M, with all it imports, has run to its end, and rejected with what was thrown. Undefined
+ * on OOM.
+ *
+ * Where V8 stops the process: a module of a cycle that ran, when the module its cycle closed at
+ * failed later (after a top-level await) and was never asked for from the top. The specification
+ * says what this gives, the cycle root's error, and that is what it gives here.
  */
 static JsValue evaluate(JsContext *ctx, JsModule *m) {
     JsVm *vm = ctx->vm;
-    if (m->status == JS_MOD_EVALUATED)
-        return settled_promise(ctx, true, module_value(m));
+    if (m->status == JS_MOD_EVALUATING) /* asked for by a job a native of a body on the path ran */
+        return settled_promise(ctx, true, js_undefined());
+    if ((m->status == JS_MOD_EVALUATING_ASYNC || m->status == JS_MOD_EVALUATED) && m->cycle_root)
+        m = m->cycle_root;
+    if (m->top_capability)
+        return js_value_from_cell(&m->top_capability->gc);
     if (m->status == JS_MOD_ERRORED)
         return settled_promise(ctx, false, m->eval_error);
-    if (m->status == JS_MOD_EVALUATING)
-        return settled_promise(ctx, true, module_value(m));
-    m->status = JS_MOD_EVALUATING;
+    if (m->status != JS_MOD_LINKED && m->status != JS_MOD_EVALUATING_ASYNC &&
+        m->status != JS_MOD_EVALUATED)
+        return rejected_ascii(ctx, "internal error: module is not linked");
 
-    JsValue statev = eval_state_new(ctx, m, js_undefined(), 1);
-    if (js_is_undefined(statev))
+    JsValue mv = module_value(m);
+    js_gc_protect(vm, &mv);
+    JsPromise *cap = js_promise_alloc(ctx);
+    if (!cap) {
+        js_gc_unprotect(vm, &mv);
         return js_undefined();
-    js_gc_protect(vm, &statev);
-    eval_walk(ctx, statev);
-    JsValue epv = mstate_get(ctx, js_value_object(statev), "promise");
-    js_gc_unprotect(vm, &statev);
-    return epv;
+    }
+    m->top_capability = cap;
+    JsValue capv = js_value_from_cell(&cap->gc);
+    js_gc_protect(vm, &capv);
+    bool ok = true;
+    if (m->status == JS_MOD_LINKED) {
+        JsValue err = js_undefined();
+        js_gc_protect(vm, &err);
+        EvalPass ep;
+        memset(&ep, 0, sizeof ep);
+        ep.ctx = ctx;
+        ep.error = &err;
+        if (++ctx->eval_passes == 0)
+            ctx->eval_passes = 1;
+        ep.id = ctx->eval_passes;
+        ok = inner_evaluation(&ep, m);
+        if (!ok) {
+            /* what was thrown is the error of every module the walk had not finished with */
+            for (uint32_t i = 0; i < ep.depth; i++) {
+                JsModule *a = ep.stack[i];
+                a->eval_pass = 0;
+                record_error(a, err);
+                if (a->async_ordinal)
+                    a->async_ordinal = 1;
+                async_parents_free(vm, a);
+            }
+            if (m->status != JS_MOD_ERRORED) /* the walk did not even start (OOM) */
+                record_error(m, err);
+            js_promise_reject(ctx, js_value_promise(capv), err);
+        }
+        walk_free(vm, &ep.walk);
+        js_realloc_raw(vm, ep.stack, (size_t)ep.cap * sizeof(JsModule *), 0);
+        js_gc_unprotect(vm, &err);
+    }
+    if (ok && m->async_ordinal < 2 && m->status != JS_MOD_ERRORED)
+        js_promise_fulfill(ctx, js_value_promise(capv), js_undefined());
+    js_gc_unprotect(vm, &capv);
+    js_gc_unprotect(vm, &mv);
+    return capv;
 }
 
 /* ---- public entry ---- */
@@ -1971,21 +2223,29 @@ static void root_fulfill(JsContext *ctx, JsPromise *done, JsModule *root, bool e
         js_promise_fulfill(ctx, done, js_value_from_cell(&root->exports->gc));
 }
 
+/* The root's evaluation is done: BOUND is { promise, module, entry } (root_wait). */
 static bool root_on_eval_done(JsContext *ctx, JsValue bound, JsValue tv,
                               const JsValue *args, int argc, JsValue *r) {
     (void)tv;
+    (void)args;
+    (void)argc;
     *r = js_undefined();
-    if (argc > 0)
-        root_fulfill(ctx, js_value_promise(bound), value_module(args[0]), false);
+    JsObject *st = js_value_object(bound);
+    JsValue pv = mstate_get(ctx, st, "promise");
+    JsValue mv = mstate_get(ctx, st, "module");
+    bool entry = mstate_get(ctx, st, "entry").bits == JS_SPECIAL_TRUE;
+    if (js_is_promise(pv) && js_is_object(mv))
+        root_fulfill(ctx, js_value_promise(pv), value_module(mv), entry);
     return true;
 }
 
-static bool entry_on_eval_done(JsContext *ctx, JsValue bound, JsValue tv,
-                               const JsValue *args, int argc, JsValue *r) {
+static bool root_on_eval_fail_state(JsContext *ctx, JsValue bound, JsValue tv,
+                                    const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     *r = js_undefined();
-    if (argc > 0)
-        root_fulfill(ctx, js_value_promise(bound), value_module(args[0]), true);
+    JsValue pv = mstate_get(ctx, js_value_object(bound), "promise");
+    if (js_is_promise(pv))
+        js_promise_reject(ctx, js_value_promise(pv), argc > 0 ? args[0] : js_undefined());
     return true;
 }
 
@@ -1995,6 +2255,29 @@ static bool root_on_eval_fail(JsContext *ctx, JsValue bound, JsValue tv,
     *r = js_undefined();
     js_promise_reject(ctx, js_value_promise(bound), argc > 0 ? args[0] : js_undefined());
     return true;
+}
+
+/* DONE settles as the evaluation EP of ROOT does, a job after it. False on OOM. */
+static bool root_wait(JsContext *ctx, JsValue donev, JsModule *root, JsValue ep, bool entry) {
+    JsVm *vm = ctx->vm;
+    JsValue mv = module_value(root);
+    js_gc_protect(vm, &donev);
+    js_gc_protect(vm, &mv);
+    js_gc_protect(vm, &ep);
+    JsValue statev = js_object_new(ctx);
+    js_gc_protect(vm, &statev);
+    bool ok = js_is_object(statev);
+    if (ok) {
+        JsObject *st = js_value_object(statev);
+        ok = mstate_set(ctx, st, "promise", donev) && mstate_set(ctx, st, "module", mv) &&
+             mstate_set(ctx, st, "entry", js_bool(entry)) &&
+             then_bound(ctx, ep, root_on_eval_done, root_on_eval_fail_state, statev);
+    }
+    js_gc_unprotect(vm, &statev);
+    js_gc_unprotect(vm, &ep);
+    js_gc_unprotect(vm, &mv);
+    js_gc_unprotect(vm, &donev);
+    return ok;
 }
 
 /* graph fetched: the synchronous prepare and link, then evaluation */
@@ -2018,17 +2301,12 @@ static void root_fetched(JsContext *ctx, JsValue bound, const JsValue *args, int
     if (!envs)
         return;
 
+    /* a job after the evaluation's promise settles, even when it is settled already: the
+     * specification's ContinueDynamicImport, and so what an import() comes to keeps its place
+     * among the other jobs whether or not the module was evaluated before */
     JsValue ep = evaluate(ctx, root);
-    int st = js_promise_state(ep);
-    if (st == 1) {
-        root_fulfill(ctx, done, root, entry);
-    } else if (st == 2) {
-        js_promise_reject(ctx, done, js_promise_result(ep));
-    } else if (st < 0 ||
-               !then_bound(ctx, ep, entry ? entry_on_eval_done : root_on_eval_done,
-                           root_on_eval_fail, bound)) {
-        js_promise_reject(ctx, done, ascii_value(ctx, "out of memory"));
-    }
+    if (!js_is_promise(ep) || !root_wait(ctx, bound, root, ep, entry))
+        js_promise_reject(ctx, js_value_promise(bound), ascii_value(ctx, "out of memory"));
 }
 
 static bool root_on_fetched(JsContext *ctx, JsValue bound, JsValue tv,
