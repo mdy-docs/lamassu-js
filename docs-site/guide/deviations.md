@@ -1,8 +1,9 @@
 # Deviations from real JS
 
-lamassu-js aims to match Node closely enough for differential testing over
-the shared subset — not full spec conformance. This page tracks every place
-that's known to differ, so you're not surprised by one in production.
+lamassu-js aims to behave as V8 does over the subset it implements (the
+reference is the V8 of Node 26), also where V8 is not the specification.
+This page tracks every place that's known to differ, so you're not surprised
+by one in production.
 
 ## Built-ins V8 has that lamassu leaves out
 
@@ -72,24 +73,14 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   property here where V8 has an accessor; it reads, writes and redefines as V8's does, but its
   descriptor has `value`/`writable` rather than `get`/`set`. The same goes for RegExp's legacy
   statics (`RegExp.$1`, `lastMatch`, `input`, ...).
-- **A module specifier may not contain U+0000** (`SyntaxError`, or a rejected `import()`): a
-  module request carries its import attributes after one.
-- **`Array.fromAsync` closes an iterator once.** When a value it awaits rejects, V8 calls the
-  iterator's `return` twice; the spec's async-from-sync iterator closes it once, and so does
-  lamassu. (There are no async iterables to give it: no symbols, no async generators.)
-- **`FinalizationRegistry` callbacks run when the job queue empties.** The collector notes the
-  dead targets; their callbacks run from `js_run_jobs` once the microtask queue is empty (and any
-  jobs they queue run in the same drain), where V8 runs them as a task of their own. A callback
-  that throws is ignored and the others still run (V8 reports the error to the host). A host that
-  never drains the queue never sees them. When anything is collected is the collector's business,
-  in lamassu as in V8: a weak reference only says it *may* be.
-  Enumerability is per property, though: what V8 makes non-enumerable (a builtin
-  prototype's methods, a function's `prototype.constructor`, an error's `message`)
-  is left out of `Object.keys`, JSON, spread and `Object.assign` here too, and
-  `Object.getOwnPropertyNames` lists it. Since only part of each builtin is
-  implemented, `Object.getOwnPropertyNames(Math)` and the like list fewer names
-  than V8's. `Array.prototype` has no `length`, being a plain object, and
-  `arguments` (an array here) has no `callee`.
+- **`Object.getOwnPropertyNames` of a builtin gives V8's names, not V8's order.** What V8 makes
+  non-enumerable (a builtin prototype's methods, a function's `prototype.constructor`, an
+  error's `message`) is non-enumerable here too: left out of `Object.keys`, JSON, spread and
+  `Object.assign`, and listed by `Object.getOwnPropertyNames`. The names of a builtin are V8's
+  but for what is left out (see the list at the top), in the order lamassu defines them rather
+  than V8's (`Math` starts `abs, floor, ceil` here and `abs, acos, acosh` in V8).
+  `Array.prototype` has no `length`, being a plain object, nor has `String.prototype` (it is
+  not a string: there are no wrapper objects), and `arguments` (an array here) has no `callee`.
 
 ## Functions
 
@@ -210,6 +201,18 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   hook could be added by an embedder that needs one.
 - **A pending top-level-await module** returns from the host's run call
   still pending — see [Async & host calls](/guide/async#top-level-await).
+- **`Array.fromAsync` closes an iterator once.** When a value it awaits rejects, V8 calls the
+  iterator's `return` twice; the spec's async-from-sync iterator closes it once, and so does
+  lamassu. (There are no async iterables to give it: no symbols, no async generators.)
+
+## Weak references
+
+- **`FinalizationRegistry` callbacks run when the job queue empties.** The collector notes the
+  dead targets; their callbacks run from `js_run_jobs` once the microtask queue is empty (and any
+  jobs they queue run in the same drain), where V8 runs them as a task of their own. A callback
+  that throws is ignored and the others still run (V8 reports the error to the host). A host that
+  never drains the queue never sees them. When anything is collected is the collector's business,
+  in lamassu as in V8: a weak reference only says it *may* be.
 
 ## Modules
 
@@ -233,6 +236,12 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
     and fails the same way. Node keeps the first failure of a dynamic
     `import()` for that URL; lamassu, like V8 alone, asks again, so an
     import that could not link earlier may link later (see the case above).
+- **A module specifier may not contain U+0000** (`SyntaxError`, or a rejected `import()`): a
+  module request carries its import attributes after one.
+- **A module graph is walked on the C stack, without a limit** (not yet fixed). A chain of
+  imports 30 000 modules deep links and runs; one of 400 000 overflows the stack and ends the
+  process. V8 throws `RangeError: Maximum call stack size exceeded` when its stack runs out,
+  and Node's loader does from a chain of several hundred.
 - **Module evaluation drains the whole microtask queue** after each module
   body runs — there's no cross-module async evaluation ordering beyond
   plain dependency order.
