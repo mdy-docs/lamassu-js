@@ -100,9 +100,6 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   `Function.prototype` has no `constructor`, and `AsyncFunction.prototype`
   (`Object.getPrototypeOf(async () => {})`) none either. `Function.prototype` has no
   `arguments` or `caller` (in V8, accessors that only throw).
-- **After `delete f.name` or `delete f.length`**, it reads `""` or `0` as in V8, but
-  `f.hasOwnProperty(...)` still says `true` and `Object.getOwnPropertyNames(f)` still
-  lists it.
 
 ## Conversions
 

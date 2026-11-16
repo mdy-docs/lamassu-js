@@ -1366,6 +1366,27 @@ static void test_function_lengths(void) {
                  "TypeError: Cannot assign to read only property 'length' of function '(a) => 0'");
     expect_result("const f = (a, b) => 0; const s = [].slice; delete f.length; delete s.length;"
                   "[f.length, s.length].join();", "0,0");
+    /* a deleted name or length is gone from the function's own keys; defined again it is listed
+     * where it was defined, while one redefined in place keeps its place; integer keys lead */
+    expect_result("const N = (f) => Object.getOwnPropertyNames(f).join(); const out = [];"
+                  "{ function f(a) {} delete f.name;"
+                  "  out.push([f.hasOwnProperty('name'), 'name' in f, N(f)].join(':'));"
+                  "  Object.defineProperty(f, 'name', { value: 'g' }); out.push(N(f) + ':' + f.name); }"
+                  "{ function f(a) {} delete f.length; out.push([Object.hasOwn(f, 'length'), N(f)].join(':'));"
+                  "  Object.defineProperty(f, 'length', { value: 5 }); out.push(N(f) + ':' + f.length); }"
+                  "out.join('|');",
+                  "false:true:length,prototype|length,prototype,name:g"
+                  "|false:name,prototype|name,prototype,length:5");
+    expect_result("const N = (f) => Object.getOwnPropertyNames(f).join(); const out = [];"
+                  "{ function f() {} f.k = 1; f[3] = 1; f[0] = 1; out.push(N(f)); }"
+                  "{ const f = () => 0; f.q = 1; delete f.name; f[2] = 0;"
+                  "  Object.defineProperty(f, 'name', { value: 'z' }); out.push(N(f)); }"
+                  "{ function f() {} f.k = 1; Object.defineProperty(f, 'name', { value: 'z' }); out.push(N(f)); }"
+                  "{ const m = Math.max; delete m.name; delete m.length; out.push('[' + N(m) + ']');"
+                  "  Object.defineProperty(m, 'length', { value: 2, configurable: true });"
+                  "  Object.defineProperty(m, 'name', { value: 'max', configurable: true }); out.push(N(m)); }"
+                  "out.join('|');",
+                  "0,3,length,name,prototype,k|2,length,q,name|length,name,prototype,k|[]|length,name");
 }
 
 /* Function.prototype.toString, as V8 gives it: the function's own source text, exactly as

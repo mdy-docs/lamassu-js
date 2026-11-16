@@ -4064,17 +4064,25 @@ static bool append_index_keys(JsContext *ctx, JsObject *out, uint32_t n) {
 static bool str_is_ascii(JsValue key, const char *a);
 static inline bool is_object_type_arg(JsValue v);
 
-/* Appends every key in O's property map, enumerable or not, in enumeration order (integer keys
- * ascending, then insertion order), to OUT; but a function's (FN) "name" and "length", listed
- * first already. O and OUT are rooted. False on OOM. */
-static bool append_map_keys_of(JsContext *ctx, JsObject *out, JsObject *o, bool fn) {
+static bool is_index_below(const JsString *s, uint32_t len);
+
+/* Appends the keys in O's property map, enumerable or not, in enumeration order (integer keys
+ * ascending, then insertion order), to OUT: all of them, or for a function (FN_PART, FN_INDICES
+ * or FN_NAMED) its integer keys, which come before the "length", "name" and "prototype" it has
+ * by nature, or the others, without the "name" (SKIP_NAME) and "length" (SKIP_LENGTH) listed
+ * already. O and OUT are rooted. False on OOM. */
+enum { FN_ALL_KEYS, FN_INDICES, FN_NAMED };
+static bool append_map_keys_of(JsContext *ctx, JsObject *out, JsObject *o, int fn_part,
+                               bool skip_name, bool skip_length) {
     js_map_sort_keys(&o->props);
     for (uint32_t i = 0; i < o->props.capacity; i++) {
         JsMapEntry *e = &o->props.entries[i];
         if (!e->key || e->key == JS_MAP_TOMBSTONE)
             continue;
-        if (fn && (str_is_ascii(js_value_from_cell(&e->key->gc), "name") ||
-                   str_is_ascii(js_value_from_cell(&e->key->gc), "length")))
+        if (fn_part != FN_ALL_KEYS && is_index_below(e->key, UINT32_MAX) != (fn_part == FN_INDICES))
+            continue;
+        if ((skip_name && str_is_ascii(js_value_from_cell(&e->key->gc), "name")) ||
+            (skip_length && str_is_ascii(js_value_from_cell(&e->key->gc), "length")))
             continue;
         if (!js_array_append(ctx->vm, out, js_value_from_cell(&e->key->gc)))
             return false;
@@ -4083,27 +4091,17 @@ static bool append_map_keys_of(JsContext *ctx, JsObject *out, JsObject *o, bool 
 }
 
 static bool append_map_keys(JsContext *ctx, JsObject *out, JsObject *o) {
-    return append_map_keys_of(ctx, out, o, false);
-}
-
-/* Whether O (or NULL) has the ASCII key A in its map. Allocates nothing. */
-static bool map_has_ascii(JsObject *o, const char *a) {
-    if (!o)
-        return false;
-    for (uint32_t i = 0; i < o->props.used; i++) {
-        JsString *k = o->props.entries[i].key;
-        if (k && k != JS_MAP_TOMBSTONE && str_is_ascii(js_value_from_cell(&k->gc), a))
-            return true;
-    }
-    return false;
+    return append_map_keys_of(ctx, out, o, FN_ALL_KEYS, false, false);
 }
 
 /* Object.getOwnPropertyNames(o): every own string key, enumerable or not, in V8's order. Its
  * [[OwnPropertyKeys]] reads no values, so a namespace's uninitialized export is listed, not thrown.
  *   string      its indices, then "length"; a number or boolean has none
  *   array       its indices, then "length", then its named properties
- *   function    "length", "name", "prototype" when it has one, then a builtin's statics and what
- *               a script wrote onto it
+ *   function    the integer keys a script gave it, then "length", "name", "prototype" when it
+ *               has one, then a builtin's statics and what else a script wrote onto it; a "name"
+ *               or "length" defined again after it was deleted is one of those, and so comes
+ *               where it was defined
  *   error       "stack" while it has one, then "message", "cause" and the rest
  *   regexp      "lastIndex", then the rest */
 static bool obj_getOwnPropertyNames(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
@@ -4123,11 +4121,14 @@ static bool obj_getOwnPropertyNames(JsContext *ctx, JsValue tv, const JsValue *a
              append_ascii_key(ctx, out, "length");
     } else if (js_is_function(v)) {
         JsGcCell *c = js_value_cell(v);
-        JsObject *own0 = js_cell_props(ctx, v, false);
-        ok = (!(js_function_has_own_special(v, false) || map_has_ascii(own0, "length")) ||
-              append_ascii_key(ctx, out, "length")) &&
-             (!(js_function_has_own_special(v, true) || map_has_ascii(own0, "name")) ||
-              append_ascii_key(ctx, out, "name")) &&
+        /* the two it has by nature keep their place while they are not deleted, whatever
+         * Object.defineProperty has made of them since */
+        bool has_length = js_function_has_own_special(v, false);
+        bool has_name = js_function_has_own_special(v, true);
+        JsObject *own = js_cell_props(ctx, v, false);
+        ok = (!own || append_map_keys_of(ctx, out, own, FN_INDICES, false, false)) &&
+             (!has_length || append_ascii_key(ctx, out, "length")) &&
+             (!has_name || append_ascii_key(ctx, out, "name")) &&
              (!js_function_has_own_prototype(v) || append_ascii_key(ctx, out, "prototype"));
 #ifdef LAMASSU_HAS_REGEX
         if (ok && c == (JsGcCell *)ctx->regexp_ctor) /* RegExp's legacy statics, where V8 lists them */
@@ -4135,9 +4136,8 @@ static bool obj_getOwnPropertyNames(JsContext *ctx, JsValue tv, const JsValue *a
 #endif
         if (ok && c->kind == JS_KIND_NATIVE && ((JsNative *)c)->statics)
             ok = append_map_keys(ctx, out, ((JsNative *)c)->statics);
-        JsObject *own = js_cell_props(ctx, v, false);
         if (ok && own)
-            ok = append_map_keys_of(ctx, out, own, true);
+            ok = append_map_keys_of(ctx, out, own, FN_NAMED, has_name, has_length);
     } else if (js_is_promise(v)) {
         JsObject *own = js_cell_props(ctx, v, false);
         if (own)
