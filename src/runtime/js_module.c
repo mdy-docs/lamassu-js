@@ -692,147 +692,11 @@ static JsValue fetch_module_async(JsContext *ctx, JsModule *referrer, JsString *
     return js_value_from_cell(&m->fetch_promise->gc);
 }
 
-/* ---- graph load (transitive fetch, shared-counter — cycle-proof) ---- */
-
-/* state: { remaining: number, promise: op promise, root: canonical spec
- * string, seen: object whose props are this operation's processed specs } */
-
-static bool graph_enqueue(JsContext *ctx, JsValue statev, JsModule *referrer,
-                          JsString *raw_spec);
-
-static void graph_fail(JsContext *ctx, JsObject *state, JsValue reason) {
-    /* reason is typically a just-allocated string held only here; mstate_get
-     * allocates and could otherwise collect it before the reject stores it. */
-    js_gc_protect(ctx->vm, &reason);
-    JsValue pv = mstate_get(ctx, state, "promise");
-    if (js_is_promise(pv))
-        js_promise_reject(ctx, js_value_promise(pv), reason); /* re-settle no-ops */
-    js_gc_unprotect(ctx->vm, &reason);
-}
-
-static bool graph_on_fetched(JsContext *ctx, JsValue bound, JsValue tv,
-                             const JsValue *args, int argc, JsValue *r) {
-    (void)tv;
-    *r = js_undefined();
-    if (argc < 1)
-        return true;
-    JsObject *state = js_value_object(bound);
-    JsModule *m = value_module(args[0]);
-    /* discover this module's dependencies before decrementing, so the
-     * counter can't hit zero with work still unprocessed */
-    for (uint32_t i = 0; i < m->dep_spec_count; i++) {
-        if (!graph_enqueue(ctx, bound, m, m->dep_specs[i])) {
-            graph_fail(ctx, state, ascii_value(ctx, "out of memory"));
-            return true;
-        }
-    }
-    double rem = js_primitive_to_number(mstate_get(ctx, state, "remaining")) - 1;
-    mstate_set(ctx, state, "remaining", js_number(rem));
-    if (rem == 0) {
-        JsValue rootspec = mstate_get(ctx, state, "root");
-        JsModule *root = js_is_string(rootspec)
-                             ? registry_find(ctx, js_value_string(rootspec))
-                             : NULL;
-        JsValue pv = mstate_get(ctx, state, "promise");
-        if (root && js_is_promise(pv))
-            js_promise_fulfill(ctx, js_value_promise(pv), module_value(root));
-    }
-    return true;
-}
-
-static bool graph_on_failed(JsContext *ctx, JsValue bound, JsValue tv,
-                            const JsValue *args, int argc, JsValue *r) {
-    (void)tv;
-    *r = js_undefined();
-    graph_fail(ctx, js_value_object(bound), argc > 0 ? args[0] : js_undefined());
-    return true;
-}
-
-/*
- * Adds one module (by raw specifier, canonicalized against `referrer`;
- * already-canonical when referrer is NULL) to the operation: dedupes against
- * the op's seen set, bumps the counter, and chains discovery of its own
- * deps onto its shallow fetch. false only on OOM.
- */
-static bool graph_enqueue(JsContext *ctx, JsValue statev, JsModule *referrer,
-                          JsString *raw_spec) {
-    JsObject *state = js_value_object(statev);
-    const char *cerr = NULL;
-    JsString *spec = referrer ? canonicalize_spec(ctx, referrer, raw_spec, &cerr) : raw_spec;
-    if (!spec) {
-        graph_fail(ctx, state, ascii_value(ctx, cerr));
-        return true; /* op failed; not an OOM to propagate */
-    }
-    /*
-     * The canonical specifier is a fresh cell held nowhere but here until
-     * the seen-set has it, and reading the seen-set allocates (its key is a
-     * cell too). A collection there swept it, and the loader was then handed
-     * a freed string's units — a use-after-free that surfaced as
-     * "unexpected character" from the lexer, on a build with enough live
-     * cells for the collector to run at that moment.
-     */
-    JsValue specv = js_value_from_cell(&spec->gc);
-    js_gc_protect(ctx->vm, &specv);
-    bool ok = true;
-    JsValue seenv = mstate_get(ctx, state, "seen");
-    if (!js_is_object(seenv)) {
-        ok = false;
-    } else {
-        JsObject *seen = js_value_object(seenv);
-        bool found;
-        js_map_get(&seen->props, spec, &found);
-        if (!found) {
-            if (!js_map_set(ctx->vm, &seen->props, spec, js_number(1))) {
-                ok = false;
-            } else {
-                double rem = js_primitive_to_number(mstate_get(ctx, state, "remaining"));
-                mstate_set(ctx, state, "remaining", js_number(rem + 1));
-                JsValue fp = fetch_module_async(ctx, referrer, spec);
-                ok = js_is_promise(fp) && then_bound(ctx, fp, graph_on_fetched, graph_on_failed, statev);
-            }
-        }
-    }
-    js_gc_unprotect(ctx->vm, &specv);
-    return ok;
-}
-
-/*
- * Promise that fulfills with the root module once the whole transitive
- * static-import graph rooted at canonical `root_spec` has been fetched
- * (compiled/adopted, not yet instantiated). Undefined only on OOM.
- */
-static JsValue load_graph(JsContext *ctx, JsString *root_spec) {
-    JsVm *vm = ctx->vm;
-    JsValue rootv = js_value_from_cell(&root_spec->gc);
-    js_gc_protect(vm, &rootv);
-    JsValue statev = js_object_new(ctx);
-    js_gc_protect(vm, &statev);
-    JsValue seenv = js_object_new(ctx);
-    js_gc_protect(vm, &seenv);
-    JsPromise *op = js_promise_alloc(ctx);
-    JsValue opv = op ? js_value_from_cell(&op->gc) : js_undefined();
-    js_gc_protect(vm, &opv);
-    bool ok = js_is_object(statev) && js_is_object(seenv) && op != NULL;
-    if (ok) {
-        JsObject *state = js_value_object(statev);
-        bool set = mstate_set(ctx, state, "remaining", js_number(0)) &&
-                   mstate_set(ctx, state, "promise", opv) &&
-                   mstate_set(ctx, state, "root", rootv) &&
-                   mstate_set(ctx, state, "seen", seenv);
-        if (!set || !graph_enqueue(ctx, statev, NULL, root_spec))
-            js_promise_reject(ctx, op, ascii_value(ctx, "out of memory"));
-    }
-    js_gc_unprotect(vm, &opv);
-    js_gc_unprotect(vm, &seenv);
-    js_gc_unprotect(vm, &statev);
-    js_gc_unprotect(vm, &rootv);
-    return ok ? opv : js_undefined();
-}
-
 /* ---- walking the graph ---- */
 
 /*
- * The walks along a graph's imports (prepare_graph, finish_link, the evaluation) go depth first,
+ * The walks along a graph's imports (the graph load over what is fetched already, prepare_graph,
+ * finish_link, the evaluation) go depth first,
  * as V8's do, but keep their path in an array of the VM's allocator where V8 recurses. How deep
  * a graph may be is then not a matter of the stack the host gave the thread (512 KB on a
  * secondary thread of macOS or iOS), and a graph too deep is an error, never a crash. V8 throws
@@ -876,6 +740,185 @@ static bool walk_push(JsVm *vm, Walk *w, JsModule *m) {
 
 static void walk_free(JsVm *vm, Walk *w) {
     js_realloc_raw(vm, w->frames, (size_t)w->cap * sizeof(WalkFrame), 0);
+}
+
+/* ---- graph load (the specification's LoadRequestedModules; cycle-proof) ---- */
+
+/*
+ * One operation fetches everything a root requires, however far down. Its state is an object:
+ * { remaining: the fetches it waits for, promise: the operation's, root: the canonical specifier,
+ * seen: an object whose properties are the specifiers the operation has been to }.
+ *
+ * A module that is fetched already is gone into at once, and its requests after it, depth first
+ * (InnerModuleLoading); only a module the loader has yet to answer for takes a job. So a graph
+ * that is all there is loaded when load_graph returns, whatever its depth, and an import() of
+ * one settles as many jobs later as an import() of any other: in the order of the calls.
+ */
+
+static void graph_fail(JsContext *ctx, JsObject *state, JsValue reason) {
+    /* reason is typically a just-allocated string held only here; mstate_get
+     * allocates and could otherwise collect it before the reject stores it. */
+    js_gc_protect(ctx->vm, &reason);
+    JsValue pv = mstate_get(ctx, state, "promise");
+    if (js_is_promise(pv))
+        js_promise_reject(ctx, js_value_promise(pv), reason); /* re-settle no-ops */
+    js_gc_unprotect(ctx->vm, &reason);
+}
+
+static bool graph_on_fetched(JsContext *ctx, JsValue bound, JsValue tv,
+                             const JsValue *args, int argc, JsValue *r);
+
+static bool graph_on_failed(JsContext *ctx, JsValue bound, JsValue tv,
+                            const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    *r = js_undefined();
+    graph_fail(ctx, js_value_object(bound), argc > 0 ? args[0] : js_undefined());
+    return true;
+}
+
+/*
+ * The operation comes to one request (a raw specifier, canonicalized against `referrer`;
+ * already canonical when referrer is NULL). One it has been to is passed. A module that is
+ * fetched comes back in *LOADED, for the caller to go into; one that could not be loaded fails
+ * the operation; any other is asked of the loader, or joined if it was already, and the
+ * operation waits for it. false only on OOM.
+ */
+static bool graph_request(JsContext *ctx, JsValue statev, JsModule *referrer,
+                          JsString *raw_spec, JsModule **loaded) {
+    JsObject *state = js_value_object(statev);
+    *loaded = NULL;
+    const char *cerr = NULL;
+    JsString *spec = referrer ? canonicalize_spec(ctx, referrer, raw_spec, &cerr) : raw_spec;
+    if (!spec) {
+        graph_fail(ctx, state, ascii_value(ctx, cerr));
+        return true; /* op failed; not an OOM to propagate */
+    }
+    /*
+     * The canonical specifier is a fresh cell held nowhere but here until
+     * the seen-set has it, and reading the seen-set allocates (its key is a
+     * cell too). A collection there swept it, and the loader was then handed
+     * a freed string's units — a use-after-free that surfaced as
+     * "unexpected character" from the lexer, on a build with enough live
+     * cells for the collector to run at that moment.
+     */
+    JsValue specv = js_value_from_cell(&spec->gc);
+    js_gc_protect(ctx->vm, &specv);
+    bool ok = true;
+    JsValue seenv = mstate_get(ctx, state, "seen");
+    if (!js_is_object(seenv)) {
+        ok = false;
+    } else {
+        JsObject *seen = js_value_object(seenv);
+        bool found;
+        js_map_get(&seen->props, spec, &found);
+        if (!found) {
+            JsModule *existing = registry_find(ctx, spec);
+            if (!js_map_set(ctx->vm, &seen->props, spec, js_number(1))) {
+                ok = false;
+            } else if (existing && existing->status == JS_MOD_LOAD_FAILED) {
+                graph_fail(ctx, state, existing->eval_error);
+            } else if (existing && existing->status != JS_MOD_FETCHING) {
+                *loaded = existing;
+            } else {
+                double rem = js_primitive_to_number(mstate_get(ctx, state, "remaining"));
+                mstate_set(ctx, state, "remaining", js_number(rem + 1));
+                JsValue fp = fetch_module_async(ctx, referrer, spec);
+                ok = js_is_promise(fp) && then_bound(ctx, fp, graph_on_fetched, graph_on_failed, statev);
+            }
+        }
+    }
+    js_gc_unprotect(ctx->vm, &specv);
+    return ok;
+}
+
+/* M is fetched: the operation goes on to what M requires, and from each of those that is
+ * fetched to what it requires, depth first, the path in the heap (see Walk). false on OOM. */
+static bool graph_visit(JsContext *ctx, JsValue statev, JsModule *m) {
+    JsVm *vm = ctx->vm;
+    Walk w = {NULL, 0, 0};
+    bool ok = walk_push(vm, &w, m);
+    while (ok && w.depth) {
+        WalkFrame *f = &w.frames[w.depth - 1];
+        if (f->i == f->m->dep_spec_count) {
+            w.depth--;
+            continue;
+        }
+        JsModule *from = f->m, *loaded = NULL;
+        ok = graph_request(ctx, statev, from, from->dep_specs[f->i++], &loaded);
+        if (ok && loaded)
+            ok = walk_push(vm, &w, loaded);
+    }
+    walk_free(vm, &w);
+    return ok;
+}
+
+/* Nothing left to wait for: the operation's promise is fulfilled with the root (to no effect
+ * when the operation has failed). */
+static void graph_settle(JsContext *ctx, JsObject *state) {
+    if (js_primitive_to_number(mstate_get(ctx, state, "remaining")) != 0)
+        return;
+    JsValue rootspec = mstate_get(ctx, state, "root");
+    JsModule *root = js_is_string(rootspec) ? registry_find(ctx, js_value_string(rootspec)) : NULL;
+    JsValue pv = mstate_get(ctx, state, "promise");
+    if (root && js_is_promise(pv))
+        js_promise_fulfill(ctx, js_value_promise(pv), module_value(root));
+}
+
+static bool graph_on_fetched(JsContext *ctx, JsValue bound, JsValue tv,
+                             const JsValue *args, int argc, JsValue *r) {
+    (void)tv;
+    *r = js_undefined();
+    if (argc < 1)
+        return true;
+    JsObject *state = js_value_object(bound);
+    /* this module's requests before the count goes down, so it cannot come to zero with work
+     * still to find */
+    if (!graph_visit(ctx, bound, value_module(args[0]))) {
+        graph_fail(ctx, state, ascii_value(ctx, "out of memory"));
+        return true;
+    }
+    double rem = js_primitive_to_number(mstate_get(ctx, state, "remaining")) - 1;
+    mstate_set(ctx, state, "remaining", js_number(rem));
+    graph_settle(ctx, state);
+    return true;
+}
+
+/*
+ * Promise that fulfills with the root module once the whole transitive
+ * static-import graph rooted at canonical `root_spec` has been fetched
+ * (compiled/adopted, not yet instantiated): before this returns when there
+ * was nothing left to fetch. Undefined only on OOM.
+ */
+static JsValue load_graph(JsContext *ctx, JsString *root_spec) {
+    JsVm *vm = ctx->vm;
+    JsValue rootv = js_value_from_cell(&root_spec->gc);
+    js_gc_protect(vm, &rootv);
+    JsValue statev = js_object_new(ctx);
+    js_gc_protect(vm, &statev);
+    JsValue seenv = js_object_new(ctx);
+    js_gc_protect(vm, &seenv);
+    JsPromise *op = js_promise_alloc(ctx);
+    JsValue opv = op ? js_value_from_cell(&op->gc) : js_undefined();
+    js_gc_protect(vm, &opv);
+    bool ok = js_is_object(statev) && js_is_object(seenv) && op != NULL;
+    if (ok) {
+        JsObject *state = js_value_object(statev);
+        JsModule *loaded = NULL;
+        bool set = mstate_set(ctx, state, "remaining", js_number(0)) &&
+                   mstate_set(ctx, state, "promise", opv) &&
+                   mstate_set(ctx, state, "root", rootv) &&
+                   mstate_set(ctx, state, "seen", seenv);
+        if (!set || !graph_request(ctx, statev, NULL, js_value_string(rootv), &loaded) ||
+            (loaded && !graph_visit(ctx, statev, loaded)))
+            js_promise_reject(ctx, js_value_promise(opv), ascii_value(ctx, "out of memory"));
+        else if (loaded)
+            graph_settle(ctx, js_value_object(statev));
+    }
+    js_gc_unprotect(vm, &opv);
+    js_gc_unprotect(vm, &seenv);
+    js_gc_unprotect(vm, &statev);
+    js_gc_unprotect(vm, &rootv);
+    return ok ? opv : js_undefined();
 }
 
 /* ---- prepare (the modules behind the specifiers; sync, post-fetch) ---- */

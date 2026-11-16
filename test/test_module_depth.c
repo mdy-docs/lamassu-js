@@ -278,6 +278,8 @@ static void test_import_chain(void) {
     g_n = 30000;
     vm_open(&v);
     check_str(import_of(&v, "m0", "d", buf, sizeof buf), "!" TOO_DEEP, "a chain of 30000 is too deep");
+    /* all of it fetched now: the graph load goes through it in one call, and not on the stack */
+    check_str(import_of(&v, "m0", "d", buf, sizeof buf), "!" TOO_DEEP, "a chain of 30000, loaded, again");
     check(vm_close(&v), "a chain of 30000: no leak");
 
     /* the last throws: every module above it fails with its error */

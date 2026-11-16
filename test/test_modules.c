@@ -1559,6 +1559,17 @@ static const EvalCase k_eval_cases[] = {
           "p('3: ' + e.message));"},
      },
      "s|t1|1: t failed|2: t failed|3: t failed"},
+    /* import() of modules that are loaded settles in the order of the calls, however deep
+     * their graphs */
+    {"selfsync",
+     {
+         {"a",
+          "import('./main').then(ns => p('main ns ' + ns.k), e => p('failed ' + e.message)); "
+          "import('./b').then(ns => p('b ns ' + ns.k), e => p('failed ' + e.message)); p('a');"},
+         {"b", "export const k = 'kb'; p('b');"},
+         {"main", "import './a'; import './b'; export const k = 'km'; p('main');"},
+     },
+     "a|b|main|main ns km|b ns kb"},
 };
 
 static void test_evaluation_order(void) {
@@ -1693,6 +1704,58 @@ static void test_evaluation_across_turns(void) {
     mods_reset();
 }
 
+/* A second graph over modules that are fetched and one that is not yet: it goes through the
+ * first at once, joins the load of the other, and both graphs complete when that arrives. A
+ * graph whose modules are all there is loaded within the call: its root is evaluated a job
+ * later, whatever its depth. */
+static void test_graph_load_over_fetched(void) {
+    mods_reset();
+    mod_add_mode("late", "export const x = 1;", MODE_DEFERRED);
+    mod_add("mid", "import { x } from 'late'; export const y = x + 1;");
+    mod_add("top", "import { y } from 'mid'; export const z = y + 1;");
+    mod_add("other", "import { z } from 'top'; import { x } from 'late'; export const w = z + x;");
+    mod_add("gone", "import 'nowhere';");
+    mod_add("over", "import 'top'; import 'gone';");
+    TestVm tv;
+    tv_open(&tv, NULL);
+    JsValue p1 = eval_named(&tv, "top");
+    js_gc_protect(tv.vm, &p1);
+    JsValue p2 = eval_named(&tv, "other");
+    js_gc_protect(tv.vm, &p2);
+    JsValue p3 = eval_named(&tv, "top");
+    js_gc_protect(tv.vm, &p3);
+    check(js_promise_state(p1) == 0 && js_promise_state(p2) == 0 && js_promise_state(p3) == 0 &&
+              g_pending.count == 1 && !js_has_pending_jobs(tv.ctx),
+          "fetched graph: three graphs wait for the one load");
+    settle_load(tv.ctx, "late");
+    check(js_promise_state(p1) == 1 && js_promise_state(p2) == 1 && js_promise_state(p3) == 1,
+          "fetched graph: and complete when it arrives");
+    check(g_mods.loads[mod_find("late")] == 1 && g_mods.loads[mod_find("mid")] == 1 &&
+              g_mods.loads[mod_find("top")] == 1,
+          "fetched graph: each module asked of the loader once");
+    if (js_promise_state(p2) == 1) {
+        char *out = export_to_cstr(tv.ctx, tv.vm, js_promise_result(p2), "w");
+        check(strcmp(out, "4") == 0, "fetched graph: exports correct (4)");
+        free(out);
+    }
+    /* a module that could not be loaded, under a graph that is otherwise there */
+    JsValue p4 = eval_named(&tv, "over");
+    js_gc_protect(tv.vm, &p4);
+    JsValue p5 = eval_named(&tv, "over");
+    js_gc_protect(tv.vm, &p5);
+    check(js_promise_state(p4) == 2 && js_promise_state(p5) == 2 &&
+              js_promise_result(p4).bits == js_promise_result(p5).bits,
+          "fetched graph: a module that failed to load fails each graph over it");
+    check(g_mods.loads[mod_find("gone")] == 1, "fetched graph: and is not asked for again");
+    js_gc_unprotect(tv.vm, &p5);
+    js_gc_unprotect(tv.vm, &p4);
+    js_gc_unprotect(tv.vm, &p3);
+    js_gc_unprotect(tv.vm, &p2);
+    js_gc_unprotect(tv.vm, &p1);
+    tv_close(&tv, "fetched graph");
+    mods_reset();
+}
+
 /* drain(): the host runs the job queue from inside a native, in the middle of a module body. V8
  * has no such state (its embedders do not run microtasks under an evaluation), so what is checked
  * is that every body still runs once, in an order that respects the imports. */
@@ -1818,6 +1881,7 @@ int main(void) {
     test_error_stack();
     test_evaluation_order();
     test_evaluation_across_turns();
+    test_graph_load_over_fetched();
     test_jobs_inside_a_body();
     /* parked bodies, cycles and top-level await again with the collector running at every
      * safe point: the rooting of a fiber between instantiation and evaluation */
@@ -1829,6 +1893,7 @@ int main(void) {
     test_error_stack();
     test_evaluation_order();
     test_evaluation_across_turns();
+    test_graph_load_over_fetched();
     test_jobs_inside_a_body();
     g_gc_stress = false;
     mods_reset();
