@@ -238,10 +238,24 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
     import that could not link earlier may link later (see the case above).
 - **A module specifier may not contain U+0000** (`SyntaxError`, or a rejected `import()`): a
   module request carries its import attributes after one.
-- **A module graph is walked on the C stack, without a limit** (not yet fixed). A chain of
-  imports 30 000 modules deep links and runs; one of 400 000 overflows the stack and ends the
-  process. V8 throws `RangeError: Maximum call stack size exceeded` when its stack runs out,
-  and Node's loader does from a chain of several hundred.
+- **A graph may be 3000 modules deep along its imports.** No walk over a module graph is on
+  the C stack, so how deep a graph may be does not depend on the stack of the thread: a chain of
+  imports 3000 modules long links and runs everywhere, and a longer one is rejected with V8's
+  `RangeError: Maximum call stack size exceeded` and left as it was (importing it again fails
+  the same way, and a part of it that is short enough works). V8 throws that error when its own
+  stack runs out: with the stack Node gives it, from a chain of about 3100 modules, and Node's
+  loader from one of several hundred. A chain of re-exports (`export * from`,
+  `export { a } from`) is followed at any length; V8 follows one of 10 000 modules and crashes
+  on one of 20 000.
+- **A graph with a module that failed before is refused before any of it runs** (not yet
+  fixed). A module whose evaluation threw keeps its error, in lamassu as in V8, and importing a
+  graph it is part of fails with that error. V8 first runs the modules of the graph that come
+  before it; lamassu runs none of them.
+- **A module waiting on a top-level `await` counts as evaluated for a second importer** (not yet
+  fixed). While a module's body is parked on an `await`, a graph imported meanwhile that depends
+  on it (through an `import()` made in between) runs without waiting for it, as the modules of
+  a cycle do: a binding the first has not initialised yet is a `ReferenceError`. V8 makes the
+  second graph wait for the first.
 - **Module evaluation drains the whole microtask queue** after each module
   body runs — there's no cross-module async evaluation ordering beyond
   plain dependency order.

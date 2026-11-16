@@ -1,6 +1,6 @@
 /*
  * ES modules: an async fetch graph feeding the synchronous
- * instantiate -> link -> evaluate pipeline.
+ * prepare -> link -> evaluate pipeline.
  *
  * Every module — the root included — arrives through the host's async
  * loader (JsModuleLoader): the loader returns a promise that fulfills with
@@ -15,11 +15,15 @@
  * from synchronous Link: js_eval_module walks the static import graph
  * asynchronously (a shared-counter graph load — cycle-proof because each
  * module is counted once, not awaited per-subtree), and only when every
- * transitive dependency has arrived does it run the unchanged synchronous
- * instantiate/link. Evaluation is promise-chained (deps strictly
+ * transitive dependency has arrived does it run the synchronous
+ * prepare and link. Evaluation is promise-chained (deps strictly
  * left-to-right, as the spec requires) so a top-level-await body that
  * suspends on a host promise keeps the whole graph's completion pending
  * until it genuinely finishes.
+ *
+ * No walk over a graph recurses on the C stack: each keeps its path in the
+ * heap, and the ones along imports stop at JS_MAX_MODULE_DEPTH modules with
+ * V8's RangeError (see "walking the graph").
  *
  * Orchestration reuses the promise machinery itself: state objects + bound
  * natives via js_promise_then, the same idiom as Promise.all in
@@ -809,73 +813,56 @@ static JsValue load_graph(JsContext *ctx, JsString *root_spec) {
     return ok ? opv : js_undefined();
 }
 
-/* ---- instantiate (resolve dependency graph; sync, post-fetch) ---- */
+/* ---- walking the graph ---- */
 
-static JsModule *instantiate(JsContext *ctx, JsModule *m, JsModError *err);
+/*
+ * The walks along a graph's imports (prepare_graph, finish_link, the evaluation) go depth first,
+ * as V8's do, but keep their path in an array of the VM's allocator where V8 recurses. How deep
+ * a graph may be is then not a matter of the stack the host gave the thread (512 KB on a
+ * secondary thread of macOS or iOS), and a graph too deep is an error, never a crash. V8 throws
+ * this RangeError when its stack runs out: with the stack Node gives it, on a chain of about
+ * 3100 modules. The limit here is of that order, and the same on every platform.
+ *
+ * The walks along re-exports (resolve_export, fetch_star_exports) keep their path the same way
+ * and have no limit: V8 follows a chain of `export *` some ten thousand modules long, and
+ * crashes on a longer one.
+ */
+#define JS_MAX_MODULE_DEPTH 3000
 
-static bool resolve_dep(JsContext *ctx, JsModule *referrer, JsString *raw_spec,
-                        JsModule **out, JsModError *err) {
-    /* The graph load already fetched and registered every transitive
-     * dependency before instantiate runs — this is a pure lookup. The
-     * canonicalizer is required to be deterministic, so re-canonicalizing
-     * the raw source-text specifier here hits the same registry key. */
-    const char *cerr = NULL;
-    JsString *spec = canonicalize_spec(ctx, referrer, raw_spec, &cerr);
-    if (!spec) {
-        err->msg = cerr;
-        err->pos = 0;
-        return false;
+static const char k_too_deep[] = "RangeError: Maximum call stack size exceeded";
+
+typedef struct WalkFrame {
+    JsModule *m;
+    uint32_t i; /* the next of its dependencies to look at */
+} WalkFrame;
+
+typedef struct Walk {
+    WalkFrame *frames; /* the path from the root to the module the walk is at */
+    uint32_t depth, cap;
+} Walk;
+
+/* M is the next module of the path. False on OOM. */
+static bool walk_push(JsVm *vm, Walk *w, JsModule *m) {
+    if (w->depth == w->cap) {
+        uint32_t ncap = w->cap ? w->cap * 2 : 16;
+        WalkFrame *na = js_realloc_raw(vm, w->frames, (size_t)w->cap * sizeof(WalkFrame),
+                                       (size_t)ncap * sizeof(WalkFrame));
+        if (!na)
+            return false;
+        w->frames = na;
+        w->cap = ncap;
     }
-    JsModule *dep = registry_find(ctx, spec);
-    if (!dep || dep->status == JS_MOD_FETCHING) {
-        err->msg = "internal error: dependency was not fetched";
-        err->pos = 0;
-        return false;
-    }
-    if (dep->status == JS_MOD_ERRORED) {
-        err->msg = "dependency failed to load";
-        err->pos = 0;
-        return false;
-    }
-    dep = instantiate(ctx, dep, err);
-    *out = dep;
-    return dep != NULL;
+    w->frames[w->depth].m = m;
+    w->frames[w->depth].i = 0;
+    w->depth++;
+    return true;
 }
 
-static JsModule *instantiate(JsContext *ctx, JsModule *m, JsModError *err) {
-    if (m->status >= JS_MOD_LINKED || m->deps) /* already instantiated */
-        return m;
-    if (m->dep_spec_count == 0)
-        return m;
-    JsValue mv = js_value_from_cell(&m->gc);
-    js_gc_protect(ctx->vm, &mv);
-    JsModule **deps = js_realloc_raw(ctx->vm, NULL, 0,
-                                     (size_t)m->dep_spec_count * sizeof(JsModule *));
-    bool ok = deps != NULL;
-    if (ok) {
-        m = value_module(mv);
-        m->deps = deps;
-        m->dep_count = m->dep_spec_count;
-        for (uint32_t i = 0; i < m->dep_spec_count; i++)
-            m->deps[i] = NULL;
-        for (uint32_t i = 0; i < m->dep_spec_count && ok; i++) {
-            JsModule *dep;
-            if (!resolve_dep(ctx, value_module(mv), value_module(mv)->dep_specs[i],
-                             &dep, err)) {
-                ok = false;
-                break;
-            }
-            value_module(mv)->deps[i] = dep;
-        }
-    } else {
-        err->oom = true;
-    }
-    m = value_module(mv);
-    js_gc_unprotect(ctx->vm, &mv);
-    return ok ? m : NULL;
+static void walk_free(JsVm *vm, Walk *w) {
+    js_realloc_raw(vm, w->frames, (size_t)w->cap * sizeof(WalkFrame), 0);
 }
 
-/* ---- link (bind imports/stars to source modules) ---- */
+/* ---- prepare (the modules behind the specifiers; sync, post-fetch) ---- */
 
 static JsModule *dep_for_spec(JsModule *m, JsString *spec) {
     for (uint32_t i = 0; i < m->dep_count; i++)
@@ -885,16 +872,45 @@ static JsModule *dep_for_spec(JsModule *m, JsString *spec) {
 }
 
 /*
- * V8's PrepareInstantiate: every import and re-export gets the module its specifier names.
- * What a name resolves to is finish_link's.
+ * V8's PrepareInstantiate for one module: each of its requests gets its module, and every
+ * import and re-export the module its specifier names. What a name resolves to is finish_link's.
+ * The graph load already fetched and registered every transitive dependency, so finding a
+ * request's module is a lookup: the canonicalizer is required to be deterministic, and
+ * canonicalizing the specifier of the source text again gives the registry's key.
  */
-static bool link_module(JsContext *ctx, JsModule *m, JsModError *err) {
-    if (m->status >= JS_MOD_LINKED || m->status == JS_MOD_LINKING)
-        return true; /* linked or in-progress (cycle) */
+static bool prepare_module(JsContext *ctx, JsModule *m, JsModError *err) {
+    err->pos = 0;
     m->status = JS_MOD_LINKING;
-    for (uint32_t i = 0; i < m->dep_count; i++)
-        if (m->deps[i] && !link_module(ctx, m->deps[i], err))
+    if (m->dep_spec_count) {
+        JsModule **deps = js_realloc_raw(ctx->vm, NULL, 0,
+                                         (size_t)m->dep_spec_count * sizeof(JsModule *));
+        if (!deps) {
+            err->oom = true;
             return false;
+        }
+        for (uint32_t i = 0; i < m->dep_spec_count; i++)
+            deps[i] = NULL;
+        m->deps = deps;
+        m->dep_count = m->dep_spec_count;
+    }
+    for (uint32_t i = 0; i < m->dep_spec_count; i++) {
+        const char *cerr = NULL;
+        JsString *spec = canonicalize_spec(ctx, m, m->dep_specs[i], &cerr);
+        if (!spec) {
+            err->msg = cerr;
+            return false;
+        }
+        JsModule *dep = registry_find(ctx, spec);
+        if (!dep || dep->status == JS_MOD_FETCHING) {
+            err->msg = "internal error: dependency was not fetched";
+            return false;
+        }
+        if (dep->status == JS_MOD_ERRORED) {
+            err->msg = "dependency failed to load";
+            return false;
+        }
+        m->deps[i] = dep;
+    }
     for (uint32_t i = 0; i < m->star_count; i++) {
         JsStarExport *re = &m->stars[i];
         if (re->kind == JS_REEXP_LOCAL)
@@ -902,7 +918,6 @@ static bool link_module(JsContext *ctx, JsModule *m, JsModError *err) {
         JsModule *src = dep_for_spec(m, re->specifier);
         if (!src) {
             err->msg = "unresolved re-export";
-            err->pos = 0;
             return false;
         }
         re->source = src;
@@ -910,8 +925,7 @@ static bool link_module(JsContext *ctx, JsModule *m, JsModError *err) {
     for (uint32_t i = 0; i < m->import_count; i++) {
         if (m->imports[i].kind == JS_IMPORT_META) {
             if (!m->imports[i].source && !(m->imports[i].source = meta_module(ctx, m))) {
-                err->msg = "out of memory";
-                err->pos = 0;
+                err->oom = true;
                 return false;
             }
             continue;
@@ -919,7 +933,6 @@ static bool link_module(JsContext *ctx, JsModule *m, JsModError *err) {
         JsModule *src = dep_for_spec(m, m->imports[i].specifier);
         if (!src) {
             err->msg = "unresolved import";
-            err->pos = 0;
             return false;
         }
         /* a named or default import is bound to the module that owns the binding once
@@ -928,8 +941,76 @@ static bool link_module(JsContext *ctx, JsModule *m, JsModError *err) {
             m->imports[i].requested = m->imports[i].imported_name;
         m->imports[i].source = src;
     }
-    m->status = JS_MOD_LINKED;
     return true;
+}
+
+/*
+ * Prepares every module under ROOT that is not prepared yet, depth first. False with *ERR, and
+ * then none of them is: like V8, which takes a graph whose instantiation failed back to
+ * unlinked, so importing it again starts over (and fails the same way).
+ */
+static bool prepare_graph(JsContext *ctx, JsModule *root, JsModError *err) {
+    JsVm *vm = ctx->vm;
+    if (root->status != JS_MOD_UNLINKED)
+        return true; /* prepared before, or adopted (a synthetic module) */
+    JsValue rootv = module_value(root);
+    js_gc_protect(vm, &rootv); /* the others are the registry's */
+    Walk w = {NULL, 0, 0};
+    JsModule **made = NULL; /* every module this pass prepared */
+    uint32_t made_count = 0, made_cap = 0;
+    bool ok = true;
+    JsModule *next = root;
+    while (ok && (next || w.depth)) {
+        if (next) {
+            if (w.depth == JS_MAX_MODULE_DEPTH) {
+                err->msg = k_too_deep;
+                err->pos = 0;
+                ok = false;
+                break;
+            }
+            if (made_count == made_cap) {
+                uint32_t ncap = made_cap ? made_cap * 2 : 16;
+                JsModule **na = js_realloc_raw(vm, made, (size_t)made_cap * sizeof(JsModule *),
+                                               (size_t)ncap * sizeof(JsModule *));
+                if (na) {
+                    made = na;
+                    made_cap = ncap;
+                }
+            }
+            if (made_count == made_cap || !walk_push(vm, &w, next)) {
+                err->oom = true;
+                ok = false;
+                break;
+            }
+            made[made_count++] = next;
+            ok = prepare_module(ctx, next, err);
+            next = NULL;
+            continue;
+        }
+        WalkFrame *f = &w.frames[w.depth - 1];
+        while (f->i < f->m->dep_count && !next) {
+            JsModule *dep = f->m->deps[f->i++];
+            if (dep && dep->status == JS_MOD_UNLINKED)
+                next = dep;
+        }
+        if (!next)
+            w.depth--;
+    }
+    for (uint32_t i = 0; i < made_count; i++) {
+        JsModule *m = made[i];
+        if (ok) {
+            m->status = JS_MOD_LINKED;
+            continue;
+        }
+        m->status = JS_MOD_UNLINKED;
+        js_realloc_raw(vm, m->deps, (size_t)m->dep_count * sizeof(JsModule *), 0);
+        m->deps = NULL;
+        m->dep_count = 0;
+    }
+    js_realloc_raw(vm, made, (size_t)made_cap * sizeof(JsModule *), 0);
+    walk_free(vm, &w);
+    js_gc_unprotect(vm, &rootv);
+    return ok;
 }
 
 /* ---- the exports table: which binding a name is (V8's cells) ---- */
@@ -1049,9 +1130,17 @@ typedef struct MoreExports {
     uint32_t count, cap;
 } MoreExports;
 
+typedef struct FetchFrame {
+    JsModule *m;
+    uint32_t i;       /* the `export *` it is at */
+    MoreExports more; /* what they brought so far */
+} FetchFrame;
+
 typedef struct FetchWalk {
     JsModule **visited;
     uint32_t count, cap;
+    FetchFrame *frames; /* the path of the walk (see Walk) */
+    uint32_t depth, frame_cap;
 } FetchWalk;
 
 /* One name of a module M re-exports with `export *`: left out when it is `default` or M has it
@@ -1092,55 +1181,100 @@ static bool more_add(JsVm *vm, JsModule *m, MoreExports *more, JsString *name, J
     return true;
 }
 
-/*
- * V8's FetchStarExports, with its order and its shortcuts, which decide what a namespace shows:
- * the modules M re-exports with `export *` first, then every name of their tables M lacks, but
- * for `default` and the names two stars give different bindings. A module whose namespace was
- * made already is taken as it is, and one this walk is in (a cycle) as far as it has got.
- */
-static bool fetch_star_exports(JsContext *ctx, FetchWalk *w, JsModule *m) {
-    JsVm *vm = ctx->vm;
+/* The names REQ exports go to MORE, for M that re-exports it with `export *`. False on OOM. */
+static bool more_add_all(JsVm *vm, JsModule *m, MoreExports *more, JsModule *req) {
+    bool ok = true;
+    for (uint32_t k = 0; ok && k < req->binding_count; k++)
+        ok = more_add(vm, m, more, req->bindings[k].name, req->bindings[k].origin,
+                      req->bindings[k].origin_name);
+    for (uint32_t k = 0; ok && req->exports && k < req->exports->props.used; k++) {
+        JsString *key = req->exports->props.entries[k].key;
+        if (!key || key == JS_MAP_TOMBSTONE)
+            continue;
+        bool bound;
+        js_map_get(&req->bound, key, &bound);
+        if (!bound) /* its own binding */
+            ok = more_add(vm, m, more, key, req, key);
+    }
+    return ok;
+}
+
+static void more_free(JsVm *vm, MoreExports *more) {
+    js_realloc_raw(vm, more->list, (size_t)more->cap * sizeof(MoreExport), 0);
+    js_map_free(vm, &more->index);
+}
+
+/* The walk comes to M: 1 when M joined its path, 0 when there is nothing to gather for it (its
+ * namespace was made already, or this walk has been there), -1 on OOM. */
+static int fetch_enter(JsVm *vm, FetchWalk *w, JsModule *m) {
     if (m->ns_ready || m->synthetic || m->fetch_mark)
-        return true;
+        return 0;
     if (w->count == w->cap) {
         uint32_t ncap = w->cap ? w->cap * 2 : 8;
         JsModule **na = js_realloc_raw(vm, w->visited, (size_t)w->cap * sizeof(JsModule *),
                                        (size_t)ncap * sizeof(JsModule *));
         if (!na)
-            return false;
+            return -1;
         w->visited = na;
         w->cap = ncap;
     }
+    if (w->depth == w->frame_cap) {
+        uint32_t ncap = w->frame_cap ? w->frame_cap * 2 : 8;
+        FetchFrame *na = js_realloc_raw(vm, w->frames, (size_t)w->frame_cap * sizeof(FetchFrame),
+                                        (size_t)ncap * sizeof(FetchFrame));
+        if (!na)
+            return -1;
+        w->frames = na;
+        w->frame_cap = ncap;
+    }
     w->visited[w->count++] = m;
     m->fetch_mark = true;
+    FetchFrame *f = &w->frames[w->depth++];
+    memset(f, 0, sizeof *f);
+    f->m = m;
+    return 1;
+}
 
-    MoreExports more;
-    memset(&more, 0, sizeof more);
-    bool ok = true;
-    for (uint32_t i = 0; ok && i < m->star_count; i++) {
-        JsModule *req = m->stars[i].source;
-        if (m->stars[i].kind != JS_REEXP_ALL || !req)
-            continue;
-        ok = fetch_star_exports(ctx, w, req);
-        for (uint32_t k = 0; ok && k < req->binding_count; k++)
-            ok = more_add(vm, m, &more, req->bindings[k].name, req->bindings[k].origin,
-                          req->bindings[k].origin_name);
-        for (uint32_t k = 0; ok && req->exports && k < req->exports->props.used; k++) {
-            JsString *key = req->exports->props.entries[k].key;
-            if (!key || key == JS_MAP_TOMBSTONE)
-                continue;
-            bool bound;
-            js_map_get(&req->bound, key, &bound);
-            if (!bound) /* its own binding */
-                ok = more_add(vm, m, &more, key, req, key);
+/*
+ * V8's FetchStarExports, with its order and its shortcuts, which decide what a namespace shows:
+ * the modules M re-exports with `export *` first, then every name of their tables M lacks, but
+ * for `default` and the names two stars give different bindings. A module whose namespace was
+ * made already is taken as it is, and one this walk is in (a cycle) as far as it has got.
+ * V8 recurses; the path is in W here (see Walk), so a chain of `export *` of any length is
+ * followed.
+ */
+static bool fetch_star_exports(JsContext *ctx, FetchWalk *w, JsModule *root) {
+    JsVm *vm = ctx->vm;
+    bool ok = fetch_enter(vm, w, root) >= 0;
+    while (ok && w->depth) {
+        FetchFrame *f = &w->frames[w->depth - 1];
+        JsModule *m = f->m;
+        bool deeper = false;
+        while (ok && !deeper && f->i < m->star_count) {
+            JsModule *req = m->stars[f->i].source;
+            if (m->stars[f->i].kind == JS_REEXP_ALL && req) {
+                /* its own stars first: the walk comes back to this one when they are done */
+                int entered = fetch_enter(vm, w, req);
+                if (entered) {
+                    ok = entered > 0;
+                    deeper = true;
+                    break;
+                }
+                ok = more_add_all(vm, m, &f->more, req);
+            }
+            f->i++;
         }
+        if (!ok || deeper)
+            continue;
+        for (uint32_t k = 0; ok && k < f->more.count; k++)
+            if (!f->more.list[k].ambiguous)
+                ok = put_binding(ctx, m, f->more.list[k].name, f->more.list[k].origin,
+                                 f->more.list[k].oname, false);
+        more_free(vm, &f->more);
+        w->depth--;
     }
-    for (uint32_t k = 0; ok && k < more.count; k++)
-        if (!more.list[k].ambiguous)
-            ok = put_binding(ctx, m, more.list[k].name, more.list[k].origin, more.list[k].oname,
-                             false);
-    js_realloc_raw(vm, more.list, (size_t)more.cap * sizeof(MoreExport), 0);
-    js_map_free(vm, &more.index);
+    while (w->depth) /* a walk that failed: what its path had gathered */
+        more_free(vm, &w->frames[--w->depth].more);
     return ok;
 }
 
@@ -1150,11 +1284,13 @@ static bool ensure_namespace(JsContext *ctx, JsModule *m) {
     m->ns_wanted = true;
     if (m->ns_ready || m->synthetic)
         return true;
-    FetchWalk w = {NULL, 0, 0};
+    FetchWalk w;
+    memset(&w, 0, sizeof w);
     bool ok = fetch_star_exports(ctx, &w, m);
     for (uint32_t i = 0; i < w.count; i++)
         w.visited[i]->fetch_mark = false;
     js_realloc_raw(ctx->vm, w.visited, (size_t)w.cap * sizeof(JsModule *), 0);
+    js_realloc_raw(ctx->vm, w.frames, (size_t)w.frame_cap * sizeof(FetchFrame), 0);
     if (ok)
         m->ns_ready = true;
     return ok;
@@ -1167,14 +1303,35 @@ typedef struct ResolvePair {
     JsString *name;
 } ResolvePair;
 
+/* One step of a resolution: the name NAME of M, asked for through SPEC */
+typedef struct ResolveFrame {
+    JsModule *m;
+    JsString *spec, *name;
+    bool must;
+    uint8_t stage; /* RESOLVE_* */
+    uint32_t i;    /* the next `export *` to ask */
+    JsModule *uo;  /* the binding the `export *` asked so far agree on */
+    JsString *un;
+} ResolveFrame;
+
+enum {
+    RESOLVE_ENTER, /* nothing looked at yet */
+    RESOLVE_NAMED, /* waiting for the name an `export { a as NAME } from` stands for */
+    RESOLVE_STARS, /* going through the `export *` */
+    RESOLVE_STAR,  /* waiting for what one of them has */
+};
+
 typedef struct LinkPass {
     JsContext *ctx;
     JsValue *error;     /* the caller's rooted slot: what failed */
+    Walk walk;          /* the path of finish_link */
     JsModule **stack;   /* the modules being linked, as Tarjan's algorithm stacks them */
     uint32_t depth, cap;
     uint32_t next_index;
     ResolvePair *set;   /* the (module, name) pairs one resolution is in: open addressing */
     uint32_t set_count, set_cap;
+    ResolveFrame *resolving; /* the path of one resolution (see Walk) */
+    uint32_t resolve_depth, resolve_cap;
 } LinkPass;
 
 static uint32_t pair_hash(const JsModule *m, const JsString *name) {
@@ -1242,80 +1399,154 @@ static int link_oom(LinkPass *lp) {
     return -1;
 }
 
+/* The resolution goes on to NAME of M. False on OOM. */
+static bool resolve_push(LinkPass *lp, JsModule *m, JsString *spec, JsString *name, bool must) {
+    if (lp->resolve_depth == lp->resolve_cap) {
+        uint32_t ncap = lp->resolve_cap ? lp->resolve_cap * 2 : 8;
+        ResolveFrame *na = js_realloc_raw(lp->ctx->vm, lp->resolving,
+                                          (size_t)lp->resolve_cap * sizeof(ResolveFrame),
+                                          (size_t)ncap * sizeof(ResolveFrame));
+        if (!na)
+            return false;
+        lp->resolving = na;
+        lp->resolve_cap = ncap;
+    }
+    ResolveFrame *f = &lp->resolving[lp->resolve_depth++];
+    f->m = m;
+    f->spec = spec;
+    f->name = name;
+    f->must = must;
+    f->stage = RESOLVE_ENTER;
+    f->i = 0;
+    f->uo = NULL;
+    f->un = NULL;
+    return true;
+}
+
 /*
  * V8's ResolveExport, step for step, since its order decides which error a graph gets: the
  * binding M exports as NAME, asked for through the specifier SPEC. 1 with the binding; 0 when
- * there is none and MUST is false (a name looked for through an `export *`); -1 with the error.
+ * there is none and MUST is false; -1 with the error.
  *
- *  1. a name in M's table is that binding (its own, or one resolved before);
+ *  1. a name in the module's table is that binding (its own, or one resolved before);
  *  2. a (module, name) this resolution is in already is a cycle;
  *  3. `export { a as NAME } from`: the binding of `a` there, which must exist; and
  *     `export * as NAME from` (as `import * as ns` then `export { ns as NAME }`): the
  *     namespace of the module named;
  *  4. else the `export *` in order, never for `default`: the one binding they agree on, and
- *     two different ones are an error whoever asks;
+ *     two different ones are an error whoever asks (a name looked for through an `export *`
+ *     need not be there: the only case of MUST false);
  *  5. else there is none.
+ *
+ * V8 recurses from module to module in steps 3 and 4. Here the modules a resolution is going
+ * through are lp->resolving (see Walk), each with the step it is at, and R, RO and RN are what
+ * the one that just ended gave the one that asked.
  */
 static int resolve_export(LinkPass *lp, JsModule *m, JsString *spec, JsString *name, bool must,
                           JsModule **origin, JsString **oname) {
-    if (lookup_cell(m, name, origin, oname))
-        return 1;
-    if (!spec)
-        spec = m->specifier;
-    if (!m->synthetic) {
-        int seen = set_add(lp, m, name);
-        if (seen < 0)
-            return link_oom(lp);
-        if (seen)
-            return must ? link_error(lp, "SyntaxError: Detected cycle while resolving name '%S' in '%S'",
-                                     spec, name, false)
-                        : 0;
-        for (uint32_t i = 0; i < m->star_count; i++) {
-            JsStarExport *re = &m->stars[i];
-            if ((re->kind != JS_REEXP_NAMED && re->kind != JS_REEXP_NS) ||
-                re->exported != name || !re->source)
+    JsContext *ctx = lp->ctx;
+    int r = 0;
+    JsModule *ro = NULL;
+    JsString *rn = NULL;
+    lp->resolve_depth = 0;
+    if (!resolve_push(lp, m, spec, name, must))
+        return link_oom(lp);
+    while (lp->resolve_depth) {
+        ResolveFrame *f = &lp->resolving[lp->resolve_depth - 1];
+        m = f->m;
+        if (f->stage == RESOLVE_ENTER) {
+            if (lookup_cell(m, f->name, &ro, &rn)) {
+                r = 1;
+                lp->resolve_depth--;
                 continue;
-            if (re->kind == JS_REEXP_NS) {
-                *origin = re->source;
-                *oname = NULL;
-            } else if (resolve_export(lp, re->source, re->specifier, re->imported, true, origin,
-                                      oname) <= 0) {
-                return -1;
             }
-            return put_binding(lp->ctx, m, name, *origin, *oname, false) ? 1 : link_oom(lp);
-        }
-        if (!str_is_default(name)) {
-            JsModule *uo = NULL;
-            JsString *un = NULL;
-            for (uint32_t i = 0; i < m->star_count; i++) {
-                JsStarExport *re = &m->stars[i];
-                if (re->kind != JS_REEXP_ALL || !re->source)
+            if (!f->spec)
+                f->spec = m->specifier;
+            f->stage = RESOLVE_STARS;
+            f->i = m->star_count; /* none to ask, unless step 4 is reached */
+            if (!m->synthetic) {
+                int seen = set_add(lp, m, f->name);
+                if (seen < 0)
+                    return link_oom(lp);
+                if (seen) {
+                    if (f->must)
+                        return link_error(lp, "SyntaxError: Detected cycle while resolving name '%S' in '%S'",
+                                          f->spec, f->name, false);
+                    r = 0;
+                    lp->resolve_depth--;
                     continue;
-                JsModule *o;
-                JsString *n;
-                int r = resolve_export(lp, re->source, re->specifier, name, false, &o, &n);
-                if (r < 0)
-                    return -1;
-                if (!r)
-                    continue;
-                if (!uo) {
-                    uo = o;
-                    un = n;
-                } else if (uo != o || un != n) {
-                    return link_error(lp, "SyntaxError: The requested module '%S' contains conflicting star exports for name '%S'",
-                                      spec, name, true);
                 }
+                JsStarExport *named = NULL;
+                for (uint32_t i = 0; i < m->star_count && !named; i++) {
+                    JsStarExport *re = &m->stars[i];
+                    if ((re->kind == JS_REEXP_NAMED || re->kind == JS_REEXP_NS) &&
+                        re->exported == f->name && re->source)
+                        named = re;
+                }
+                if (named && named->kind == JS_REEXP_NS) {
+                    ro = named->source;
+                    rn = NULL;
+                    if (!put_binding(ctx, m, f->name, ro, rn, false))
+                        return link_oom(lp);
+                    r = 1;
+                    lp->resolve_depth--;
+                    continue;
+                }
+                if (named) {
+                    f->stage = RESOLVE_NAMED;
+                    if (!resolve_push(lp, named->source, named->specifier, named->imported, true))
+                        return link_oom(lp);
+                    continue;
+                }
+                if (!str_is_default(f->name))
+                    f->i = 0;
             }
-            if (uo) {
-                *origin = uo;
-                *oname = un;
-                return put_binding(lp->ctx, m, name, uo, un, false) ? 1 : link_oom(lp);
+        } else if (f->stage == RESOLVE_NAMED) {
+            /* it was there: one that must be and is not ends the resolution with its error */
+            if (!put_binding(ctx, m, f->name, ro, rn, false))
+                return link_oom(lp);
+            r = 1;
+            lp->resolve_depth--;
+            continue;
+        } else if (f->stage == RESOLVE_STAR) {
+            if (r && !f->uo) {
+                f->uo = ro;
+                f->un = rn;
+            } else if (r && (f->uo != ro || f->un != rn)) {
+                return link_error(lp, "SyntaxError: The requested module '%S' contains conflicting star exports for name '%S'",
+                                  f->spec, f->name, true);
             }
+            f->stage = RESOLVE_STARS;
         }
+        JsStarExport *star = NULL;
+        while (f->i < m->star_count && !star) {
+            JsStarExport *re = &m->stars[f->i++];
+            if (re->kind == JS_REEXP_ALL && re->source)
+                star = re;
+        }
+        if (star) {
+            f->stage = RESOLVE_STAR;
+            if (!resolve_push(lp, star->source, star->specifier, f->name, false))
+                return link_oom(lp);
+            continue;
+        }
+        if (f->uo) {
+            ro = f->uo;
+            rn = f->un;
+            if (!put_binding(ctx, m, f->name, ro, rn, false))
+                return link_oom(lp);
+            r = 1;
+        } else if (f->must) {
+            return link_error(lp, "SyntaxError: The requested module '%S' does not provide an export named '%S'",
+                              f->spec, f->name, true);
+        } else {
+            r = 0;
+        }
+        lp->resolve_depth--;
     }
-    return must ? link_error(lp, "SyntaxError: The requested module '%S' does not provide an export named '%S'",
-                             spec, name, true)
-                : 0;
+    *origin = ro;
+    *oname = rn;
+    return r;
 }
 
 /*
@@ -1356,13 +1587,16 @@ static bool module_ready(LinkPass *lp, JsModule *m) {
  * every name it imports and of every name it re-exports by name, each with a resolve set of its
  * own; and when the module closes a strongly connected component, module_ready for the
  * component, last entered first. A module linked already is left alone, so a later graph (a
- * dynamic import) only links what it brings. False with *lp->error: the caller takes the
- * modules still on the stack back to unlinked (link_graph).
+ * dynamic import) only links what it brings. V8 recurses; the path is lp->walk here (see Walk).
+ *
+ * link_enter: the walk comes to M, which joins the path and Tarjan's stack.
  */
-static bool finish_link(LinkPass *lp, JsModule *m) {
+static bool link_enter(LinkPass *lp, JsModule *m) {
     JsVm *vm = lp->ctx->vm;
-    if (m->link_state)
-        return true;
+    if (lp->walk.depth == JS_MAX_MODULE_DEPTH) {
+        *lp->error = js_error_from_ascii(lp->ctx, k_too_deep);
+        return false;
+    }
     if (lp->depth == lp->cap) {
         uint32_t ncap = lp->cap ? lp->cap * 2 : 16;
         JsModule **na = js_realloc_raw(vm, lp->stack, (size_t)lp->cap * sizeof(JsModule *),
@@ -1372,19 +1606,17 @@ static bool finish_link(LinkPass *lp, JsModule *m) {
         lp->stack = na;
         lp->cap = ncap;
     }
+    if (!walk_push(vm, &lp->walk, m))
+        return link_oom(lp) > 0;
     reset_bindings(vm, m);
     lp->stack[lp->depth++] = m;
     m->link_state = 1;
     m->dfs_index = m->dfs_ancestor = lp->next_index++;
-    for (uint32_t i = 0; i < m->dep_count; i++) {
-        JsModule *dep = m->deps[i];
-        if (!dep)
-            continue;
-        if (!finish_link(lp, dep))
-            return false;
-        if (dep->link_state == 1 && dep->dfs_ancestor < m->dfs_ancestor)
-            m->dfs_ancestor = dep->dfs_ancestor;
-    }
+    return true;
+}
+
+/* link_leave: M's dependencies are linked, and now its names are. */
+static bool link_leave(LinkPass *lp, JsModule *m) {
     /* the further names of its own exports: one binding each (export { x as a, x as b }) */
     for (uint32_t i = 0; i < m->star_count; i++) {
         JsStarExport *re = &m->stars[i];
@@ -1427,6 +1659,42 @@ static bool finish_link(LinkPass *lp, JsModule *m) {
     return true;
 }
 
+/* False with *lp->error: the caller takes the modules still on the stack back to unlinked
+ * (link_graph). */
+static bool finish_link(LinkPass *lp, JsModule *root) {
+    if (root->link_state)
+        return true;
+    if (!link_enter(lp, root))
+        return false;
+    while (lp->walk.depth) {
+        WalkFrame *f = &lp->walk.frames[lp->walk.depth - 1];
+        JsModule *m = f->m, *next = NULL;
+        while (f->i < m->dep_count && !next) {
+            JsModule *dep = m->deps[f->i++];
+            if (!dep)
+                continue;
+            if (!dep->link_state)
+                next = dep;
+            else if (dep->link_state == 1 && dep->dfs_ancestor < m->dfs_ancestor)
+                m->dfs_ancestor = dep->dfs_ancestor; /* one of the path, or of a component still open */
+        }
+        if (next) {
+            if (!link_enter(lp, next))
+                return false;
+            continue;
+        }
+        if (!link_leave(lp, m))
+            return false;
+        lp->walk.depth--;
+        if (lp->walk.depth && m->link_state == 1) { /* its component closes further up */
+            JsModule *from = lp->walk.frames[lp->walk.depth - 1].m;
+            if (m->dfs_ancestor < from->dfs_ancestor)
+                from->dfs_ancestor = m->dfs_ancestor;
+        }
+    }
+    return true;
+}
+
 /* Links the graph under ROOT. False with *ERROR, and then nothing of the modules whose linking
  * did not finish stays: importing one again links it again, and fails the same way. */
 static bool link_graph(JsContext *ctx, JsModule *root, JsValue *error) {
@@ -1441,17 +1709,24 @@ static bool link_graph(JsContext *ctx, JsModule *root, JsValue *error) {
             reset_bindings(ctx->vm, lp.stack[i]);
         }
     }
+    walk_free(ctx->vm, &lp.walk);
     js_realloc_raw(ctx->vm, lp.stack, (size_t)lp.cap * sizeof(JsModule *), 0);
     js_realloc_raw(ctx->vm, lp.set, (size_t)lp.set_cap * sizeof(ResolvePair), 0);
+    js_realloc_raw(ctx->vm, lp.resolving, (size_t)lp.resolve_cap * sizeof(ResolveFrame), 0);
     return ok;
 }
 
 /* ---- evaluate (promise-chained; deps strictly left-to-right) ---- */
 
-/* chain state: { module, index: next dep to evaluate, promise } */
+/*
+ * A module's evaluation is a state object: { module, index: the dependency it is at, promise:
+ * what its evaluation comes to, parent: the state of the module the walk came from, depth: how
+ * many modules that path has }. V8's InnerModuleEvaluation recurses from a module into its
+ * dependencies; eval_walk goes the same way along the states, so the path is in the heap (see
+ * Walk) and a top-level await anywhere leaves nothing on the C stack to come back to.
+ */
 
-static JsValue evaluate(JsContext *ctx, JsModule *m);
-static bool eval_step(JsContext *ctx, JsValue statev);
+static void eval_walk(JsContext *ctx, JsValue basev);
 
 static void eval_fail_state(JsContext *ctx, JsObject *state, JsValue reason) {
     /* Root reason across the mstate_get allocations below; it is usually a
@@ -1466,16 +1741,14 @@ static void eval_fail_state(JsContext *ctx, JsObject *state, JsValue reason) {
     js_gc_unprotect(ctx->vm, &reason);
 }
 
+/* The dependency a module waited for is evaluated: its evaluation goes on past it. */
 static bool eval_on_dep_done(JsContext *ctx, JsValue bound, JsValue tv,
                              const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     (void)args;
     (void)argc;
     *r = js_undefined();
-    JsObject *state = js_value_object(bound);
-    double i = js_primitive_to_number(mstate_get(ctx, state, "index"));
-    mstate_set(ctx, state, "index", js_number(i + 1));
-    eval_step(ctx, bound);
+    eval_walk(ctx, bound);
     return true;
 }
 
@@ -1502,47 +1775,44 @@ static bool eval_on_body_done(JsContext *ctx, JsValue bound, JsValue tv,
     return true;
 }
 
+/* The state of M's evaluation, which the walk comes to from the state PARENTV (undefined: M is
+ * where it starts) as the DEPTH-th module of its path. Undefined on OOM. */
+static JsValue eval_state_new(JsContext *ctx, JsModule *m, JsValue parentv, uint32_t depth) {
+    JsVm *vm = ctx->vm;
+    JsValue mv = module_value(m);
+    js_gc_protect(vm, &mv);
+    js_gc_protect(vm, &parentv);
+    JsValue statev = js_object_new(ctx);
+    js_gc_protect(vm, &statev);
+    JsPromise *ep = js_promise_alloc(ctx);
+    JsValue epv = ep ? js_value_from_cell(&ep->gc) : js_undefined();
+    js_gc_protect(vm, &epv);
+    bool ok = js_is_object(statev) && ep != NULL;
+    if (ok) {
+        JsObject *state = js_value_object(statev);
+        ok = mstate_set(ctx, state, "module", mv) &&
+             mstate_set(ctx, state, "index", js_number(0)) &&
+             mstate_set(ctx, state, "promise", epv) &&
+             mstate_set(ctx, state, "parent", parentv) &&
+             mstate_set(ctx, state, "depth", js_number((double)depth));
+    }
+    js_gc_unprotect(vm, &epv);
+    js_gc_unprotect(vm, &statev);
+    js_gc_unprotect(vm, &parentv);
+    js_gc_unprotect(vm, &mv);
+    return ok ? statev : js_undefined();
+}
+
 /*
- * Advances m's evaluation from state.index: already-settled dependency
- * evaluations are folded inline (so a fully-synchronous graph completes
- * within one call), a pending one parks the chain on its promise. After the
- * last dep: the body — whose own completion promise (js_run_module) may
- * itself be pending on top-level await.
+ * The dependencies of the state's module are evaluated: its body runs, to its end (and the
+ * state's promise is settled) or to a top-level await that waits for the host, and then the
+ * promise settles when the body's own (js_run_module) does.
  */
-static bool eval_step(JsContext *ctx, JsValue statev) {
+static void eval_body(JsContext *ctx, JsValue statev) {
     JsObject *state = js_value_object(statev);
     JsModule *m = value_module(mstate_get(ctx, state, "module"));
     if (!m)
-        return false; /* a state whose module could not be recorded: OOM */
-    uint32_t i = (uint32_t)js_primitive_to_number(mstate_get(ctx, state, "index"));
-    for (; i < m->dep_count; i++) {
-        JsModule *dep = m->deps[i];
-        if (!dep)
-            continue;
-        JsValue dp = evaluate(ctx, dep);
-        int st = js_promise_state(dp);
-        if (st == 1)
-            continue;
-        if (st == 2) {
-            eval_fail_state(ctx, state, js_promise_result(dp));
-            return true;
-        }
-        if (st < 0) {
-            eval_fail_state(ctx, state, ascii_value(ctx, "out of memory"));
-            return true;
-        }
-        /* dp is held only here (and by whatever the dependency awaits) across the
-         * allocations below */
-        js_gc_protect(ctx->vm, &dp);
-        mstate_set(ctx, state, "index", js_number(i));
-        if (!then_bound(ctx, dp, eval_on_dep_done, eval_on_fail, statev))
-            eval_fail_state(ctx, state, ascii_value(ctx, "out of memory"));
-        js_gc_unprotect(ctx->vm, &dp);
-        return true;
-    }
-    mstate_set(ctx, state, "index", js_number(i));
-
-    m = value_module(mstate_get(ctx, state, "module"));
+        return; /* the key could not be made: OOM */
     refresh_synthetic(ctx, m); /* what it re-exports of the host's objects, as they are now */
 
     /* the body parked at the end of its instantiation (init_environments): run the rest */
@@ -1562,20 +1832,103 @@ static bool eval_step(JsContext *ctx, JsValue statev) {
         JsValue pv = mstate_get(ctx, state, "promise");
         if (js_is_promise(pv))
             js_promise_fulfill(ctx, js_value_promise(pv), module_value(m));
-        return true;
+        return;
     }
     if (st == 2) {
         eval_fail_state(ctx, state, js_promise_result(bp));
-        return true;
+        return;
     }
     if (st < 0) {
         eval_fail_state(ctx, state, ascii_value(ctx, "out of memory"));
-        return true;
+        return;
     }
     /* body suspended on top-level await: finish when it settles */
     if (!then_bound(ctx, bp, eval_on_body_done, eval_on_fail, statev))
         eval_fail_state(ctx, state, ascii_value(ctx, "out of memory"));
-    return true;
+}
+
+/*
+ * Takes the evaluation of the state BASEV as far as it goes now: the dependencies of its module
+ * from state.index, in order and each with its own first, then its body. A dependency that is
+ * evaluated, or being evaluated (a cycle: its bindings are there, their values maybe not yet),
+ * is passed; one that failed fails the module with its error; one that would be the path's
+ * JS_MAX_MODULE_DEPTH + 1st fails it with V8's RangeError; any other gets a state and the walk
+ * goes down to it. When a state is done the walk goes back up: a dependency evaluated lets its
+ * parent go on; one that failed fails the parent; one that waits (a top-level await in it or
+ * below it) makes the parent wait for it, and so every state up to BASEV, which each come back
+ * here as the base of a walk of their own when their dependency settles. A graph without a
+ * pending top-level await is evaluated within one call.
+ */
+static void eval_walk(JsContext *ctx, JsValue basev) {
+    JsVm *vm = ctx->vm;
+    JsValue cur = basev;        /* the state the walk is at */
+    JsValue was = js_undefined(); /* the promise of the one it came back from */
+    js_gc_protect(vm, &basev);
+    js_gc_protect(vm, &cur);
+    js_gc_protect(vm, &was);
+    for (;;) {
+        JsObject *state = js_value_object(cur);
+        JsModule *m = value_module(mstate_get(ctx, state, "module"));
+        if (!m)
+            break; /* the key could not be made: OOM */
+        uint32_t i = (uint32_t)js_primitive_to_number(mstate_get(ctx, state, "index"));
+        uint32_t depth = (uint32_t)js_primitive_to_number(mstate_get(ctx, state, "depth"));
+        JsModule *next = NULL;
+        bool failed = false;
+        for (; i < m->dep_count && !next && !failed; i++) {
+            JsModule *dep = m->deps[i];
+            if (!dep || dep->status == JS_MOD_EVALUATED || dep->status == JS_MOD_EVALUATING)
+                continue;
+            if (dep->status == JS_MOD_ERRORED) {
+                eval_fail_state(ctx, state, dep->eval_error);
+                failed = true;
+            } else if (depth >= JS_MAX_MODULE_DEPTH) {
+                eval_fail_state(ctx, state, ascii_value(ctx, k_too_deep));
+                failed = true;
+            } else {
+                next = dep;
+            }
+        }
+        if (next) {
+            /* the index stays at the dependency: evaluated, it is passed when the walk is back */
+            mstate_set(ctx, state, "index", js_number((double)(i - 1)));
+            JsValue childv = eval_state_new(ctx, next, cur, depth + 1);
+            if (!js_is_undefined(childv)) {
+                next->status = JS_MOD_EVALUATING;
+                cur = childv;
+                continue;
+            }
+            eval_fail_state(ctx, state, ascii_value(ctx, "out of memory"));
+            failed = true;
+        }
+        if (!failed) {
+            mstate_set(ctx, state, "index", js_number((double)i));
+            eval_body(ctx, cur);
+        }
+        /* this state is done, failed, or waiting: back up, as far as there is something to do */
+        bool on = false;
+        while (!on && js_value_object(cur) != js_value_object(basev)) {
+            state = js_value_object(cur);
+            was = mstate_get(ctx, state, "promise");
+            JsValue parentv = mstate_get(ctx, state, "parent");
+            if (!js_is_object(parentv))
+                break; /* the key could not be made: OOM */
+            cur = parentv;
+            JsObject *parent = js_value_object(cur);
+            int st = js_promise_state(was);
+            if (st == 1)
+                on = true;
+            else if (st == 2)
+                eval_fail_state(ctx, parent, js_promise_result(was));
+            else if (st < 0 || !then_bound(ctx, was, eval_on_dep_done, eval_on_fail, cur))
+                eval_fail_state(ctx, parent, ascii_value(ctx, "out of memory"));
+        }
+        if (!on)
+            break;
+    }
+    js_gc_unprotect(vm, &was);
+    js_gc_unprotect(vm, &cur);
+    js_gc_unprotect(vm, &basev);
 }
 
 /*
@@ -1596,26 +1949,14 @@ static JsValue evaluate(JsContext *ctx, JsModule *m) {
         return settled_promise(ctx, true, module_value(m));
     m->status = JS_MOD_EVALUATING;
 
-    JsValue mv = module_value(m);
-    js_gc_protect(vm, &mv);
-    JsValue statev = js_object_new(ctx);
+    JsValue statev = eval_state_new(ctx, m, js_undefined(), 1);
+    if (js_is_undefined(statev))
+        return js_undefined();
     js_gc_protect(vm, &statev);
-    JsPromise *ep = js_promise_alloc(ctx);
-    JsValue epv = ep ? js_value_from_cell(&ep->gc) : js_undefined();
-    js_gc_protect(vm, &epv);
-    bool ok = js_is_object(statev) && ep != NULL;
-    if (ok) {
-        JsObject *state = js_value_object(statev);
-        ok = mstate_set(ctx, state, "module", mv) &&
-             mstate_set(ctx, state, "index", js_number(0)) &&
-             mstate_set(ctx, state, "promise", epv);
-        if (ok)
-            eval_step(ctx, statev);
-    }
-    js_gc_unprotect(vm, &epv);
+    eval_walk(ctx, statev);
+    JsValue epv = mstate_get(ctx, js_value_object(statev), "promise");
     js_gc_unprotect(vm, &statev);
-    js_gc_unprotect(vm, &mv);
-    return ok ? epv : js_undefined();
+    return epv;
 }
 
 /* ---- public entry ---- */
@@ -1656,7 +1997,7 @@ static bool root_on_eval_fail(JsContext *ctx, JsValue bound, JsValue tv,
     return true;
 }
 
-/* graph fetched: run the synchronous instantiate/link, then evaluation */
+/* graph fetched: the synchronous prepare and link, then evaluation */
 static void root_fetched(JsContext *ctx, JsValue bound, const JsValue *args, int argc, bool entry) {
     JsPromise *done = js_value_promise(bound);
     if (argc < 1)
@@ -1664,16 +2005,13 @@ static void root_fetched(JsContext *ctx, JsValue bound, const JsValue *args, int
     JsModule *root = value_module(args[0]);
 
     JsModError err = {NULL, 0, false};
-    JsModule *inst = instantiate(ctx, root, &err);
-    if (inst && !link_module(ctx, inst, &err))
-        inst = NULL;
-    if (!inst) {
+    if (!prepare_graph(ctx, root, &err)) {
         js_promise_reject(ctx, done, mod_error_value(ctx, &err));
         return;
     }
     JsValue ierr = js_undefined();
     js_gc_protect(ctx->vm, &ierr);
-    bool envs = link_graph(ctx, inst, &ierr);
+    bool envs = link_graph(ctx, root, &ierr);
     if (!envs)
         js_promise_reject(ctx, done, ierr);
     js_gc_unprotect(ctx->vm, &ierr);
