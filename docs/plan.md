@@ -341,8 +341,11 @@ Tracked so differential testing against Node has a baseline.
   An array's named properties follow its elements.
 - **Case mapping is ASCII only** (`toUpperCase`/`toLowerCase`); full Unicode
   case folding would need the UCD tables the regex engine ships.
-- **`Array.prototype.sort` is a stable O(n²) binary insertion sort** — fine
-  for templating-sized arrays; revisit if large-array sorting matters.
+- **`Array.prototype.sort` and `toSorted` are V8's TimSort**, ported from V8 14.6's
+  `array-sort.tq` so that the comparator is called with the same pairs in the same order (it was a
+  binary insertion sort, O(n²) in moves, that also compared `undefined` elements). V8 has since
+  moved to PowerSort (April 2026, not yet in the Node the tests are checked against): the merge
+  policy is the part to change when Node has it.
 - **Transcendental math is ~1e-12 accurate**, not correctly-rounded (custom
   freestanding kernel, no libm). `sqrt`/`floor`/`ceil`/`trunc`/`round` are
   exact (native ops).

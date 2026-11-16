@@ -148,6 +148,12 @@ array of that length; anything else behaves like `Array.of`.
   `join` is a function, else `Object.prototype.toString`), and `keys`, `values`, `entries`, which
   return an `Array Iterator` ([Iteration](#iteration)) that reads the array live (an element
   pushed before it reaches the end is visited) and works on any array-like, as V8's does.
+  `sort` and `toSorted` are V8's TimSort (as in V8 14.6, Node 26): stable, O(n log n), and the
+  comparator is called with the same pairs in the same order, so a comparator that logs, or one
+  that is not a consistent ordering (`(a, b) => a > b`), gives what it gives in Node. `undefined`
+  elements are never compared and go last. The elements are sorted aside and written back at the
+  end, so a comparator that changes the array does not disturb the sort, and a frozen array is
+  refused only after its comparator has run, as in V8.
 - The callback methods read the length once, as V8's do: an element the callback appends is not
   visited, and one it removes is skipped (`find`, `findIndex`, `findLast` and `findLastIndex` see
   `undefined` there; `map` leaves `undefined` where V8 leaves a hole). `splice` and `copyWithin`

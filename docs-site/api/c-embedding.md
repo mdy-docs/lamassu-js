@@ -447,8 +447,8 @@ calls it once at startup has given the whole process a single budget, not one
 per request.
 
 ::: warning Fuel counts instructions, not time
-A single instruction can enter a builtin that runs a while — `sort` is O(n²)
-in element moves and charges nothing for them, string concatenation can copy
+A single instruction can enter a builtin that runs a while — `sort` without a
+comparator makes all its O(n log n) comparisons for one unit, string concatenation can copy
 and rehash a large string, and the regex step budget is per call, so a loop of
 cheap-looking `re.test(s)` calls multiplies it. All of those are individually
 bounded and none are memory-unsafe, but the aggregate is not bounded in *time*

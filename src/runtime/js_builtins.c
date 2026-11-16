@@ -16,7 +16,7 @@
  *
  * Known deviations (documented): object key iteration follows hash order,
  * not insertion order (resolved when shapes land); case mapping is ASCII
- * only; sort is a stable O(n^2) binary insertion sort.
+ * only.
  */
 #include "js_bytecode.h"
 #include "js_error.h"
@@ -1108,15 +1108,16 @@ static bool array_this(JsContext *ctx, JsValue tv, JsObject **out, JsValue *r) {
  * The mutating array methods write a->elems and a->elem_count directly, so
  * they never reach set_property's freeze check and have to make it themselves.
  * `changes_length` separates the two states: sealing forbids adding and
- * removing elements, freezing forbids touching them at all, so reverse/fill/
- * sort are legal on a sealed array but not a frozen one.
+ * removing elements, freezing forbids touching them at all, so reverse and fill
+ * are legal on a sealed array but not a frozen one. (sort writes its result
+ * back after the comparator has run, and checks there: sort_array.)
  */
 typedef enum {
     MUT_ADD,          /* push, unshift: new elements at the end */
     MUT_REMOVE_END,   /* pop: deletes the last element */
     MUT_REMOVE_FRONT, /* shift: moves the elements down, then deletes the last */
     MUT_WRITE,        /* fill, copyWithin: writes elements in place */
-    MUT_REORDER,      /* reverse, sort: as MUT_WRITE, but fewer than two elements stay put */
+    MUT_REORDER,      /* reverse: as MUT_WRITE, but fewer than two elements stay put */
 } ArrayMut;
 
 /* The refusal is worded as V8 words the first write such a method makes. */
@@ -1658,106 +1659,611 @@ static bool am_reduce(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     return true;
 }
 
-/* stable binary insertion sort; comparator optional */
+/* ---------------------------------------------------------------------
+ * Array.prototype.sort and toSorted: V8's TimSort
+ *
+ * A port of V8's third_party/v8/builtins/array-sort.tq as V8 14.6 has it
+ * (itself CPython's listsort), statement for statement, so that the comparator
+ * is called with the same pairs in the same order as in V8. The order is
+ * observable: in what a comparator logs, and in the result when the comparator
+ * is not a consistent ordering (`(a, b) => a > b`, a random one).
+ *
+ * As there, the elements that are not undefined are sorted in a work array the
+ * script cannot reach and written back afterwards, the undefined ones after
+ * them: whatever the comparator does to the array meanwhile neither disturbs
+ * the sort nor survives it. Only `order < 0` is ever asked of a comparison, so
+ * one is carried here as "less".
+ * --------------------------------------------------------------------- */
+
+enum { SORT_MAX_RUNS = 85, SORT_MIN_GALLOP = 7, SORT_TEMP_MIN = 32 };
+
+typedef struct {
+    JsContext *ctx;
+    JsValue *r;           /* where the error of a failed sort goes */
+    JsValue cmp;          /* the comparator, or undefined (rooted, as the three below are) */
+    JsValue workv, tempv; /* the work array and the merge buffer: hidden array cells */
+    JsValue str;          /* the default comparison: x's string while y is converted */
+    JsObject *work;
+    int64_t min_gallop;
+    int runs; /* the pending runs, a stack */
+    int64_t run_base[SORT_MAX_RUNS], run_len[SORT_MAX_RUNS];
+} SortState;
+
+/* An array cell of N undefined elements, for the collector to trace what is put in it */
+static JsObject *sort_buffer(JsContext *ctx, int64_t n) {
+    JsObject *o = js_array_new_cell(ctx, (uint32_t)(n ? n : 1));
+    if (!o)
+        return NULL;
+    for (int64_t i = 0; i < n; i++)
+        o->elems[i] = js_undefined();
+    o->elem_count = (uint32_t)n;
+    return o;
+}
+
+/* The merge buffer, at least N long (GetTempArray); NULL thrown */
+static JsValue *sort_temp(SortState *st, int64_t n) {
+    JsObject *t = js_is_undefined(st->tempv) ? NULL : js_value_object(st->tempv);
+    if (!t || t->elem_count < n) {
+        t = sort_buffer(st->ctx, n < SORT_TEMP_MIN ? SORT_TEMP_MIN : n);
+        if (!t) {
+            oom(st->ctx, st->r);
+            return NULL;
+        }
+        st->tempv = js_value_from_cell(&t->gc);
+    }
+    return t->elems;
+}
+
+/* Compare(x, y) < 0: the comparator's result through ToNumber (NaN is 0), or without one
+ * ToString(x) against ToString(y) by code unit. False thrown. */
+static bool sort_less(SortState *st, JsValue x, JsValue y, bool *less) {
+    JsContext *ctx = st->ctx;
+    /* A native costs one unit of fuel however long it runs, and a large sort is the longest a
+     * guest can stay inside one: poll the stop flag so an interrupt does not wait for it. */
+    if (ctx->vm->interrupt)
+        return native_throw(ctx, st->r, JS_MSG_INTERRUPT);
+    if (!js_is_undefined(st->cmp)) {
+        JsValue argv[2] = {x, y};
+        JsValue res;
+        if (!js_call(ctx, st->cmp, js_undefined(), argv, 2, &res)) {
+            *st->r = res;
+            return false;
+        }
+        double d;
+        if (!js_op_to_number(ctx, res, &d))
+            return oom(ctx, st->r);
+        *less = d < 0;
+        return true;
+    }
+    JsString *sx = js_op_to_string(ctx, x);
+    if (!sx)
+        return oom(ctx, st->r);
+    st->str = js_value_from_cell(&sx->gc); /* converting y allocates, and may run a toString */
+    JsString *sy = js_op_to_string(ctx, y);
+    if (!sy)
+        return oom(ctx, st->r);
+    uint32_t n = sx->length < sy->length ? sx->length : sy->length;
+    for (uint32_t k = 0; k < n; k++)
+        if (sx->units[k] != sy->units[k]) {
+            *less = sx->units[k] < sy->units[k];
+            return true;
+        }
+    *less = sx->length < sy->length;
+    return true;
+}
+
+/* Sorts [low, high) of the work array, of which [low, start) is sorted already */
+static bool sort_binary_insertion(SortState *st, int64_t low, int64_t start, int64_t high) {
+    JsValue *w = st->work->elems;
+    if (start == low)
+        start++;
+    for (; start < high; start++) {
+        int64_t left = low, right = start;
+        JsValue pivot = w[right];
+        while (left < right) {
+            int64_t mid = left + ((right - left) >> 1);
+            bool less;
+            if (!sort_less(st, pivot, w[mid], &less))
+                return false;
+            if (less)
+                right = mid;
+            else
+                left = mid + 1;
+        }
+        for (int64_t p = start; p > left; p--)
+            w[p] = w[p - 1];
+        w[left] = pivot;
+    }
+    return true;
+}
+
+/* The length of the run that starts at LOW (an ascending one, or a strictly descending one,
+ * which is reversed in place) */
+static bool sort_count_run(SortState *st, int64_t low_arg, int64_t high, int64_t *run) {
+    JsValue *w = st->work->elems;
+    int64_t low = low_arg + 1;
+    *run = 1;
+    if (low == high)
+        return true;
+    int64_t len = 2;
+    bool less;
+    if (!sort_less(st, w[low], w[low - 1], &less))
+        return false;
+    bool descending = less;
+    for (int64_t i = low + 1; i < high; i++) {
+        if (!sort_less(st, w[i], w[i - 1], &less))
+            return false;
+        if (less != descending)
+            break;
+        len++;
+    }
+    if (descending)
+        for (int64_t a = low_arg, b = low_arg + len - 1; a < b; a++, b--) {
+            JsValue t = w[a];
+            w[a] = w[b];
+            w[b] = t;
+        }
+    *run = len;
+    return true;
+}
+
+/* Where KEY belongs in the sorted A[base, base + length), before any equal to it, searching
+ * outwards from HINT: the count of elements less than KEY */
+static bool sort_gallop_left(SortState *st, const JsValue *a, JsValue key, int64_t base,
+                             int64_t length, int64_t hint, int64_t *out) {
+    int64_t last = 0, ofs = 1;
+    bool less;
+    if (!sort_less(st, a[base + hint], key, &less))
+        return false;
+    if (less) {
+        int64_t max = length - hint;
+        while (ofs < max) {
+            if (!sort_less(st, a[base + hint + ofs], key, &less))
+                return false;
+            if (!less)
+                break;
+            last = ofs;
+            ofs = (ofs << 1) + 1;
+        }
+        if (ofs > max)
+            ofs = max;
+        last += hint;
+        ofs += hint;
+    } else {
+        int64_t max = hint + 1;
+        while (ofs < max) {
+            if (!sort_less(st, a[base + hint - ofs], key, &less))
+                return false;
+            if (less)
+                break;
+            last = ofs;
+            ofs = (ofs << 1) + 1;
+        }
+        if (ofs > max)
+            ofs = max;
+        int64_t tmp = last;
+        last = hint - ofs;
+        ofs = hint - tmp;
+    }
+    last++;
+    while (last < ofs) {
+        int64_t m = last + ((ofs - last) >> 1);
+        if (!sort_less(st, a[base + m], key, &less))
+            return false;
+        if (less)
+            last = m + 1;
+        else
+            ofs = m;
+    }
+    *out = ofs;
+    return true;
+}
+
+/* As sort_gallop_left, but after any equal to KEY: the count of elements not greater */
+static bool sort_gallop_right(SortState *st, const JsValue *a, JsValue key, int64_t base,
+                              int64_t length, int64_t hint, int64_t *out) {
+    int64_t last = 0, ofs = 1;
+    bool less;
+    if (!sort_less(st, key, a[base + hint], &less))
+        return false;
+    if (less) {
+        int64_t max = hint + 1;
+        while (ofs < max) {
+            if (!sort_less(st, key, a[base + hint - ofs], &less))
+                return false;
+            if (!less)
+                break;
+            last = ofs;
+            ofs = (ofs << 1) + 1;
+        }
+        if (ofs > max)
+            ofs = max;
+        int64_t tmp = last;
+        last = hint - ofs;
+        ofs = hint - tmp;
+    } else {
+        int64_t max = length - hint;
+        while (ofs < max) {
+            if (!sort_less(st, key, a[base + hint + ofs], &less))
+                return false;
+            if (less)
+                break;
+            last = ofs;
+            ofs = (ofs << 1) + 1;
+        }
+        if (ofs > max)
+            ofs = max;
+        last += hint;
+        ofs += hint;
+    }
+    last++;
+    while (last < ofs) {
+        int64_t m = last + ((ofs - last) >> 1);
+        if (!sort_less(st, key, a[base + m], &less))
+            return false;
+        if (less)
+            ofs = m;
+        else
+            last = m + 1;
+    }
+    *out = ofs;
+    return true;
+}
+
+static void sort_copy(JsValue *dst, const JsValue *src, int64_t n) {
+    memmove(dst, src, (size_t)n * sizeof *dst);
+}
+
+/* Merges the adjacent runs A and B of the work array, A no longer than B: A goes to the buffer
+ * and the merge fills from the left */
+static bool sort_merge_low(SortState *st, int64_t base_a, int64_t len_a, int64_t base_b, int64_t len_b) {
+    JsValue *t = sort_temp(st, len_a);
+    if (!t)
+        return false;
+    JsValue *w = st->work->elems;
+    sort_copy(t, w + base_a, len_a);
+    int64_t dest = base_a, ct = 0, cb = base_b;
+    w[dest++] = w[cb++];
+    if (--len_b == 0)
+        goto succeed;
+    if (len_a == 1)
+        goto copy_b;
+    int64_t min_gallop = st->min_gallop;
+    for (;;) {
+        int64_t wins_a = 0, wins_b = 0; /* how many times in a row each run has won */
+        for (;;) {
+            bool less;
+            if (!sort_less(st, w[cb], t[ct], &less))
+                return false;
+            if (less) {
+                w[dest++] = w[cb++];
+                wins_b++;
+                len_b--;
+                wins_a = 0;
+                if (len_b == 0)
+                    goto succeed;
+                if (wins_b >= min_gallop)
+                    break;
+            } else {
+                w[dest++] = t[ct++];
+                wins_a++;
+                len_a--;
+                wins_b = 0;
+                if (len_a == 1)
+                    goto copy_b;
+                if (wins_a >= min_gallop)
+                    break;
+            }
+        }
+        /* one run is winning consistently: gallop, until neither does */
+        min_gallop++;
+        for (bool first = true; wins_a >= SORT_MIN_GALLOP || wins_b >= SORT_MIN_GALLOP || first;) {
+            first = false;
+            min_gallop = min_gallop > 2 ? min_gallop - 1 : 1;
+            st->min_gallop = min_gallop;
+            if (!sort_gallop_right(st, t, w[cb], ct, len_a, 0, &wins_a))
+                return false;
+            if (wins_a > 0) {
+                sort_copy(w + dest, t + ct, wins_a);
+                dest += wins_a;
+                ct += wins_a;
+                len_a -= wins_a;
+                if (len_a == 1)
+                    goto copy_b;
+                if (len_a == 0) /* only with a comparator that is not consistent */
+                    goto succeed;
+            }
+            w[dest++] = w[cb++];
+            if (--len_b == 0)
+                goto succeed;
+            if (!sort_gallop_left(st, w, t[ct], cb, len_b, 0, &wins_b))
+                return false;
+            if (wins_b > 0) {
+                sort_copy(w + dest, w + cb, wins_b);
+                dest += wins_b;
+                cb += wins_b;
+                len_b -= wins_b;
+                if (len_b == 0)
+                    goto succeed;
+            }
+            w[dest++] = t[ct++];
+            if (--len_a == 1)
+                goto copy_b;
+        }
+        min_gallop++; /* the price of leaving galloping mode */
+        st->min_gallop = min_gallop;
+    }
+succeed:
+    if (len_a > 0)
+        sort_copy(w + dest, t + ct, len_a);
+    return true;
+copy_b: /* the last of A goes after all that is left of B */
+    sort_copy(w + dest, w + cb, len_b);
+    w[dest + len_b] = t[ct];
+    return true;
+}
+
+/* As sort_merge_low with B no longer than A: B goes to the buffer, filling from the right */
+static bool sort_merge_high(SortState *st, int64_t base_a, int64_t len_a, int64_t base_b, int64_t len_b) {
+    JsValue *t = sort_temp(st, len_b);
+    if (!t)
+        return false;
+    JsValue *w = st->work->elems;
+    sort_copy(t, w + base_b, len_b);
+    int64_t dest = base_b + len_b - 1, ct = len_b - 1, ca = base_a + len_a - 1;
+    w[dest--] = w[ca--];
+    if (--len_a == 0)
+        goto succeed;
+    if (len_b == 1)
+        goto copy_a;
+    int64_t min_gallop = st->min_gallop;
+    for (;;) {
+        int64_t wins_a = 0, wins_b = 0;
+        for (;;) {
+            bool less;
+            if (!sort_less(st, t[ct], w[ca], &less))
+                return false;
+            if (less) {
+                w[dest--] = w[ca--];
+                wins_a++;
+                len_a--;
+                wins_b = 0;
+                if (len_a == 0)
+                    goto succeed;
+                if (wins_a >= min_gallop)
+                    break;
+            } else {
+                w[dest--] = t[ct--];
+                wins_b++;
+                len_b--;
+                wins_a = 0;
+                if (len_b == 1)
+                    goto copy_a;
+                if (wins_b >= min_gallop)
+                    break;
+            }
+        }
+        min_gallop++;
+        for (bool first = true; wins_a >= SORT_MIN_GALLOP || wins_b >= SORT_MIN_GALLOP || first;) {
+            first = false;
+            min_gallop = min_gallop > 2 ? min_gallop - 1 : 1;
+            st->min_gallop = min_gallop;
+            int64_t k;
+            if (!sort_gallop_right(st, w, t[ct], base_a, len_a, len_a - 1, &k))
+                return false;
+            wins_a = len_a - k;
+            if (wins_a > 0) {
+                dest -= wins_a;
+                ca -= wins_a;
+                sort_copy(w + dest + 1, w + ca + 1, wins_a);
+                len_a -= wins_a;
+                if (len_a == 0)
+                    goto succeed;
+            }
+            w[dest--] = t[ct--];
+            if (--len_b == 1)
+                goto copy_a;
+            if (!sort_gallop_left(st, t, w[ca], 0, len_b, len_b - 1, &k))
+                return false;
+            wins_b = len_b - k;
+            if (wins_b > 0) {
+                dest -= wins_b;
+                ct -= wins_b;
+                sort_copy(w + dest + 1, t + ct + 1, wins_b);
+                len_b -= wins_b;
+                if (len_b == 1)
+                    goto copy_a;
+                if (len_b == 0) /* only with a comparator that is not consistent */
+                    goto succeed;
+            }
+            w[dest--] = w[ca--];
+            if (--len_a == 0)
+                goto succeed;
+        }
+        min_gallop++;
+        st->min_gallop = min_gallop;
+    }
+succeed:
+    if (len_b > 0)
+        sort_copy(w + dest - (len_b - 1), t, len_b);
+    return true;
+copy_a: /* the first of B goes before all that is left of A */
+    dest -= len_a;
+    ca -= len_a;
+    sort_copy(w + dest + 1, w + ca + 1, len_a);
+    w[dest] = t[ct];
+    return true;
+}
+
+/* Merges pending runs I and I + 1 (I is the second or the third from the top) */
+static bool sort_merge_at(SortState *st, int i) {
+    JsValue *w = st->work->elems;
+    int64_t base_a = st->run_base[i], len_a = st->run_len[i];
+    int64_t base_b = st->run_base[i + 1], len_b = st->run_len[i + 1];
+    st->run_len[i] = len_a + len_b;
+    if (i == st->runs - 3) {
+        st->run_base[i + 1] = st->run_base[i + 2];
+        st->run_len[i + 1] = st->run_len[i + 2];
+    }
+    st->runs--;
+    /* what of A is already in place before B's first, and of B after A's last, needs no merging */
+    int64_t k;
+    if (!sort_gallop_right(st, w, w[base_b], base_a, len_a, 0, &k))
+        return false;
+    base_a += k;
+    len_a -= k;
+    if (len_a == 0)
+        return true;
+    if (!sort_gallop_left(st, w, w[base_a + len_a - 1], base_b, len_b, len_b - 1, &len_b))
+        return false;
+    if (len_b == 0)
+        return true;
+    return len_a <= len_b ? sort_merge_low(st, base_a, len_a, base_b, len_b)
+                          : sort_merge_high(st, base_a, len_a, base_b, len_b);
+}
+
+/* run N and the two below it: len[N - 2] > len[N - 1] + len[N] */
+static bool sort_run_invariant(const SortState *st, int n) {
+    return n < 2 || st->run_len[n - 2] > st->run_len[n - 1] + st->run_len[n];
+}
+
+/* Merges runs until the stack's invariants hold again (MergeCollapse) */
+static bool sort_merge_collapse(SortState *st) {
+    while (st->runs > 1) {
+        int n = st->runs - 2;
+        if (!sort_run_invariant(st, n + 1) || !sort_run_invariant(st, n)) {
+            if (st->run_len[n - 1] < st->run_len[n + 1])
+                n--;
+        } else if (st->run_len[n] > st->run_len[n + 1]) {
+            break;
+        }
+        if (!sort_merge_at(st, n))
+            return false;
+    }
+    return true;
+}
+
+/* Sorts the work array. Array.prototype.sort inserts fewer than 8 elements one by one from the
+ * first (ArrayTimSort); toSorted does not have that shortcut (ArrayTimSortIntoCopy), and the
+ * comparator can tell. */
+static bool sort_work(SortState *st, bool to_sorted) {
+    int64_t length = st->work->elem_count;
+    if (!to_sorted && length < 8)
+        return sort_binary_insertion(st, 0, 0, length);
+    if (length < 2)
+        return true;
+    int64_t min_run = length, bit = 0; /* ComputeMinRunLength */
+    while (min_run >= 64) {
+        bit |= min_run & 1;
+        min_run >>= 1;
+    }
+    min_run += bit;
+    for (int64_t low = 0, remaining = length; remaining != 0;) {
+        int64_t run;
+        if (!sort_count_run(st, low, low + remaining, &run))
+            return false;
+        if (run < min_run) {
+            int64_t forced = min_run < remaining ? min_run : remaining;
+            if (!sort_binary_insertion(st, low, low + run, low + forced))
+                return false;
+            run = forced;
+        }
+        if (st->runs == SORT_MAX_RUNS) /* cannot be: the invariants bound the stack far below */
+            return native_throw(st->ctx, st->r, "internal: sort run stack");
+        st->run_base[st->runs] = low;
+        st->run_len[st->runs++] = run;
+        if (!sort_merge_collapse(st))
+            return false;
+        low += run;
+        remaining -= run;
+    }
+    while (st->runs > 1) { /* MergeForceCollapse */
+        int n = st->runs - 2;
+        if (n > 0 && st->run_len[n - 1] < st->run_len[n + 1])
+            n--;
+        if (!sort_merge_at(st, n))
+            return false;
+    }
+    return true;
+}
+
+/* sort (in place, the result ARRV) or toSorted (the result a new array) of the array ARRV under
+ * CMP, a function or undefined */
+static bool sort_array(JsContext *ctx, JsValue arrv, JsValue cmp, bool to_sorted, JsValue *r) {
+    SortState st;
+    st.ctx = ctx;
+    st.r = r;
+    st.cmp = cmp;
+    st.workv = st.tempv = st.str = js_undefined();
+    st.min_gallop = SORT_MIN_GALLOP;
+    st.runs = 0;
+    js_gc_protect(ctx->vm, &arrv);
+    js_gc_protect(ctx->vm, &st.cmp);
+    js_gc_protect(ctx->vm, &st.workv);
+    js_gc_protect(ctx->vm, &st.tempv);
+    js_gc_protect(ctx->vm, &st.str);
+    JsObject *a = js_value_object(arrv);
+    uint32_t n = a->elem_count; /* the length the sort is of, whatever the comparator makes of it */
+    bool ok = false;
+    JsObject *work = st.work = js_array_new_cell(ctx, n ? n : 1);
+    if (!work) {
+        oom(ctx, r);
+    } else {
+        st.workv = js_value_from_cell(&work->gc);
+        for (uint32_t i = 0; i < n; i++)
+            if (!js_is_undefined(a->elems[i]))
+                work->elems[work->elem_count++] = a->elems[i];
+        ok = sort_work(&st, to_sorted);
+    }
+    if (ok && to_sorted) { /* the work array is the result, once it has the undefined ones */
+        while (work->elem_count < n)
+            work->elems[work->elem_count++] = js_undefined();
+        *r = st.workv;
+    } else if (ok) {
+        /* Written back as V8 does, an element at a time and as an assignment would: to an array
+         * the comparator froze that is an error, one it shortened grows again, and what it
+         * added past the end stays. */
+        for (uint32_t i = 0; i < n && ok; i++) {
+            JsValue v = i < work->elem_count ? work->elems[i] : js_undefined();
+            if (i < a->elem_count) {
+                if (a->obj_flags & JS_OBJ_FROZEN) {
+                    *r = js_error_fmt(ctx, "TypeError: Cannot assign to read only property '%s' of object "
+                                           "'[object Array]'", "0");
+                    ok = false;
+                } else {
+                    a->elems[i] = v;
+                }
+            } else if (a->obj_flags & JS_OBJ_NO_ADD) {
+                *r = js_error_fmt(ctx, "TypeError: Cannot add property %v, object is not extensible",
+                                  js_number((double)i));
+                ok = false;
+            } else if (!js_array_set_index(ctx->vm, a, i, v)) {
+                ok = oom(ctx, r);
+            }
+        }
+        if (ok)
+            *r = arrv;
+    }
+    js_gc_unprotect(ctx->vm, &st.str);
+    js_gc_unprotect(ctx->vm, &st.tempv);
+    js_gc_unprotect(ctx->vm, &st.workv);
+    js_gc_unprotect(ctx->vm, &st.cmp);
+    js_gc_unprotect(ctx->vm, &arrv);
+    return ok;
+}
+
 static bool am_sort(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     JsObject *a;
-    if (!array_this_mut(ctx, tv, &a, r, MUT_REORDER))
+    if (!array_this(ctx, tv, &a, r))
         return false;
     JsValue cmp = ARG(0);
-    bool has_cmp = js_is_function(cmp);
-    if (argc > 0 && !has_cmp && !js_is_undefined(cmp))
+    if (!js_is_undefined(cmp) && !js_is_function(cmp))
         return native_throw_fmt(ctx, r, "TypeError: The comparison function must be either a function or undefined: %v", cmp);
-    JsValue arrv = tv, key = js_undefined(), midstr = js_undefined();
-    js_gc_protect(ctx->vm, &arrv);
-    js_gc_protect(ctx->vm, &cmp);
-    js_gc_protect(ctx->vm, &key);
-    js_gc_protect(ctx->vm, &midstr);
-    bool failed = false;
-
-    /* Insertion sort is quadratic in element moves and the interpreter charges
-     * one fuel unit for the whole call, so a large sort is the longest a guest
-     * can keep the engine inside a single native. Poll the stop flag per pass
-     * so an interrupt is not left waiting for it. */
-    for (uint32_t i = 1; i < a->elem_count && !failed; i++) {
-        if (ctx->vm->interrupt) {
-            failed = true;
-            native_throw(ctx, r, JS_MSG_INTERRUPT);
-            break; /* not `return`: the roots below still have to come off */
-        }
-        key = a->elems[i];
-        uint32_t lo = 0, hi = i;
-        while (lo < hi) {
-            uint32_t mid = (lo + hi) / 2;
-            int c; /* c>0 means a->elems[mid] should come after key */
-            /* A user comparator (or a user toString) may mutate — even shrink —
-             * the array, freeing the slot `mid` used to name. Re-read against
-             * the current elem_count so we never touch a freed element. */
-            JsValue midv = mid < a->elem_count ? a->elems[mid] : js_undefined();
-            if (has_cmp) {
-                JsValue argv[2] = {midv, key};
-                JsValue res;
-                if (!js_call(ctx, cmp, js_undefined(), argv, 2, &res)) {
-                    *r = res;
-                    failed = true;
-                    break;
-                }
-                double d;
-                if (!js_op_to_number(ctx, res, &d)) {
-                    oom(ctx, r);
-                    failed = true;
-                    break;
-                }
-                c = d > 0 ? 1 : (d < 0 ? -1 : 0);
-            } else {
-                /* Converting `key` allocates, which is a GC safe point — so
-                 * `sa` must be rooted across it or the collector can reclaim
-                 * the string this comparison is about to read. */
-                JsString *sa = js_op_to_string(ctx, midv);
-                if (!sa) {
-                    failed = true;
-                    oom(ctx, r);
-                    break;
-                }
-                midstr = js_value_from_cell(&sa->gc);
-                JsString *sk = js_op_to_string(ctx, key);
-                if (!sk) {
-                    failed = true;
-                    oom(ctx, r);
-                    break;
-                }
-                uint32_t n = sa->length < sk->length ? sa->length : sk->length, k = 0;
-                c = 0;
-                for (; k < n; k++)
-                    if (sa->units[k] != sk->units[k]) {
-                        c = sa->units[k] < sk->units[k] ? -1 : 1;
-                        break;
-                    }
-                if (c == 0 && sa->length != sk->length)
-                    c = sa->length < sk->length ? -1 : 1;
-            }
-            if (c > 0)
-                hi = mid;
-            else
-                lo = mid + 1;
-        }
-        if (failed)
-            break;
-        /* If the comparator shrank the array below i, the insertion slot no
-         * longer exists — skip placing this key rather than writing OOB. */
-        if (i >= a->elem_count)
-            continue;
-        for (uint32_t j = i; j > lo; j--)
-            a->elems[j] = a->elems[j - 1];
-        a->elems[lo] = key;
+    if (a->elem_count < 2) { /* nothing to do, to a frozen array either */
+        *r = tv;
+        return true;
     }
-    js_gc_unprotect(ctx->vm, &midstr);
-    js_gc_unprotect(ctx->vm, &key);
-    js_gc_unprotect(ctx->vm, &cmp);
-    js_gc_unprotect(ctx->vm, &arrv);
-    if (failed)
-        return false;
-    *r = tv;
-    return true;
+    return sort_array(ctx, tv, cmp, false, r);
 }
 
 static bool am_flat(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
@@ -2091,10 +2597,7 @@ static bool am_toSorted(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     JsValue cmp = ARG(0);
     if (!js_is_undefined(cmp) && !js_is_function(cmp))
         return native_throw_fmt(ctx, r, "TypeError: The comparison function must be either a function or undefined: %v", cmp);
-    JsObject *out = array_copy(ctx, a, a->elem_count);
-    if (!out)
-        return oom(ctx, r);
-    return am_sort(ctx, js_value_from_cell(&out->gc), args, argc > 1 ? 1 : argc, r);
+    return sort_array(ctx, tv, cmp, true, r);
 }
 
 static bool am_toSpliced(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {

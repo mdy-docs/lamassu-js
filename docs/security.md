@@ -108,8 +108,8 @@ top-level run plus the microtask drain it feeds. A server that sets it once at
 startup gives the whole process one budget, not one per request.
 
 **Bound wall-clock.** Fuel counts instructions, not time, and a single
-instruction can enter a builtin that runs long. `sort` is O(n²) in
-element moves and charges nothing for them; string concatenation can copy and
+instruction can enter a builtin that runs long. `sort` without a comparator makes
+all its O(n log n) comparisons for one unit; string concatenation can copy and
 rehash up to `JS_MAX_STRING_UNITS` per instruction; the regex step budget is per
 call, so a loop of cheap-looking `re.test(s)` calls multiplies it. None of these
 are memory-unsafe, and all are bounded per operation — but the aggregate is not

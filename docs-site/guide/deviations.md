@@ -121,9 +121,6 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   `arr.length = n` both throw `RangeError` past a fixed growth cap rather
   than eagerly allocating an attacker-chosen size; see
   [Built-ins → Array](/guide/builtins#array).
-- **`Array.prototype.sort` is a stable O(n²) binary insertion sort** —
-  fine for templating-sized arrays; revisit if you're sorting something
-  large.
 
 ## Numbers
 

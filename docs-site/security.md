@@ -162,8 +162,8 @@ carrying on.
 ### Bound wall-clock separately
 
 ::: warning Fuel counts instructions, not time
-A single instruction can enter a builtin that runs long. `sort` is O(n²) in
-element moves and charges nothing for them; string concatenation can copy and
+A single instruction can enter a builtin that runs long. `sort` without a comparator
+makes all its O(n log n) comparisons for one unit; string concatenation can copy and
 rehash a large string in one step; the regex step budget is per call, so a
 loop of cheap-looking `re.test(s)` calls multiplies it. None of these are
 memory-unsafe and all are bounded per operation — but the aggregate is not
