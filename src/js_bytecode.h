@@ -308,6 +308,10 @@ typedef struct JsModBinding {
 /* Marks a module cell and frees its owned arrays (js_module.c helpers). */
 void js_gc_mark_module(JsVm *vm, JsModule *m);
 void js_module_free_cell(JsVm *vm, JsModule *m);
+/* Live re-exports (js_module.c): the write of an export reaching the namespaces that re-export
+ * it, and the collector dropping the mirrors of namespaces about to be swept. */
+void js_module_export_written(JsVm *vm, JsModule *m, JsString *name, JsValue v);
+void js_module_mirrors_prune(JsVm *vm);
 void js_modules_free_registry(JsContext *ctx);
 void js_gc_mark_module_registry(JsContext *ctx);
 

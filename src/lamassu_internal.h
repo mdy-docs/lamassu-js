@@ -462,7 +462,9 @@ typedef enum JsImportKind {
 
 typedef struct JsModuleImport {
     JsString *specifier;     /* module to import from */
-    JsString *imported_name; /* export name in source (NULL for ns/side) */
+    JsString *imported_name; /* export name in source (NULL for ns/side); after linking, the
+                              * name in `source` that owns the binding, or NULL where the name
+                              * turned out to be a module's namespace (`requested` is still set) */
     uint8_t kind;            /* JsImportKind */
     JsModule *source;        /* resolved at link */
     JsString *requested;     /* the name as this module imports it (link may follow re-exports
@@ -471,21 +473,55 @@ typedef struct JsModuleImport {
 
 /*
  * A re-export: `export * from`, `export * as ns from`, or
- * `export { x as y } from`. Applied at evaluation once `source` has run.
+ * `export { x as y } from`. Linking binds each name to the binding it stands for
+ * (JsExportBinding below); none is a copy.
  */
 typedef enum JsReExpKind {
-    JS_REEXP_ALL = 0,   /* export * from 'm'  -> copy all named exports */
+    JS_REEXP_ALL = 0,   /* export * from 'm'  -> every name of m but `default` */
     JS_REEXP_NS = 1,    /* export * as ns from 'm' -> exports[ns] = m namespace */
-    JS_REEXP_NAMED = 2, /* export { x as y } from 'm' -> exports[y] = m.exports[x] */
+    JS_REEXP_NAMED = 2, /* export { x as y } from 'm' -> y is m's binding x */
+    JS_REEXP_LOCAL = 3, /* export { x as a, x as b }: `exported` (b) is one more name of this
+                         * module's own export `imported` (a); no specifier */
 } JsReExpKind;
 
 typedef struct JsStarExport {
-    JsString *specifier;
+    JsString *specifier; /* NULL for LOCAL */
     JsModule *source;
     uint8_t kind;
-    JsString *imported; /* NAMED: source export name */
-    JsString *exported; /* NS: binding name; NAMED: exported name */
+    JsString *imported; /* NAMED: source export name; LOCAL: the binding's first export name */
+    JsString *exported; /* NS: binding name; NAMED, LOCAL: exported name */
 } JsStarExport;
+
+/*
+ * A name a module exports without holding the binding under that name: the binding it stands
+ * for, as the module and the export name that own it (V8's cell in the module's exports table).
+ * Linking adds one for every `export { x } from`, every name an `export *` brings and every
+ * further name of a local export; two names are the same binding when both fields are equal.
+ * A NULL origin_name is the namespace of `origin`: what `export * as ns from` and `import * as
+ * ns from; export { ns }` export. A module has one, so two modules re-exporting the namespace
+ * of a third export one binding (V8's namespace cell), not two that conflict under `export *`.
+ */
+typedef struct JsExportBinding {
+    JsString *name;
+    JsModule *origin;
+    JsString *origin_name;
+    bool alias;  /* LOCAL: the compiler writes this slot with the binding's other names */
+    bool hidden; /* resolved after the namespace was made: V8's namespace object keeps the
+                  * names it was made with, so no slot */
+} JsExportBinding;
+
+/*
+ * The other end of a JsExportBinding, on the module that owns the binding: a slot of another
+ * module's namespace that shows it, rewritten at every write of the export (JS_OP_SET_EXPORT).
+ * The namespace is held weakly: the collector drops the mirrors of one that died
+ * (js_module_mirrors_prune), so an evicted re-exporter does not stay alive through them.
+ */
+typedef struct JsExportMirror {
+    JsObject *exports; /* the namespace object written (not marked) */
+    JsString *name;    /* its key there */
+    JsString *key;     /* the export mirrored */
+    uint32_t next;     /* index + 1 of the next mirror of the same export; 0 ends the chain */
+} JsExportMirror;
 
 typedef enum JsModuleStatus {
     JS_MOD_FETCHING = 0, /* loader promise in flight; body/exports unknown */
@@ -524,8 +560,22 @@ struct JsModule {
     /* The body's fiber between instantiation (its functions made, parked at JS_OP_MODULE_READY)
      * and evaluation, which resumes it; NULL before and after. */
     JsFiber *fiber;
-    bool env_ready;           /* instantiation ran (or this module has no body to run) */
-    bool imports_checked;     /* every name it imports or re-exports is provided */
+    /* Linking, as V8's FinishInstantiate does it (js_module.c): 0 until the names this module
+     * imports and re-exports are resolved, 1 while its strongly connected component is being
+     * resolved, 2 once that is done and its body's functions are made */
+    uint8_t link_state;
+    bool ns_ready;            /* the names its `export *` bring are in its namespace */
+    bool ns_wanted;           /* somebody takes its namespace (import *, export * as, import()) */
+    bool fetch_mark;          /* visited by the walk that is gathering them */
+    uint32_t dfs_index, dfs_ancestor;
+    JsExportBinding *bindings; /* the exported names that are another binding */
+    uint32_t binding_count, binding_cap;
+    uint32_t binding_committed; /* [0, this) are in `exports` and mirrored */
+    JsMap bound;               /* name -> index in `bindings` */
+    JsExportMirror *mirrors;   /* the namespaces showing this module's exports */
+    uint32_t mirror_count, mirror_cap;
+    JsMap mirrored;            /* export name -> index + 1 of its first mirror */
+    JsModule *mirror_next;     /* vm->mirror_modules: every module with mirrors */
 };
 
 /* Opaque host-provided module bytecode; bytes owned by the cell. */
@@ -761,6 +811,7 @@ struct JsVm {
     /* Map and Set iterators not yet done, held weakly: a delete or clear moves their positions
      * (js_iter.h), and the collector drops the unmarked ones before it sweeps */
     struct JsIterObj *live_iters;
+    JsModule *mirror_modules;    /* every module with export mirrors (js_module_mirrors_prune) */
     struct JsWeakObj *weak_list; /* every WeakMap, WeakSet, WeakRef, FinalizationRegistry (js_weak.h) */
     bool weak_cleanup_pending;   /* a registry has held values waiting for its callback */
 

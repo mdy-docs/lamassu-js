@@ -150,9 +150,11 @@ a, b as c }` must be declared in the module (else `SyntaxError: Export 'a' is
 not defined in module`) and keeps that declaration's rules, so assigning a
 listed `const` throws; one binding may be exported under several names; an
 imported name exported again is a re-export. A namespace object (`import * as
-ns`) is sealed and read-only, and lists its exports in name order. See the
-[Deviations](/guide/deviations) page for the edge cases (snapshot vs. live
-re-exports).
+ns`) is sealed and read-only, and lists its exports in name order. Every
+re-export (`export { a as b } from`, `export * from`, `export * as ns from`,
+an imported name exported again) is a live binding of the module that
+declares it. Linking follows V8 also in the few places where V8 is not the
+specification: see the [Deviations](/guide/deviations#modules) page.
 
 Import attributes are V8's syntax (`import data from './d.json' with { type: 'json' }`, the same
 on `export ... from` and in `import(spec, { with: { type: 'json' } })`; `assert` is gone, as in V8).

@@ -17,7 +17,7 @@
 #ifndef JS_BCFORMAT_H
 #define JS_BCFORMAT_H
 
-#define JSBC_VERSION 18u /* 3: JS_FN_USES_ARGUMENTS function flag; 4: callee-name table after the line table;
+#define JSBC_VERSION 19u /* 3: JS_FN_USES_ARGUMENTS function flag; 4: callee-name table after the line table;
                            5: JS_OP_THROW_CONST_ASSIGN, and the name table also marks iteration,
                            destructuring and TDZ-able reads;
                            6: JS_OP_SET_LOCAL_CHECKED, JS_OP_SET_UPVAL_CHECKED, JS_OP_INIT_EXPORT,
@@ -41,7 +41,9 @@
                            `arguments`), JS_IMPORT_META import kind, CTAG_IMPORT_META and CTAG_TEMPLATE constants;
                            17: JS_OP_DYNAMIC_IMPORT takes [specifier, options], and a module request
                            carries its import attributes after a 0 unit; CTAG_BIGINT constants;
-                           18: JS_OP_UPDATE and JS_OP_UPDATE_POST for ++ and -- */
+                           18: JS_OP_UPDATE and JS_OP_UPDATE_POST for ++ and --;
+                           19: a re-export's specifier is optional (JS_REEXP_LOCAL has none), and a
+                           module lists every export of its own, each after a flag (1: in the TDZ) */
 #define JSBC_FLAG_HAS_REGEX 1u /* producer had regex enabled (informational) */
 
 /* Sanity caps: reject absurd sizes early (before allocating) rather than

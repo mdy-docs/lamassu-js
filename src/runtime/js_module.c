@@ -26,9 +26,15 @@
  * js_promise.c. JsModule cells ride through captures disguised as JsValues
  * (they tag as objects via js_value_from_cell) — never hand one to script.
  *
- * Live bindings: an importer reads `source.exports[name]` at each use
- * (GET_IMPORT), so a mutation in the exporting module is observed. Star
- * re-exports are snapshot-copied once the source has evaluated.
+ * Live bindings: an importer reads the exports object of the module that owns
+ * the binding at each use (GET_IMPORT), wherever the name came through, so a
+ * write in that module is observed. Linking is V8's: ResolveExport finds the
+ * binding behind every imported and re-exported name (with its three
+ * SyntaxErrors), strongly connected component by component, and
+ * FetchStarExports gathers what `export *` brings into a namespace somebody
+ * takes. A re-exported name is a slot in the re-exporter's namespace that the
+ * owning module rewrites at every write of the export (a mirror), so
+ * namespaces are as live as imports.
  */
 #include "js_bytecode.h"
 #include "js_error.h"
@@ -75,6 +81,20 @@ void js_gc_mark_module(JsVm *vm, JsModule *m) {
     for (uint32_t i = 0; i < m->dep_count; i++)
         if (m->deps[i])
             js_gc_mark_cell(vm, &m->deps[i]->gc);
+    for (uint32_t i = 0; i < m->binding_count; i++) {
+        js_gc_mark_cell(vm, &m->bindings[i].name->gc);
+        js_gc_mark_cell(vm, &m->bindings[i].origin->gc);
+        if (m->bindings[i].origin_name)
+            js_gc_mark_cell(vm, &m->bindings[i].origin_name->gc);
+    }
+    /* a mirror's namespace is held weakly (js_module_mirrors_prune); its keys are not */
+    for (uint32_t i = 0; i < m->mirror_count; i++)
+        js_gc_mark_cell(vm, &m->mirrors[i].name->gc);
+    for (uint32_t i = 0; i < m->mirrored.used; i++) {
+        JsString *k = m->mirrored.entries[i].key;
+        if (k && k != JS_MAP_TOMBSTONE)
+            js_gc_mark_cell(vm, &k->gc);
+    }
 }
 
 void js_module_free_cell(JsVm *vm, JsModule *m) {
@@ -82,6 +102,85 @@ void js_module_free_cell(JsVm *vm, JsModule *m) {
     js_realloc_raw(vm, m->stars, (size_t)m->star_count * sizeof(JsStarExport), 0);
     js_realloc_raw(vm, m->dep_specs, (size_t)m->dep_spec_count * sizeof(JsString *), 0);
     js_realloc_raw(vm, m->deps, (size_t)m->dep_count * sizeof(JsModule *), 0);
+    js_realloc_raw(vm, m->bindings, (size_t)m->binding_cap * sizeof(JsExportBinding), 0);
+    js_realloc_raw(vm, m->mirrors, (size_t)m->mirror_cap * sizeof(JsExportMirror), 0);
+    js_map_free(vm, &m->bound);
+    js_map_free(vm, &m->mirrored);
+}
+
+/* ---- export mirrors (the owning module's end of a re-exported name) ---- */
+
+/* O's export KEY shows in the namespace EXPORTS under NAME from now on. False on OOM. */
+static bool add_mirror(JsVm *vm, JsModule *o, JsString *key, JsObject *exports, JsString *name) {
+    if (o->mirror_count == o->mirror_cap) {
+        uint32_t ncap = o->mirror_cap ? o->mirror_cap * 2 : 4;
+        JsExportMirror *na = js_realloc_raw(vm, o->mirrors,
+                                            (size_t)o->mirror_cap * sizeof(JsExportMirror),
+                                            (size_t)ncap * sizeof(JsExportMirror));
+        if (!na)
+            return false;
+        if (!o->mirror_cap) { /* its first: the collector prunes the modules on this list */
+            o->mirror_next = vm->mirror_modules;
+            vm->mirror_modules = o;
+        }
+        o->mirrors = na;
+        o->mirror_cap = ncap;
+    }
+    bool found;
+    JsValue head = js_map_get(&o->mirrored, key, &found);
+    uint32_t next = found ? (uint32_t)js_get_number(head) : 0;
+    if (!js_map_set(vm, &o->mirrored, key, js_number((double)o->mirror_count + 1)))
+        return false;
+    JsExportMirror *mr = &o->mirrors[o->mirror_count++];
+    mr->exports = exports;
+    mr->name = name;
+    mr->key = key;
+    mr->next = next;
+    return true;
+}
+
+/* M wrote V to its export NAME (JS_OP_SET_EXPORT, JS_OP_INIT_EXPORT): the namespaces that
+ * re-export it show the same. The slots exist, so nothing is allocated. */
+void js_module_export_written(JsVm *vm, JsModule *m, JsString *name, JsValue v) {
+    bool found;
+    JsValue head = js_map_get(&m->mirrored, name, &found);
+    if (!found)
+        return;
+    for (uint32_t i = (uint32_t)js_get_number(head); i; i = m->mirrors[i - 1].next)
+        (void)js_map_set(vm, &m->mirrors[i - 1].exports->props, m->mirrors[i - 1].name, v);
+}
+
+/* Between marking and the sweep: a mirror whose namespace is about to be freed goes (the
+ * namespace of an evicted re-exporter nobody holds any more), and so does a module about to be
+ * freed itself from the list. Nothing is allocated: the chains are rebuilt in place. */
+void js_module_mirrors_prune(JsVm *vm) {
+    JsModule **link = &vm->mirror_modules;
+    while (*link) {
+        JsModule *m = *link;
+        if (!m->gc.mark) {
+            *link = m->mirror_next;
+            continue;
+        }
+        link = &m->mirror_next;
+        uint32_t kept = 0;
+        for (uint32_t i = 0; i < m->mirror_count; i++)
+            if (m->mirrors[i].exports->gc.mark)
+                m->mirrors[kept++] = m->mirrors[i];
+        if (kept == m->mirror_count)
+            continue;
+        m->mirror_count = kept;
+        for (uint32_t i = 0; i < m->mirrored.used; i++) {
+            JsString *k = m->mirrored.entries[i].key;
+            if (k && k != JS_MAP_TOMBSTONE)
+                m->mirrored.entries[i].value = js_number(0);
+        }
+        for (uint32_t i = 0; i < kept; i++) {
+            bool found;
+            JsValue head = js_map_get(&m->mirrored, m->mirrors[i].key, &found);
+            m->mirrors[i].next = found ? (uint32_t)js_get_number(head) : 0;
+            (void)js_map_set(vm, &m->mirrored, m->mirrors[i].key, js_number((double)i + 1));
+        }
+    }
 }
 
 void js_gc_mark_module_registry(JsContext *ctx) {
@@ -305,7 +404,7 @@ static JsModule *meta_module(JsContext *ctx, JsModule *m) {
         mm->exports = js_value_object(meta);
         mm->synthetic = true;
         mm->status = JS_MOD_EVALUATED;
-        mm->env_ready = true;
+        mm->link_state = 2;
         ok = js_object_set_ascii(ctx, mm->exports, "url", js_value_from_cell(&m->specifier->gc));
     }
     js_gc_unprotect(vm, &mmv);
@@ -786,46 +885,27 @@ static JsModule *dep_for_spec(JsModule *m, JsString *spec) {
 }
 
 /*
- * Follows NAMED re-export chains so an import binds to the module that actually
- * *defines* the export (and the local name there), giving `export { x } from`
- * true live-binding semantics: the importer reads the origin module's live slot
- * rather than a value snapshotted at evaluation time. `export *` / `export * as`
- * are not followed here (their names are materialized into the exports object at
- * eval time). Bounded against re-export cycles.
+ * V8's PrepareInstantiate: every import and re-export gets the module its specifier names.
+ * What a name resolves to is finish_link's.
  */
-static void resolve_export(JsModule *m, JsString *name, JsModule **out_mod,
-                           JsString **out_name, int depth) {
-    if (depth <= 32) {
-        for (uint32_t i = 0; i < m->star_count; i++) {
-            JsStarExport *re = &m->stars[i];
-            if (re->kind == JS_REEXP_NAMED && re->exported == name && re->source) {
-                resolve_export(re->source, re->imported, out_mod, out_name, depth + 1);
-                return;
-            }
-        }
-    }
-    *out_mod = m;
-    *out_name = name;
-}
-
 static bool link_module(JsContext *ctx, JsModule *m, JsModError *err) {
-    (void)ctx;
     if (m->status >= JS_MOD_LINKED || m->status == JS_MOD_LINKING)
         return true; /* linked or in-progress (cycle) */
     m->status = JS_MOD_LINKING;
-    /* Link dependencies first so their re-export tables are bound before we
-     * resolve this module's imports through them. */
     for (uint32_t i = 0; i < m->dep_count; i++)
         if (m->deps[i] && !link_module(ctx, m->deps[i], err))
             return false;
     for (uint32_t i = 0; i < m->star_count; i++) {
-        JsModule *src = dep_for_spec(m, m->stars[i].specifier);
+        JsStarExport *re = &m->stars[i];
+        if (re->kind == JS_REEXP_LOCAL)
+            continue;
+        JsModule *src = dep_for_spec(m, re->specifier);
         if (!src) {
             err->msg = "unresolved re-export";
             err->pos = 0;
             return false;
         }
-        m->stars[i].source = src;
+        re->source = src;
     }
     for (uint32_t i = 0; i < m->import_count; i++) {
         if (m->imports[i].kind == JS_IMPORT_META) {
@@ -842,97 +922,531 @@ static bool link_module(JsContext *ctx, JsModule *m, JsModError *err) {
             err->pos = 0;
             return false;
         }
-        /* Named/default imports follow the source's re-export chain to the
-         * defining module; namespace/side imports bind to the source itself. */
-        if (m->imports[i].imported_name) {
-            JsModule *rmod;
-            JsString *rname;
-            if (!m->imports[i].requested)
-                m->imports[i].requested = m->imports[i].imported_name;
-            resolve_export(src, m->imports[i].imported_name, &rmod, &rname, 0);
-            m->imports[i].source = rmod;
-            m->imports[i].imported_name = rname;
-        } else {
-            m->imports[i].source = src;
-        }
+        /* a named or default import is bound to the module that owns the binding once
+         * finish_link has resolved it; a namespace or side-effect one to the source itself */
+        if (m->imports[i].imported_name && !m->imports[i].requested)
+            m->imports[i].requested = m->imports[i].imported_name;
+        m->imports[i].source = src;
     }
     m->status = JS_MOD_LINKED;
     return true;
 }
 
-/* ---- instantiate the bodies (functions made before any body runs) ---- */
+/* ---- the exports table: which binding a name is (V8's cells) ---- */
+
+/* The binding M exports as NAME, if its table has one: a name linking bound to another binding,
+ * or M's own (the key is in its exports object). A binding is the module that owns it and its
+ * name there; no name is that module's namespace (V8's namespace cell, one per module: two
+ * modules re-exporting the namespace of a third export one binding). */
+static bool lookup_cell(JsModule *m, JsString *name, JsModule **origin, JsString **oname) {
+    bool found;
+    JsValue at = js_map_get(&m->bound, name, &found);
+    if (found) {
+        JsExportBinding *b = &m->bindings[(uint32_t)js_get_number(at)];
+        *origin = b->origin;
+        *oname = b->origin_name;
+        return true;
+    }
+    if (!m->exports)
+        return false;
+    js_map_get(&m->exports->props, name, &found);
+    if (!found)
+        return false;
+    *origin = m;
+    *oname = name;
+    return true;
+}
+
+/* Puts the bindings of M not yet in its namespace there: the slot takes the value the binding
+ * has now (the TDZ marker as well: a read through the namespace then throws as a read of the
+ * binding does) and the owning module mirrors every later write into it. A synthetic module's
+ * object is the host's, written behind our back: its values are copied again when M runs
+ * (refresh_synthetic). False on OOM. */
+static bool commit_bindings(JsContext *ctx, JsModule *m) {
+    JsVm *vm = ctx->vm;
+    while (m->binding_committed < m->binding_count) {
+        JsExportBinding *b = &m->bindings[m->binding_committed];
+        if (!b->alias && !b->hidden) {
+            JsModule *o = b->origin;
+            bool found = false;
+            JsValue v = js_undefined();
+            if (!o->exports)
+                ;
+            else if (!b->origin_name) /* its namespace: never written again */
+                v = js_value_from_cell(&o->exports->gc);
+            else
+                v = js_map_get(&o->exports->props, b->origin_name, &found);
+            if (b->origin_name && !found)
+                v = js_undefined();
+            if (!m->exports || !js_map_set(vm, &m->exports->props, b->name, v))
+                return false;
+            if (b->origin_name && !o->synthetic &&
+                !add_mirror(vm, o, b->origin_name, m->exports, b->name))
+                return false;
+        }
+        m->binding_committed++;
+    }
+    return true;
+}
+
+static void refresh_synthetic(JsContext *ctx, JsModule *m) {
+    for (uint32_t i = 0; i < m->binding_committed; i++) {
+        JsExportBinding *b = &m->bindings[i];
+        if (b->alias || b->hidden || !b->origin_name || !b->origin->synthetic ||
+            !b->origin->exports)
+            continue;
+        bool found;
+        JsValue v = js_map_get(&b->origin->exports->props, b->origin_name, &found);
+        (void)js_map_set(ctx->vm, &m->exports->props, b->name, found ? v : js_undefined());
+    }
+}
+
+/* V8's Put into M's exports table: NAME is the binding ONAME of ORIGIN. A module still being
+ * linked keeps it out of its namespace until its component is done (a failed link takes it
+ * back: reset_bindings). False on OOM. */
+static bool put_binding(JsContext *ctx, JsModule *m, JsString *name, JsModule *origin,
+                        JsString *oname, bool alias) {
+    JsVm *vm = ctx->vm;
+    if (m->binding_count == m->binding_cap) {
+        uint32_t ncap = m->binding_cap ? m->binding_cap * 2 : 4;
+        JsExportBinding *na = js_realloc_raw(vm, m->bindings,
+                                             (size_t)m->binding_cap * sizeof(JsExportBinding),
+                                             (size_t)ncap * sizeof(JsExportBinding));
+        if (!na)
+            return false;
+        m->bindings = na;
+        m->binding_cap = ncap;
+    }
+    if (!js_map_set(vm, &m->bound, name, js_number((double)m->binding_count)))
+        return false;
+    JsExportBinding *b = &m->bindings[m->binding_count++];
+    b->name = name;
+    b->origin = origin;
+    b->origin_name = oname;
+    b->alias = alias;
+    b->hidden = m->ns_ready;
+    return m->link_state != 2 || commit_bindings(ctx, m);
+}
+
+static void reset_bindings(JsVm *vm, JsModule *m) {
+    m->binding_count = m->binding_committed = 0;
+    js_map_free(vm, &m->bound);
+    m->ns_ready = false;
+}
+
+/* ---- the names `export *` brings (V8's FetchStarExports) ---- */
+
+typedef struct MoreExport {
+    JsString *name;
+    JsModule *origin;
+    JsString *oname;
+    bool ambiguous;
+} MoreExport;
+
+typedef struct MoreExports {
+    JsMap index; /* name -> position in list */
+    MoreExport *list;
+    uint32_t count, cap;
+} MoreExports;
+
+typedef struct FetchWalk {
+    JsModule **visited;
+    uint32_t count, cap;
+} FetchWalk;
+
+/* One name of a module M re-exports with `export *`: left out when it is `default` or M has it
+ * already, and marked ambiguous when another star gave the name a different binding. */
+static bool more_add(JsVm *vm, JsModule *m, MoreExports *more, JsString *name, JsModule *origin,
+                     JsString *oname) {
+    if (str_is_default(name))
+        return true;
+    bool found;
+    js_map_get(&m->bound, name, &found);
+    if (!found && m->exports)
+        js_map_get(&m->exports->props, name, &found);
+    if (found)
+        return true;
+    JsValue at = js_map_get(&more->index, name, &found);
+    if (found) {
+        MoreExport *e = &more->list[(uint32_t)js_get_number(at)];
+        if (e->origin != origin || e->oname != oname)
+            e->ambiguous = true;
+        return true;
+    }
+    if (more->count == more->cap) {
+        uint32_t ncap = more->cap ? more->cap * 2 : 8;
+        MoreExport *na = js_realloc_raw(vm, more->list, (size_t)more->cap * sizeof(MoreExport),
+                                        (size_t)ncap * sizeof(MoreExport));
+        if (!na)
+            return false;
+        more->list = na;
+        more->cap = ncap;
+    }
+    if (!js_map_set(vm, &more->index, name, js_number((double)more->count)))
+        return false;
+    MoreExport *e = &more->list[more->count++];
+    e->name = name;
+    e->origin = origin;
+    e->oname = oname;
+    e->ambiguous = false;
+    return true;
+}
 
 /*
- * V8's InitializeEnvironment: every module in a linked graph gets its function declarations
- * made and its exported ones bound before any module body runs, so in a cycle the module that
- * runs first can already call the functions the others export. Each body runs up to
- * JS_OP_MODULE_READY and parks there (m->fiber); evaluation resumes it. Depth first, a module's
- * dependencies before it, as V8 orders it. A module evaluated, evaluating or parked already is
- * left alone, so a later graph (a dynamic import) only instantiates what it brings.
+ * V8's FetchStarExports, with its order and its shortcuts, which decide what a namespace shows:
+ * the modules M re-exports with `export *` first, then every name of their tables M lacks, but
+ * for `default` and the names two stars give different bindings. A module whose namespace was
+ * made already is taken as it is, and one this walk is in (a cycle) as far as it has got.
  */
-static bool init_environments(JsContext *ctx, JsModule *m, JsValue *error) {
-    if (m->env_ready)
+static bool fetch_star_exports(JsContext *ctx, FetchWalk *w, JsModule *m) {
+    JsVm *vm = ctx->vm;
+    if (m->ns_ready || m->synthetic || m->fetch_mark)
         return true;
-    m->env_ready = true; /* before the dependencies: a cycle comes back here */
-    JsValue mv = module_value(m);
-    js_gc_protect(ctx->vm, &mv);
-    bool ok = true;
-    for (uint32_t i = 0; ok && i < value_module(mv)->dep_count; i++) {
-        JsModule *dep = value_module(mv)->deps[i];
-        if (dep)
-            ok = init_environments(ctx, dep, error);
+    if (w->count == w->cap) {
+        uint32_t ncap = w->cap ? w->cap * 2 : 8;
+        JsModule **na = js_realloc_raw(vm, w->visited, (size_t)w->cap * sizeof(JsModule *),
+                                       (size_t)ncap * sizeof(JsModule *));
+        if (!na)
+            return false;
+        w->visited = na;
+        w->cap = ncap;
     }
-    m = value_module(mv);
-    if (ok && m->body && !m->synthetic && m->status == JS_MOD_LINKED) {
-        JsFiber *fb = js_module_instantiate_body(ctx, m->body, error);
-        m = value_module(mv);
-        if (fb) {
-            m->fiber = fb;
-        } else {
-            m->status = JS_MOD_ERRORED;
-            m->eval_error = *error;
-            ok = false;
+    w->visited[w->count++] = m;
+    m->fetch_mark = true;
+
+    MoreExports more;
+    memset(&more, 0, sizeof more);
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < m->star_count; i++) {
+        JsModule *req = m->stars[i].source;
+        if (m->stars[i].kind != JS_REEXP_ALL || !req)
+            continue;
+        ok = fetch_star_exports(ctx, w, req);
+        for (uint32_t k = 0; ok && k < req->binding_count; k++)
+            ok = more_add(vm, m, &more, req->bindings[k].name, req->bindings[k].origin,
+                          req->bindings[k].origin_name);
+        for (uint32_t k = 0; ok && req->exports && k < req->exports->props.used; k++) {
+            JsString *key = req->exports->props.entries[k].key;
+            if (!key || key == JS_MAP_TOMBSTONE)
+                continue;
+            bool bound;
+            js_map_get(&req->bound, key, &bound);
+            if (!bound) /* its own binding */
+                ok = more_add(vm, m, &more, key, req, key);
         }
     }
-    js_gc_unprotect(ctx->vm, &mv);
+    for (uint32_t k = 0; ok && k < more.count; k++)
+        if (!more.list[k].ambiguous)
+            ok = put_binding(ctx, m, more.list[k].name, more.list[k].origin, more.list[k].oname,
+                             false);
+    js_realloc_raw(vm, more.list, (size_t)more.cap * sizeof(MoreExport), 0);
+    js_map_free(vm, &more.index);
+    return ok;
+}
+
+/* M's namespace is about to be taken (V8's GetModuleNamespace): the names its `export *` bring
+ * join it, once. False on OOM. */
+static bool ensure_namespace(JsContext *ctx, JsModule *m) {
+    m->ns_wanted = true;
+    if (m->ns_ready || m->synthetic)
+        return true;
+    FetchWalk w = {NULL, 0, 0};
+    bool ok = fetch_star_exports(ctx, &w, m);
+    for (uint32_t i = 0; i < w.count; i++)
+        w.visited[i]->fetch_mark = false;
+    js_realloc_raw(ctx->vm, w.visited, (size_t)w.cap * sizeof(JsModule *), 0);
+    if (ok)
+        m->ns_ready = true;
+    return ok;
+}
+
+/* ---- resolve and instantiate (V8's FinishInstantiate) ---- */
+
+typedef struct ResolvePair {
+    JsModule *m;
+    JsString *name;
+} ResolvePair;
+
+typedef struct LinkPass {
+    JsContext *ctx;
+    JsValue *error;     /* the caller's rooted slot: what failed */
+    JsModule **stack;   /* the modules being linked, as Tarjan's algorithm stacks them */
+    uint32_t depth, cap;
+    uint32_t next_index;
+    ResolvePair *set;   /* the (module, name) pairs one resolution is in: open addressing */
+    uint32_t set_count, set_cap;
+} LinkPass;
+
+static uint32_t pair_hash(const JsModule *m, const JsString *name) {
+    uint64_t h = ((uint64_t)(uintptr_t)m >> 3) * 0x9E3779B97F4A7C15u;
+    h ^= ((uint64_t)(uintptr_t)name >> 3) * 0xC2B2AE3D27D4EB4Fu;
+    return (uint32_t)(h ^ (h >> 29));
+}
+
+static void set_clear(LinkPass *lp) {
+    if (lp->set_count)
+        memset(lp->set, 0, (size_t)lp->set_cap * sizeof(ResolvePair));
+    lp->set_count = 0;
+}
+
+/* 1 when (M, NAME) is in the set already, 0 when it was added, -1 on OOM */
+static int set_add(LinkPass *lp, JsModule *m, JsString *name) {
+    JsVm *vm = lp->ctx->vm;
+    if ((lp->set_count + 1) * 2 > lp->set_cap) {
+        uint32_t ncap = lp->set_cap ? lp->set_cap * 2 : 16;
+        ResolvePair *ns = js_realloc_raw(vm, NULL, 0, (size_t)ncap * sizeof(ResolvePair));
+        if (!ns)
+            return -1;
+        memset(ns, 0, (size_t)ncap * sizeof(ResolvePair));
+        for (uint32_t i = 0; i < lp->set_cap; i++) {
+            if (!lp->set[i].m)
+                continue;
+            uint32_t at = pair_hash(lp->set[i].m, lp->set[i].name) & (ncap - 1);
+            while (ns[at].m)
+                at = (at + 1) & (ncap - 1);
+            ns[at] = lp->set[i];
+        }
+        js_realloc_raw(vm, lp->set, (size_t)lp->set_cap * sizeof(ResolvePair), 0);
+        lp->set = ns;
+        lp->set_cap = ncap;
+    }
+    uint32_t at = pair_hash(m, name) & (lp->set_cap - 1);
+    while (lp->set[at].m) {
+        if (lp->set[at].m == m && lp->set[at].name == name)
+            return 1;
+        at = (at + 1) & (lp->set_cap - 1);
+    }
+    lp->set[at].m = m;
+    lp->set[at].name = name;
+    lp->set_count++;
+    return 0;
+}
+
+/* One of V8's three link errors, with the specifier as the module wrote it (its import
+ * attributes are not part of it). */
+static int link_error(LinkPass *lp, const char *fmt, JsString *spec, JsString *name,
+                      bool spec_first) {
+    JsContext *ctx = lp->ctx;
+    JsString *shown = js_string_cell_new(ctx->vm, spec->units, spec_len(spec));
+    if (!shown)
+        *lp->error = js_oom_value(ctx->vm);
+    else if (spec_first)
+        *lp->error = js_error_fmt(ctx, fmt, shown, name);
+    else
+        *lp->error = js_error_fmt(ctx, fmt, name, shown);
+    return -1;
+}
+
+static int link_oom(LinkPass *lp) {
+    *lp->error = js_oom_value(lp->ctx->vm);
+    return -1;
+}
+
+/*
+ * V8's ResolveExport, step for step, since its order decides which error a graph gets: the
+ * binding M exports as NAME, asked for through the specifier SPEC. 1 with the binding; 0 when
+ * there is none and MUST is false (a name looked for through an `export *`); -1 with the error.
+ *
+ *  1. a name in M's table is that binding (its own, or one resolved before);
+ *  2. a (module, name) this resolution is in already is a cycle;
+ *  3. `export { a as NAME } from`: the binding of `a` there, which must exist; and
+ *     `export * as NAME from` (as `import * as ns` then `export { ns as NAME }`): the
+ *     namespace of the module named;
+ *  4. else the `export *` in order, never for `default`: the one binding they agree on, and
+ *     two different ones are an error whoever asks;
+ *  5. else there is none.
+ */
+static int resolve_export(LinkPass *lp, JsModule *m, JsString *spec, JsString *name, bool must,
+                          JsModule **origin, JsString **oname) {
+    if (lookup_cell(m, name, origin, oname))
+        return 1;
+    if (!spec)
+        spec = m->specifier;
+    if (!m->synthetic) {
+        int seen = set_add(lp, m, name);
+        if (seen < 0)
+            return link_oom(lp);
+        if (seen)
+            return must ? link_error(lp, "SyntaxError: Detected cycle while resolving name '%S' in '%S'",
+                                     spec, name, false)
+                        : 0;
+        for (uint32_t i = 0; i < m->star_count; i++) {
+            JsStarExport *re = &m->stars[i];
+            if ((re->kind != JS_REEXP_NAMED && re->kind != JS_REEXP_NS) ||
+                re->exported != name || !re->source)
+                continue;
+            if (re->kind == JS_REEXP_NS) {
+                *origin = re->source;
+                *oname = NULL;
+            } else if (resolve_export(lp, re->source, re->specifier, re->imported, true, origin,
+                                      oname) <= 0) {
+                return -1;
+            }
+            return put_binding(lp->ctx, m, name, *origin, *oname, false) ? 1 : link_oom(lp);
+        }
+        if (!str_is_default(name)) {
+            JsModule *uo = NULL;
+            JsString *un = NULL;
+            for (uint32_t i = 0; i < m->star_count; i++) {
+                JsStarExport *re = &m->stars[i];
+                if (re->kind != JS_REEXP_ALL || !re->source)
+                    continue;
+                JsModule *o;
+                JsString *n;
+                int r = resolve_export(lp, re->source, re->specifier, name, false, &o, &n);
+                if (r < 0)
+                    return -1;
+                if (!r)
+                    continue;
+                if (!uo) {
+                    uo = o;
+                    un = n;
+                } else if (uo != o || un != n) {
+                    return link_error(lp, "SyntaxError: The requested module '%S' contains conflicting star exports for name '%S'",
+                                      spec, name, true);
+                }
+            }
+            if (uo) {
+                *origin = uo;
+                *oname = un;
+                return put_binding(lp->ctx, m, name, uo, un, false) ? 1 : link_oom(lp);
+            }
+        }
+    }
+    return must ? link_error(lp, "SyntaxError: The requested module '%S' does not provide an export named '%S'",
+                             spec, name, true)
+                : 0;
+}
+
+/*
+ * V8's RunInitializationCode and the end of a module's linking: its function declarations are
+ * made and its exported ones bound before any body runs (so in a cycle the module that runs
+ * first can already call the functions the others export: the body runs up to
+ * JS_OP_MODULE_READY and parks there, m->fiber, for evaluation to resume), the namespaces it
+ * takes are made, and the names it re-exports go into its own.
+ */
+static bool module_ready(LinkPass *lp, JsModule *m) {
+    JsContext *ctx = lp->ctx;
+    if (m->body && !m->synthetic && m->status == JS_MOD_LINKED && !m->fiber) {
+        JsFiber *fb = js_module_instantiate_body(ctx, m->body, lp->error);
+        if (!fb) {
+            m->status = JS_MOD_ERRORED;
+            m->eval_error = *lp->error;
+            return false;
+        }
+        m->fiber = fb;
+    }
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < m->import_count; i++)
+        if (m->imports[i].kind == JS_IMPORT_NS && m->imports[i].source)
+            ok = ensure_namespace(ctx, m->imports[i].source);
+    for (uint32_t i = 0; ok && i < m->star_count; i++)
+        if (m->stars[i].kind == JS_REEXP_NS && m->stars[i].source)
+            ok = ensure_namespace(ctx, m->stars[i].source);
+    if (ok && m->ns_wanted) /* asked before a failed link took its names back */
+        ok = ensure_namespace(ctx, m);
+    ok = ok && commit_bindings(ctx, m);
+    if (!ok)
+        link_oom(lp);
+    return ok;
+}
+
+/*
+ * V8's FinishInstantiate: depth first, a module's dependencies before it; then the binding of
+ * every name it imports and of every name it re-exports by name, each with a resolve set of its
+ * own; and when the module closes a strongly connected component, module_ready for the
+ * component, last entered first. A module linked already is left alone, so a later graph (a
+ * dynamic import) only links what it brings. False with *lp->error: the caller takes the
+ * modules still on the stack back to unlinked (link_graph).
+ */
+static bool finish_link(LinkPass *lp, JsModule *m) {
+    JsVm *vm = lp->ctx->vm;
+    if (m->link_state)
+        return true;
+    if (lp->depth == lp->cap) {
+        uint32_t ncap = lp->cap ? lp->cap * 2 : 16;
+        JsModule **na = js_realloc_raw(vm, lp->stack, (size_t)lp->cap * sizeof(JsModule *),
+                                       (size_t)ncap * sizeof(JsModule *));
+        if (!na)
+            return link_oom(lp) > 0;
+        lp->stack = na;
+        lp->cap = ncap;
+    }
+    reset_bindings(vm, m);
+    lp->stack[lp->depth++] = m;
+    m->link_state = 1;
+    m->dfs_index = m->dfs_ancestor = lp->next_index++;
+    for (uint32_t i = 0; i < m->dep_count; i++) {
+        JsModule *dep = m->deps[i];
+        if (!dep)
+            continue;
+        if (!finish_link(lp, dep))
+            return false;
+        if (dep->link_state == 1 && dep->dfs_ancestor < m->dfs_ancestor)
+            m->dfs_ancestor = dep->dfs_ancestor;
+    }
+    /* the further names of its own exports: one binding each (export { x as a, x as b }) */
+    for (uint32_t i = 0; i < m->star_count; i++) {
+        JsStarExport *re = &m->stars[i];
+        if (re->kind == JS_REEXP_LOCAL && !put_binding(lp->ctx, m, re->exported, m, re->imported, true))
+            return link_oom(lp) > 0;
+    }
+    for (uint32_t i = 0; i < m->import_count; i++) {
+        JsModuleImport *imp = &m->imports[i];
+        if (!imp->requested || imp->kind == JS_IMPORT_META)
+            continue;
+        JsModule *src = dep_for_spec(m, imp->specifier), *origin;
+        JsString *oname;
+        if (!src)
+            continue;
+        set_clear(lp);
+        if (resolve_export(lp, src, imp->specifier, imp->requested, true, &origin, &oname) <= 0)
+            return false;
+        imp->source = origin;
+        imp->imported_name = oname;
+    }
+    for (uint32_t i = 0; i < m->star_count; i++) {
+        JsModule *origin;
+        JsString *oname;
+        if (m->stars[i].kind != JS_REEXP_NAMED && m->stars[i].kind != JS_REEXP_NS)
+            continue;
+        set_clear(lp);
+        if (resolve_export(lp, m, NULL, m->stars[i].exported, true, &origin, &oname) <= 0)
+            return false;
+    }
+    if (m->dfs_ancestor == m->dfs_index) {
+        JsModule *a;
+        do {
+            a = lp->stack[lp->depth - 1];
+            if (!module_ready(lp, a))
+                return false;
+            lp->depth--;
+            a->link_state = 2;
+        } while (a != m);
+    }
+    return true;
+}
+
+/* Links the graph under ROOT. False with *ERROR, and then nothing of the modules whose linking
+ * did not finish stays: importing one again links it again, and fails the same way. */
+static bool link_graph(JsContext *ctx, JsModule *root, JsValue *error) {
+    LinkPass lp;
+    memset(&lp, 0, sizeof lp);
+    lp.ctx = ctx;
+    lp.error = error;
+    bool ok = finish_link(&lp, root);
+    if (!ok) {
+        for (uint32_t i = 0; i < lp.depth; i++) {
+            lp.stack[i]->link_state = 0;
+            reset_bindings(ctx->vm, lp.stack[i]);
+        }
+    }
+    js_realloc_raw(ctx->vm, lp.stack, (size_t)lp.cap * sizeof(JsModule *), 0);
+    js_realloc_raw(ctx->vm, lp.set, (size_t)lp.set_cap * sizeof(ResolvePair), 0);
     return ok;
 }
 
 /* ---- evaluate (promise-chained; deps strictly left-to-right) ---- */
-
-/* Applies one re-export from `src` (already evaluated) into dst->exports. */
-static bool apply_reexport(JsContext *ctx, JsModule *dst, const JsStarExport *re) {
-    JsModule *src = re->source;
-    if (!src || !src->exports)
-        return true;
-    JsObject *doo = dst->exports;
-    if (re->kind == JS_REEXP_NS) {
-        /* export * as ns: bind ns to the source namespace (live by reference) */
-        return js_map_set(ctx->vm, &doo->props, re->exported,
-                          js_value_from_cell(&src->exports->gc));
-    }
-    if (re->kind == JS_REEXP_NAMED) {
-        bool found;
-        JsValue v = js_map_get(&src->exports->props, re->imported, &found);
-        /* a source in a cycle that has not run yet: the snapshot (a known deviation) is
-         * undefined, never the TDZ marker, which would stay in this namespace for good */
-        if (!found || v.bits == JS_SPECIAL_TDZ)
-            v = js_undefined();
-        return js_map_set(ctx->vm, &doo->props, re->exported, v);
-    }
-    /* export * from: copy all named exports (excluding default) */
-    JsObject *so = src->exports;
-    js_map_sort_keys(&so->props);
-    for (uint32_t i = 0; i < so->props.capacity; i++) {
-        JsMapEntry *e = &so->props.entries[i];
-        if (!e->key || e->key == JS_MAP_TOMBSTONE || str_is_default(e->key) ||
-            e->value.bits == JS_SPECIAL_TDZ)
-            continue;
-        if (!js_map_set(ctx->vm, &doo->props, e->key, e->value))
-            return false;
-    }
-    return true;
-}
 
 /* chain state: { module, index: next dep to evaluate, promise } */
 
@@ -992,9 +1506,8 @@ static bool eval_on_body_done(JsContext *ctx, JsValue bound, JsValue tv,
  * Advances m's evaluation from state.index: already-settled dependency
  * evaluations are folded inline (so a fully-synchronous graph completes
  * within one call), a pending one parks the chain on its promise. After the
- * last dep: re-exports (their sources have now run), then the body — whose
- * own completion promise (js_run_module) may itself be pending on
- * top-level await.
+ * last dep: the body — whose own completion promise (js_run_module) may
+ * itself be pending on top-level await.
  */
 static bool eval_step(JsContext *ctx, JsValue statev) {
     JsObject *state = js_value_object(statev);
@@ -1030,12 +1543,7 @@ static bool eval_step(JsContext *ctx, JsValue statev) {
     mstate_set(ctx, state, "index", js_number(i));
 
     m = value_module(mstate_get(ctx, state, "module"));
-    for (uint32_t s = 0; s < m->star_count; s++) {
-        if (!apply_reexport(ctx, m, &m->stars[s])) {
-            eval_fail_state(ctx, state, ascii_value(ctx, "out of memory"));
-            return true;
-        }
-    }
+    refresh_synthetic(ctx, m); /* what it re-exports of the host's objects, as they are now */
 
     /* the body parked at the end of its instantiation (init_environments): run the rest */
     JsValue bp;
@@ -1114,7 +1622,12 @@ static JsValue evaluate(JsContext *ctx, JsModule *m) {
 
 /* What the root's promise fulfills with: the namespace, or for js_eval_entry what the body returned. */
 static void root_fulfill(JsContext *ctx, JsPromise *done, JsModule *root, bool entry) {
-    js_promise_fulfill(ctx, done, entry ? root->returned : js_value_from_cell(&root->exports->gc));
+    if (entry)
+        js_promise_fulfill(ctx, done, root->returned);
+    else if (!ensure_namespace(ctx, root)) /* as V8 makes a namespace: when it is first taken */
+        js_promise_reject(ctx, done, ascii_value(ctx, "out of memory"));
+    else
+        js_promise_fulfill(ctx, done, js_value_from_cell(&root->exports->gc));
 }
 
 static bool root_on_eval_done(JsContext *ctx, JsValue bound, JsValue tv,
@@ -1143,68 +1656,6 @@ static bool root_on_eval_fail(JsContext *ctx, JsValue bound, JsValue tv,
     return true;
 }
 
-/* Whether M provides the export NAME (ResolveExport): its own (a local export is in its exports
- * object once instantiated, a let/const one in the TDZ), a named or namespace re-export, or one an
- * `export *` brings (never `default`) */
-static bool module_provides(JsModule *m, JsString *name, int depth) {
-    if (!m || depth > 64)
-        return false;
-    bool found = false;
-    if (m->exports)
-        js_map_get(&m->exports->props, name, &found);
-    if (found || m->synthetic)
-        return found;
-    static const uint16_t kdefault[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
-    bool is_default = name->length == 7 && !memcmp(name->units, kdefault, sizeof kdefault);
-    for (uint32_t i = 0; i < m->star_count; i++) {
-        JsStarExport *re = &m->stars[i];
-        if ((re->kind == JS_REEXP_NAMED || re->kind == JS_REEXP_NS) && re->exported == name)
-            return re->kind == JS_REEXP_NS || module_provides(re->source, re->imported, depth + 1);
-    }
-    for (uint32_t i = 0; !is_default && i < m->star_count; i++)
-        if (m->stars[i].kind == JS_REEXP_ALL && module_provides(m->stars[i].source, name, depth + 1))
-            return true;
-    return false;
-}
-
-/* V8's link-time SyntaxError for a name a module imports or re-exports that its source does not
- * provide, checked once the graph is instantiated (no module code has run). False with *ERROR. */
-static bool check_imports(JsContext *ctx, JsModule *m, JsValue *error) {
-    if (m->imports_checked)
-        return true;
-    m->imports_checked = true;
-    for (uint32_t i = 0; i < m->dep_count; i++)
-        if (m->deps[i] && !check_imports(ctx, m->deps[i], error))
-            return false;
-    for (uint32_t i = 0; i < m->import_count + m->star_count; i++) {
-        JsString *spec, *name;
-        JsModule *src;
-        if (i < m->import_count) {
-            JsModuleImport *imp = &m->imports[i];
-            if (!imp->requested || imp->kind == JS_IMPORT_META)
-                continue;
-            spec = imp->specifier;
-            name = imp->requested;
-            src = dep_for_spec(m, spec);
-        } else {
-            JsStarExport *re = &m->stars[i - m->import_count];
-            if (re->kind != JS_REEXP_NAMED)
-                continue;
-            spec = re->specifier;
-            name = re->imported;
-            src = re->source;
-        }
-        if (!src || module_provides(src, name, 0))
-            continue;
-        JsString *shown = js_string_cell_new(ctx->vm, spec->units, spec_len(spec));
-        *error = shown ? js_error_fmt(ctx, "SyntaxError: The requested module '%S' does not provide an export named '%S'",
-                                      shown, name)
-                       : js_oom_value(ctx->vm);
-        return false;
-    }
-    return true;
-}
-
 /* graph fetched: run the synchronous instantiate/link, then evaluation */
 static void root_fetched(JsContext *ctx, JsValue bound, const JsValue *args, int argc, bool entry) {
     JsPromise *done = js_value_promise(bound);
@@ -1222,7 +1673,7 @@ static void root_fetched(JsContext *ctx, JsValue bound, const JsValue *args, int
     }
     JsValue ierr = js_undefined();
     js_gc_protect(ctx->vm, &ierr);
-    bool envs = init_environments(ctx, inst, &ierr) && check_imports(ctx, inst, &ierr);
+    bool envs = link_graph(ctx, inst, &ierr);
     if (!envs)
         js_promise_reject(ctx, done, ierr);
     js_gc_unprotect(ctx->vm, &ierr);

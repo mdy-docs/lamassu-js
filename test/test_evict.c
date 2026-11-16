@@ -1,7 +1,9 @@
 /*
  * Module eviction: a changed dependency is evicted together with its importer, the next
  * evaluation sees the new source, unrelated modules stay, in-flight modules cannot be evicted,
- * and a closure from the evicted graph still runs.
+ * and a closure from the evicted graph still runs. Re-exports are live across an eviction: a
+ * namespace that passes another module's bindings on follows them for as long as it is
+ * reachable, and is forgotten by that module once it is not.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,6 +79,75 @@ static bool evict(JsContext *ctx, const char *spec) {
     return ok;
 }
 
+static bool call_is(JsContext *ctx, JsValue f, const char *expected) {
+    JsValue out;
+    return js_call(ctx, f, js_undefined(), NULL, 0, &out) && (!expected || str_is(out, expected));
+}
+
+/* cnt.js owns a binding that re.js passes on (by `export *` and under another name) and main.js
+ * reads through re.js's namespace, a named import and its own re-export. Evicting re.js leaves
+ * cnt.js, which goes on feeding both the evicted graph's closures and the new graph's. */
+static void test_reexports(void) {
+    JsVm *vm = js_vm_new(NULL);
+    JsContext *ctx = js_context_new(vm);
+    js_enable_source_modules(ctx);
+    js_set_module_loader(ctx, loader, NULL, vm);
+
+    g_nmods = 0;
+    g_mods[g_nmods++] = (Mod){ "main.js", "import * as re from 're.js';\nimport { n } from 're.js';\nexport { inc } from 'cnt.js';\nexport const see = () => re.n + ':' + re.m + ':' + n;\n" };
+    g_mods[g_nmods++] = (Mod){ "re.js", "export * from 'cnt.js';\nexport { n as m } from 'cnt.js';\n" };
+    g_mods[g_nmods++] = (Mod){ "cnt.js", "export let n = 0;\nexport function inc() { n++; }\n" };
+    JsValue p1 = eval_root(ctx, vm);
+    js_gc_protect(vm, &p1);
+    CHECK(js_promise_state(p1) == 1, "re-exporting graph evaluates");
+    JsValue old_see = export_of(ctx, p1, "see"), old_inc = export_of(ctx, p1, "inc");
+    js_gc_protect(vm, &old_see);
+    js_gc_protect(vm, &old_inc);
+    CHECK(call_is(ctx, old_see, "0:0:0"), "re-exports read the binding");
+    CHECK(call_is(ctx, old_inc, NULL) && call_is(ctx, old_see, "1:1:1"), "re-exports are live");
+
+    CHECK(evict(ctx, "re.js"), "evict re.js");
+    CHECK(js_context_module_count(ctx) == 1, "re.js and main.js are gone, cnt.js stays");
+    CHECK(call_is(ctx, old_inc, NULL) && call_is(ctx, old_see, "2:2:2"), "the evicted graph's re-exports stay live");
+
+    JsValue p2 = eval_root(ctx, vm);
+    js_gc_protect(vm, &p2);
+    CHECK(js_promise_state(p2) == 1 && js_context_module_count(ctx) == 3, "re-evaluates over the kept cnt.js");
+    JsValue see = export_of(ctx, p2, "see"), inc = export_of(ctx, p2, "inc");
+    js_gc_protect(vm, &see);
+    js_gc_protect(vm, &inc);
+    CHECK(call_is(ctx, see, "2:2:2"), "the new graph reads the kept module's binding");
+    CHECK(call_is(ctx, inc, NULL) && call_is(ctx, see, "3:3:3") && call_is(ctx, old_see, "3:3:3"),
+          "both graphs follow it");
+
+    /* the evicted graph becomes unreachable: cnt.js stops feeding its namespaces */
+    js_gc_unprotect(vm, &old_inc);
+    js_gc_unprotect(vm, &old_see);
+    js_gc_unprotect(vm, &p1);
+    p1 = old_see = old_inc = js_undefined();
+    js_gc_collect(vm);
+    CHECK(call_is(ctx, inc, NULL) && call_is(ctx, see, "4:4:4"), "writes after the old graph was collected");
+
+    /* the owner goes: the whole graph with it, and its closures keep working */
+    CHECK(evict(ctx, "cnt.js"), "evict cnt.js");
+    CHECK(js_context_module_count(ctx) == 0, "every module passed its bindings on");
+    js_gc_collect(vm);
+    CHECK(call_is(ctx, inc, NULL) && call_is(ctx, see, "5:5:5"), "the evicted owner still feeds its re-exports");
+    JsValue p3 = eval_root(ctx, vm);
+    js_gc_protect(vm, &p3);
+    CHECK(js_promise_state(p3) == 1, "the graph evaluates afresh");
+    JsValue out;
+    CHECK(js_call(ctx, export_of(ctx, p3, "see"), js_undefined(), NULL, 0, &out) && str_is(out, "0:0:0"),
+          "with a new owner");
+    CHECK(call_is(ctx, see, "5:5:5"), "that the old graph does not see");
+
+    js_gc_unprotect(vm, &p3);
+    js_gc_unprotect(vm, &inc);
+    js_gc_unprotect(vm, &see);
+    js_gc_unprotect(vm, &p2);
+    js_vm_free(vm);
+}
+
 int main(void) {
     JsVm *vm = js_vm_new(NULL);
     JsContext *ctx = js_context_new(vm);
@@ -123,6 +194,7 @@ int main(void) {
     js_gc_unprotect(vm, &old_f);
     js_gc_unprotect(vm, &p1);
     js_vm_free(vm);
+    test_reexports();
     printf("test_evict: %d checks, %d failed\n", checks_run, checks_failed);
     return checks_failed ? 1 : 0;
 }

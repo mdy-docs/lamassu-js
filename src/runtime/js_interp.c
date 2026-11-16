@@ -3843,6 +3843,8 @@ run:; /* (re)load the top frame */
                 }
                 if (!js_map_set(vm, &fn->module->exports->props, name, PEEK(0)))
                     RT_THROW("out of memory");
+                if (fn->module->mirror_count) /* the namespaces that re-export it */
+                    js_module_export_written(vm, fn->module, name, PEEK(0));
                 break;
             }
             case JS_OP_SET_FUNCTION_NAME: {
@@ -3875,13 +3877,21 @@ run:; /* (re)load the top frame */
                  * — but a tampered module buffer can pair the two, and
                  * js_map_get dereferences the key to hash it. The verifier
                  * bounds the import INDEX; the record's shape is checked here. */
-                if (!imp->source || !imp->source->exports || !imp->imported_name)
+                if (!imp->source || !imp->source->exports ||
+                    (!imp->imported_name && !imp->requested))
                     RT_THROW("ReferenceError: module binding is not available");
+                if (!imp->imported_name) { /* linking found the name to be a module's namespace */
+                    PUSH(js_value_from_cell(&imp->source->exports->gc));
+                    break;
+                }
                 bool found;
                 JsValue v = js_map_get(&imp->source->exports->props, imp->imported_name,
                                        &found);
                 if (v.bits == JS_SPECIAL_TDZ) {
-                    fiber_throw_tdz_binding(ctx, fb, fn, op_ip, imp->imported_name);
+                    /* named as this module imports it, as V8 does (linking bound the import
+                     * to the module and name that own the binding) */
+                    fiber_throw_tdz_binding(ctx, fb, fn, op_ip,
+                                            imp->requested ? imp->requested : imp->imported_name);
                     RT_RAISE();
                 }
                 PUSH(found ? v : js_undefined());

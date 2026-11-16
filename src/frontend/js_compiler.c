@@ -780,15 +780,8 @@ static bool prescan_declarations(JsCompiler *cx, JsAstNode *const *stmts,
         /* unwrap `export <decl>` */
         if (s->kind == JS_AST_EXPORT_NAMED && s->a)
             s = s->a;
-        if (named_default_decl(s) && cx->module && cx->cur->is_module) {
-            const JsAstNode *f = named_default_decl(s);
-            JsModBinding *b = resolve_module_binding(cx, f->units, f->len);
-            uint16_t slot;
-            if ((!b || b->kind != JS_MB_EXPORT) &&
-                !declare_local(cx, f->units, f->len, false, f->pos, scope_floor, &slot))
-                return false;
-            continue;
-        }
+        if (named_default_decl(s) && cx->module && cx->cur->is_module)
+            continue; /* the export binding `default` (analyze_module), not a local */
         if (s->kind == JS_AST_LET_DECL) {
             /* the body's own block (a function declaration there may take a parameter's name,
              * as a `var` could) */
@@ -2633,23 +2626,17 @@ static bool hoist_functions(JsCompiler *cx, JsAstNode *const *stmts, uint32_t co
             static const uint16_t def_name[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
             uint16_t c;
             note_pos(cx, s->pos);
-            if (!compile_function_as(cx, s->a, def_name, 7) || !atom_const(cx, def_name, 7, s->pos, &c) ||
-                !emit_op_u16(cx, JS_OP_INIT_EXPORT, c, 0))
+            if (!compile_function_as(cx, s->a, def_name, 7))
                 return false;
             const JsAstNode *f = named_default_decl(s);
             if (f) {
-                /* its name too: a local, or the export binding of `export { name }` */
-                JsModBinding *b = resolve_module_binding(cx, f->units, f->len);
-                if (b && b->kind == JS_MB_EXPORT) {
-                    if (emit_export_writes(cx, f->units, f->len, f->pos, JS_OP_INIT_EXPORT) <= 0)
-                        return cx->err_msg ? false : cerr(cx, f->pos, "internal: export not bound");
-                } else {
-                    int idx = resolve_local_in(cx->cur, f->units, f->len);
-                    if (idx < 0)
-                        return cerr(cx, f->pos, "internal: function not pre-declared");
-                    if (!emit_op_u16(cx, JS_OP_SET_LOCAL, cx->cur->locals[idx].slot, 0))
-                        return false;
-                }
+                /* a named one is the binding of its name, exported as `default` (and as
+                 * whatever else `export { name }` says): analyze_module */
+                if (emit_export_writes(cx, f->units, f->len, f->pos, JS_OP_INIT_EXPORT) <= 0)
+                    return cx->err_msg ? false : cerr(cx, f->pos, "internal: export not bound");
+            } else if (!atom_const(cx, def_name, 7, s->pos, &c) ||
+                       !emit_op_u16(cx, JS_OP_INIT_EXPORT, c, 0)) {
+                return false;
             }
             if (!emit_op(cx, JS_OP_POP, -1))
                 return false;
@@ -3315,6 +3302,153 @@ static bool mbind_add(JsCompiler *cx, uint32_t *cap, JsModBinding b) {
     return true;
 }
 
+/* V8 keeps a module's imports and its re-exports of imported names in maps keyed by the local
+ * name, so it links them in the order of those names (code units; a prefix before the longer
+ * name), not in source order. That order decides which of two link errors in one module is the
+ * one reported and in which order the namespaces of star cycles are made, so the module record
+ * is written in it: linking then only follows the arrays. */
+typedef struct ModSortItem {
+    const uint16_t *key; /* the local name */
+    uint32_t len;
+    uint32_t seq; /* position in the module record: equal names keep source order */
+} ModSortItem;
+
+typedef struct ModAnalysis {
+    uint32_t cap; /* of cx->mbind */
+    /* the re-exports of imported names (`import { a } from 'm'; export { a as b }`, `import *
+     * as w from 'm'; export { w }`, `export * as z from 'm'`): each one's local name and its
+     * place in mod->stars, where mod_order_links moves them behind the others */
+    ModSortItem *keys;
+    uint32_t reexport_count, reexport_cap;
+    uint32_t ns_exports; /* `export * as` seen so far: numbers their hidden local names */
+} ModAnalysis;
+
+static bool mod_item_less(const ModSortItem *a, const ModSortItem *b) {
+    uint32_t n = a->len < b->len ? a->len : b->len;
+    for (uint32_t i = 0; i < n; i++)
+        if (a->key[i] != b->key[i])
+            return a->key[i] < b->key[i];
+    if (a->len != b->len)
+        return a->len < b->len;
+    return a->seq < b->seq;
+}
+
+static void mod_sift_down(ModSortItem *v, uint32_t i, uint32_t n) {
+    for (;;) {
+        uint32_t c = 2 * i + 1;
+        if (c >= n)
+            return;
+        if (c + 1 < n && mod_item_less(&v[c], &v[c + 1]))
+            c++;
+        if (!mod_item_less(&v[i], &v[c]))
+            return;
+        ModSortItem t = v[i];
+        v[i] = v[c];
+        v[c] = t;
+        i = c;
+    }
+}
+
+/* Heapsort: no two items compare equal (seq differs), so the order is the stable one */
+static void mod_sort(ModSortItem *v, uint32_t n) {
+    for (uint32_t i = n / 2; i-- > 0;)
+        mod_sift_down(v, i, n);
+    for (uint32_t end = n; end-- > 1;) {
+        ModSortItem t = v[0];
+        v[0] = v[end];
+        v[end] = t;
+        mod_sift_down(v, 0, end);
+    }
+}
+
+/* The two atoms of a record that names two. Atoms are held weakly and a collection can run at
+ * any allocation, so the first is rooted while the second is made; the caller stores both in
+ * the module record (which is traced) before anything else allocates a cell. */
+static bool intern_pair(JsCompiler *cx, const uint16_t *a, uint32_t alen, const uint16_t *b,
+                        uint32_t blen, JsString **one, JsString **other) {
+    JsValue first = js_atom(cx->vm, a, alen);
+    if (!js_is_string(first))
+        return false;
+    js_gc_protect(cx->vm, &first);
+    *other = intern_atom(cx, b, blen);
+    js_gc_unprotect(cx->vm, &first);
+    *one = js_value_string(first);
+    return *other != NULL;
+}
+
+/* Records a re-export of an imported name. It goes into the module record at once, where its
+ * atoms are traced; only its local name is kept aside, for mod_order_links to place it by. */
+static bool mod_add_reexport(JsCompiler *cx, ModAnalysis *an, const uint16_t *key, uint32_t len,
+                             JsModule *mod, JsString *spec, uint8_t kind, JsString *imported,
+                             JsString *exported) {
+    if (!mod_add_star(cx, mod, spec, kind, imported, exported))
+        return false;
+    if (an->reexport_count == an->reexport_cap) {
+        uint32_t ncap = an->reexport_cap ? an->reexport_cap * 2 : 8;
+        ModSortItem *nk = js_arena_alloc(&cx->arena, (size_t)ncap * sizeof *nk);
+        if (!nk)
+            return false;
+        if (an->reexport_count)
+            memcpy(nk, an->keys, an->reexport_count * sizeof *nk);
+        an->keys = nk;
+        an->reexport_cap = ncap;
+    }
+    ModSortItem *k = &an->keys[an->reexport_count++];
+    k->key = key;
+    k->len = len;
+    k->seq = mod->star_count - 1;
+    return true;
+}
+
+/* Puts the imports in the order of their local names, and the re-exports of imported names in
+ * the order of theirs behind the `export ... from` declarations, which stay in source order. */
+static bool mod_order_links(JsCompiler *cx, ModAnalysis *an, JsModule *mod) {
+    uint32_t n = mod->import_count;
+    if (n > 1) {
+        ModSortItem *v = js_arena_alloc(&cx->arena, (size_t)n * sizeof *v);
+        JsModuleImport *old = js_arena_alloc(&cx->arena, (size_t)n * sizeof *old);
+        uint16_t *at = js_arena_alloc(&cx->arena, (size_t)n * sizeof *at);
+        if (!v || !old || !at)
+            return false;
+        memcpy(old, mod->imports, (size_t)n * sizeof *old);
+        for (uint32_t i = 0; i < cx->mbind_count; i++) { /* every import has one binding */
+            JsModBinding *b = &cx->mbind[i];
+            if (b->kind == JS_MB_EXPORT)
+                continue;
+            v[b->import_index].key = b->name;
+            v[b->import_index].len = b->len;
+            v[b->import_index].seq = b->import_index;
+        }
+        mod_sort(v, n);
+        for (uint32_t i = 0; i < n; i++) {
+            mod->imports[i] = old[v[i].seq];
+            at[v[i].seq] = (uint16_t)i;
+        }
+        for (uint32_t i = 0; i < cx->mbind_count; i++)
+            if (cx->mbind[i].kind != JS_MB_EXPORT)
+                cx->mbind[i].import_index = at[cx->mbind[i].import_index];
+    }
+    uint32_t stars = mod->star_count, held = an->reexport_count;
+    if (held) {
+        JsStarExport *old = js_arena_alloc(&cx->arena, (size_t)stars * sizeof *old);
+        uint8_t *is_held = js_arena_alloc(&cx->arena, stars);
+        if (!old || !is_held)
+            return false;
+        memcpy(old, mod->stars, (size_t)stars * sizeof *old);
+        memset(is_held, 0, stars);
+        for (uint32_t i = 0; i < held; i++)
+            is_held[an->keys[i].seq] = 1;
+        uint32_t out = 0;
+        for (uint32_t i = 0; i < stars; i++)
+            if (!is_held[i])
+                mod->stars[out++] = old[i];
+        mod_sort(an->keys, held);
+        for (uint32_t i = 0; i < held; i++)
+            mod->stars[out++] = old[an->keys[i].seq];
+    }
+    return true;
+}
+
 /* Adds exported names from a declaration (let/const/function) to mbind. */
 static bool mbind_add_export(JsCompiler *cx, uint32_t *cap, const uint16_t *local,
                              uint32_t local_len, const uint16_t *exp, uint32_t exp_len,
@@ -3393,8 +3527,9 @@ static bool pattern_binds(const JsAstNode *pat, const uint16_t *name, uint32_t l
  * or function becomes an export binding with that declaration's rules, anything else is a
  * SyntaxError.
  */
-static bool list_export(JsCompiler *cx, uint32_t *cap, const JsAstNode *module, JsModule *mod,
+static bool list_export(JsCompiler *cx, ModAnalysis *an, const JsAstNode *module, JsModule *mod,
                         const JsAstNode *sp) {
+    uint32_t *cap = &an->cap;
     const uint16_t *name = sp->units, *exp = sp->units2;
     uint32_t len = sp->len, exp_len = sp->len2;
     for (uint32_t i = 0; i < cx->mbind_count; i++) {
@@ -3403,9 +3538,9 @@ static bool list_export(JsCompiler *cx, uint32_t *cap, const JsAstNode *module, 
             continue;
         JsModuleImport *imp = &mod->imports[b->import_index];
         JsString *ex = intern_atom(cx, exp, exp_len);
-        if (!ex || !mod_add_star(cx, mod, imp->specifier,
-                                 b->kind == JS_MB_IMPORT_NS ? JS_REEXP_NS : JS_REEXP_NAMED,
-                                 b->kind == JS_MB_IMPORT_NS ? NULL : imp->imported_name, ex))
+        if (!ex || !mod_add_reexport(cx, an, b->name, b->len, mod, imp->specifier,
+                                     b->kind == JS_MB_IMPORT_NS ? JS_REEXP_NS : JS_REEXP_NAMED,
+                                     b->kind == JS_MB_IMPORT_NS ? NULL : imp->imported_name, ex))
             return cerr(cx, sp->pos, "out of memory");
         return true;
     }
@@ -3428,26 +3563,29 @@ static bool list_export(JsCompiler *cx, uint32_t *cap, const JsAstNode *module, 
                                                   name, len));
 }
 
-/* Puts every let/const export (and an `export default` expression) in the TDZ in the exports
- * object before anything runs, so that a read ahead of the declaration throws as in V8. */
+/* Gives the exports object every name the module itself exports before anything runs: linking
+ * resolves names against it. A let/const export (and an `export default` expression) starts in
+ * the TDZ, so that a read ahead of the declaration throws as in V8; a function declaration's
+ * is undefined until instantiation makes the function. */
 static bool exports_start_in_tdz(JsCompiler *cx, const JsAstNode *module, JsModule *mod) {
     JsValue tdz;
     tdz.bits = JS_SPECIAL_TDZ;
     for (uint32_t i = 0; i < cx->mbind_count; i++) {
         JsModBinding *b = &cx->mbind[i];
-        if (b->kind != JS_MB_EXPORT || !b->lexical)
+        if (b->kind != JS_MB_EXPORT)
             continue;
         JsString *k = intern_atom(cx, b->export_name, b->export_len);
-        if (!k || !js_map_set(cx->vm, &mod->exports->props, k, tdz))
+        if (!k || !js_map_set(cx->vm, &mod->exports->props, k, b->lexical ? tdz : js_undefined()))
             return cerr(cx, 0, "out of memory");
     }
     for (uint32_t i = 0; i < module->count; i++) {
         const JsAstNode *n = module->items[i];
-        if (n->kind != JS_AST_EXPORT_DEFAULT || (n->flags & JS_F_DEFAULT_DECL))
+        if (n->kind != JS_AST_EXPORT_DEFAULT || named_default_decl(n))
             continue;
         static const uint16_t d[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
         JsString *k = intern_atom(cx, d, 7);
-        if (!k || !js_map_set(cx->vm, &mod->exports->props, k, tdz))
+        if (!k || !js_map_set(cx->vm, &mod->exports->props, k,
+                              (n->flags & JS_F_DEFAULT_DECL) ? js_undefined() : tdz))
             return cerr(cx, 0, "out of memory");
     }
     return true;
@@ -3473,7 +3611,8 @@ static JsString *module_request(JsCompiler *cx, const JsAstNode *n) {
 }
 
 static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mod) {
-    uint32_t cap = 0;
+    ModAnalysis an;
+    memset(&an, 0, sizeof an);
     for (uint32_t i = 0; i < module->count; i++) {
         const JsAstNode *n = module->items[i];
         switch ((JsAstKind)n->kind) {
@@ -3506,8 +3645,10 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
                                                                         : JS_IMPORT_NAMED))
                         return cerr(cx, n->pos, "out of memory");
                 }
+                if (mod->import_count > 0x10000)
+                    return cerr(cx, n->pos, "too many imports");
                 b.import_index = (uint16_t)(mod->import_count - 1);
-                if (!mbind_add(cx, &cap, b))
+                if (!mbind_add(cx, &an.cap, b))
                     return cerr(cx, n->pos, "out of memory");
             }
             break;
@@ -3516,9 +3657,34 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
             JsString *spec = module_request(cx, n);
             if (!spec || !mod_add_dep(cx, mod, spec))
                 return cerr(cx, n->pos, "out of memory");
-            if (n->len2) { /* export * as ns from 'm' */
+            if (n->len2) {
+                /* export * as ns from 'm': as V8 reads it, a namespace import under a local
+                 * name no source can spell (".ns-export" and a count) and an export of that
+                 * name. The name gives the import and the re-export their places in the
+                 * order of linking. */
+                static const char prefix[] = ".ns-export";
+                char digits[10];
+                uint32_t nd = 0, count = an.ns_exports++;
+                do
+                    digits[nd++] = (char)('0' + count % 10);
+                while ((count /= 10) != 0);
+                uint32_t klen = (uint32_t)(sizeof prefix - 1) + nd;
+                uint16_t *key = js_arena_alloc(&cx->arena, (size_t)klen * sizeof *key);
                 JsString *ns = intern_atom(cx, n->units2, n->len2);
-                if (!ns || !mod_add_star(cx, mod, spec, JS_REEXP_NS, NULL, ns))
+                if (!key || !ns || !mod_add_import(cx, mod, spec, NULL, JS_IMPORT_NS))
+                    return cerr(cx, n->pos, "out of memory");
+                if (mod->import_count > 0x10000)
+                    return cerr(cx, n->pos, "too many imports");
+                for (uint32_t k = 0; k < klen; k++)
+                    key[k] = (uint16_t)(k < sizeof prefix - 1 ? prefix[k] : digits[klen - 1 - k]);
+                JsModBinding b;
+                memset(&b, 0, sizeof b);
+                b.name = key;
+                b.len = klen;
+                b.kind = JS_MB_IMPORT_NS;
+                b.import_index = (uint16_t)(mod->import_count - 1);
+                if (!mbind_add(cx, &an.cap, b) ||
+                    !mod_add_reexport(cx, &an, key, klen, mod, spec, JS_REEXP_NS, NULL, ns))
                     return cerr(cx, n->pos, "out of memory");
             } else { /* export * from 'm' */
                 if (!mod_add_star(cx, mod, spec, JS_REEXP_ALL, NULL, NULL))
@@ -3532,10 +3698,10 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
                 if (d->kind == JS_AST_LET_DECL) {
                     bool is_const = (d->flags & JS_F_CONST) != 0;
                     for (uint32_t k = 0; k < d->count; k++)
-                        if (!export_pattern_names(cx, &cap, d->items[k]->a, is_const))
+                        if (!export_pattern_names(cx, &an.cap, d->items[k]->a, is_const))
                             return false;
                 } else if (d->kind == JS_AST_FUNC_DECL) {
-                    if (!mbind_add_export(cx, &cap, d->units, d->len, NULL, 0, false, false))
+                    if (!mbind_add_export(cx, &an.cap, d->units, d->len, NULL, 0, false, false))
                         return false;
                 }
             } else if (n->len) { /* export { x as y } from 'm' (re-export) */
@@ -3544,14 +3710,22 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
                     return cerr(cx, n->pos, "out of memory");
                 for (uint32_t s = 0; s < n->count; s++) {
                     const JsAstNode *sp = n->items[s];
-                    JsString *imp = intern_atom(cx, sp->units, sp->len);
-                    JsString *exp = intern_atom(cx, sp->units2, sp->len2);
-                    if (!imp || !exp ||
+                    JsString *imp, *exp;
+                    if (!intern_pair(cx, sp->units, sp->len, sp->units2, sp->len2, &imp, &exp) ||
                         !mod_add_star(cx, mod, spec, JS_REEXP_NAMED, imp, exp))
                         return cerr(cx, n->pos, "out of memory");
                 }
             } /* export { a, b as c } (local): resolved below, once every binding is known */
             break;
+        case JS_AST_EXPORT_DEFAULT: {
+            /* `export default function f() {}` exports the binding f as `default`: assigning
+             * to f changes what importers of the default read, as in V8 */
+            static const uint16_t d[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
+            const JsAstNode *f = named_default_decl(n);
+            if (f && !mbind_add_export(cx, &an.cap, f->units, f->len, d, 7, false, false))
+                return false;
+            break;
+        }
         default:
             break;
         }
@@ -3561,8 +3735,26 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
         if (n->kind != JS_AST_EXPORT_NAMED || n->a || n->len)
             continue;
         for (uint32_t s = 0; s < n->count; s++)
-            if (!list_export(cx, &cap, module, mod, n->items[s]))
+            if (!list_export(cx, &an, module, mod, n->items[s]))
                 return false;
+    }
+    if (!mod_order_links(cx, &an, mod))
+        return cerr(cx, 0, "out of memory");
+    /* a binding exported under several names (`export { x as a, x as b }`): the later names
+     * are recorded as names of the first, so that linking knows them for one binding (two
+     * `export *` bringing a and b under one name do not conflict) */
+    for (uint32_t i = 0; i < cx->mbind_count; i++) {
+        JsModBinding *b = &cx->mbind[i];
+        if (b->kind != JS_MB_EXPORT)
+            continue;
+        JsModBinding *first = resolve_module_binding(cx, b->name, b->len);
+        if (first == b || first->kind != JS_MB_EXPORT)
+            continue;
+        JsString *one, *other;
+        if (!intern_pair(cx, first->export_name, first->export_len, b->export_name,
+                         b->export_len, &one, &other) ||
+            !mod_add_star(cx, mod, NULL, JS_REEXP_LOCAL, one, other))
+            return cerr(cx, 0, "out of memory");
     }
     return true;
 }

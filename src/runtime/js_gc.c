@@ -419,6 +419,7 @@ void js_gc_collect(JsVm *vm) {
     /* the weak list of live collection iterators loses what is about to be swept */
     js_iter_prune(vm);
     js_weak_prune(vm); /* and weak collections, refs and registries their dead entries */
+    js_module_mirrors_prune(vm); /* and modules the mirrors of re-exporters that died */
 
     JsGcCell **link = &vm->cells;
     while (*link) {

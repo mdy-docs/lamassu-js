@@ -213,17 +213,26 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
 
 ## Modules
 
-- **Named and `export *` re-exports are snapshots**, taken once the source
-  module finishes evaluating (dependency order guarantees this has already
-  happened). A later mutation of a re-exported *mutable* binding isn't
-  observed through the re-export. `export * as ns from` is live by
-  reference instead (it aliases the source's namespace object). A module that
-  *imports* a re-exported name reads the defining module's live binding, as
-  in V8 (this includes `import { x } from 'm'; export { x }`); only the
-  re-exporting module's own namespace object holds the snapshot, which is
-  `undefined` for a binding whose module, in a cycle, had not run yet. For a
-  templating workload this is exact in practice, since re-exports are
-  almost always functions or constants.
+- **Linking is V8's, also where V8 is not the specification.** Re-exports
+  are live bindings, and a graph links or fails to link as it does in V8:
+  the same error, naming the same module and export when several would
+  fail. Three places where V8, and so lamassu, differs from the
+  specification or from Node's loader:
+  - `import * as w from 'm'; export { w }` and `export * as w from 'm'`
+    export one and the same binding, the namespace of `m`. Two modules that
+    pass it on under one name do not conflict under `export *` (by the
+    specification the first form is a local binding of its module, and they
+    do).
+  - A name that the `export *` of a module `s` leave ambiguous is not
+    ambiguous one level up: a module with `export * from 's'` and `export *
+    from 't'` lists the name in its namespace, with `t`'s binding. Importing
+    it by name from that module is still `SyntaxError: ... contains
+    conflicting star exports`, unless the module's namespace was made
+    before.
+  - A module that failed to link is linked again by the next import of it
+    and fails the same way. Node keeps the first failure of a dynamic
+    `import()` for that URL; lamassu, like V8 alone, asks again, so an
+    import that could not link earlier may link later (see the case above).
 - **Module evaluation drains the whole microtask queue** after each module
   body runs — there's no cross-module async evaluation ordering beyond
   plain dependency order.

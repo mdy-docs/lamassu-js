@@ -1303,17 +1303,25 @@ bool js_bc_load_module(JsContext *ctx, JsModule *m, const uint8_t *buf, size_t l
         m->star_count = star_count;
         for (uint32_t i = 0; i < star_count; i++) {
             uint8_t sk = in_u8(&b);
-            if (b.bad || sk > JS_REEXP_NAMED) {
+            if (b.bad || sk > JS_REEXP_LOCAL) {
                 *err = "SyntaxError: bad re-export kind";
                 goto done;
             }
-            m->stars[i].kind = sk;
-            m->stars[i].specifier = load_req_str(ctx, &b, err);
-            if (!m->stars[i].specifier)
+            JsStarExport *re = &m->stars[i];
+            re->kind = sk;
+            if (!load_opt_str(ctx, &b, &re->specifier, err) ||
+                !load_opt_str(ctx, &b, &re->imported, err) ||
+                !load_opt_str(ctx, &b, &re->exported, err))
                 goto done;
-            if (!load_opt_str(ctx, &b, &m->stars[i].imported, err) ||
-                !load_opt_str(ctx, &b, &m->stars[i].exported, err))
+            /* the names each kind has: linking reads them unchecked */
+            bool shaped = sk == JS_REEXP_ALL     ? re->specifier != NULL
+                          : sk == JS_REEXP_NS    ? re->specifier && re->exported
+                          : sk == JS_REEXP_NAMED ? re->specifier && re->imported && re->exported
+                                                 : !re->specifier && re->imported && re->exported;
+            if (!shaped) {
+                *err = "SyntaxError: bad re-export record";
                 goto done;
+            }
         }
     }
 
@@ -1352,19 +1360,25 @@ bool js_bc_load_module(JsContext *ctx, JsModule *m, const uint8_t *buf, size_t l
     ((JsModule *)js_value_cell(mv))->exports = js_value_object(exports);
     m = (JsModule *)js_value_cell(mv);
 
-    /* let/const exports: in the TDZ until their declarations run, so that another module of a
-     * cycle (or a hoisted function) reading one first throws, as in V8 */
-    uint32_t tdz_count = in_u32(&b);
-    if (b.bad || tdz_count > JSBC_MAX_CONSTS) {
+    /* the module's own exports, which linking resolves names against. The let/const ones
+     * (flag 1) are in the TDZ until their declarations run, so that another module of a cycle
+     * (or a hoisted function) reading one first throws, as in V8 */
+    uint32_t key_count = in_u32(&b);
+    if (b.bad || key_count > JSBC_MAX_CONSTS) {
         *err = "SyntaxError: bad module export count";
         goto done;
     }
-    for (uint32_t i = 0; i < tdz_count; i++) {
+    for (uint32_t i = 0; i < key_count; i++) {
+        uint8_t flag = in_u8(&b);
+        if (b.bad || flag > 1) {
+            *err = "SyntaxError: bad module export flag";
+            goto done;
+        }
         JsString *name = load_req_str(ctx, &b, err);
         if (!name)
             goto done;
         JsValue tdz;
-        tdz.bits = JS_SPECIAL_TDZ;
+        tdz.bits = flag ? JS_SPECIAL_TDZ : js_undefined().bits;
         if (!js_map_set(vm, &m->exports->props, name, tdz)) {
             *err = "out of memory";
             goto done;

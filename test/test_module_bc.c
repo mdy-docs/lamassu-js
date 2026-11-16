@@ -173,10 +173,13 @@ static bool compile_all(void) {
     return true;
 }
 
+/* set for a second pass of the re-export graphs with a collection at every safe point */
+static bool g_gc_stress;
+
 /* Evaluates root `name` through `load`, reads export `exp`, returns ToString. */
 static char *eval_with(JsModuleLoader load, const char *name, const char *exp, bool *ok) {
     CountAlloc ca = {0, 0};
-    JsVmConfig cfg = {.realloc_fn = count_realloc, .alloc_ud = &ca};
+    JsVmConfig cfg = {.realloc_fn = count_realloc, .alloc_ud = &ca, .gc_stress = g_gc_stress};
     JsVm *vm = js_vm_new(&cfg);
     JsContext *ctx = js_context_new(vm);
     js_set_module_loader(ctx, load, NULL, vm);
@@ -185,6 +188,7 @@ static char *eval_with(JsModuleLoader load, const char *name, const char *exp, b
     uint16_t *nu = to_u16(name, &nlen);
     JsValue p = js_eval_module(ctx, nu, nlen);
     js_gc_protect(vm, &p);
+    js_run_jobs(ctx);
     int st = js_promise_state(p);
     *ok = st == 1;
     char *out;
@@ -242,12 +246,368 @@ static void expect(const char *root, const char *exp, const char *expected) {
     char *b = eval_with(bc_loader, root, exp, &bok);
     if (!sok || !bok || strcmp(s, expected) != 0 || strcmp(s, b) != 0) {
         checks_failed++;
-        fprintf(stderr, "FAIL root=%s.%s\n  expected: %s\n  source:   %s%s\n  bytecode: %s%s\n",
-                root, exp, expected, s, sok ? "" : " (err)", b, bok ? "" : " (err)");
+        fprintf(stderr, "FAIL root=%s.%s%s\n  expected: %s\n  source:   %s%s\n  bytecode: %s%s\n",
+                root, exp, g_gc_stress ? " (gc stress)" : "", expected, s, sok ? "" : " (err)", b,
+                bok ? "" : " (err)");
     }
     free(s);
     free(b);
     mods_reset();
+}
+
+/* As expect(), for a graph that must not link: from source and from bytecode alike the root's
+ * promise rejects with `expected` as the reason. */
+static void expect_error(const char *root, const char *expected) {
+    checks_run++;
+    if (!compile_all()) {
+        checks_failed++;
+        fprintf(stderr, "FAIL(compile) root=%s\n", root);
+        mods_reset();
+        return;
+    }
+    bool sok, bok;
+    char *s = eval_with(src_loader, root, "r", &sok);
+    char *b = eval_with(bc_loader, root, "r", &bok);
+    if (sok || bok || strcmp(s, expected) != 0 || strcmp(s, b) != 0) {
+        checks_failed++;
+        fprintf(stderr, "FAIL root=%s%s\n  expected error: %s\n  source:   %s%s\n  bytecode: %s%s\n",
+                root, g_gc_stress ? " (gc stress)" : "", expected, s, sok ? " (no error)" : "", b,
+                bok ? " (no error)" : "");
+    }
+    free(s);
+    free(b);
+    mods_reset();
+}
+
+/*
+ * Re-exports are the bindings they name, linked as V8 links them (ResolveExport,
+ * FinishInstantiate and FetchStarExports of its source-text-module.cc). Every expected string
+ * here is what Node 26 (V8 14.6) prints for the same graph.
+ */
+static void test_reexports(void) {
+    /* one binding by every route: by name, renamed, through `export *` once and twice, in a
+     * namespace and in a re-exported namespace; `export *` leaves `default` out */
+    mod_add("c", "export let x = 1; export function inc() { x++; } export let late;"
+                 "export function setLate(v) { late = v; } export default 'cdef';");
+    mod_add("b", "export { x, inc } from 'c'; export { x as y } from 'c'; export * from 'c';"
+                 "export * as cns from 'c'; export const own = 'own';");
+    mod_add("star", "export * from 'c';");
+    mod_add("star2", "export * from 'star'; export { late as renamed } from 'star';");
+    mod_add("main", "import * as b from 'b'; import * as s from 'star'; import * as s2 from 'star2';"
+                    "import { x as sx, late as slate } from 'star';"
+                    "import { x as s2x, renamed } from 'star2'; import { x as bx, y as by } from 'b';"
+                    "const now = () => [b.x, b.y, s.x, s2.x, sx, s2x, bx, by, b.cns.x].join('');"
+                    "const out = [Object.keys(b), Object.keys(s), Object.keys(s2), now()];"
+                    "b.inc(); out.push(now()); s.inc(); s2.inc(); out.push(now());"
+                    "s.setLate('L'); out.push([s.late, s2.late, s2.renamed, slate, renamed].join(''));"
+                    "out.push('default' in s, 'default' in b, b.inc === s.inc, s2.inc === s.inc);"
+                    "export const r = out.join('|');");
+    expect("main", "r", "cns,inc,late,own,setLate,x,y|inc,late,setLate,x|inc,late,renamed,setLate,x|"
+                        "111111111|222222222|444444444|LLLLL|false|false|true|true");
+
+    /* `default` re-exported by name, and an import re-exported by an export list */
+    mod_add("c", "let d = 'd0'; export { d as default }; export let x = 1;"
+                 "export function set(v) { d = v; x = v; }");
+    mod_add("m", "import dflt, { x } from 'c'; export { dflt, x as xx }; export { default } from 'c';"
+                 "export { default as dd, x as default2 } from 'c';");
+    mod_add("main", "import * as m from 'm'; import * as c from 'c'; import md, { dflt, xx, dd } from 'm';"
+                    "const now = () => [m.dflt, m.xx, m.default, m.dd, m.default2, md, dflt, xx, dd].join(' ');"
+                    "const out = [Object.keys(m), now()]; c.set('S'); out.push(now());"
+                    "export const r = out.join('|');");
+    expect("main", "r", "dd,default,default2,dflt,xx|d0 1 d0 d0 1 d0 d0 1 d0|S S S S S S S S S");
+
+    /* `export default function f() {}` exports the binding f: an assignment to f shows */
+    mod_add("a", "export default function f() { return 1; } export { f as g };"
+                 "export function change() { f = 5; }");
+    mod_add("b", "export { default as a } from 'a';");
+    mod_add("c", "export { g as a } from 'a';");
+    mod_add("d", "export * from 'b'; export * from 'c';");
+    mod_add("main", "import d, { g, change } from 'a'; import * as ns from 'd'; import * as na from 'a';"
+                    "const out = [typeof d, typeof g, Object.keys(ns), Object.keys(na).join()];"
+                    "change(); out.push(d, g, ns.a, na.default); export const r = out.join(' ');");
+    expect("main", "r", "function function a change,default,g 5 5 5 5");
+
+    /* a name two `export *` bring as different bindings is no export: left out of the
+     * namespace, a SyntaxError to import */
+    mod_add("p", "export let x = 'p'; export let onlyp = 1;");
+    mod_add("q", "export let x = 'q'; export let onlyq = 2;");
+    mod_add("m", "export * from 'p'; export * from 'q';");
+    mod_add("main", "import * as m from 'm'; export const r = [Object.keys(m), String(m.x), 'x' in m].join('|');");
+    expect("main", "r", "onlyp,onlyq|undefined|false");
+    mod_add("p", "export let x = 'p';");
+    mod_add("q", "export let x = 'q';");
+    mod_add("m", "export * from 'p'; export * from 'q';");
+    mod_add("main", "import { x } from 'm'; export const r = x;");
+    expect_error("main", "SyntaxError: The requested module 'm' contains conflicting star exports for name 'x'");
+    mod_add("p", "export let x = 'p';");
+    mod_add("q", "export let x = 'q';");
+    mod_add("m", "export * from 'p'; export * from 'q';");
+    mod_add("n", "export { x } from 'm';");
+    mod_add("main", "import * as n from 'n'; export const r = Object.keys(n).join();");
+    expect_error("main", "SyntaxError: The requested module 'm' contains conflicting star exports for name 'x'");
+
+    /* the module's own export and its named re-export win over what `export *` brings */
+    mod_add("p", "export let x = 'p'; export let y = 'py'; export let z = 'pz';");
+    mod_add("q", "export let y = 'qy'; export let z = 'qz';");
+    mod_add("m", "export * from 'p'; export let x = 'local'; export { y } from 'q'; export * from 'q';");
+    mod_add("main", "import * as m from 'm'; import { x, y } from 'm';"
+                    "export const r = [Object.keys(m), m.x, m.y, String(m.z), x, y].join('|');");
+    expect("main", "r", "x,y|local|qy|undefined|local|qy");
+
+    /* one binding reached twice does not conflict: through two modules, under two names of
+     * its own (`export { x as a, x as b }`) */
+    mod_add("c", "export let x = 1; export function inc() { x++; }");
+    mod_add("e", "export * from 'c';");
+    mod_add("f", "export * from 'c';");
+    mod_add("m", "export * from 'e'; export * from 'f';");
+    mod_add("main", "import * as m from 'm'; import { x } from 'm'; const out = [Object.keys(m), m.x, x];"
+                    "m.inc(); out.push(m.x, x); export const r = out.join('|');");
+    expect("main", "r", "inc,x|1|1|2|2");
+    mod_add("c", "let x = 1; export { x as a, x as b }; export function inc() { x++; }");
+    mod_add("e", "export { a as z } from 'c';");
+    mod_add("f", "export { b as z } from 'c';");
+    mod_add("m", "export * from 'e'; export * from 'f';");
+    mod_add("main", "import * as m from 'm'; import * as c from 'c'; const out = [Object.keys(m), String(m.z)];"
+                    "c.inc(); out.push(String(m.z)); export const r = out.join('|');");
+    expect("main", "r", "z|1|2");
+    mod_add("c", "export let x = 1; export function inc() { return ++x; }");
+    mod_add("s", "export * from 'c';");
+    mod_add("r", "export { x as y } from 's';");
+    mod_add("r2", "export { y as z } from 'r'; export * from 'r';");
+    mod_add("main", "import * as r2 from 'r2'; import { z, y } from 'r2'; import { inc } from 's';"
+                    "const out = [Object.keys(r2).join(','), r2.z, r2.y, z, y]; inc();"
+                    "out.push(r2.z, r2.y, z, y); export const r = out.join(' ');");
+    expect("main", "r", "y,z 1 1 1 1 2 2 2 2");
+
+    /* a module has one namespace binding (V8's namespace cell): re-exported by two modules,
+     * as `export * as` or as an imported namespace in an export list, it is one binding; the
+     * namespaces of two modules under one name conflict */
+    mod_add("c", "export let x = 1;");
+    mod_add("e", "export * as z from 'c'; import * as w from 'c'; export { w };");
+    mod_add("f", "import * as z from 'c'; export { z }; export * as w from 'c';");
+    mod_add("m", "export * from 'e'; export * from 'f';");
+    mod_add("main", "import * as m from 'm'; import * as e from 'e'; import * as c from 'c'; import { z, w } from 'm';"
+                    "export const r = [Object.keys(m), Object.keys(e), e.z === c, e.w === c, m.z === c, z === w].join('|');");
+    expect("main", "r", "w,z|w,z|true|true|true|true");
+    mod_add("c", "export let x = 1;");
+    mod_add("d", "export let x = 1;");
+    mod_add("e", "export * as z from 'c';");
+    mod_add("f", "export * as z from 'd';");
+    mod_add("m", "export * from 'e'; export * from 'f';");
+    mod_add("main", "import * as m from 'm'; export const r = '[' + Object.keys(m) + ']';");
+    expect("main", "r", "[]");
+    mod_add("c", "export let x = 1;");
+    mod_add("d", "export let x = 1;");
+    mod_add("e", "export * as z from 'c';");
+    mod_add("f", "import * as z from 'd'; export { z };");
+    mod_add("m", "export * from 'e'; export * from 'f';");
+    mod_add("main", "import { z } from 'm'; export const r = typeof z;");
+    expect_error("main", "SyntaxError: The requested module 'm' contains conflicting star exports for name 'z'");
+
+    /* the link errors, worded as V8's and naming the module request they came through */
+    mod_add("c", "export let x = 1;");
+    mod_add("m", "export * from 'c';");
+    mod_add("main", "import { nope } from 'm'; export const r = nope;");
+    expect_error("main", "SyntaxError: The requested module 'm' does not provide an export named 'nope'");
+    mod_add("c", "export let x = 1;");
+    mod_add("m", "export { nope } from 'c';");
+    mod_add("main", "import * as m from 'm'; export const r = Object.keys(m).join();");
+    expect_error("main", "SyntaxError: The requested module 'c' does not provide an export named 'nope'");
+    mod_add("a", "export { x } from 'b';");
+    mod_add("b", "export { x } from 'a';");
+    mod_add("main", "import * as a from 'a'; export const r = Object.keys(a).join();");
+    expect_error("main", "SyntaxError: Detected cycle while resolving name 'x' in 'b'");
+    mod_add("c", "export default 1; export let x = 1;");
+    mod_add("m", "export * from 'c';");
+    mod_add("main", "import d from 'm'; export const r = d;");
+    expect_error("main", "SyntaxError: The requested module 'm' does not provide an export named 'default'");
+    mod_add("u", "export let other = 1;");
+    mod_add("s", "export * from 'u';");
+    mod_add("t", "export let x = 't';");
+    mod_add("m", "export * from 's'; export * from 't';");
+    mod_add("main", "import { x } from 'm'; import { x as x2 } from 'u'; export const r = x + x2;");
+    expect_error("main", "SyntaxError: The requested module 'u' does not provide an export named 'x'");
+
+    /* V8 as it is: a conflict one `export *` further down is no conflict for the namespace
+     * (the name stays, from the module that has it), yet importing the name reports it */
+    mod_add("p", "export let x = 'p';");
+    mod_add("q", "export let x = 'q';");
+    mod_add("s", "export * from 'p'; export * from 'q';");
+    mod_add("t", "export let x = 't'; export let t = 1;");
+    mod_add("m", "export * from 's'; export * from 't';");
+    mod_add("main", "import * as m from 'm'; export const r = Object.keys(m) + ' ' + String(m.x);");
+    expect("main", "r", "t,x t");
+    mod_add("p", "export let x = 'p';");
+    mod_add("q", "export let x = 'q';");
+    mod_add("s", "export * from 'p'; export * from 'q';");
+    mod_add("t", "export let x = 't'; export let t = 1;");
+    mod_add("m", "export * from 't'; export * from 's';");
+    mod_add("main", "import { x } from 'm'; export const r = x;");
+    expect_error("main", "SyntaxError: The requested module 's' contains conflicting star exports for name 'x'");
+    /* ... unless the namespace was made first, in a module linked before this one */
+    mod_add("p", "export let x = 'p';");
+    mod_add("q", "export let x = 'q';");
+    mod_add("s", "export * from 'p'; export * from 'q';");
+    mod_add("t", "export let x = 't'; export let t = 1;");
+    mod_add("m", "export * from 't'; export * from 's';");
+    mod_add("mid", "import * as ns from 'm'; export const k = Object.keys(ns).join();");
+    mod_add("main", "import { x } from 'm'; import { k } from 'mid'; export const r = x + ' ' + k;");
+    expect("main", "r", "t t,x");
+    /* a module whose linking failed is linked again by the next import (V8 does; Node keeps
+     * the failed job, so its third line repeats the first) */
+    mod_add("p", "export let x = 'p';");
+    mod_add("q", "export let x = 'q';");
+    mod_add("s", "export * from 'p'; export * from 'q';");
+    mod_add("t", "export let x = 't'; export let t = 1;");
+    mod_add("m", "export * from 't'; export * from 's';");
+    mod_add("n1", "import { x } from 'm'; export const r = x;");
+    mod_add("n2", "import { x } from 'm'; export const r = x;");
+    mod_add("main", "import 'm'; const out = [];"
+                    "try { out.push((await import('n1')).r); } catch (e) { out.push(e.message); }"
+                    "out.push(Object.keys(await import('m')).join());"
+                    "try { out.push((await import('n2')).r); } catch (e) { out.push(e.message); }"
+                    "try { out.push((await import('n1')).r); } catch (e) { out.push(e.message); }"
+                    "export const r = out.join('|');");
+    expect("main", "r", "The requested module 's' contains conflicting star exports for name 'x'|t,x|t|t");
+    /* and fails again where the error is still there: never half linked */
+    mod_add("c", "export let x = 1;");
+    mod_add("bad", "import { nope } from 'c'; export let y = nope;");
+    mod_add("bad2", "export * from 'bad'; export let z = 1;");
+    mod_add("main", "const out = [];"
+                    "for (const s of ['bad', 'bad', 'bad2', 'bad2', 'c']) {"
+                    "  try { out.push(s + ' ok ' + Object.keys(await import(s))); }"
+                    "  catch (e) { out.push(s + ' ' + e.name + ': ' + e.message); } }"
+                    "export const r = out.join('|');");
+    expect("main", "r", "bad SyntaxError: The requested module 'c' does not provide an export named 'nope'|"
+                        "bad SyntaxError: The requested module 'c' does not provide an export named 'nope'|"
+                        "bad2 SyntaxError: The requested module 'c' does not provide an export named 'nope'|"
+                        "bad2 SyntaxError: The requested module 'c' does not provide an export named 'nope'|"
+                        "c ok x");
+    /* a module that threw stays failed, for the importer of its names too */
+    mod_add("a", "export let x = 1; throw new Error('boom');");
+    mod_add("b", "import { x } from 'a'; export let y = x;");
+    mod_add("main", "const out = [];"
+                    "for (const s of ['a', 'b', 'a']) { try { await import(s); } catch (e) { out.push(e.message); } }"
+                    "export const r = out.join('|');");
+    expect("main", "r", "boom|boom|boom");
+    /* a module linked later binds to values as they are by then, and stays live */
+    mod_add("c", "export let x = 1; export function inc() { x++; }");
+    mod_add("m", "export * from 'c'; export { x as y } from 'c';");
+    mod_add("main", "import * as c from 'c'; c.inc(); const m = await import('m'); const out = [m.x, m.y];"
+                    "c.inc(); out.push(m.x, m.y); export const r = out.join('|');");
+    expect("main", "r", "2|2|3|3");
+
+    /* cycles of `export *`: every namespace is complete, a module may star-export itself */
+    mod_add("a", "export * from 'b'; export let ax = 'ax'; export function setA(v) { ax = v; }");
+    mod_add("b", "export * from 'a'; export let bx = 'bx';");
+    mod_add("main", "import * as a from 'a'; import * as b from 'b'; import { ax } from 'b';"
+                    "const out = [Object.keys(a), Object.keys(b), b.ax, ax]; a.setA('new');"
+                    "out.push(b.ax, a.ax, ax); export const r = out.join('|');");
+    expect("main", "r", "ax,bx,setA|ax,bx,setA|ax|ax|new|new|new");
+    mod_add("a", "export * from 'b'; export let a1 = 1;");
+    mod_add("b", "export * from 'c'; export let b1 = 1;");
+    mod_add("c", "export * from 'a'; export let c1 = 1; export * from 'd';");
+    mod_add("d", "export let d1 = 1;");
+    mod_add("main", "import * as c from 'c'; import * as b from 'b'; import * as a from 'a'; import { a1, d1 } from 'b';"
+                    "export const r = [Object.keys(a), Object.keys(b), Object.keys(c)].join('|') + a1 + d1;");
+    expect("main", "r", "a1,b1,c1,d1|a1,b1,c1,d1|a1,b1,c1,d111");
+    mod_add("m", "export * from 'm'; export let x = 1; export { x as y } from 'm'; export function inc() { x++; }");
+    mod_add("main", "import * as m from 'm'; const out = [Object.keys(m).join(','), m.x, m.y]; m.inc();"
+                    "out.push(m.x, m.y); export const r = out.join(' ');");
+    expect("main", "r", "inc,x,y 1 1 2 2");
+
+    /* a re-exported name read in a cycle before its declaration ran: the TDZ error, naming
+     * the local name of an import and the property of a namespace */
+    mod_add("a", "import { v, w } from 'b'; export const out = [];"
+                 "try { out.push('a sees v: ' + v); } catch (e) { out.push(e.name + ': ' + e.message); }"
+                 "try { out.push('a sees w: ' + w); } catch (e) { out.push(e.name + ': ' + e.message); }"
+                 "export let v0 = 'av'; export { v0 as w0 };");
+    mod_add("b", "export { v0 as v } from 'a'; export { w0 as w } from 'a';");
+    mod_add("main", "import * as b from 'b'; import { out } from 'a'; out.push('main: ' + b.v + ' ' + b.w);"
+                    "export const r = out.join('|');");
+    expect("main", "r", "ReferenceError: Cannot access 'v' before initialization|"
+                        "ReferenceError: Cannot access 'w' before initialization|main: av av");
+    mod_add("a", "import { v as lv } from 'b'; import * as b from 'b'; export const out = [];"
+                 "try { out.push('a sees lv: ' + lv); } catch (e) { out.push(e.name + ': ' + e.message); }"
+                 "try { out.push('a sees b.v: ' + b.v); } catch (e) { out.push(e.name + ': ' + e.message); }"
+                 "export let v0 = 'av';");
+    mod_add("b", "export { v0 as v } from 'a';");
+    mod_add("main", "import * as b from 'b'; import { out } from 'a'; out.push('main: ' + b.v);"
+                    "export const r = out.join('|');");
+    expect("main", "r", "ReferenceError: Cannot access 'lv' before initialization|"
+                        "ReferenceError: Cannot access 'v' before initialization|main: av");
+    mod_add("a", "import * as b from 'b'; export const out = [];"
+                 "try { out.push('a sees b.v: ' + b.v); } catch (e) { out.push(e.name + ': ' + e.message); }"
+                 "out.push('in: ' + ('v' in b) + ' ' + ('out' in b)); export let v = 'av';");
+    mod_add("b", "export * from 'a'; import 'a';");
+    mod_add("main", "import * as b from 'b'; import { v } from 'b'; import { out } from 'a';"
+                    "out.push('main: ' + b.v + ' ' + v + ' ' + Object.keys(b)); export const r = out.join('|');");
+    expect("main", "r", "ReferenceError: Cannot access 'v' before initialization|in: true true|main: av av out,v");
+
+    /* the order of linking inside one module is V8's: imports by local name (not in source
+     * order), then the `export ... from` declarations in source order. It decides which of
+     * two errors is the one reported. */
+    mod_add("g", "export let g = 1;");
+    mod_add("h", "export let h = 1;");
+    mod_add("main", "import { zz } from 'g'; import { aa } from 'h'; export const r = 1;");
+    expect_error("main", "SyntaxError: The requested module 'h' does not provide an export named 'aa'");
+    mod_add("g", "export let g = 1;");
+    mod_add("h", "export let h = 1;");
+    mod_add("main", "import { zz as b } from 'g'; import { aa as a, bb as ab } from 'h'; export const r = 1;");
+    expect_error("main", "SyntaxError: The requested module 'h' does not provide an export named 'aa'");
+    mod_add("g", "export let g = 1;");
+    mod_add("h", "export let h = 1;");
+    mod_add("main", "import { zz as ab } from 'g'; import { aa as a } from 'h'; export const r = 1;");
+    expect_error("main", "SyntaxError: The requested module 'h' does not provide an export named 'aa'");
+    mod_add("g", "export let g = 1;");
+    mod_add("h", "export let h = 1;");
+    mod_add("main", "export { nope } from 'g'; import { bad } from 'h'; export const r = 1;");
+    expect_error("main", "SyntaxError: The requested module 'h' does not provide an export named 'bad'");
+    mod_add("g", "export let g = 1;");
+    mod_add("h", "export let h = 1;");
+    mod_add("main", "export { q } from 'g'; export { p } from 'h'; export const r = 1;");
+    expect_error("main", "SyntaxError: The requested module 'g' does not provide an export named 'q'");
+    mod_add("g", "export let g = 1;");
+    mod_add("h", "export let h = 1;");
+    mod_add("main", "import { g as z } from 'g'; export { z as y }; export { nope } from 'h';"
+                    "import { bad as zz } from 'h'; export const r = 1;");
+    expect_error("main", "SyntaxError: The requested module 'h' does not provide an export named 'bad'");
+
+    /* and the namespaces a module imports are made in the order of their local names, which
+     * shows where two modules in a cycle of `export *` each get a name the other may not:
+     * the one whose namespace is made first loses it. `export * as` counts under a hidden
+     * name, ".ns-export" and its number among the module's: after `$`, before any letter,
+     * and ".ns-export10" before ".ns-export2". */
+    static const char *const ring[][2] = {
+        {"a", "export * from 'c'; export * from 'd';"},
+        {"c", "export * from 'a'; export * from 'b';"},
+        {"b", "export let k = 2;"},
+        {"d", "export let k = 1;"},
+        {"g", "export let g = 1;"},
+    };
+    static const char *const order[][3] = {
+        {"import * as b from 'a'; import * as a from 'c'; export const r = Object.keys(b) + '|' + Object.keys(a);",
+         NULL, "k|"},
+        {"import * as a from 'a'; import * as b from 'c'; export const r = Object.keys(a) + '|' + Object.keys(b);",
+         NULL, "|k"},
+        {"import { zz, q } from 'm'; export const r = Object.keys(zz) + '|' + Object.keys(q);",
+         "import * as q from 'c'; export * as zz from 'a'; export { q };", "|k"},
+        {"import { zz, q } from 'm'; export const r = Object.keys(zz) + '|' + Object.keys(q);",
+         "import * as $q from 'c'; export * as zz from 'a'; export { $q as q };", "k|"},
+        {"import { za, zc } from 'm'; export const r = Object.keys(za) + '|' + Object.keys(zc);",
+         "export * as g0 from 'g'; export * as g1 from 'g'; export * as zc from 'c';"
+         "export * as h0 from 'g'; export * as h1 from 'g'; export * as h2 from 'g'; export * as h3 from 'g';"
+         "export * as h4 from 'g'; export * as h5 from 'g'; export * as h6 from 'g'; export * as za from 'a';",
+         "|k"},
+    };
+    for (size_t i = 0; i < sizeof order / sizeof order[0]; i++) {
+        for (size_t k = 0; k < sizeof ring / sizeof ring[0]; k++)
+            mod_add(ring[k][0], ring[k][1]);
+        if (order[i][1])
+            mod_add("m", order[i][1]);
+        mod_add("main", order[i][0]);
+        expect("main", "r", order[i][2]);
+    }
 }
 
 static void test_graphs(void) {
@@ -377,6 +737,30 @@ static bool try_module_bc(JsContext *ctx, JsVm *vm, const uint8_t *buf, size_t l
     return ok;
 }
 
+/* Every byte of `bc` past the magic x three mutations, each loaded as 'main' and evaluated in
+ * a fresh registry; returns the number of cases run. */
+static int mutation_sweep(const uint8_t *bc, size_t len) {
+    const uint8_t muts[3] = {0xA5, 0x00, 0xFF};
+    int total = 0;
+    uint8_t *t = malloc(len);
+    for (size_t i = 4; i < len; i++) {
+        for (int mi = 0; mi < 3; mi++) {
+            CountAlloc ca = {0, 0};
+            JsVmConfig cfg = {.realloc_fn = count_realloc, .alloc_ud = &ca};
+            JsVm *vm = js_vm_new(&cfg);
+            JsContext *ctx = js_context_new(vm);
+            js_set_module_loader(ctx, bc_loader, NULL, vm);
+            memcpy(t, bc, len);
+            t[i] = mi == 0 ? (uint8_t)(bc[i] ^ 0xA5) : muts[mi];
+            (void)try_module_bc(ctx, vm, t, len);
+            total++;
+            js_vm_free(vm);
+        }
+    }
+    free(t);
+    return total;
+}
+
 static void test_kind_and_tamper(void) {
     /* Build one self-contained module buffer (no deps) for the sweep. */
     mod_add("main",
@@ -432,34 +816,57 @@ static void test_kind_and_tamper(void) {
      * import-index bounds and module-opcode gating hold under corruption.
      * ASan/UBSan enforces it.
      */
-    const uint8_t muts[3] = {0xA5, 0x00, 0xFF};
-    int total = 0;
-    uint8_t *t = malloc(len);
-    for (size_t i = 4; i < len; i++) {
-        for (int mi = 0; mi < 3; mi++) {
-            CountAlloc ca = {0, 0};
-            JsVmConfig cfg = {.realloc_fn = count_realloc, .alloc_ud = &ca};
-            JsVm *vm = js_vm_new(&cfg);
-            JsContext *ctx = js_context_new(vm);
-            js_set_module_loader(ctx, bc_loader, NULL, vm);
-            memcpy(t, bc, len);
-            t[i] = mi == 0 ? (uint8_t)(bc[i] ^ 0xA5) : muts[mi];
-            (void)try_module_bc(ctx, vm, t, len);
-            total++;
-            js_vm_free(vm);
-        }
-    }
-    free(t);
     checks_run++;
-    if (total == 0) {
+    if (mutation_sweep(bc, len) == 0) {
         checks_failed++;
         fprintf(stderr, "FAIL: module mutation sweep ran no cases\n");
+    }
+    mods_reset();
+
+    /* the same over a module with every kind of link record: a namespace import, a hidden one,
+     * each kind of re-export, a second name of an export, exports that start in the TDZ and
+     * ones that do not. Its dependency loads untouched. */
+    mod_add("c", "export let x = 1; export function inc() { x++; }");
+    mod_add("main", "export * from 'c'; export { x as y } from 'c'; export * as ns from 'c';"
+                    "import * as w from 'c'; import { inc as bump } from 'c'; export { w, bump };"
+                    "let q = 1; export { q as a, q as b }; export default function f() {}"
+                    "export function g() { return q; } bump(); export const r = w.x + g();");
+    checks_run++;
+    if (!compile_all()) {
+        checks_failed++;
+        fprintf(stderr, "FAIL: could not compile the re-exporting module for the tamper test\n");
+        mods_reset();
+        return;
+    }
+    {
+        CountAlloc ca = {0, 0};
+        JsVmConfig cfg = {.realloc_fn = count_realloc, .alloc_ud = &ca};
+        JsVm *vm = js_vm_new(&cfg);
+        JsContext *ctx = js_context_new(vm);
+        js_set_module_loader(ctx, bc_loader, NULL, vm);
+        checks_run++;
+        if (!try_module_bc(ctx, vm, g_mods.bc[1], g_mods.bc_len[1])) {
+            checks_failed++;
+            fprintf(stderr, "FAIL: valid re-exporting module buffer failed to load/eval\n");
+        }
+        js_vm_free(vm);
+    }
+    checks_run++;
+    if (mutation_sweep(g_mods.bc[1], g_mods.bc_len[1]) == 0) {
+        checks_failed++;
+        fprintf(stderr, "FAIL: re-export mutation sweep ran no cases\n");
     }
     mods_reset();
 }
 
 int main(void) {
     test_graphs();
+    test_reexports();
+    /* linking again with the collector running at every safe point: the bindings, the mirrors
+     * of live re-exports and the namespaces made while linking stay rooted */
+    g_gc_stress = true;
+    test_reexports();
+    g_gc_stress = false;
     test_kind_and_tamper();
     if (checks_failed) {
         fprintf(stderr, "%d/%d module-bytecode checks FAILED\n", checks_failed, checks_run);

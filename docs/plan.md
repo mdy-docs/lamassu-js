@@ -370,15 +370,16 @@ Tracked so differential testing against Node has a baseline.
   `js_run_module` still pending; the host settles the promise, calls
   `js_run_jobs`, and reads the completion via the module's result (the
   microtask queue drives the resumption).
-- **All re-export forms are supported** — `export * from`,
-  `export { a as b } from`, and `export * as ns from`. Named and `export *`
-  re-exports are **snapshots** taken once the source module finishes
-  evaluating (dependency order guarantees it has); a later mutation of a
-  re-exported *mutable* binding is not observed. `export * as ns` is live by
-  reference (it aliases the source namespace object). For a template runtime
-  this is exact, since re-exports are functions/constants; true live indirect
-  re-export of mutable bindings would need accessor-property exports (a
-  candidate for the shapes pass).
+- **All re-export forms are supported and live** — `export * from`,
+  `export { a as b } from`, `export * as ns from`, and an imported name
+  exported again. Linking is a port of V8's (`SourceTextModule::
+  FinishInstantiate`, `ResolveExport`, `FetchStarExports`): every exported
+  name resolves to the module and name that own the binding, an import reads
+  that module's exports object directly, and a namespace that passes
+  bindings on holds a copy the owning module rewrites at every write (a
+  mirror; the owner holds its mirrors weakly). The compiler writes a
+  module's imports and re-exports in the order V8 links them (by local name),
+  so the error reported for a graph with several is V8's.
 - **Cross-module cycles:** a `let`/`const` export (or an `export default`
   expression) read before the exporting module initialized it throws the TDZ
   error, as real ESM does: the exports object holds `JS_SPECIAL_TDZ` for it
