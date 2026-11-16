@@ -1,0 +1,1 @@
+lib/thrower.mjs:2:8: uncaught TypeError: Cannot read properties of null (reading 'x')

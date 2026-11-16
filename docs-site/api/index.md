@@ -46,9 +46,27 @@ lamassu --emit-bytecode SRC OUT         # compile SRC to a bytecode cache
 | `--heap-limit N` | Cap on the guest heap, with an optional `K`/`M`/`G` suffix (e.g. `64M`). |
 | `-h`, `--help` | The same summary, from the tool itself. |
 
-A script's `import` specifiers resolve against the directory of the file it
-runs, taken as written when the file name has an extension (`./m.mjs`,
-`./util.js`) and with `.js` added when it has none (`./util`).
+A source file is run as a module, whether or not it imports or exports, and
+is named by its path: a file is one module however it is reached, the file
+being run included. What it prints is what it passes to `print()`; the value
+of its last expression is not printed (the REPL prints each line's).
+
+| specifier | the file |
+| --- | --- |
+| `./x`, `../x` | beside the module that imports it |
+| `/x` | as written |
+| `x` | beside the file being run: there are no packages to look in |
+
+`.` and `..` are removed by name and links are not followed. A name is taken
+as written when it has an extension (`./m.mjs`, `./util.js`) and given `.js`
+when it has none (`./util`).
+
+| exit status | the run |
+| --- | --- |
+| `0` | finished |
+| `1` | ended with an error nothing caught, reported as `file:line:col: uncaught …` at the place it was thrown (for a syntax error, where the parser stopped) |
+| `2` | could not start: a file that cannot be read, a bad option |
+| `13` | was left waiting at a top-level `await` that nothing will settle, as Node reports it |
 
 Options come before the subcommand or filename. Both limits are off by
 default, which is what you want for your own code and not what you want for

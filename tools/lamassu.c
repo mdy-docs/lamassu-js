@@ -2,12 +2,13 @@
  * lamassu — compile and run a JavaScript (lamassu subset) file.
  *
  * Host-side tool: file I/O and UTF-8 <-> UTF-16 conversion live here, never
- * in the core. Prints the module's completion value (REPL-style), or a
- * diagnostic with line:col on error.
+ * in the core.
  *
- * A file that imports or exports is a module, named by its path, and what it
- * imports are files: see the module loader below. Its completion value is not
- * printed (a module has none to give).
+ * A file is a module, named by its path, and what it imports are files: see
+ * the module loader below. What it prints is what it calls print() with; an
+ * error nothing caught is a diagnostic with file:line:col. The REPL prints the
+ * value of each line, and a bytecode cache of a file with no imports is still
+ * a function run for its completion value (what the reactor renders).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -153,8 +154,7 @@ static void print_utf16(FILE *f, const uint16_t *units, size_t len) {
  * entry imported back by a module it imports, "./a.js" and "./sub/../a.js" -- and "./x.js" in
  * sub/m.js is sub/x.js.
  *
- *   ./x  ../x   beside the module that imports it; beside the entry, for an import() from an
- *               entry that is run without the loader (see main)
+ *   ./x  ../x   beside the module that imports it
  *   /x          as written
  *   x           beside the entry: there are no packages to look in
  *
@@ -457,6 +457,49 @@ static void set_root_dir(const char *file) {
 static int unsettled(const char *file) {
     fprintf(stderr, "%s: unsettled top-level await\n", file);
     return EXIT_UNSETTLED;
+}
+
+/*
+ * The error a run was rejected with, as "file:line:col: uncaught <error>". The place is where
+ * it was thrown -- for a syntax error, where the parser stopped -- in whichever module that
+ * was: the entry under the name the command line gave (FILE, its source SRC), another by its
+ * path. An error with no place (a module that was not found) has the entry's name alone.
+ */
+static void report_uncaught(JsContext *ctx, JsVm *vm, const char *file, const uint16_t *src,
+                            size_t len, JsValue reason) {
+    /* the place first: turning the error into a string can run code, and raise another */
+    JsStackFrame at;
+    size_t pl = 0;
+    const uint16_t *pu = js_context_error_stack(ctx, &at, 1) ? js_string_units(at.specifier, &pl)
+                                                             : NULL;
+    bool entry = pu && pl == g_entry_len && memcmp(pu, g_entry, pl * sizeof *pu) == 0;
+    uint32_t line = 0, col = 0;
+    if (entry) {
+        js_source_line_col(src, len, at.pos, &line, &col);
+    } else if (pu) {
+        size_t bl, ml;
+        uint8_t *bytes = read_open(open_path(pu, pl), &bl);
+        uint16_t *msrc = bytes ? utf8_to_utf16(bytes, bl, &ml) : NULL;
+        free(bytes);
+        if (msrc)
+            js_source_line_col(msrc, ml, at.pos, &line, &col);
+        free(msrc);
+    }
+    if (line && !entry)
+        print_utf16(stderr, pu, pl);
+    else
+        fprintf(stderr, "%s", file);
+    if (line)
+        fprintf(stderr, ":%u:%u", line, col);
+    fprintf(stderr, ": uncaught ");
+    js_gc_protect(vm, &reason);
+    JsValue str = js_to_string(ctx, reason);
+    js_gc_unprotect(vm, &reason);
+    size_t slen;
+    const uint16_t *su = js_string_units(str, &slen);
+    if (su)
+        print_utf16(stderr, su, slen);
+    fputc('\n', stderr);
 }
 
 /* Interactive REPL over one persistent context (top-level let/const/function
@@ -925,76 +968,31 @@ int main(int argc, char **argv) {
     js_set_module_loader(ctx, file_loader, file_canonicalize, vm);
     js_enable_source_modules(ctx);
 
+    /* The file is run through the module pipeline, as the module its path names, so an import
+     * that comes back to it finds it there. The loader answers with the source read above. The
+     * specifier goes through the canonicalizer as any does: "./" and the file's name, beside
+     * the entry, is the entry. */
     int status = 0;
-    const char *err_msg;
-    uint32_t err_pos;
-    JsValue fn = js_compile_module(ctx, src, len, &err_msg, &err_pos);
-    bool is_module = !js_is_function(fn) && err_msg &&
-                     strcmp(err_msg, JS_ERR_NEEDS_MODULE_LOADER) == 0;
-
-    if (is_module) {
-        /* The file uses import/export: it is run through the module pipeline, as the module its
-         * path names, so an import that comes back to it finds it there. The loader answers
-         * with the source read above. The specifier goes through the canonicalizer as any does:
-         * "./" and the file's name, beside the entry, is the entry. */
-        g_entry_src = src;
-        g_entry_src_len = len;
-        static uint16_t root_spec[PATH_CAP + 2];
-        size_t base = g_entry_len;
-        while (base && g_entry[base - 1] != '/')
-            base--;
-        root_spec[0] = '.';
-        root_spec[1] = '/';
-        memcpy(root_spec + 2, g_entry + base, (g_entry_len - base) * sizeof *g_entry);
-        arm_fuel(ctx);
-        JsValue p = js_eval_module(ctx, root_spec, 2 + g_entry_len - base);
-        js_gc_protect(vm, &p);
-        if (js_promise_state(p) == 2) {
-            JsValue str = js_to_string(ctx, js_promise_result(p));
-            size_t slen;
-            const uint16_t *su = js_string_units(str, &slen);
-            fprintf(stderr, "%s: uncaught ", argv[1]);
-            if (su)
-                print_utf16(stderr, su, slen);
-            fputc('\n', stderr);
-            status = 1;
-        } else if (js_promise_state(p) == 0) {
-            status = unsettled(argv[1]);
-        }
-        js_gc_unprotect(vm, &p);
-        g_entry_src = NULL;
-    } else if (!js_is_function(fn)) {
-        uint32_t line, col;
-        js_source_line_col(src, len, err_pos, &line, &col);
-        fprintf(stderr, "%s:%u:%u: SyntaxError: %s\n", argv[1], line, col, err_msg);
+    g_entry_src = src;
+    g_entry_src_len = len;
+    static uint16_t root_spec[PATH_CAP + 2];
+    size_t base = g_entry_len;
+    while (base && g_entry[base - 1] != '/')
+        base--;
+    root_spec[0] = '.';
+    root_spec[1] = '/';
+    memcpy(root_spec + 2, g_entry + base, (g_entry_len - base) * sizeof *g_entry);
+    arm_fuel(ctx);
+    JsValue p = js_eval_module(ctx, root_spec, 2 + g_entry_len - base);
+    js_gc_protect(vm, &p);
+    if (js_promise_state(p) == 2) {
+        report_uncaught(ctx, vm, argv[1], src, len, js_promise_result(p));
         status = 1;
-    } else {
-        js_gc_protect(vm, &fn);
-        arm_fuel(ctx);
-        JsValue p = js_run_module(ctx, fn);
-        int st = js_promise_state(p);
-        bool ok = st == 1;
-        JsValue result = js_promise_result(p);
-        js_gc_protect(vm, &result);
-        JsValue str = js_to_string(ctx, result);
-        size_t slen;
-        const uint16_t *sunits = js_string_units(str, &slen);
-        if (st == 0) {
-            status = unsettled(argv[1]);
-        } else if (ok) {
-            if (sunits)
-                print_utf16(stdout, sunits, slen);
-            fputc('\n', stdout);
-        } else {
-            uint32_t line, col;
-            js_source_line_col(src, len, js_context_error_pos(ctx), &line, &col);
-            fprintf(stderr, "%s:%u:%u: uncaught ", argv[1], line, col);
-            if (sunits)
-                print_utf16(stderr, sunits, slen);
-            fputc('\n', stderr);
-            status = 1;
-        }
+    } else if (js_promise_state(p) == 0) {
+        status = unsettled(argv[1]);
     }
+    js_gc_unprotect(vm, &p);
+    g_entry_src = NULL;
 
     js_vm_free(vm);
     free(src);
