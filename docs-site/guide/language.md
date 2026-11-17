@@ -135,7 +135,10 @@ functions.
 
 `import` / `export`, including named exports, `export default`,
 `export * from`, `export { a as b } from`, and `export * as ns from`.
-Cyclic and diamond import graphs are supported.
+Cyclic and diamond import graphs are supported. An exported or imported name is
+a word, any word (`export { a as if }`, `import { default as d } from 'm'`),
+never a string: `export { a as "a b" }` is left out (see
+[Explicit non-goals](#explicit-non-goals)).
 
 The declaration rules are V8's. Every module's function declarations
 (`export function`, `export default function` and the module's own) are
@@ -188,6 +191,8 @@ These are permanent scoping decisions, not a "not yet implemented" list:
   no script goal to make sloppy.
 - **`for...in` and `with`.** (Labeled statements are supported: `break` and `continue` to a
   label, on loops, blocks and other statements.)
+- **String literals as module export names** (`export { a as "a b" }`, `import { "a b" as a }
+  from 'm'`, ES2022): a name a module exports is always an identifier name.
 - **Advanced built-ins**: `Reflect`, `Proxy`, `Symbol`, generators, typed
   arrays, `Intl`.
 - **Full spec conformance.** Where the subset overlaps real JS, behavior is

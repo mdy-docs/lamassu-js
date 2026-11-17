@@ -40,6 +40,13 @@ by design (see [Supported syntax](/guide/language#explicit-non-goals)): `var`,
 `for...in`, `with`, classes (and with them private names, `#x`), getters and setters in object
 literals, generators, sloppy mode, `eval` and the `Function` constructor.
 
+String literals as module export names are left out too (2026-11-17): V8, as ES2022 has it,
+takes `export { a as "a b" }`, `import { "a b" as a } from 'm'` and `export * as "a b" from
+'m'`; in lamassu a name in an import or export clause is always a word, and a string there is
+`SyntaxError: Unexpected string` (this one in V8's general wording, not naming the feature). A
+string V8 refuses too gets that message where V8 has another: `import { "a" } from 'm'` is
+`Unexpected reserved word` in V8.
+
 ## Objects
 
 - **`Object.prototype` has five methods** — `hasOwnProperty`, `isPrototypeOf`,
@@ -156,7 +163,11 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
   for a custom discriminator.
 - **Messages follow V8's wording**, with these differences: an error about
   a feature lamassu leaves out says so (`'var' is not supported; use 'let' or
-  'const'`, `classes are not supported`) where V8 would compile the script;
+  'const'`, `classes are not supported`) where V8 would compile the script
+  (where V8 would not, as for `import * as class from 'm'` or `const var = 1`, the
+  message is V8's, `Unexpected token 'class'`), and also in a destructuring pattern or a
+  parenthesised parameter list, which V8 gets no further with either (`let [var] = []`,
+  `(var) => 1`: V8 has `Unexpected token 'var'`);
   one of V8's own quirks is not copied (a destructured
   parameter given `null` is `'object null'` in V8's message, `'null'` here); an
   operand with no readable name shows its value (`undefined is not a function` for `(void 0)()`
@@ -239,6 +250,14 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
     and fails the same way. Node keeps the first failure of a dynamic
     `import()` for that URL; lamassu, like V8 alone, asks again, so an
     import that could not link earlier may link later (see the case above).
+- **The words of an import or export clause are checked as V8 checks them**, by the parser,
+  before anything is compiled: a name an import binds must be one a declaration could bind
+  (`import { if } from 'm'` and `import { a as let } from 'm'` are `Unexpected reserved word`,
+  at the word), and so must every local name of an `export { ... }` with no `from` (`export {
+  if }`; with `from` the names are the other module's, and any word will do). As in V8, the
+  first such word of an export list is what is reported whatever else is wrong after it, and it
+  comes before `Export 'x' is not defined in module`. The one difference is the string names
+  lamassu leaves out (see Syntax, above).
 - **A module specifier may not contain U+0000** (`SyntaxError`, or a rejected `import()`): a
   module request carries its import attributes after one.
 - **A graph may be 3000 modules deep along its imports.** No walk over a module graph is on

@@ -241,6 +241,17 @@ static JsAstNode *perr_here(JsParser *p, const char *msg) {
     return perr(p, TOK(p).pos, msg);
 }
 
+/* An error V8 reports on its way out of a construct that has already failed further on: of
+ * two reports it keeps the one earlier in the source (see fail_at), so this one, about the
+ * source from POS to END, replaces a later one -- unless that begins right where this ends */
+static JsAstNode *perr_earlier(JsParser *p, uint32_t pos, uint32_t end, const char *msg) {
+    if (p->err_msg && (p->err_pos <= end || strcmp(p->err_msg, "out of memory") == 0))
+        return NULL;
+    p->err_msg = NULL;
+    fail_at(p, pos, msg);
+    return NULL;
+}
+
 static bool advance(JsParser *p) {
     if (p->err_msg)
         return false;
@@ -379,8 +390,10 @@ static bool escaped_async_function(JsParser *p) {
 }
 
 static JsAstNode *parse_ident(JsParser *p, const char *msg) {
+    /* a reserved word where a name belongs: V8 does not compile that either, so its words, and
+     * not the ones for a statement lamassu leaves out (reserved_message) */
     if (TOK(p).kind == JS_T_RESERVED)
-        return perr_here(p, reserved_message(&TOK(p)));
+        return perr_here(p, unexpected_text(p));
     if (TOK(p).kind != JS_T_IDENT)
         return perr_here(p, msg);
     if (escaped_keyword(&TOK(p)))
@@ -414,11 +427,16 @@ static JsAstNode *check_binding_name(JsParser *p, JsAstNode *ident) {
     return ident;
 }
 
+/* A token that is an IdentifierName: an identifier or any reserved word */
+static bool tok_is_any_name(const JsToken *t) {
+    return t->kind == JS_T_IDENT || t->kind == JS_T_RESERVED ||
+           (t->kind >= JS_T_AWAIT && t->kind <= JS_T_WHILE);
+}
+
 /* IdentifierName: keywords allowed (obj.default, import { default as x }). */
 static JsAstNode *parse_name_any(JsParser *p, const char *msg) {
     JsToken *t = &TOK(p);
-    if (t->kind != JS_T_IDENT && t->kind != JS_T_RESERVED &&
-        !(t->kind >= JS_T_AWAIT && t->kind <= JS_T_WHILE))
+    if (!tok_is_any_name(t))
         return perr_here(p, msg);
     JsAstNode *n = new_node(p, JS_AST_IDENT, t->pos);
     if (!n)
@@ -433,6 +451,26 @@ static JsAstNode *parse_name_any(JsParser *p, const char *msg) {
     if (!advance(p))
         return NULL;
     return n;
+}
+
+/* A token that can name a binding in a module: an identifier that spells no reserved word,
+ * escaped or not (`await`, `let`, `yield` and `static` are reserved in every module) */
+static bool tok_is_binding_name(const JsToken *t) {
+    return t->kind == JS_T_IDENT && !escaped_keyword(t);
+}
+
+/* `as` and `from` where a module declaration cannot go on without them. Spelled with an escape
+ * the word is there and refused, as V8 has it; anything else is the unexpected token. */
+static bool expect_contextual(JsParser *p, const char *word) {
+    const JsToken *t = &TOK(p);
+    if (tok_is_name(t, word))
+        return advance(p);
+    if (t->kind == JS_T_IDENT && t->escaped && units_is(t->u.str.units, t->u.str.len, word))
+        perr_here(p, word[0] == 'a' ? "'as' must not contain escaped characters"
+                                    : "'from' must not contain escaped characters");
+    else
+        perr_here(p, word[0] == 'a' ? "expected 'as'" : "expected 'from'");
+    return false;
 }
 
 /* ---- ASI ---- */
@@ -3148,23 +3186,29 @@ static JsAstNode *parse_import_named(JsParser *p, JsNodeVec *specs) {
         JsAstNode *spec = new_node(p, JS_AST_IMPORT_SPEC, TOK(p).pos);
         if (!spec)
             return NULL;
-        JsAstNode *imported = parse_name_any(p, "expected import name");
-        if (!imported)
+        /* The name of the export is any IdentifierName; the name it is bound to here, after
+         * `as` or the same one without, is a binding. V8 calls every word that cannot be one
+         * reserved, whichever it is (`import { if }`, `import { x as let }`). */
+        bool binds = tok_is_binding_name(&TOK(p));
+        JsAstNode *local = parse_name_any(p, "expected import name");
+        if (!local)
             return NULL;
-        spec->units = imported->units;
-        spec->len = imported->len;
+        spec->units = local->units;
+        spec->len = local->len;
         if (tok_is_name(&TOK(p), "as")) {
             if (!advance(p))
                 return NULL;
-            JsAstNode *local = check_binding_name(p, parse_ident(p, "expected local name"));
+            binds = tok_is_binding_name(&TOK(p));
+            local = parse_name_any(p, "expected local name");
             if (!local)
                 return NULL;
-            spec->units2 = local->units;
-            spec->len2 = local->len;
-        } else {
-            spec->units2 = spec->units;
-            spec->len2 = spec->len;
         }
+        if (!binds)
+            return perr(p, local->pos, "Unexpected reserved word");
+        if (!check_binding_name(p, local))
+            return NULL;
+        spec->units2 = local->units;
+        spec->len2 = local->len;
         if (!vec_push(p, specs, spec))
             return NULL;
         if (TOK(p).kind != JS_T_RBRACE && !expect(p, JS_T_COMMA, "expected ',' or '}'"))
@@ -3198,19 +3242,16 @@ static JsAstNode *parse_import(JsParser *p) {
         spec->len2 = local->len;
         if (!vec_push(p, &specs, spec))
             return NULL;
+        uint32_t comma = TOK(p).pos;
         if (accept(p, JS_T_COMMA)) {
             if (TOK(p).kind != JS_T_STAR && TOK(p).kind != JS_T_LBRACE)
-                return perr_here(p, "expected '*' or '{' after ','");
+                return perr(p, comma, "Unexpected token ','"); /* V8 has not looked past it */
         } else {
             goto from;
         }
     }
     if (TOK(p).kind == JS_T_STAR) {
-        if (!advance(p))
-            return NULL;
-        if (!tok_is_name(&TOK(p), "as"))
-            return perr_here(p, "expected 'as' after '*'");
-        if (!advance(p))
+        if (!advance(p) || !expect_contextual(p, "as"))
             return NULL;
         JsAstNode *local = check_binding_name(p, parse_ident(p, "expected namespace name"));
         if (!local)
@@ -3230,12 +3271,53 @@ static JsAstNode *parse_import(JsParser *p) {
         return perr_here(p, "expected import bindings or module specifier");
     }
 from:
-    if (!tok_is_name(&TOK(p), "from"))
-        return perr_here(p, "expected 'from'");
-    if (!advance(p))
+    if (!expect_contextual(p, "from"))
         return NULL;
     vec_store(n, &specs);
     return parse_module_source(p, n);
+}
+
+/*
+ * The names between the braces of `export { ... }`, up to and including the `}`. Each is any
+ * IdentifierName, as a re-export (`export { if } from 'm'`) names another module's exports;
+ * without a `from` the first of each pair is a binding of this module, and a reserved word is
+ * none. RESERVED[0] to RESERVED[1] is where the first such word is (and *HAS_RESERVED that
+ * there is one).
+ */
+static bool parse_export_specs(JsParser *p, JsNodeVec *specs, bool *has_reserved,
+                               uint32_t reserved[2]) {
+    while (TOK(p).kind != JS_T_RBRACE) {
+        JsAstNode *spec = new_node(p, JS_AST_EXPORT_SPEC, TOK(p).pos);
+        if (!spec)
+            return false;
+        if (!*has_reserved && tok_is_any_name(&TOK(p)) && !tok_is_binding_name(&TOK(p))) {
+            *has_reserved = true;
+            reserved[0] = TOK(p).pos;
+            reserved[1] = TOK(p).end;
+        }
+        JsAstNode *local = parse_name_any(p, "expected export name");
+        if (!local)
+            return false;
+        spec->units = local->units;
+        spec->len = local->len;
+        if (tok_is_name(&TOK(p), "as")) {
+            if (!advance(p))
+                return false;
+            JsAstNode *exported = parse_name_any(p, "expected export alias");
+            if (!exported)
+                return false;
+            spec->units2 = exported->units;
+            spec->len2 = exported->len;
+        } else {
+            spec->units2 = spec->units;
+            spec->len2 = spec->len;
+        }
+        if (!vec_push(p, specs, spec))
+            return false;
+        if (TOK(p).kind != JS_T_RBRACE && !expect(p, JS_T_COMMA, "expected ',' or '}'"))
+            return false;
+    }
+    return advance(p); /* } */
 }
 
 static JsAstNode *parse_export(JsParser *p) {
@@ -3289,9 +3371,7 @@ static JsAstNode *parse_export(JsParser *p) {
             n->units2 = alias->units;
             n->len2 = alias->len;
         }
-        if (!tok_is_name(&TOK(p), "from"))
-            return perr_here(p, "expected 'from'");
-        if (!advance(p))
+        if (!expect_contextual(p, "from"))
             return NULL;
         return parse_module_source(p, n);
     }
@@ -3303,49 +3383,31 @@ static JsAstNode *parse_export(JsParser *p) {
         if (!n)
             return NULL;
         JsNodeVec specs = {0};
-        while (TOK(p).kind != JS_T_RBRACE) {
-            JsAstNode *spec = new_node(p, JS_AST_EXPORT_SPEC, TOK(p).pos);
-            if (!spec)
-                return NULL;
-            JsAstNode *local = parse_name_any(p, "expected export name");
-            if (!local)
-                return NULL;
-            spec->units = local->units;
-            spec->len = local->len;
-            if (tok_is_name(&TOK(p), "as")) {
-                if (!advance(p))
-                    return NULL;
-                JsAstNode *exported = parse_name_any(p, "expected export alias");
-                if (!exported)
-                    return NULL;
-                spec->units2 = exported->units;
-                spec->len2 = exported->len;
-            } else {
-                spec->units2 = spec->units;
-                spec->len2 = spec->len;
-            }
-            if (!vec_push(p, &specs, spec))
-                return NULL;
-            if (TOK(p).kind != JS_T_RBRACE && !expect(p, JS_T_COMMA, "expected ',' or '}'"))
-                return NULL;
-        }
-        if (!advance(p)) /* } */
-            return NULL;
-        vec_store(n, &specs);
-        if (tok_is_name(&TOK(p), "from")) {
+        bool has_reserved = false;
+        uint32_t reserved[2] = {0, 0};
+        bool closed = parse_export_specs(p, &specs, &has_reserved, reserved);
+        if (closed && tok_is_name(&TOK(p), "from")) {
             if (!advance(p))
                 return NULL;
+            vec_store(n, &specs);
             return parse_module_source(p, n); /* re-export */
         }
+        /* No `from`, so the names are this module's bindings. V8 learns that only here, after
+         * the list, and also when the list itself went wrong: its report of the reserved word
+         * is the earlier of the two and the one it keeps. */
+        if (has_reserved)
+            return perr_earlier(p, reserved[0], reserved[1], "Unexpected reserved word");
+        if (!closed)
+            return NULL;
+        vec_store(n, &specs);
         if (!expect_semicolon(p))
             return NULL;
         return n;
     }
 
-    /* export <declaration> */
+    /* export <declaration>: after `export`, `let` only ever begins one, so what follows it is
+     * read as the binding and is where an error about it points */
     JsAstNode *decl = NULL;
-    if (TOK(p).kind == JS_T_LET && !let_starts_declaration(p))
-        return perr_here(p, unexpected_text(p));
     if (TOK(p).kind == JS_T_LET || TOK(p).kind == JS_T_CONST) {
         decl = parse_var_decl(p, TOK(p).kind == JS_T_CONST);
         if (decl && !expect_semicolon(p))
@@ -3361,8 +3423,18 @@ static JsAstNode *parse_export(JsParser *p) {
         if (!advance(p) || !advance(p))
             return NULL;
         decl = parse_func_common(p, JS_F_ASYNC, true, TOK(p).pos, JS_AST_FUNC_DECL, start);
+    } else if (escaped_async_function(p)) {
+        return perr_here(p, "Keyword must not contain escaped characters");
+    } else if (TOK(p).kind == JS_T_IDENT &&
+               units_is(TOK(p).u.str.units, TOK(p).u.str.len, "async")) {
+        return perr_here(p, "Unexpected token 'async'"); /* V8 has taken it for the keyword */
+    } else if (TOK(p).kind == JS_T_RESERVED &&
+               (units_is(TOK(p).u.str.units, TOK(p).u.str.len, "var") ||
+                units_is(TOK(p).u.str.units, TOK(p).u.str.len, "class"))) {
+        return perr_here(p, reserved_message(&TOK(p))); /* a declaration lamassu leaves out */
     } else {
-        return perr_here(p, "expected declaration or '{' after 'export'");
+        /* nothing that can be exported: the fault is the `export`, as V8 has it */
+        return perr(p, pos, "Unexpected token 'export'");
     }
     if (!decl)
         return NULL;

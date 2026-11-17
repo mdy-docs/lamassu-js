@@ -747,6 +747,105 @@ static void test_modules(void) {
                "(module (export (afn go () (block (expr (await (call x)))))))");
 }
 
+/* Reserved words in import and export clauses, as V8 reports them (checked against Node 26) */
+static void test_module_clause_errors(void) {
+    /* any word is a name where no binding is made */
+    check_dump("import {if as x, default as y, let as z} from \"m\";",
+               "(module (import \"m\" (n if x) (n default y) (n let z)))");
+    check_dump("export {if, default as class, let as var} from \"m\";",
+               "(module (export-from \"m\" (n if if) (n default class) (n let var)))");
+    check_dump("let q; export {q as if, q as default};",
+               "(module (let (d q)) (export (n q if) (n q default)))");
+    check_dump("export * as if from \"m\";", "(module (export-all \"m\" if))");
+    /* a named import binds a name: every other word is refused where it stands */
+    check_err("import { if } from 'm';", "Unexpected reserved word", 9);
+    check_err("import { default } from 'm';", "Unexpected reserved word", 9);
+    check_err("import { let } from 'm';", "Unexpected reserved word", 9);
+    check_err("import { yield } from 'm';", "Unexpected reserved word", 9);
+    check_err("import { await } from 'm';", "Unexpected reserved word", 9);
+    check_err("import { enum } from 'm';", "Unexpected reserved word", 9);
+    check_err("import { class } from 'm';", "Unexpected reserved word", 9);
+    check_err("import { a as if } from 'm';", "Unexpected reserved word", 14);
+    check_err("import { a as var } from 'm';", "Unexpected reserved word", 14);
+    check_err("import { a as static } from 'm';", "Unexpected reserved word", 14);
+    check_err("import { if as let, b } from 'm';", "Unexpected reserved word", 15);
+    check_err("import { \\u0069f } from 'm';", "Unexpected reserved word", 9);
+    check_err("import { a as \\u0069f } from 'm';", "Unexpected reserved word", 14);
+    check_err("import { eval } from 'm';", "Unexpected eval or arguments in strict mode", 9);
+    check_err("import { a as arguments } from 'm';", "Unexpected eval or arguments in strict mode", 14);
+    /* the default and the namespace binding */
+    check_err("import if from 'm';", "Unexpected token 'if'", 7);
+    check_err("import class from 'm';", "Unexpected token 'class'", 7);
+    check_err("import var from 'm';", "Unexpected token 'var'", 7);
+    check_err("import enum from 'm';", "Unexpected reserved word", 7);
+    check_err("import * as if from 'm';", "Unexpected token 'if'", 12);
+    check_err("import * as class from 'm';", "Unexpected token 'class'", 12);
+    check_err("import * as let from 'm';", "Unexpected strict mode reserved word", 12);
+    check_err("import d, * as with from 'm';", "Unexpected token 'with'", 15);
+    /* what may follow the default binding */
+    check_err("import d, e from 'm';", "Unexpected token ','", 8);
+    check_err("import d, from 'm';", "Unexpected token ','", 8);
+    check_err("import d, 'm';", "Unexpected token ','", 8);
+    /* `as` and `from` are not written with escapes */
+    check_err("import * \\u0061s ns from 'm';", "'as' must not contain escaped characters", 9);
+    check_err("import d fr\\u006fm 'm';", "'from' must not contain escaped characters", 9);
+    check_err("import * as ns fr\\u006fm 'm';", "'from' must not contain escaped characters", 15);
+    check_err("import {} fr\\u006fm 'm';", "'from' must not contain escaped characters", 10);
+    check_err("export * fr\\u006fm 'm';", "'from' must not contain escaped characters", 9);
+    check_err("export * as ns fr\\u006fm 'm';", "'from' must not contain escaped characters", 15);
+    check_err("import { a \\u0061s b } from 'm';", "Unexpected identifier 'as'", 11);
+    check_err("let q; export { q } fr\\u006fm 'm';", "Unexpected identifier 'from'", 20);
+    /* an export list of this module's names: the first reserved one, whatever fails after it */
+    check_err("export { if };", "Unexpected reserved word", 9);
+    check_err("export { if as x };", "Unexpected reserved word", 9);
+    check_err("let q; export { q, default };", "Unexpected reserved word", 19);
+    check_err("let q; export { q, let as x, if };", "Unexpected reserved word", 19);
+    check_err("export { enum };", "Unexpected reserved word", 9);
+    check_err("export { class as c };", "Unexpected reserved word", 9);
+    check_err("export { \\u0069f };", "Unexpected reserved word", 9);
+    check_err("export { if } 5;", "Unexpected reserved word", 9);
+    check_err("export { if, };;", "Unexpected reserved word", 9);
+    check_err("export { if as };", "Unexpected reserved word", 9);
+    check_err("export { if, 5 };", "Unexpected reserved word", 9);
+    check_err("let q; export { q as if, var };", "Unexpected reserved word", 25);
+    /* export of what is no declaration */
+    check_err("export if;", "Unexpected token 'export'", 0);
+    check_err("export 5;", "Unexpected token 'export'", 0);
+    check_err("export q;", "Unexpected token 'export'", 0);
+    check_err("export ;", "Unexpected token 'export'", 0);
+    check_err("export = 1;", "Unexpected token 'export'", 0);
+    check_err("export this;", "Unexpected token 'export'", 0);
+    check_err("export import('m');", "Unexpected token 'export'", 0);
+    check_err("export async;", "Unexpected token 'async'", 7);
+    check_err("export async x => 1;", "Unexpected token 'async'", 7);
+    check_err("export let if = 1;", "Unexpected token 'if'", 11);
+    check_err("export let 5;", "Unexpected number", 11);
+    check_err("export let;", "Unexpected token ';'", 10);
+    check_err("export let class = 1;", "Unexpected token 'class'", 11);
+    check_err("export let enum = 1;", "Unexpected reserved word", 11);
+    check_err("export const var = 1;", "Unexpected token 'var'", 13);
+    check_err("export function if() {}", "Unexpected token 'if'", 16);
+    /* names in other binding places */
+    check_err("const class = 1;", "Unexpected token 'class'", 6);
+    check_err("function f(var) {}", "Unexpected token 'var'", 11);
+    check_err("function f(...with) {}", "Unexpected token 'with'", 14);
+    check_err("try {} catch (super) {}", "Unexpected token 'super'", 14);
+    check_err("for (const extends of []) {}", "Unexpected token 'extends'", 11);
+    /* ... but V8 keeps a later report that begins where the word ends: the end of the input */
+    check_err("export { if", "Unexpected end of input", 11);
+    check_err("export { if ", "Unexpected reserved word", 9);
+    /* declarations lamassu leaves out, which V8 would export */
+    check_err("export var x = 1;", "'var' is not supported", 7);
+    check_err("export class C {}", "classes are not supported", 7);
+    check_err("export default class {}", "classes are not supported", 15);
+    /* a string is no module export name here (V8 takes one; see the deviations page) */
+    check_err("let q; export { q as \"a b\" };", "Unexpected string", 21);
+    check_err("import { \"a b\" as q } from 'm';", "Unexpected string", 9);
+    check_err("import { \"q\" } from 'm';", "Unexpected string", 9);
+    check_err("export { \"a\" as b } from 'm';", "Unexpected string", 9);
+    check_err("export * as \"a b\" from 'm';", "Unexpected string", 12);
+}
+
 static void test_asi(void) {
     check_dump("let a = 1\nlet b = 2",
                "(module (let (d a 1)) (let (d b 2)))");
@@ -943,6 +1042,7 @@ int main(void) {
     test_new();
     test_destructuring_assign();
     test_modules();
+    test_module_clause_errors();
     test_asi();
     test_top_level_await();
     test_errors();
