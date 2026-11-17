@@ -561,6 +561,83 @@ static uint32_t expr_start(const JsAstNode *n) {
 
 /* ---- patterns (declaration/parameter positions) ---- */
 
+static const char INVALID_TARGET[] = "Invalid destructuring assignment target";
+
+/* After `get`, `set` or `async` at the start of a property: the word is the property's key if
+ * what follows is what follows a key, and a modifier of the key to come otherwise */
+static bool prop_name_follows(JsParser *p) {
+    JsToken t = peek(p);
+    return t.kind != JS_T_COLON && t.kind != JS_T_LPAREN && t.kind != JS_T_COMMA &&
+           t.kind != JS_T_RBRACE && t.kind != JS_T_EQ;
+}
+
+/* A property's key that is a literal, into PROP: a string, a number, or a BigInt. A BigInt names
+ * the property its value does (`5n` is "5"), which is what a computed key of that constant
+ * names, so that is how it is compiled. */
+static bool parse_literal_key(JsParser *p, JsAstNode *prop) {
+    const JsToken *t = &TOK(p);
+    JsAstNode *key = new_node(p, t->kind == JS_T_STR ? JS_AST_STRING :
+                                 t->kind == JS_T_NUM ? JS_AST_NUMBER : JS_AST_BIGINT, t->pos);
+    if (!key)
+        return false;
+    if (t->kind == JS_T_NUM) {
+        key->number = t->u.number;
+    } else {
+        key->units = t->u.str.units;
+        key->len = t->u.str.len;
+        if (t->kind == JS_T_BIGINT)
+            prop->flags |= JS_F_COMPUTED;
+    }
+    prop->a = key;
+    return advance(p);
+}
+
+static bool tok_is_literal_key(const JsToken *t) {
+    return t->kind == JS_T_STR || t->kind == JS_T_NUM || t->kind == JS_T_BIGINT;
+}
+
+/* A key that is not a name, with no value after it (`{ 5 }`, `{ "a" = 1 }`, `{ [k], b }`): V8's
+ * error names the key's first token, KEY, and points at its last. */
+static bool key_without_value(JsParser *p, const JsToken *key) {
+    if (TOK(p).kind != JS_T_COMMA && TOK(p).kind != JS_T_RBRACE && TOK(p).kind != JS_T_EQ)
+        return false;
+    perr(p, p->prev_pos, unexpected_token_text(p, key));
+    return true;
+}
+
+/* `get`, `set` or `async` spelled with an escape where it would be a modifier, which is V8's
+ * error at the word. Where the word is the key itself (`{ g\u0065t: 1 }`) the escape is allowed;
+ * V8 takes it for the key before `;` too, and `get` and `set` before `*`. */
+static bool escaped_prop_modifier(JsParser *p) {
+    const JsToken *t = &TOK(p);
+    if (t->kind != JS_T_IDENT || !t->escaped)
+        return false;
+    bool async = units_is(t->u.str.units, t->u.str.len, "async");
+    if (!async && !units_is(t->u.str.units, t->u.str.len, "get") &&
+        !units_is(t->u.str.units, t->u.str.len, "set"))
+        return false;
+    JsToken nx = peek(p);
+    if (nx.kind == JS_T_SEMI || (async ? nx.newline_before : nx.kind == JS_T_STAR))
+        return false;
+    return prop_name_follows(p);
+}
+
+/* A property of a declaration's pattern that begins as a method does (`*`, or `get`, `set` or
+ * `async` before a key): V8 reads the key, and with it knows the property is no target. The
+ * current token is the first after the modifiers; START is where the property began. */
+static JsAstNode *perr_pattern_method(JsParser *p, uint32_t start) {
+    if (TOK(p).kind == JS_T_LBRACK) {
+        if (!advance(p) || !parse_assign_scoped(p) || !expect(p, JS_T_RBRACK, "expected ']'"))
+            return NULL;
+    } else if (tok_is_literal_key(&TOK(p))) {
+        if (!advance(p))
+            return NULL;
+    } else if (!parse_name_any(p, "expected property name")) {
+        return NULL;
+    }
+    return perr(p, start, INVALID_TARGET);
+}
+
 static JsAstNode *parse_object_pattern(JsParser *p) {
     uint32_t pos = TOK(p).pos;
     if (!advance(p)) /* { */
@@ -586,6 +663,22 @@ static JsAstNode *parse_object_pattern(JsParser *p) {
         JsAstNode *prop = new_node(p, JS_AST_PROPERTY, TOK(p).pos);
         if (!prop)
             return NULL;
+        if (escaped_prop_modifier(p))
+            return perr_here(p, "Keyword must not contain escaped characters");
+        /* a method is no target, and V8 says so at the property, however it begins: with `*`,
+         * with `get`, `set` or `async` before a key, or (below) with a key and then `(` */
+        if (TOK(p).kind == JS_T_STAR ||
+            ((tok_is_name(&TOK(p), "get") || tok_is_name(&TOK(p), "set")) && prop_name_follows(p))) {
+            if (!advance(p))
+                return NULL;
+            return perr_pattern_method(p, prop->pos);
+        }
+        if (tok_is_name(&TOK(p), "async") && !peek(p).newline_before && prop_name_follows(p)) {
+            if (!advance(p) || (TOK(p).kind == JS_T_STAR && !advance(p)))
+                return NULL;
+            return perr_pattern_method(p, prop->pos);
+        }
+        JsToken keytok = TOK(p);
         if (TOK(p).kind == JS_T_LBRACK) {
             prop->flags |= JS_F_COMPUTED;
             if (!advance(p))
@@ -593,29 +686,28 @@ static JsAstNode *parse_object_pattern(JsParser *p) {
             prop->a = parse_assign_scoped(p);
             if (!prop->a || !expect(p, JS_T_RBRACK, "expected ']'"))
                 return NULL;
-            if (!expect(p, JS_T_COLON, "expected ':' after computed key"))
+            if (TOK(p).kind == JS_T_LPAREN)
+                return perr(p, prop->pos, INVALID_TARGET);
+            if (key_without_value(p, &keytok) ||
+                !expect(p, JS_T_COLON, "expected ':' after computed key"))
                 return NULL;
             prop->b = parse_pattern_element(p);
-        } else if (TOK(p).kind == JS_T_STR || TOK(p).kind == JS_T_NUM) {
-            prop->a = new_node(p, TOK(p).kind == JS_T_STR ? JS_AST_STRING : JS_AST_NUMBER,
-                               TOK(p).pos);
-            if (!prop->a)
+        } else if (tok_is_literal_key(&TOK(p))) {
+            if (!parse_literal_key(p, prop))
                 return NULL;
-            if (TOK(p).kind == JS_T_STR) {
-                prop->a->units = TOK(p).u.str.units;
-                prop->a->len = TOK(p).u.str.len;
-            } else {
-                prop->a->number = TOK(p).u.number;
-            }
-            if (!advance(p) || !expect(p, JS_T_COLON, "expected ':' after property key"))
+            if (TOK(p).kind == JS_T_LPAREN)
+                return perr(p, prop->pos, INVALID_TARGET);
+            if (key_without_value(p, &keytok) ||
+                !expect(p, JS_T_COLON, "expected ':' after property key"))
                 return NULL;
             prop->b = parse_pattern_element(p);
         } else {
-            JsToken keytok = TOK(p);
             JsAstNode *key = parse_name_any(p, "expected property name");
             if (!key)
                 return NULL;
             prop->a = key;
+            if (TOK(p).kind == JS_T_LPAREN)
+                return perr(p, prop->pos, INVALID_TARGET);
             if (accept(p, JS_T_COLON)) {
                 prop->b = parse_pattern_element(p);
             } else {
@@ -839,7 +931,6 @@ static bool is_eval_or_arguments(const JsAstNode *n) {
            (units_is(n->units, n->len, "eval") || units_is(n->units, n->len, "arguments"));
 }
 
-static const char INVALID_TARGET[] = "Invalid destructuring assignment target";
 static const char ILLEGAL_PROPERTY[] = "Illegal property in declaration context";
 static const char REST_BINDING[] = "`...` must be followed by an identifier in declaration contexts";
 static const char REST_ASSIGNMENT[] =
@@ -1516,12 +1607,6 @@ static JsAstNode *parse_array_literal_inner(JsParser *p) {
     return n;
 }
 
-static bool prop_name_follows(JsParser *p) {
-    JsToken t = peek(p);
-    return t.kind != JS_T_COLON && t.kind != JS_T_LPAREN && t.kind != JS_T_COMMA &&
-           t.kind != JS_T_RBRACE && t.kind != JS_T_EQ;
-}
-
 static JsAstNode *parse_object_literal_inner(JsParser *p) {
     uint32_t pos = TOK(p).pos;
     if (!advance(p)) /* { */
@@ -1550,6 +1635,8 @@ static JsAstNode *parse_object_literal_inner(JsParser *p) {
              * and a head V8 would go on from is the feature, which the error names. */
             const char *left_out = NULL;
             uint32_t left_out_pos = TOK(p).pos;
+            if (escaped_prop_modifier(p))
+                return perr_here(p, "Keyword must not contain escaped characters");
             if ((tok_is_name(&TOK(p), "get") || tok_is_name(&TOK(p), "set")) &&
                 prop_name_follows(p)) {
                 left_out = "getter/setter properties are not supported";
@@ -1578,18 +1665,8 @@ static JsAstNode *parse_object_literal_inner(JsParser *p) {
                 prop->a = parse_assign_scoped(p);
                 if (!prop->a || !expect(p, JS_T_RBRACK, "expected ']'"))
                     return NULL;
-            } else if (TOK(p).kind == JS_T_STR || TOK(p).kind == JS_T_NUM) {
-                prop->a = new_node(p, TOK(p).kind == JS_T_STR ? JS_AST_STRING : JS_AST_NUMBER,
-                                   TOK(p).pos);
-                if (!prop->a)
-                    return NULL;
-                if (TOK(p).kind == JS_T_STR) {
-                    prop->a->units = TOK(p).u.str.units;
-                    prop->a->len = TOK(p).u.str.len;
-                } else {
-                    prop->a->number = TOK(p).u.number;
-                }
-                if (!advance(p))
+            } else if (tok_is_literal_key(&TOK(p))) {
+                if (!parse_literal_key(p, prop))
                     return NULL;
             } else {
                 prop->a = parse_name_any(p, "expected property name");
@@ -1634,7 +1711,11 @@ static JsAstNode *parse_object_literal_inner(JsParser *p) {
                     return NULL;
             } else if (!(prop->flags & JS_F_COMPUTED) &&
                        prop->a->kind == JS_AST_IDENT) {
-                /* shorthand */
+                /* shorthand, if the key is all there is: V8 looks at what follows the key
+                 * before it asks whether the key can be a name */
+                if (TOK(p).kind != JS_T_COMMA && TOK(p).kind != JS_T_RBRACE &&
+                    TOK(p).kind != JS_T_EQ)
+                    return perr_here(p, "expected ':' after property key");
                 if (!shorthand_name_ok(p, &keytok))
                     return NULL;
                 prop->flags |= JS_F_SHORTHAND;
@@ -1663,6 +1744,8 @@ static JsAstNode *parse_object_literal_inner(JsParser *p) {
                     prop->b = val;
                 }
             } else {
+                if (key_without_value(p, &keytok))
+                    return NULL;
                 return perr_here(p, "expected ':' after property key");
             }
             if (!prop->b || !vec_push(p, &props, prop))

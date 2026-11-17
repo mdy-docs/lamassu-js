@@ -943,6 +943,147 @@ static void test_left_out_functions(void) {
     check_err("({ get\nx() {} });", "getter/setter properties are not supported", 3);
 }
 
+/* The head of a property, in an object literal and in a pattern, read as V8 reads it: what
+ * V8 refuses, where V8 refuses it (messages and positions from Node 26). */
+static void test_property_heads(void) {
+    /* a method in a declaration's pattern is no target, and V8 says so where the property starts */
+    check_err("const { m() {} } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { m( } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { \"m\"() {} } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { 5() {} } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { [k]() {} } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { if() {} } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { async() {} } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { get() {} } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { a, m() {} } = {};", "Invalid destructuring assignment target", 11);
+    check_err("const { a: { m() {} } } = {};", "Invalid destructuring assignment target", 13);
+    check_err("const [{ m() {} }] = [];", "Invalid destructuring assignment target", 9);
+    check_err("let { m() {} };", "Invalid destructuring assignment target", 6);
+    check_err("function f({ m() {} }) {}", "Invalid destructuring assignment target", 13);
+    check_err("function f(a, { m() {} }) {}", "Invalid destructuring assignment target", 16);
+    check_err("const o = { f({ m() {} }) {} };", "Invalid destructuring assignment target", 16);
+    check_err("for (const { m() {} } of []) {}", "Invalid destructuring assignment target", 13);
+    check_err("try {} catch ({ m() {} }) {}", "Invalid destructuring assignment target", 16);
+    check_err("export const { m() {} } = {};", "Invalid destructuring assignment target", 15);
+    /* so does `async`, `get`, `set` or `*` before a key, whatever follows the key */
+    check_err("const { async m() {} } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { async m } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { async m: a } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { async \"m\" } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { async [k] } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { async if } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { async 5 } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { async *m } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { async *m() {} } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { get x() {} } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { get x } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { get x: a } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { get \"x\" } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { get [k] } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { get if } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { set x(v) {} } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { set x } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { *m } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { *m() {} } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { *m: a } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { *\"m\" } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { *[k] } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { *async m } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { *get x } = {};", "Invalid destructuring assignment target", 8);
+    check_err("function f({ *m() {} }) {}", "Invalid destructuring assignment target", 13);
+    check_err("function f({ get x() {} }) {}", "Invalid destructuring assignment target", 13);
+    check_err("function f({ async m }) {}", "Invalid destructuring assignment target", 13);
+    check_err("for (let { get x } of []) {}", "Invalid destructuring assignment target", 11);
+    check_err("try {} catch ({ async m }) {}", "Invalid destructuring assignment target", 16);
+    /* short of a key it is the token that is wrong */
+    check_err("const { * } = {};", "Unexpected token '}'", 10);
+    check_err("const { *, a } = {};", "Unexpected token ','", 9);
+    check_err("const { * * } = {};", "Unexpected token '*'", 10);
+    check_err("const { async * } = {};", "Unexpected token '}'", 16);
+    check_err("const { async ; } = {};", "Unexpected token ';'", 14);
+    check_err("const { get * } = {};", "Unexpected token '*'", 12);
+    check_err("const { get ; } = {};", "Unexpected token ';'", 12);
+    check_err("const { get + } = {};", "Unexpected token '+'", 12);
+    check_err("const { *[1+] } = {};", "Unexpected token ']'", 12);
+    check_err("const { get [k } = {};", "Unexpected token '}'", 15);
+    /* `get`, `set` or `async` written with an escape is no modifier, in a literal or a pattern */
+    check_err("({ \\u0067et x() {} });", "Keyword must not contain escaped characters", 3);
+    check_err("({ \\u0067et x });", "Keyword must not contain escaped characters", 3);
+    check_err("({ \\u0073et x(v) {} });", "Keyword must not contain escaped characters", 3);
+    check_err("({ \\u0061sync m() {} });", "Keyword must not contain escaped characters", 3);
+    check_err("({ \\u0061sync *m() {} });", "Keyword must not contain escaped characters", 3);
+    check_err("({ \\u0061sync [k]() {} });", "Keyword must not contain escaped characters", 3);
+    check_err("({ \\u0067et + });", "Keyword must not contain escaped characters", 3);
+    check_err("({ \\u0067et ...a });", "Keyword must not contain escaped characters", 3);
+    check_err("({ a, \\u0067et x() {} });", "Keyword must not contain escaped characters", 6);
+    check_err("const { \\u0067et x } = {};", "Keyword must not contain escaped characters", 8);
+    check_err("const { \\u0073et x } = {};", "Keyword must not contain escaped characters", 8);
+    check_err("const { \\u0061sync m } = {};", "Keyword must not contain escaped characters", 8);
+    check_err("const { \\u0061sync * } = {};", "Keyword must not contain escaped characters", 8);
+    check_err("function f({ \\u0067et x }) {}", "Keyword must not contain escaped characters", 13);
+    check_err("({ \\u0067et x }) => 1;", "Keyword must not contain escaped characters", 3);
+    /* where V8 takes the word for the key, the escape is allowed and the next token is what is wrong */
+    check_err("({ \\u0067et *m() {} });", "Unexpected token '*'", 12);
+    check_err("({ \\u0067et ; });", "Unexpected token ';'", 12);
+    check_err("({ \\u0061sync ; });", "Unexpected token ';'", 14);
+    check_err("const { \\u0067et * } = {};", "Unexpected token '*'", 17);
+    check_err("const { \\u0061sync ; } = {};", "Unexpected token ';'", 19);
+    /* a key and then something that is no value: the token after the key, before the key's own fault */
+    check_err("({ static x });", "Unexpected identifier 'x'", 10);
+    check_err("({ if x });", "Unexpected identifier 'x'", 6);
+    check_err("({ let x });", "Unexpected identifier 'x'", 7);
+    check_err("({ \\u0069f x });", "Unexpected identifier 'x'", 11);
+    check_err("({ \\u0073tatic x() {} });", "Unexpected identifier 'x'", 15);
+    check_err("({ if });", "Unexpected token 'if'", 3);
+    check_err("({ \\u0069f });", "Keyword must not contain escaped characters", 3);
+    /* a key that is no name cannot stand alone: V8 names its first token and points at its last */
+    check_err("({ 5 });", "Unexpected number", 3);
+    check_err("({ 5, a });", "Unexpected number", 3);
+    check_err("({ 5 = 1 });", "Unexpected number", 3);
+    check_err("({ \"a\" });", "Unexpected string", 3);
+    check_err("({ \"a\" = 1 });", "Unexpected string", 3);
+    check_err("({ [k] });", "Unexpected token '['", 5);
+    check_err("({ [k] = 1 });", "Unexpected token '['", 5);
+    check_err("({ 5n });", "Unexpected number", 3);
+    check_err("const { 5 } = {};", "Unexpected number", 8);
+    check_err("const { \"a\" } = {};", "Unexpected string", 8);
+    check_err("const { \"a\", b } = {};", "Unexpected string", 8);
+    check_err("const { [k] } = {};", "Unexpected token '['", 10);
+    check_err("const { 5 = 1 } = {};", "Unexpected number", 8);
+    check_err("const { 5n } = {};", "Unexpected number", 8);
+    check_err("({ 5 x });", "Unexpected identifier 'x'", 5);
+    check_err("({ \"a\" x });", "Unexpected identifier 'x'", 7);
+    check_err("const { 5 x } = {};", "Unexpected identifier 'x'", 10);
+    /* a BigInt is a key */
+    check_err("const { 5n() {} } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { async 5n } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { *5n } = {};", "Invalid destructuring assignment target", 8);
+    check_err("const { 5n: 1 } = {};", "Invalid destructuring assignment target", 12);
+    check_err("({ 5n: 1 } = {});", "Invalid destructuring assignment target", 7);
+    check_err("({ 5n.x: 1 });", "Unexpected token '.'", 5);
+    check_err("({ 5n 5 });", "Unexpected number", 6);
+    /* what stays valid: the words as keys and names, methods in a default or a computed key,
+     * escapes in a key, BigInt keys */
+    check_parses("const { get } = {};");
+    check_parses("const { get: g, set: s, async: a } = {};");
+    check_parses("const { get = 1, set = 2, async = 3 } = {};");
+    check_parses("const { get\n} = {};");
+    check_parses("const { a = { m() {} } } = {};");
+    check_parses("const { [{ m() {} }.k]: a } = {};");
+    check_parses("({ \\u0067et: 1 });");
+    check_parses("({ \\u0061sync() {} });");
+    check_parses("const { \\u0067et: a } = {};");
+    check_parses("const { \\u0061sync } = {};");
+    check_parses("({ \\u0073tatic: 1, \\u0069f: 2 });");
+    check_parses("({ \\u0073tatic() {} });");
+    check_parses("({ 5n: 1, 0x10n: 2 });");
+    check_parses("({ 5n() {} });");
+    check_parses("({ async 5n() {} });");
+    check_parses("const { 5n: a, 1_000n: b = 1 } = {};");
+    check_parses("const f = ({ 5n: a }) => a;");
+    check_parses("function f({ 0x10n: a }) { return a; }");
+}
+
 static void test_module_clause_errors(void) {
     /* any word is a name where no binding is made */
     check_dump("import {if as x, default as y, let as z} from \"m\";",
@@ -1240,6 +1381,7 @@ int main(void) {
     test_module_clause_errors();
     test_reserved_words();
     test_left_out_functions();
+    test_property_heads();
     test_asi();
     test_top_level_await();
     test_errors();
