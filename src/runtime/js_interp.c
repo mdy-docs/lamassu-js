@@ -4377,7 +4377,9 @@ void js_resume_fiber(JsContext *ctx, JsFiber *fb, JsValue value, bool is_throw) 
 /* Synchronous call: cl must not be async. Returns false with *result=error. */
 static bool run_closure(JsContext *ctx, JsClosure *cl, JsValue this_val,
                         const JsValue *args, int argc, JsValue *result) {
-    *result = js_undefined();
+    /* RESULT may be the very slot that roots an argument (`item = f(item)` in a native), so it is
+     * not written until the fiber has the arguments: spawning allocates, and a collection there
+     * with the slot already cleared freed the argument under the callee. */
     const char *err;
     JsFiber *fb = spawn_fiber(ctx, cl, this_val, args, argc, &err);
     if (!fb) {
@@ -4385,6 +4387,7 @@ static bool run_closure(JsContext *ctx, JsClosure *cl, JsValue this_val,
         *result = s ? js_value_from_cell(&s->gc) : js_undefined();
         return false;
     }
+    *result = js_undefined();
     JsRunStatus st = advance_fiber(ctx, fb, result);
     return st == JS_RUN_DONE;
 }

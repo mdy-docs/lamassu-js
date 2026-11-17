@@ -1570,6 +1570,11 @@ static void test_function_prototype(void) {
          "apply => [{\"tag\":\"x\"},{\"tag\":\"y\"},\"str3\",1,2,3]");
     eq_s("\"use strict\"; const out = []; const t = (s, f) => { let v; try { v = s + ' => ' + JSON.stringify(f()); } catch (e) { v = s + ' => ' + e.constructor.name + ': ' + e.message; } out.push(v); }; t('bound', () => { const junk = []; const churn = () => { for (let i = 0; i < 8; i++) junk.push({ i, s: 'x' + i }); junk.length = 0; }; let g = Array.prototype.fill.bind([3, 1, 2], { tag: 'b' + junk.length }); const h = g; g = null; return h({ valueOf() { churn(); return 0; } }); }); out.join(\"\\n\");",
          "bound => [{\"tag\":\"b0\"},{\"tag\":\"b0\"},{\"tag\":\"b0\"}]");
+    /* a callback's result may go into the slot that roots its argument (Array.from's mapper: the value its
+     * iterator has just made is reachable from nowhere else): the argument is the callee's before the slot
+     * is cleared */
+    eq_s("[Array.from([1, 2].entries(), ([i, v]) => v * 2 + i), Array.from('ab', (x) => x + x), Array.from(new Set(['p', 'q']).entries(), (e) => e.join('')), Array.from(new Map([[1, 'm']]), ([k, v]) => v + k)].join('|');",
+         "2,5|aa,bb|pp,qq|m1");
 }
 
 static void test_set_prototype(void) {
