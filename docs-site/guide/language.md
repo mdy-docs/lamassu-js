@@ -60,7 +60,9 @@ supported. `debugger;` is a statement that does nothing (there is no debugger to
 - `Object.getPrototypeOf` / `Object.setPrototypeOf` are available.
   `__proto__` as an accessor property is **not**.
 - **Classes are not supported.** Use constructor functions and
-  `Ctor.prototype` instead — see the example below.
+  `Ctor.prototype` instead — see the example below. `super` goes with them: V8 also takes
+  `super.x` in a method of an object literal, which here is
+  `SyntaxError: 'super' is not supported`.
 
 ```js
 function Point(x, y) {

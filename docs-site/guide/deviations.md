@@ -37,8 +37,9 @@ so everything left is left out by design:
 Each is a compile error that names the feature (`SyntaxError: classes are not supported`), never
 a silent difference. What was not yet implemented has been (2026-11-16); this is what is left out
 by design (see [Supported syntax](/guide/language#explicit-non-goals)): `var`,
-`for...in`, `with`, classes (and with them private names, `#x`), getters and setters in object
-literals, generators, sloppy mode, `eval` and the `Function` constructor.
+`for...in`, `with`, classes (and with them private names, `#x`), `super` in the methods of an
+object literal (`'super' is not supported`), getters and setters in object literals, generators,
+sloppy mode, `eval` and the `Function` constructor.
 
 String literals as module export names are left out too (2026-11-17): V8, as ES2022 has it,
 takes `export { a as "a b" }`, `import { "a b" as a } from 'm'` and `export * as "a b" from
@@ -164,10 +165,17 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
 - **Messages follow V8's wording**, with these differences: an error about
   a feature lamassu leaves out says so (`'var' is not supported; use 'let' or
   'const'`, `classes are not supported`) where V8 would compile the script
-  (where V8 would not, as for `import * as class from 'm'` or `const var = 1`, the
-  message is V8's, `Unexpected token 'class'`), and also in a destructuring pattern or a
-  parenthesised parameter list, which V8 gets no further with either (`let [var] = []`,
-  `(var) => 1`: V8 has `Unexpected token 'var'`);
+  (where V8 would not, as for `import * as class from 'm'`, `const var = 1`, `let [var] = []`
+  or `(class) => 1`, the message is V8's, `Unexpected token 'var'`, at the token V8 stops at).
+  What decides it is the start of the construct, not the whole of it: `var` and then a name or
+  a pattern is a declaration, `class` as far as the `{` of its body is a class (its name and
+  its `extends` clause are read as V8 reads them, so `x = class;` is `Unexpected token ';'`
+  and `class {}` is `Unexpected token '{'`), and `super.x` or `super[x]` in a method of an
+  object literal is a reference to `super` (anywhere else it is V8's `'super' keyword
+  unexpected here`). Past that point lamassu has stopped reading, so an error V8 would find
+  further on is not the one reported: `var x y;` is `'var' is not supported` here and
+  `Unexpected identifier 'y'` in V8, and `const [class {}] = []` is `classes are not
+  supported` here and `Invalid destructuring assignment target` in V8;
   one of V8's own quirks is not copied (a destructured
   parameter given `null` is `'object null'` in V8's message, `'null'` here); an
   operand with no readable name shows its value (`undefined is not a function` for `(void 0)()`

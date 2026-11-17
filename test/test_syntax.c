@@ -748,6 +748,130 @@ static void test_modules(void) {
 }
 
 /* Reserved words in import and export clauses, as V8 reports them (checked against Node 26) */
+/* A reserved word where a name or an expression belongs: V8's report, at V8's token. The words
+ * of what lamassu leaves out (`var`, `class`, `super`) name the feature only where the source
+ * has it, which is where V8 would go on. Each line but those of the last group was run in Node. */
+static void test_reserved_words(void) {
+    /* in a destructuring pattern */
+    check_err("let [var] = [];", "Unexpected token 'var'", 5);
+    check_err("const [class] = [];", "Unexpected token ']'", 12);
+    check_err("let [with] = [];", "Unexpected token 'with'", 5);
+    check_err("const [a, extends] = [];", "Unexpected token 'extends'", 10);
+    check_err("let [...var] = [];", "Unexpected token 'var'", 8);
+    check_err("const {a: var} = {};", "Unexpected token 'var'", 10);
+    check_err("const {a: class} = {};", "Unexpected token '}'", 15);
+    check_err("let {...class} = {};", "Unexpected token '}'", 13);
+    check_err("const {a: {b: [with]}} = {};", "Unexpected token 'with'", 15);
+    check_err("const [a = var] = [];", "Unexpected token 'var'", 11);
+    check_err("const {a = class} = {};", "Unexpected token '}'", 16);
+    check_err("const {var} = {};", "Unexpected token 'var'", 7);
+    check_err("function f([class]) {}", "Unexpected token ']'", 17);
+    check_err("function f({a: var}) {}", "Unexpected token 'var'", 15);
+    check_err("try {} catch ([var]) {}", "Unexpected token 'var'", 15);
+    check_err("for (const [class] of []) {}", "Unexpected token ']'", 17);
+    check_err("[var] = [];", "Unexpected token 'var'", 1);
+    check_err("({a: class} = {});", "Unexpected token '}'", 10);
+    check_err("for ([var] of []) {}", "Unexpected token 'var'", 6);
+    /* in a parenthesised parameter list */
+    check_err("(var) => 1;", "Unexpected token 'var'", 1);
+    check_err("(class) => 1;", "Unexpected token ')'", 6);
+    check_err("(a, with) => 1;", "Unexpected token 'with'", 4);
+    check_err("(a, ...var) => 1;", "Unexpected token 'var'", 7);
+    check_err("([var]) => 1;", "Unexpected token 'var'", 2);
+    check_err("({a: class}) => 1;", "Unexpected token '}'", 10);
+    check_err("(a = var) => 1;", "Unexpected token 'var'", 5);
+    check_err("async (var) => 1;", "Unexpected token 'var'", 7);
+    check_err("async (a, class) => 1;", "Unexpected token ')'", 15);
+    check_err("(super) => 1;", "'super' keyword unexpected here", 1);
+    check_err("(extends) => 1;", "Unexpected token 'extends'", 1);
+    /* and as the one parameter */
+    check_err("var => 1;", "Unexpected token '=>'", 4);
+    check_err("class => 1;", "Unexpected token '=>'", 6);
+    check_err("with => 1;", "Strict mode code may not include a with statement", 0);
+    check_err("async var => 1;", "Unexpected token 'var'", 6);
+    /* where an expression begins */
+    check_err("x = var;", "Unexpected token 'var'", 4);
+    check_err("x = with;", "Unexpected token 'with'", 4);
+    check_err("x = extends B;", "Unexpected token 'extends'", 4);
+    check_err("x = [var];", "Unexpected token 'var'", 5);
+    check_err("x = f(with);", "Unexpected token 'with'", 6);
+    check_err("x = a + var;", "Unexpected token 'var'", 8);
+    check_err("x = `${var}`;", "Unexpected token 'var'", 7);
+    check_err("export default var;", "Unexpected token 'var'", 15);
+    /* a class is read as far as its head goes */
+    check_err("x = class;", "Unexpected token ';'", 9);
+    check_err("x = class A;", "Unexpected token ';'", 11);
+    check_err("x = class A B {};", "Unexpected identifier 'B'", 12);
+    check_err("x = class if {};", "Unexpected token 'if'", 10);
+    check_err("x = class let {};", "Unexpected strict mode reserved word", 10);
+    check_err("x = class await {};", "Unexpected reserved word", 10);
+    check_err("x = class A extends {};", "Unexpected token ';'", 22);
+    check_err("x = class extends a ? b : c {};", "Unexpected token '?'", 20);
+    check_err("x = class extends var {};", "Unexpected token 'var'", 18);
+    check_err("x = (class);", "Unexpected token ')'", 10);
+    check_err("class;", "Unexpected token ';'", 5);
+    check_err("class {}", "Unexpected token '{'", 6);
+    check_err("class A;", "Unexpected token ';'", 7);
+    check_err("class 5;", "Unexpected number", 6);
+    check_err("class => 1;", "Unexpected token '=>'", 6);
+    check_err("class A extends B;", "Unexpected token ';'", 17);
+    check_err("export class {}", "Unexpected token '{'", 13);
+    check_err("export class A;", "Unexpected token ';'", 14);
+    check_err("export default class A;", "Unexpected token ';'", 22);
+    /* a class is a declaration: one statement is no place for it */
+    check_err("if (1) class A {}", "Unexpected token 'class'", 7);
+    check_err("x: class A {}", "Unexpected token 'class'", 3);
+    check_err("while (0) class A {}", "Unexpected token 'class'", 10);
+    /* var is a declaration when a name or a pattern follows */
+    check_err("var;", "Unexpected token ';'", 3);
+    check_err("var 5;", "Unexpected number", 4);
+    check_err("var => 1;", "Unexpected token '=>'", 4);
+    check_err("var if;", "Unexpected token 'if'", 4);
+    check_err("var let;", "Unexpected strict mode reserved word", 4);
+    check_err("var var;", "Unexpected token 'var'", 4);
+    check_err("for (var;;) {}", "Unexpected token ';'", 8);
+    check_err("export var;", "Unexpected token ';'", 10);
+    check_err("() => var;", "Unexpected token 'var'", 6);
+    /* super outside a method, or without a property */
+    check_err("super;", "'super' keyword unexpected here", 0);
+    check_err("super.x;", "'super' keyword unexpected here", 0);
+    check_err("super();", "'super' keyword unexpected here", 0);
+    check_err("x = super.x;", "'super' keyword unexpected here", 4);
+    check_err("function f() { return super.x; }", "'super' keyword unexpected here", 22);
+    check_err("const g = () => super.x;", "'super' keyword unexpected here", 16);
+    check_err("({ m: function () { return super.x; } });", "'super' keyword unexpected here", 27);
+    check_err("({ m: () => super.x });", "'super' keyword unexpected here", 12);
+    check_err("({ m() { return function () { return super.x; }; } });", "'super' keyword unexpected here", 37);
+    check_err("({ m() { function g(a = super.x) {} } });", "'super' keyword unexpected here", 24);
+    check_err("({ m() { super(); } });", "'super' keyword unexpected here", 9);
+    check_err("({ m() { return super; } });", "'super' keyword unexpected here", 16);
+    check_err("({ m() { return super?.x; } });", "'super' keyword unexpected here", 16);
+    check_err("({ m() { new super(); } });", "'super' keyword unexpected here", 13);
+    check_err("({ [super.x]() {} });", "'super' keyword unexpected here", 4);
+    check_err("let [super] = [];", "'super' keyword unexpected here", 5);
+    /* what lamassu leaves out, where V8 would go on */
+    check_err("var x;", "'var' is not supported; use 'let' or 'const'", 0);
+    check_err("var [a] = [];", "'var' is not supported; use 'let' or 'const'", 0);
+    check_err("var {a} = {};", "'var' is not supported; use 'let' or 'const'", 0);
+    check_err("if (1) var x;", "'var' is not supported; use 'let' or 'const'", 7);
+    check_err("for (var i = 0; i < 1; i++) {}", "'var' is not supported; use 'let' or 'const'", 5);
+    check_err("for (var x of []) {}", "'var' is not supported; use 'let' or 'const'", 5);
+    check_err("function f() { var x; }", "'var' is not supported; use 'let' or 'const'", 15);
+    check_err("class A {}", "classes are not supported", 0);
+    check_err("class A extends B {}", "classes are not supported", 0);
+    check_err("x = class {};", "classes are not supported", 4);
+    check_err("x = class A extends B.c {};", "classes are not supported", 4);
+    check_err("x = new class {};", "classes are not supported", 8);
+    check_err("function f(a = class {}) {}", "classes are not supported", 15);
+    check_err("{ class A {} }", "classes are not supported", 2);
+    check_err("({ m() { return super.x; } });", "'super' is not supported", 16);
+    check_err("({ m() { return super[0]; } });", "'super' is not supported", 16);
+    check_err("({ m() { return () => super.x; } });", "'super' is not supported", 22);
+    check_err("({ async m() { return super.x; } });", "'super' is not supported", 22);
+    check_err("({ m(a = super.x) {} });", "'super' is not supported", 9);
+    check_err("({ m() { return { [super.x]: 1 }; } });", "'super' is not supported", 19);
+}
+
 static void test_module_clause_errors(void) {
     /* any word is a name where no binding is made */
     check_dump("import {if as x, default as y, let as z} from \"m\";",
@@ -1043,6 +1167,7 @@ int main(void) {
     test_destructuring_assign();
     test_modules();
     test_module_clause_errors();
+    test_reserved_words();
     test_asi();
     test_top_level_await();
     test_errors();

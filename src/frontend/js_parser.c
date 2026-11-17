@@ -26,6 +26,7 @@ typedef struct JsParser {
     bool fn_async;   /* await allowed (module top level counts) */
     int fn_nesting;  /* 0 = module top level */
     bool new_target_ok; /* inside a function that is not an arrow (an arrow inherits it) */
+    bool super_ok;      /* inside a method of an object literal (an arrow inherits it) */
     int loop_depth, switch_depth;
     /* The labels in scope in this function (label_base and up; an enclosing function's are below
      * it and out of reach). The statement about to be parsed carries the top pending_labels of
@@ -79,6 +80,7 @@ static JsAstNode *parse_expression(JsParser *p);
 static JsAstNode *parse_expression_cover(JsParser *p);
 static JsAstNode *parse_assign_scoped(JsParser *p);
 static JsAstNode *parse_new_expr(JsParser *p);
+static JsAstNode *parse_call_member(JsParser *p);
 static JsAstNode *parse_assign(JsParser *p);
 static JsAstNode *parse_index_expression(JsParser *p);
 static JsAstNode *parse_arguments(JsParser *p, JsNodeVec *out);
@@ -177,8 +179,7 @@ static bool reported_as_token(const char *msg) {
            strcmp(msg, "import/export is only allowed at the top level of a module") == 0 ||
            strcmp(msg, "'import' is only allowed at the top level of a module") == 0 ||
            strcmp(msg, "no line break allowed before '=>'") == 0 ||
-           strcmp(msg, "'...' is only valid in arrow parameters here") == 0 ||
-           strcmp(msg, "reserved word cannot be used as an identifier") == 0;
+           strcmp(msg, "'...' is only valid in arrow parameters here") == 0;
 }
 
 /* Every error ends here. V8 goes on unwinding after an error, each expression scope and each
@@ -361,18 +362,8 @@ static bool units_is(const uint16_t *u, uint32_t len, const char *ascii) {
     return ascii[len] == '\0';
 }
 
-static const char *reserved_message(const JsToken *t) {
-    if (units_is(t->u.str.units, t->u.str.len, "var"))
-        return "'var' is not supported; use 'let' or 'const'";
-    if (units_is(t->u.str.units, t->u.str.len, "class") ||
-        units_is(t->u.str.units, t->u.str.len, "extends") ||
-        units_is(t->u.str.units, t->u.str.len, "super"))
-        return "classes are not supported";
-    if (units_is(t->u.str.units, t->u.str.len, "with"))
-        return "'with' is not allowed in strict mode";
-    if (units_is(t->u.str.units, t->u.str.len, "debugger"))
-        return "Unexpected token 'debugger'"; /* only a statement */
-    return "reserved word cannot be used as an identifier";
+static bool tok_is_reserved(const JsToken *t, const char *word) {
+    return t->kind == JS_T_RESERVED && units_is(t->u.str.units, t->u.str.len, word);
 }
 
 /* Identifier node from the current token (consumes it). */
@@ -391,7 +382,7 @@ static bool escaped_async_function(JsParser *p) {
 
 static JsAstNode *parse_ident(JsParser *p, const char *msg) {
     /* a reserved word where a name belongs: V8 does not compile that either, so its words, and
-     * not the ones for a statement lamassu leaves out (reserved_message) */
+     * not the ones for a statement lamassu leaves out (perr_var, perr_class) */
     if (TOK(p).kind == JS_T_RESERVED)
         return perr_here(p, unexpected_text(p));
     if (TOK(p).kind != JS_T_IDENT)
@@ -1234,14 +1225,14 @@ static JsAstNode *collapse_cover(JsParser *p, JsAstNode *cover) {
 /* ---- function bodies / arrows ---- */
 
 typedef struct {
-    bool in_function, fn_async, new_target_ok, decl_element, no_in;
+    bool in_function, fn_async, new_target_ok, super_ok, decl_element, no_in;
     int loop_depth, switch_depth;
     uint32_t label_base, cover_base;
 } JsSavedCtx;
 
 static JsSavedCtx ctx_enter_function(JsParser *p, bool is_async, bool arrow) {
-    JsSavedCtx s = {p->in_function, p->fn_async, p->new_target_ok, p->decl_element, p->no_in,
-                    p->loop_depth, p->switch_depth, p->label_base, p->cover_base};
+    JsSavedCtx s = {p->in_function, p->fn_async, p->new_target_ok, p->super_ok, p->decl_element,
+                    p->no_in, p->loop_depth, p->switch_depth, p->label_base, p->cover_base};
     p->decl_element = false;
     p->no_in = false;
     p->cover_base = p->cover_count; /* what is open around the function is not its statements' */
@@ -1250,6 +1241,7 @@ static JsSavedCtx ctx_enter_function(JsParser *p, bool is_async, bool arrow) {
     p->pending_own = 0;
     p->in_function = true;
     p->new_target_ok = p->new_target_ok || !arrow;
+    p->super_ok = p->super_ok && arrow; /* a method's caller says so after this */
     p->fn_async = is_async;
     p->fn_nesting++;
     p->loop_depth = 0;
@@ -1260,6 +1252,7 @@ static JsSavedCtx ctx_enter_function(JsParser *p, bool is_async, bool arrow) {
 static void ctx_leave_function(JsParser *p, JsSavedCtx s) {
     p->in_function = s.in_function;
     p->new_target_ok = s.new_target_ok;
+    p->super_ok = s.super_ok;
     p->fn_async = s.fn_async;
     p->decl_element = s.decl_element;
     p->no_in = s.no_in;
@@ -1328,12 +1321,15 @@ static JsAstNode *parse_func_common(JsParser *p, uint8_t flags, bool need_name,
         return perr_here(p, unexpected_text(p));
     }
     JsNodeVec params = {0};
+    bool super_ok = p->super_ok; /* the parameters' defaults are the function's, not the method's around it */
+    p->super_ok = false;
     if (!parse_params(p, &params))
         return NULL;
     vec_store(fn, &params);
     JsSavedCtx s = ctx_enter_function(p, (flags & JS_F_ASYNC) != 0, false);
     fn->a = parse_block(p);
     ctx_leave_function(p, s);
+    p->super_ok = super_ok;
     fn->src_start = src_start;
     fn->src_end = p->prev_end;
     return fn->a && octal_check(p, src_start) ? fn : NULL;
@@ -1581,12 +1577,16 @@ static JsAstNode *parse_object_literal_inner(JsParser *p) {
                 fn->flags = (uint8_t)(JS_F_METHOD_FN | ((prop->flags & JS_F_PROP_ASYNC) ? JS_F_ASYNC : 0));
                 JsNodeVec params = {0};
                 uint32_t params_pos = TOK(p).pos;
+                bool super_ok = p->super_ok; /* a method may say `super.x`, from its parameters on */
+                p->super_ok = true;
                 if (!parse_params(p, &params))
                     return NULL;
                 vec_store(fn, &params);
                 JsSavedCtx s = ctx_enter_function(p, (fn->flags & JS_F_ASYNC) != 0, false);
+                p->super_ok = true;
                 fn->a = parse_block(p);
                 ctx_leave_function(p, s);
+                p->super_ok = super_ok;
                 if (!fn->a || !octal_check(p, params_pos))
                     return NULL;
                 fn->src_start = prop->pos; /* a method's text starts at its key (or `async`) */
@@ -1645,6 +1645,63 @@ static JsAstNode *parse_object_literal_inner(JsParser *p) {
         return NULL;
     vec_store(n, &props);
     return n;
+}
+
+/*
+ * The words of what lamassu leaves out (`var`, `class`, `super`). The error names the feature
+ * where the source has it: where V8 would go on to compile a declaration, a class or a
+ * reference to `super`. Where V8 could not read one either, the word is only a word out of
+ * place and the error is V8's own, at the token V8 stops at.
+ */
+
+/* `class`: a class as far as the `{` of its body, which is where lamassu stops reading it. Up to
+ * there the head is read as V8 reads it: a name (which a declaration must have), `extends` and
+ * an expression, and what is wrong in those is reported as V8 reports it. */
+static JsAstNode *perr_class(JsParser *p, bool need_name) {
+    uint32_t pos = TOK(p).pos;
+    if (!advance(p))
+        return NULL;
+    if (TOK(p).kind == JS_T_IDENT) {
+        if (!check_binding_name(p, parse_ident(p, "expected name")))
+            return NULL;
+    } else if (need_name || (TOK(p).kind != JS_T_LBRACE && !tok_is_reserved(&TOK(p), "extends"))) {
+        return perr_here(p, unexpected_text(p));
+    }
+    if (tok_is_reserved(&TOK(p), "extends") && (!advance(p) || !parse_call_member(p)))
+        return NULL;
+    if (TOK(p).kind != JS_T_LBRACE)
+        return perr_here(p, unexpected_text(p));
+    return perr(p, pos, "classes are not supported");
+}
+
+/* `super`: V8 takes `super.x` and `super[x]` in a method (and in the arrows inside one), and
+ * nothing else outside a class */
+static JsAstNode *perr_super(JsParser *p) {
+    if (p->super_ok) {
+        JsTokKind nx = peek(p).kind;
+        if (nx == JS_T_DOT || nx == JS_T_LBRACK)
+            return perr_here(p, "'super' is not supported");
+    }
+    return perr_here(p, "'super' keyword unexpected here");
+}
+
+/* `var` where a statement may begin: a declaration if a name or a pattern follows */
+static JsAstNode *perr_var(JsParser *p) {
+    JsTokKind nx = peek(p).kind;
+    if (nx == JS_T_IDENT || nx == JS_T_LBRACK || nx == JS_T_LBRACE)
+        return perr_here(p, "'var' is not supported; use 'let' or 'const'");
+    if (!advance(p))
+        return NULL;
+    return perr_here(p, unexpected_text(p));
+}
+
+/* A reserved word where an expression begins: only `class` and `super` can begin one */
+static JsAstNode *perr_reserved(JsParser *p) {
+    if (tok_is_reserved(&TOK(p), "class"))
+        return perr_class(p, false);
+    if (tok_is_reserved(&TOK(p), "super"))
+        return perr_super(p);
+    return perr_here(p, unexpected_text(p));
 }
 
 static JsAstNode *parse_primary(JsParser *p) {
@@ -1754,7 +1811,7 @@ static JsAstNode *parse_primary(JsParser *p) {
         return parse_ident(p, "expected expression");
     }
     case JS_T_RESERVED:
-        return perr_here(p, reserved_message(t));
+        return perr_reserved(p);
     case JS_T_NEW:
         /* reachable only via covers/edge paths that bypass parse_call_member's
          * dedicated new-expression handling (see parse_new_expr) */
@@ -2523,6 +2580,10 @@ static JsAstNode *parse_substatement(JsParser *p) {
         return perr_here(p, "In strict mode code, functions can only be declared at top level or inside a block.");
     case JS_T_CONST:
         return perr_here(p, unexpected_text(p));
+    case JS_T_RESERVED:
+        if (tok_is_reserved(t, "class")) /* a declaration, as `const` is */
+            return perr_here(p, unexpected_text(p));
+        break;
     case JS_T_LET: {
         JsToken nx = peek(p);
         if (nx.kind == JS_T_LBRACK ||
@@ -2632,6 +2693,8 @@ static JsAstNode *parse_for(JsParser *p) {
         if (is_const)
             init->flags |= JS_F_CONST;
         vec_store(init, &decls);
+    } else if (tok_is_reserved(&TOK(p), "var")) {
+        return perr_var(p);
     } else if (TOK(p).kind != JS_T_SEMI) {
         uint32_t head_pos = TOK(p).pos, mark = p->cover_count;
         bool head_async = tok_is_name(&TOK(p), "async");
@@ -3011,7 +3074,14 @@ static JsAstNode *parse_statement(JsParser *p) {
                 result = NULL;
             break;
         }
-        result = perr(p, pos, reserved_message(t));
+        if (tok_is_reserved(t, "var"))
+            result = perr_var(p);
+        else if (tok_is_reserved(t, "class"))
+            result = perr_class(p, true);
+        else if (tok_is_reserved(t, "with"))
+            result = perr(p, pos, "'with' is not allowed in strict mode");
+        else
+            result = perr_reserved(p); /* an expression statement, then */
         break;
     case JS_T_IDENT: {
         if (tok_is_name(t, "async")) {
@@ -3428,10 +3498,10 @@ static JsAstNode *parse_export(JsParser *p) {
     } else if (TOK(p).kind == JS_T_IDENT &&
                units_is(TOK(p).u.str.units, TOK(p).u.str.len, "async")) {
         return perr_here(p, "Unexpected token 'async'"); /* V8 has taken it for the keyword */
-    } else if (TOK(p).kind == JS_T_RESERVED &&
-               (units_is(TOK(p).u.str.units, TOK(p).u.str.len, "var") ||
-                units_is(TOK(p).u.str.units, TOK(p).u.str.len, "class"))) {
-        return perr_here(p, reserved_message(&TOK(p))); /* a declaration lamassu leaves out */
+    } else if (tok_is_reserved(&TOK(p), "var")) {
+        return perr_var(p); /* the declarations lamassu leaves out */
+    } else if (tok_is_reserved(&TOK(p), "class")) {
+        return perr_class(p, true);
     } else {
         /* nothing that can be exported: the fault is the `export`, as V8 has it */
         return perr(p, pos, "Unexpected token 'export'");
