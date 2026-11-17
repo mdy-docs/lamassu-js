@@ -255,8 +255,8 @@ bool     js_array_push(JsVm *vm, JsValue arr, JsValue value);
 /*
  * Runs a compiled module function and returns its completion promise:
  * fulfilled with the completion value (the value of the last expression
- * statement), rejected with the thrown error (js_context_error_pos() gives
- * its source offset), or still pending when top-level await suspended on a
+ * statement), rejected with the thrown error (js_promise_error_stack() says
+ * where it came from), or still pending when top-level await suspended on a
  * promise the host hasn't settled yet. In that last case, protect the
  * returned promise, settle the host promises it is waiting on, and call
  * js_run_jobs(); observe completion with js_promise_state /
@@ -447,6 +447,25 @@ int js_promise_state(JsValue v);
 /* Fulfillment value or rejection reason; undefined if pending or not a promise. */
 JsValue js_promise_result(JsValue v);
 
+/*
+ * HostPromiseRejectionTracker. FN is called when a promise is rejected with
+ * nothing reacting to it (handled false: no then, catch or await), and once
+ * more if something reacts to it later (handled true). A host that wants to
+ * report unhandled rejections as V8's hosts do keeps the first kind until the
+ * second arrives, and reports what is left once the jobs have run
+ * (js_run_jobs): a rejection handled later in the same turn is not an error.
+ *
+ * The promises a host is given to watch itself (js_eval_module's, the one an
+ * async function returns to js_call) are reported like any other when they
+ * are rejected: nothing in the script reacts to them.
+ *
+ * FN runs in the middle of the settlement: it may protect the promise
+ * (js_gc_protect) and read it, and must not run script code or settle
+ * promises. NULL removes it.
+ */
+typedef void (*JsRejectionTracker)(JsContext *ctx, JsValue promise, bool handled, void *userdata);
+void js_set_rejection_tracker(JsContext *ctx, JsRejectionTracker fn, void *userdata);
+
 /* ---- ES modules (phase 7) ---- */
 
 /*
@@ -605,8 +624,36 @@ size_t js_context_stack(JsContext *ctx, JsStackFrame *out, size_t max);
  * js_context_error_pos, captured when the exception started unwinding and
  * before any frame was popped. A compile error has one frame: the module and
  * the offset of the syntax error. Returns the number written, at most max.
+ *
+ * "Last" is the last error to leave any function the engine ran, caught
+ * later or not: this is the place of an error only straight after the call
+ * that returned it (js_call, js_run_module). For a rejected promise, which is
+ * read after other jobs have run, ask js_promise_error_stack.
  */
 size_t js_context_error_stack(const JsContext *ctx, JsStackFrame *out, size_t max);
+
+/*
+ * The frames an error object was made in, innermost first: where V8 says an
+ * exception is from (the first of them is the line Node prints above an
+ * uncaught error). They are the frames of the error's `stack`, less the
+ * builtins' own, so there are at most Error.stackTraceLimit of them (10
+ * unless a script changes it), and none once the script has read, assigned
+ * or deleted `stack`: the text has taken their place, as in V8. A SyntaxError
+ * a module's source gave has one frame, the module and the offset of the
+ * error, and keeps it. Any other value has none. Returns the number written,
+ * at most max.
+ */
+size_t js_error_stack(JsContext *ctx, JsValue error, JsStackFrame *out, size_t max);
+
+/*
+ * Where the error a rejected promise holds is from: js_error_stack of the
+ * reason; and when that has nothing (a thrown string or number, an error
+ * whose `stack` was read), the frames the reason was thrown in, if the throw
+ * is what rejected the promise and no other error has left a function since.
+ * V8 has no place at all for those; this one is right when it is given and
+ * absent otherwise (0). Returns the number written, at most max.
+ */
+size_t js_promise_error_stack(JsContext *ctx, JsValue promise, JsStackFrame *out, size_t max);
 
 /* 1-based line and column of a source offset (CR, LF, CRLF, U+2028 and U+2029 end lines). */
 void js_source_line_col(const uint16_t *src, size_t len, uint32_t pos,

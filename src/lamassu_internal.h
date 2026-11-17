@@ -184,6 +184,10 @@ typedef struct JsErrorObject {
     uint32_t frame_count;
     uint8_t stack_state;   /* JS_STACK_*: PENDING = made by the interpreter for a raise,
                             * captured when the raise unwinds */
+    bool has_origin;       /* a syntax error a module's source gave: where in it, which V8
+                            * keeps with the error too, and whatever becomes of `stack` */
+    uint32_t origin_pos;
+    JsString *origin_spec; /* the module's specifier, or NULL */
 } JsErrorObject;
 
 /* Whether enumerating O's own properties leaves out the one at position I of its map (a
@@ -425,6 +429,9 @@ typedef struct JsPromise {
     JsValue own_proto;     /* its [[Prototype]] once a script has set one (proto_set), as
                             * JsClosure's; until then Promise.prototype */
     bool proto_set;
+    bool handled;          /* [[PromiseIsHandled]]: something has reacted to it */
+    uint32_t raise;        /* rejected by an error leaving a fiber: that raise's serial, while
+                            * the context's trace (error_trace) may still be its; else 0 */
 } JsPromise;
 
 /* A queued microtask. Raw allocation; the VM's queue is a GC root. */
@@ -440,6 +447,7 @@ struct JsJob {
     /* await */
     struct JsFiber *fiber;
     bool is_throw;
+    uint32_t raise; /* a rejection's: the promise's (JsPromise.raise) */
 };
 
 typedef enum JsRunStatus {
@@ -760,6 +768,15 @@ struct JsContext {
     uint32_t error_trace_count;
     JsValue error_trace_value; /* the error those frames belong to: a rethrow of the same value
                                 * (an await resuming with a rejection) appends its frames */
+    /* Which raise the trace is of, and whether that raise is still on its way out: set when an
+     * error leaves a fiber, and when a job hands on a rejection that carries this serial; cleared
+     * as soon as script code runs again (a fiber is entered, a handler catches, a native
+     * returns). A promise rejected meanwhile with the same value was rejected by that raise, and
+     * takes the serial: the trace is its own for as long as the serial stands. */
+    uint32_t raise_serial;
+    bool raise_fresh;
+    JsRejectionTracker rejection_fn; /* js_set_rejection_tracker */
+    void *rejection_ud;
     uint32_t reentry_depth; /* nested interpreter entries (native re-entry);
                              * bounds C-stack recursion the per-fiber frame
                              * limit can't see */

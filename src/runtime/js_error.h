@@ -37,6 +37,9 @@ bool js_in_native(const JsContext *ctx);
 uint32_t js_capture_frames(JsContext *ctx, JsErrorFrame *out, uint32_t limit, JsValue skip);
 bool js_error_capture(JsContext *ctx, JsObject *o, JsValue skip);
 bool js_error_capture_pending(JsContext *ctx, JsValue v);
+/* A syntax error in a module's source: where it is (js_error_stack), and no frames, as V8 makes
+ * it. V is left alone unless it is an error object. */
+void js_error_set_origin(JsContext *ctx, JsValue v, JsString *specifier, uint32_t pos);
 bool js_error_stack_get(JsContext *ctx, JsObject *o, JsValue key, JsValue *out, bool *handled);
 bool js_error_stack_set(JsContext *ctx, JsObject *o, JsValue key, JsValue val);
 bool js_error_stack_has(JsObject *o, JsValue key);

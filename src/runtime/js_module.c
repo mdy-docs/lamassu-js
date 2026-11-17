@@ -492,12 +492,16 @@ static void module_fetch_fail(JsContext *ctx, JsModule *m, JsValue reason, uint3
     m->eval_error = reason;
     ctx->error_pos = pos;
     ctx->error_trace_count = 0; /* a load failure has no frames; see module_compile_fail */
+    ctx->raise_fresh = false;   /* and the trace is no longer the raise's it was of */
+    if (++ctx->raise_serial == 0)
+        ctx->raise_serial = 1;
     js_promise_reject(ctx, m->fetch_promise, reason);
 }
 
 /* A syntax error has a place: one trace frame naming the module and the offset,
  * so a host can report file and line without a running stack. */
 static void module_compile_fail(JsContext *ctx, JsModule *m, JsValue reason, uint32_t pos) {
+    js_error_set_origin(ctx, reason, m->specifier, pos); /* kept with the error: js_error_stack */
     module_fetch_fail(ctx, m, reason, pos);
     ctx->error_trace[0].specifier = m->specifier ? js_value_from_cell(&m->specifier->gc) : js_undefined();
     ctx->error_trace[0].function = js_undefined();

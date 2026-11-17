@@ -364,8 +364,9 @@ Tracked so differential testing against Node has a baseline.
   accommodation since withdrawn); constructor functions and prototype chains are real
   ([[Prototype]] set by `new`, walked by property lookup, inspectable via
   `Object.get/setPrototypeOf`).
-- **Unhandled promise rejections are silent** — tracked (`handled` flag) but
-  not reported; a host hook can be added later.
+- **Unhandled promise rejections go to the host** — `js_set_rejection_tracker`
+  (HostPromiseRejectionTracker); the command line tool reports the first one
+  left after the run and exits 1, a host with no tracker hears nothing.
 - **A top-level-await module awaiting a host promise** returns from
   `js_run_module` still pending; the host settles the promise, calls
   `js_run_jobs`, and reads the completion via the module's result (the

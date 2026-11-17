@@ -250,8 +250,8 @@ JsValue js_run_module(JsContext *ctx, JsValue fn);
 
 Runs a compiled module function and returns its **completion promise**:
 fulfilled with the completion value (the value of the last expression
-statement), rejected with the thrown error (`js_context_error_pos()` gives its
-source offset), or still pending if top-level `await` suspended on a promise
+statement), rejected with the thrown error (`js_promise_error_stack()` says
+where it came from), or still pending if top-level `await` suspended on a promise
 the host hasn't settled yet. In that last case, protect the returned promise,
 settle the host promises it is waiting on, call `js_run_jobs()`, and observe
 the outcome with `js_promise_state` / `js_promise_result`.
@@ -398,19 +398,39 @@ typedef struct JsStackFrame {
 #define JS_TRACE_MAX 32
 
 size_t js_context_stack(JsContext *ctx, JsStackFrame *out, size_t max);
+size_t js_promise_error_stack(JsContext *ctx, JsValue promise, JsStackFrame *out, size_t max);
+size_t js_error_stack(JsContext *ctx, JsValue error, JsStackFrame *out, size_t max);
 size_t js_context_error_stack(const JsContext *ctx, JsStackFrame *out, size_t max);
 void   js_source_line_col(const uint16_t *src, size_t len, uint32_t pos, uint32_t *line, uint32_t *col);
 ```
 
-`js_context_error_pos` is an offset with no module attached, and a throw inside
-library code points at the library. The trace fixes both. It is captured the
-moment an exception starts unwinding, before any frame is popped, and includes
-the fibers a re-entering native was called from, so a host can walk outward to
+`js_promise_error_stack` is where the error a promise was rejected with came
+from, innermost frame first: the question a host has when a run ends rejected.
+The answer belongs to that rejection, whatever else was thrown and caught
+before the host asked:
+
+- An **error object** carries the frames it was made in, the ones behind its
+  `stack` property, and those are the answer: the place `new Error(...)` ran
+  (or the engine raised its own `TypeError`), as in V8, not the place a
+  `throw` statement later sent it from. `js_error_stack` reads the same frames
+  from the error value alone. They are at most `Error.stackTraceLimit` deep
+  (10 unless the script changes it), and they are gone once the script reads,
+  assigns or deletes `stack`, as V8's are.
+- A **syntax error** from compiling a module has one frame, naming the module
+  and the offset the parser stopped at.
+- For **anything else** thrown (a string, a number, a plain object, an error
+  whose frames are gone) the answer is the trace of the throw, when that throw
+  is still the last error to have left a function. If another has since, there
+  are no frames: the engine does not guess.
+- A loader rejection, and a rejection made by `Promise.reject` or a `reject`
+  function with a value that is not an error, have no frames.
+
+A throw inside library code points at the library, so a host walks outward to
 the first frame in the user's own file:
 
 ```c
 JsStackFrame fr[JS_TRACE_MAX];
-size_t n = js_context_error_stack(ctx, fr, JS_TRACE_MAX);
+size_t n = js_promise_error_stack(ctx, promise, fr, JS_TRACE_MAX);
 for (size_t i = 0; i < n; i++) {
     if (!is_user_file(fr[i].specifier)) continue;   // skip the prelude / library frames
     uint32_t line, col;
@@ -422,10 +442,17 @@ for (size_t i = 0; i < n; i++) {
 
 `js_context_stack` reads the frames of the fiber currently running, so a
 native can learn its call site (frame 0 is the caller) — the way to give a
-`log()` or `warn()` the script line it was called from. A compile error in a
-module graph produces a one-frame trace naming the module and the offset; a
-loader rejection has no frames. The strings in a frame are engine values and
-stay valid while the module and function live; copy them to keep them.
+`log()` or `warn()` the script line it was called from. The strings in a frame
+are engine values and stay valid while the module and function live; copy them
+to keep them.
+
+`js_context_error_stack` and `js_context_error_pos` are the trace of the
+**last** error to leave any function, captured the moment it starts unwinding
+and including the fibers a re-entering native was called from. That is the
+error just returned only straight after the call that returned it (`js_call`
+returning false, a native's failure): once jobs have run, another error may
+have been thrown and caught since. For a rejected promise ask
+`js_promise_error_stack`.
 
 `js_context_set_fuel` arms an execution budget, charged **one unit per
 dispatched bytecode instruction** — the CPU-bound half of running untrusted
@@ -477,6 +504,27 @@ verbatim, that object simply must not itself be a promise.
 
 See [Async & host calls](/guide/async) for the full picture, including how
 this differs from the npm package's Asyncify-based `__hostcall`.
+
+### Unhandled rejections
+
+```c
+typedef void (*JsRejectionTracker)(JsContext *ctx, JsValue promise, bool handled, void *userdata);
+void js_set_rejection_tracker(JsContext *ctx, JsRejectionTracker fn, void *userdata);
+```
+
+The specification's HostPromiseRejectionTracker. `fn` is called when a promise
+is rejected with nothing reacting to it (`handled` false: no `then`, `catch` or
+`await`), and once more if something reacts to it later (`handled` true). To
+report unhandled rejections as Node does, keep the first kind (protect each
+with `js_gc_protect`), drop one when the second arrives, and report what is
+left once `js_run_jobs` has returned: a rejection handled later in the same
+turn is not an error.
+
+The promises a host watches itself (the one `js_eval_module` or `js_run_module`
+returns) are reported like any other, since nothing in the script reacts to
+them; skip them by comparing with `js_same_value`. `fn` must not run script
+code or settle promises. `NULL` removes the tracker, and with none set the
+engine says nothing about unhandled rejections.
 
 ## Modules
 

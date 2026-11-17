@@ -196,9 +196,12 @@ literals, generators, sloppy mode, `eval` and the `Function` constructor.
 
 ## Promises & async
 
-- **Unhandled promise rejections are silent.** The engine tracks a
-  `handled` flag internally but doesn't report unhandled rejections; a host
-  hook could be added by an embedder that needs one.
+- **An unhandled promise rejection is the host's to report.** The engine has no process to
+  end. It tells the host which rejected promises nothing reacts to, and which of those are
+  reacted to later (`js_set_rejection_tracker`, the specification's
+  HostPromiseRejectionTracker); a host that sets no tracker hears nothing. The `lamassu`
+  command line tool reports the first one still unhandled when the run is over and exits with
+  status 1, as Node does. There is no `unhandledrejection` event for a script to listen to.
 - **A pending top-level-await module** returns from the host's run call
   still pending — see [Async & host calls](/guide/async#top-level-await).
 - **`Array.fromAsync` closes an iterator once.** When a value it awaits rejects, V8 calls the

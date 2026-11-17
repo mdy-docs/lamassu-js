@@ -1851,6 +1851,8 @@ __attribute__((noinline)) static bool call_native(JsContext *ctx, JsFiber *fiber
                            : nf->fn(ctx, this_val, args, argc, res);
     ctx->native_act = act.outer;
     ctx->running_native = outer_native;
+    if (ok) /* whatever it ran and failed, it took care of: the script goes on */
+        ctx->raise_fresh = false;
     return ok;
 }
 
@@ -3966,15 +3968,18 @@ on_error:
         S[fb->sp++] = fb->error;
         fb->failed = false;
         fb->frames[fb->frame_count - 1].ip = t.target;
+        ctx->raise_fresh = false; /* caught: what the script throws from here on is another raise */
         goto run;
     }
     *result = fb->error;
     ctx->error_pos = fb->err_pos;
-    /* The same error value leaving a second fiber — an awaiting fiber resumed
-     * with the rejection — extends the trace outward instead of replacing it,
-     * so the frames read: where it was thrown, then who was waiting. */
-    if (ctx->error_trace_count > 0 && js_same_value(ctx->error_trace_value, fb->error) &&
-        !js_is_undefined(fb->error)) {
+    /* The raise the context's trace is of, going on out through a second fiber — the fiber a
+     * native re-entered from, or an awaiting fiber resumed with the rejection — extends the
+     * trace outward instead of replacing it, so the frames read: where it was thrown, then who
+     * was waiting. Any other is a raise of its own (raise_serial), whatever value it has: two
+     * throws of the same number are not one error. */
+    if (ctx->raise_fresh && ctx->error_trace_count > 0 &&
+        js_same_value(ctx->error_trace_value, fb->error)) {
         uint32_t room = JS_TRACE_MAX - ctx->error_trace_count;
         uint32_t add = fb->trace_count < room ? fb->trace_count : room;
         memcpy(ctx->error_trace + ctx->error_trace_count, fb->trace, add * sizeof fb->trace[0]);
@@ -3982,8 +3987,11 @@ on_error:
     } else {
         ctx->error_trace_count = fb->trace_count;
         memcpy(ctx->error_trace, fb->trace, fb->trace_count * sizeof fb->trace[0]);
+        if (++ctx->raise_serial == 0)
+            ctx->raise_serial = 1;
     }
     ctx->error_trace_value = fb->error;
+    ctx->raise_fresh = true;
     return JS_RUN_ERROR;
 
 #undef S
@@ -4082,6 +4090,9 @@ static JsRunStatus advance_fiber(JsContext *ctx, JsFiber *fb, JsValue *out) {
     JsFiber *saved = ctx->fiber;
     fb->caller = saved;
     ctx->fiber = fb; /* roots fb across any allocation below */
+    if (!fb->failed) /* script code runs: a raise before it is over (resumed with a rejection, it
+                      * is that rejection's raise going on, when the job says so) */
+        ctx->raise_fresh = false;
     JsRunStatus st;
     /* Bound nested interpreter entries so native-mediated recursion (a native
      * calling back into JS) cannot exhaust the C stack — the per-fiber frame
@@ -4132,6 +4143,7 @@ static bool call_async(JsContext *ctx, JsClosure *cl, JsValue this_val,
     fb->is_async = true;
     JsValue tmp;
     advance_fiber(ctx, fb, &tmp); /* settles pv if it completes now; else parks */
+    ctx->raise_fresh = false; /* what it threw is in the promise: the caller goes on */
     js_gc_unprotect(vm, &pv);
     *out = pv;
     return true;
@@ -4252,6 +4264,9 @@ JsValue js_module_finish_body(JsContext *ctx, JsFiber *fb) {
     }
     JsValue pv = js_value_from_cell(&p->gc);
     js_gc_protect(vm, &pv);
+    /* the module machinery's own promise, which no script sees: what it is rejected with goes
+     * on to the promise of the evaluation, and that one is the host's to hear of */
+    p->handled = true;
     /* the time since it parked belongs to whoever runs it now */
     fb->fuel = fiber_start_fuel(ctx);
     JsValue out;
@@ -4290,16 +4305,19 @@ JsValue js_run_module(JsContext *ctx, JsValue fnv) {
          * outcome in an already-settled promise. */
         JsValue result;
         bool ok = run_closure(ctx, cl, js_undefined(), NULL, 0, &result);
+        uint32_t raise = !ok && ctx->raise_fresh ? ctx->raise_serial : 0;
         js_gc_protect(vm, &result); /* the jobs allocate: the completion value must survive them */
         js_run_jobs(ctx);
         JsPromise *p = js_promise_alloc(ctx);
         js_gc_unprotect(vm, &result);
         if (!p)
             return js_undefined();
-        if (ok)
+        if (ok) {
             js_promise_fulfill(ctx, p, result);
-        else
+        } else {
+            p->raise = raise; /* the body's, whatever the jobs threw after it */
             js_promise_reject(ctx, p, result);
+        }
         return js_value_from_cell(&p->gc);
     }
 

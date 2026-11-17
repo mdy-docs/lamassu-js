@@ -303,6 +303,10 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->re_legacy_deleted = 0;
     ctx->error_trace_count = 0;
     ctx->error_trace_value = js_undefined();
+    ctx->raise_serial = 0;
+    ctx->raise_fresh = false;
+    ctx->rejection_fn = NULL;
+    ctx->rejection_ud = NULL;
     ctx->pending_error = js_undefined();
     ctx->join_stack = NULL;
     ctx->join_len = ctx->join_cap = 0;
@@ -366,6 +370,11 @@ void js_set_module_loader(JsContext *ctx, JsModuleLoader load,
 
 JsValue js_context_globals(JsContext *ctx) {
     return js_value_from_cell(&ctx->globals->gc);
+}
+
+void js_set_rejection_tracker(JsContext *ctx, JsRejectionTracker fn, void *userdata) {
+    ctx->rejection_fn = fn;
+    ctx->rejection_ud = userdata;
 }
 
 uint32_t js_context_error_pos(const JsContext *ctx) {

@@ -34,6 +34,8 @@ JsPromise *js_promise_alloc(JsContext *ctx) {
     p->props = NULL;
     p->own_proto = js_undefined();
     p->proto_set = false;
+    p->handled = false;
+    p->raise = 0;
     return p;
 }
 
@@ -56,6 +58,7 @@ static JsJob *job_alloc(JsVm *vm) {
     job->result = NULL;
     job->fiber = NULL;
     job->is_throw = false;
+    job->raise = 0;
     return job;
 }
 
@@ -143,15 +146,16 @@ void js_jobs_free_all(JsVm *vm) {
 
 /* ---- settlement ---- */
 
-/* Schedules a job from a reaction + settlement. Consumes nothing. */
-static void schedule_reaction(JsContext *ctx, JsReaction *rx, bool fulfilled,
-                              JsValue value) {
+/* Schedules a job from a reaction + settlement of P. Consumes nothing. */
+static void schedule_reaction(JsContext *ctx, JsReaction *rx, const JsPromise *p) {
     JsJob *job = job_alloc(ctx->vm);
     if (!job)
         return; /* unreachable: reaction_alloc reserved this node (job_reserve) */
+    bool fulfilled = p->state == JS_PROMISE_FULFILLED;
     job->kind = rx->kind;
     job->fulfilled = fulfilled;
-    job->value = value;
+    job->value = p->value;
+    job->raise = fulfilled ? 0 : p->raise;
     if (rx->kind == RX_THEN) {
         job->on_fulfilled = rx->on_fulfilled;
         job->on_rejected = rx->on_rejected;
@@ -168,7 +172,16 @@ static void settle(JsContext *ctx, JsPromise *p, uint8_t state, JsValue value) {
         return;
     p->value = value; /* rooted via p from here on */
     p->state = state;
-    bool fulfilled = state == JS_PROMISE_FULFILLED;
+    if (state == JS_PROMISE_REJECTED) {
+        /* rejected by the error on its way out of a fiber: the trace of that raise is this
+         * rejection's (js_promise_error_stack) */
+        if (ctx->raise_fresh && js_same_value(value, ctx->error_trace_value))
+            p->raise = ctx->raise_serial;
+        /* HostPromiseRejectionTracker(p, "reject"): after the stamp, so the host can ask where
+         * the rejection came from there and then */
+        if (!p->handled && ctx->rejection_fn)
+            ctx->rejection_fn(ctx, js_value_from_cell(&p->gc), false, ctx->rejection_ud);
+    }
     /* Reactions are prepended in add_reaction (O(1)), so the list is in reverse
      * attachment order. Reverse it here — pure pointer surgery, no allocation
      * and thus no GC safe point — so handlers fire FIFO, as the spec requires.
@@ -186,7 +199,7 @@ static void settle(JsContext *ctx, JsPromise *p, uint8_t state, JsValue value) {
      * enqueued, then unlink and free it. */
     while (p->reactions) {
         JsReaction *rx = p->reactions;
-        schedule_reaction(ctx, rx, fulfilled, value); /* GC-safe: rx still on p */
+        schedule_reaction(ctx, rx, p); /* GC-safe: rx still on p */
         p->reactions = rx->next;
         js_realloc_raw(ctx->vm, rx, sizeof *rx, 0);
     }
@@ -202,12 +215,18 @@ void js_promise_reject(JsContext *ctx, JsPromise *p, JsValue reason) {
 
 /* Registers a reaction; if already settled, schedules it immediately. */
 static void add_reaction(JsContext *ctx, JsPromise *p, JsReaction *rx) {
+    if (!p->handled) {
+        p->handled = true;
+        /* HostPromiseRejectionTracker(p, "handle") */
+        if (p->state == JS_PROMISE_REJECTED && ctx->rejection_fn)
+            ctx->rejection_fn(ctx, js_value_from_cell(&p->gc), true, ctx->rejection_ud);
+    }
     if (p->state == JS_PROMISE_PENDING) {
         rx->next = p->reactions;
         p->reactions = rx;
         return;
     }
-    schedule_reaction(ctx, rx, p->state == JS_PROMISE_FULFILLED, p->value);
+    schedule_reaction(ctx, rx, p);
     js_realloc_raw(ctx->vm, rx, sizeof *rx, 0);
 }
 
@@ -394,12 +413,16 @@ again:
          * in-flight job stays rooted across nested drains. */
         job->next = vm->running_job;
         vm->running_job = job;
+        /* a rejection handed on: the raise it came from is still the one the trace is of, when
+         * no other error has left a fiber since */
+        ctx->raise_fresh = job->raise && job->raise == ctx->raise_serial;
         if (job->kind == RX_AWAIT)
             js_resume_fiber(ctx, job->fiber, job->value, job->is_throw);
         else if (job->kind == RX_THENABLE)
             run_thenable_job(ctx, job);
         else
             run_then_job(ctx, job);
+        ctx->raise_fresh = false;
         vm->running_job = job->next;
         job_recycle(vm, job);
     }
@@ -453,6 +476,18 @@ JsValue js_promise_result(JsValue v) {
         return js_undefined();
     JsPromise *p = js_value_promise(v);
     return p->state == JS_PROMISE_PENDING ? js_undefined() : p->value;
+}
+
+size_t js_promise_error_stack(JsContext *ctx, JsValue promise, JsStackFrame *out, size_t max) {
+    if (!out || !js_is_promise(promise))
+        return 0;
+    const JsPromise *p = js_value_promise(promise);
+    if (p->state != JS_PROMISE_REJECTED)
+        return 0;
+    size_t n = js_error_stack(ctx, p->value, out, max);
+    if (n || !p->raise || p->raise != ctx->raise_serial)
+        return n;
+    return js_context_error_stack(ctx, out, max);
 }
 
 /* ===================================================================

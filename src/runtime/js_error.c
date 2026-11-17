@@ -590,6 +590,54 @@ bool js_error_capture_pending(JsContext *ctx, JsValue v) {
     return js_error_capture(ctx, js_value_object(v), js_undefined());
 }
 
+void js_error_set_origin(JsContext *ctx, JsValue v, JsString *specifier, uint32_t pos) {
+    if (!js_is_object(v) || js_value_object(v)->obj_kind != JS_OBJ_ERROR)
+        return;
+    JsErrorObject *e = (JsErrorObject *)js_value_object(v);
+    e->has_origin = true;
+    e->origin_spec = specifier;
+    e->origin_pos = pos;
+    if (e->stack_state == JS_STACK_PENDING) { /* nothing was running: no raise is to fill it in */
+        drop_frames(ctx, e);
+        e->stack_state = JS_STACK_FRAMES;
+    }
+}
+
+size_t js_error_stack(JsContext *ctx, JsValue error, JsStackFrame *out, size_t max) {
+    (void)ctx;
+    if (!out || !js_is_object(error) || js_value_cell(error)->kind != JS_KIND_OBJECT ||
+        js_value_object(error)->obj_kind != JS_OBJ_ERROR)
+        return 0;
+    const JsErrorObject *e = (const JsErrorObject *)js_value_object(error);
+    size_t n = 0;
+    if (e->has_origin) {
+        if (max) {
+            out[0].specifier = e->origin_spec ? js_value_from_cell(&e->origin_spec->gc) : js_undefined();
+            out[0].function = js_undefined();
+            out[0].pos = e->origin_pos;
+            n = 1;
+        }
+        return n;
+    }
+    if (e->stack_state != JS_STACK_FRAMES)
+        return 0;
+    for (uint32_t i = 0; i < e->frame_count && n < max; i++) {
+        const JsGcCell *c = js_value_cell(e->frames[i].fn);
+        if (c->kind != JS_KIND_CLOSURE)
+            continue; /* a builtin has no place in a source */
+        const JsClosure *cl = (const JsClosure *)c;
+        const JsFunctionCell *fn = cl->fn;
+        JsString *name = cl->name ? cl->name : fn->name;
+        out[n].specifier = fn->module && fn->module->specifier
+                               ? js_value_from_cell(&fn->module->specifier->gc)
+                               : js_undefined();
+        out[n].function = name ? js_value_from_cell(&name->gc) : js_undefined();
+        out[n].pos = e->frames[i].pos;
+        n++;
+    }
+    return n;
+}
+
 /* ---- the text, as V8's CallSite serializes a frame ---- */
 
 static void fb_cell_str(FmtBuf *b, const JsString *s) {
@@ -919,6 +967,9 @@ static JsValue error_object_new(JsContext *ctx, JsErrorKind kind, JsString *mess
         eo->frames = NULL;
         eo->frame_count = 0;
         eo->stack_state = JS_STACK_PENDING;
+        eo->has_origin = false;
+        eo->origin_pos = 0;
+        eo->origin_spec = NULL;
         ev = js_value_from_cell(c);
         js_gc_protect(vm, &ev);
         if (message) {

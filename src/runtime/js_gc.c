@@ -107,6 +107,8 @@ static void js_gc_trace(JsVm *vm) {
             if (o->obj_kind == JS_OBJ_ERROR) {
                 JsErrorObject *e = (JsErrorObject *)o;
                 js_gc_mark_value(vm, e->stack);
+                if (e->origin_spec)
+                    js_gc_mark_cell(vm, &e->origin_spec->gc);
                 for (uint32_t i = 0; i < e->frame_count; i++) {
                     js_gc_mark_value(vm, e->frames[i].fn);
                     js_gc_mark_value(vm, e->frames[i].receiver);

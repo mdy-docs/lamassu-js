@@ -460,18 +460,81 @@ static int unsettled(const char *file) {
 }
 
 /*
- * The error a run was rejected with, as "file:line:col: uncaught <error>". The place is where
- * it was thrown -- for a syntax error, where the parser stopped -- in whichever module that
- * was: the entry under the name the command line gave (FILE, its source SRC), another by its
- * path. An error with no place (a module that was not found) has the entry's name alone.
+ * The rejected promises nothing has reacted to, oldest first: what HostPromiseRejectionTracker
+ * is for. A promise is added when it is rejected with no handler and taken out again if one is
+ * attached later, so what is left when the run is over was never handled. Each is kept alive
+ * until then.
+ */
+typedef struct Unhandled {
+    JsValue promise;
+    struct Unhandled *next;
+} Unhandled;
+static Unhandled *g_unhandled;
+
+static void track_rejection(JsContext *ctx, JsValue promise, bool handled, void *userdata) {
+    (void)ctx;
+    JsVm *vm = userdata;
+    Unhandled **at = &g_unhandled;
+    if (!handled) {
+        Unhandled *u = malloc(sizeof *u);
+        if (!u)
+            return;
+        u->promise = promise;
+        u->next = NULL;
+        js_gc_protect(vm, &u->promise);
+        while (*at)
+            at = &(*at)->next;
+        *at = u;
+        return;
+    }
+    for (; *at; at = &(*at)->next) {
+        if (js_same_value((*at)->promise, promise)) {
+            Unhandled *u = *at;
+            *at = u->next;
+            js_gc_unprotect(vm, &u->promise);
+            free(u);
+            return;
+        }
+    }
+}
+
+/* Forgets the promise a run was started with: the run reports that one itself. */
+static void untrack(JsContext *ctx, JsVm *vm, JsValue promise) {
+    track_rejection(ctx, promise, true, vm);
+}
+
+/* The oldest rejection still unhandled, or undefined. */
+static JsValue first_unhandled(void) {
+    return g_unhandled ? g_unhandled->promise : js_undefined();
+}
+
+static void forget_unhandled(JsVm *vm) {
+    while (g_unhandled) {
+        Unhandled *u = g_unhandled;
+        g_unhandled = u->next;
+        js_gc_unprotect(vm, &u->promise);
+        free(u);
+    }
+}
+
+/*
+ * The error PROMISE was rejected with, as "file:line:col: uncaught <error>". The place is
+ * where the error was made -- for a syntax error, where the parser stopped; for a thrown value
+ * that is no error, where it was thrown -- in whichever module that was: the entry under the
+ * name the command line gave (FILE, its source SRC), another by its path. An error with no
+ * place (a module that was not found, an error whose stack the script took) has the entry's
+ * name alone.
  */
 static void report_uncaught(JsContext *ctx, JsVm *vm, const char *file, const uint16_t *src,
-                            size_t len, JsValue reason) {
+                            size_t len, JsValue promise) {
+    JsValue reason = js_promise_result(promise);
+    fflush(stdout); /* what the run printed comes before what ended it */
     /* the place first: turning the error into a string can run code, and raise another */
     JsStackFrame at;
     size_t pl = 0;
-    const uint16_t *pu = js_context_error_stack(ctx, &at, 1) ? js_string_units(at.specifier, &pl)
-                                                             : NULL;
+    const uint16_t *pu = js_promise_error_stack(ctx, promise, &at, 1)
+                             ? js_string_units(at.specifier, &pl)
+                             : NULL;
     bool entry = pu && pl == g_entry_len && memcmp(pu, g_entry, pl * sizeof *pu) == 0;
     uint32_t line = 0, col = 0;
     if (entry) {
@@ -500,6 +563,30 @@ static void report_uncaught(JsContext *ctx, JsVm *vm, const char *file, const ui
     if (su)
         print_utf16(stderr, su, slen);
     fputc('\n', stderr);
+}
+
+/*
+ * The oldest rejection nothing handled, as "PREFIX<error>" on OUT, for the runs with no source
+ * to place it in (a bytecode cache, a line of the REPL). False when there is none. It is
+ * forgotten once reported.
+ */
+static bool report_unhandled(JsContext *ctx, JsVm *vm, FILE *out, const char *name,
+                             const char *prefix) {
+    Unhandled *u = g_unhandled;
+    if (!u)
+        return false;
+    fflush(stdout);
+    if (name)
+        fprintf(out, "%s: ", name);
+    fputs(prefix, out);
+    JsValue str = js_to_string(ctx, js_promise_result(u->promise));
+    size_t slen;
+    const uint16_t *su = js_string_units(str, &slen);
+    if (su)
+        print_utf16(out, su, slen);
+    fputc('\n', out);
+    untrack(ctx, vm, u->promise);
+    return true;
 }
 
 /* Interactive REPL over one persistent context (top-level let/const/function
@@ -539,6 +626,7 @@ static int run_repl(void) {
     }
     static const uint16_t print_name[] = {'p', 'r', 'i', 'n', 't'};
     js_register_native(ctx, print_name, 5, native_print, NULL);
+    js_set_rejection_tracker(ctx, track_rejection, vm);
 
     fprintf(stderr, "lamassu REPL — Ctrl-D to exit\n");
     char line[8192];
@@ -563,6 +651,7 @@ static int run_repl(void) {
         } else {
             js_gc_protect(vm, &fn);
             JsValue p = js_run_module(ctx, fn);
+            untrack(ctx, vm, p); /* the line's own failure is printed here */
             int st = js_promise_state(p);
             bool ok = st == 0 || st == 1;
             JsValue result = js_promise_result(p);
@@ -575,12 +664,16 @@ static int run_repl(void) {
             if (su)
                 print_utf16(stdout, su, sl);
             fputc('\n', stdout);
-            fflush(stdout);
             js_gc_unprotect(vm, &result);
             js_gc_unprotect(vm, &fn);
+            /* and every rejection the line left unhandled, as an uncaught error is */
+            while (report_unhandled(ctx, vm, stdout, NULL, "Uncaught "))
+                ;
+            fflush(stdout);
         }
         free(src);
     }
+    forget_unhandled(vm);
     js_vm_free(vm);
     return 0;
 }
@@ -759,6 +852,7 @@ static int run_bytecode(const char *path) {
     }
     static const uint16_t print_name[] = {'p', 'r', 'i', 'n', 't'};
     js_register_native(ctx, print_name, 5, native_print, NULL);
+    js_set_rejection_tracker(ctx, track_rejection, vm);
 
     int status = 0;
     int kind = js_bytecode_kind(bytes, len);
@@ -778,7 +872,11 @@ static int run_bytecode(const char *path) {
         free(bytes); /* the loader re-reads the root from disk */
         JsValue pr = js_eval_module(ctx, spec, sn);
         js_gc_protect(vm, &pr);
-        if (js_promise_state(pr) == 0) {
+        untrack(ctx, vm, pr);
+        if (js_promise_state(pr) != 2 && report_unhandled(ctx, vm, stderr, path, "uncaught ")) {
+            js_gc_unprotect(vm, &pr);
+            status = 1;
+        } else if (js_promise_state(pr) == 0) {
             js_gc_unprotect(vm, &pr);
             status = unsettled(path);
         } else if (js_promise_state(pr) != 1) {
@@ -809,6 +907,7 @@ static int run_bytecode(const char *path) {
                 js_gc_unprotect(vm, &def);
             }
         }
+        forget_unhandled(vm);
         js_vm_free(vm);
         return status;
     }
@@ -823,6 +922,7 @@ static int run_bytecode(const char *path) {
         js_gc_protect(vm, &fn);
         arm_fuel(ctx);
         JsValue p = js_run_module(ctx, fn);
+        untrack(ctx, vm, p);
         int st = js_promise_state(p);
         bool ok = st == 1;
         JsValue result = js_promise_result(p);
@@ -830,7 +930,9 @@ static int run_bytecode(const char *path) {
         JsValue str = js_to_string(ctx, result);
         size_t slen;
         const uint16_t *su = js_string_units(str, &slen);
-        if (st == 0) {
+        if (st != 2 && report_unhandled(ctx, vm, stderr, path, "uncaught ")) {
+            status = 1;
+        } else if (st == 0) {
             status = unsettled(path);
         } else if (ok) {
             if (su)
@@ -844,6 +946,7 @@ static int run_bytecode(const char *path) {
             status = 1;
         }
     }
+    forget_unhandled(vm);
     js_vm_free(vm);
     return status;
 }
@@ -967,6 +1070,7 @@ int main(int argc, char **argv) {
     }
     js_set_module_loader(ctx, file_loader, file_canonicalize, vm);
     js_enable_source_modules(ctx);
+    js_set_rejection_tracker(ctx, track_rejection, vm);
 
     /* The file is run through the module pipeline, as the module its path names, so an import
      * that comes back to it finds it there. The loader answers with the source read above. The
@@ -985,13 +1089,20 @@ int main(int argc, char **argv) {
     arm_fuel(ctx);
     JsValue p = js_eval_module(ctx, root_spec, 2 + g_entry_len - base);
     js_gc_protect(vm, &p);
+    untrack(ctx, vm, p);
+    /* The module's own failure first, then a rejection nothing handled: either ends the run
+     * with status 1, as an uncaught error does. */
     if (js_promise_state(p) == 2) {
-        report_uncaught(ctx, vm, argv[1], src, len, js_promise_result(p));
+        report_uncaught(ctx, vm, argv[1], src, len, p);
+        status = 1;
+    } else if (js_is_promise(first_unhandled())) {
+        report_uncaught(ctx, vm, argv[1], src, len, first_unhandled());
         status = 1;
     } else if (js_promise_state(p) == 0) {
         status = unsettled(argv[1]);
     }
     js_gc_unprotect(vm, &p);
+    forget_unhandled(vm);
     g_entry_src = NULL;
 
     js_vm_free(vm);
