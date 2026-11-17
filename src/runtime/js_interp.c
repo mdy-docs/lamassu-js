@@ -1967,6 +1967,8 @@ __attribute__((noinline)) static bool call_native(JsContext *ctx, JsFiber *fiber
     act.outer = ctx->native_act;
     act.nf = nf;
     act.this_val = is_new ? js_undefined() : this_val;
+    act.args = args;
+    act.argc = argc > 0 ? (uint32_t)argc : 0;
     act.fiber = fiber;
     act.frame_count = fiber ? fiber->frame_count : 0;
     act.is_new = is_new;

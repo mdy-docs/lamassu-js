@@ -2678,8 +2678,10 @@ static bool fm_call(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     return js_call(ctx, tv, self, argc > 1 ? args + 1 : NULL, argc > 1 ? argc - 1 : 0, r);
 }
 
-/* Calls fn with `this` = self and the arguments `pre` then `post`, gathered in one buffer (the
- * values stay reachable through their owners: the bound array, the caller's stack). */
+/* Calls fn with `this` = self and the arguments `pre` then `post`, gathered in one buffer. The
+ * buffer is no GC root of its own and the owners the values came from (the bound array, the list
+ * given to apply) may let go of them while the callee runs: a function callee has them in its
+ * frame's slots, and a native one in its activation, which the collector marks. */
 static bool call_joined(JsContext *ctx, JsValue fn, JsValue self, const JsValue *pre, uint32_t npre,
                         const JsValue *post, uint32_t npost, JsValue *r) {
     size_t n = (size_t)npre + npost;

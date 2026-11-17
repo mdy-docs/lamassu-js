@@ -414,11 +414,13 @@ void js_gc_collect(JsVm *vm) {
         if (ctx->re_subject)
             js_gc_mark_cell(vm, &ctx->re_subject->gc);
         js_gc_mark_value(vm, ctx->re_input);
-        /* the natives running now: their receivers (the callee is on its caller's stack, or
-         * held by the host) */
+        /* the natives running now: their receivers and arguments (the callee is on its caller's
+         * stack, or held by the host) */
         for (const JsNativeAct *a = ctx->native_act; a; a = a->outer) {
             js_gc_mark_cell(vm, (JsGcCell *)&a->nf->gc);
             js_gc_mark_value(vm, a->this_val);
+            for (uint32_t i = 0; i < a->argc; i++)
+                js_gc_mark_value(vm, a->args[i]);
             for (uint8_t i = 0; i < a->nkeep; i++)
                 js_gc_mark_value(vm, a->keep[i]);
         }

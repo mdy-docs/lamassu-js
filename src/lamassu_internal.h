@@ -308,6 +308,10 @@ struct JsNativeAct {
     JsNativeAct *outer;
     struct JsNative *nf;
     JsValue this_val;
+    /* its arguments, GC roots while it runs: the caller's own copy may be the only reference left
+     * (Function.prototype.apply's list, emptied by an argument's valueOf) */
+    const JsValue *args;
+    uint32_t argc;
     JsFiber *fiber;       /* the fiber whose top frame called it, or NULL (the host) */
     uint32_t frame_count; /* that fiber's frame count at the call */
     bool is_new;
