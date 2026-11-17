@@ -493,8 +493,7 @@ static void module_fetch_fail(JsContext *ctx, JsModule *m, JsValue reason, uint3
     ctx->error_pos = pos;
     ctx->error_trace_count = 0; /* a load failure has no frames; see module_compile_fail */
     ctx->raise_fresh = false;   /* and the trace is no longer the raise's it was of */
-    if (++ctx->raise_serial == 0)
-        ctx->raise_serial = 1;
+    ctx->raise_trace = NULL;
     js_promise_reject(ctx, m->fetch_promise, reason);
 }
 

@@ -364,8 +364,8 @@ static void test_rejection_keeps_its_place(void) {
     }
     js_gc_unprotect(vm, &p);
 
-    /* ...but not once another error has left a function: the same value thrown later, in a
-     * job, is another throw, and its trace is not this rejection's */
+    /* ...and it is the rejection's to keep, whatever leaves a function afterwards: the same
+     * value thrown later, in a job, is another throw with a trace of its own */
     src = "async function later() { await 0; throw 5; }\n"
           "later().catch(() => {});\n"
           "throw 5;\n";
@@ -373,7 +373,68 @@ static void test_rejection_keeps_its_place(void) {
     CHECK(js_promise_state(p) == 2, "rejected with 5");
     n = js_context_error_stack(ctx, fr, JS_TRACE_MAX);
     CHECK(n >= 1 && str_is(fr[0].function, "later"), "the last throw of 5 was the later one");
-    CHECK(js_promise_error_stack(ctx, p, fr, JS_TRACE_MAX) == 0, "which is not the rejection's: no frames");
+    n = js_promise_error_stack(ctx, p, fr, JS_TRACE_MAX);
+    CHECK(n == 1 && js_is_undefined(fr[0].function) && line_of(src, fr[0].pos) == 3,
+          "the rejection keeps the throw on line 3");
+    js_gc_collect(vm);
+    n = js_promise_error_stack(ctx, p, fr, JS_TRACE_MAX);
+    CHECK(n == 1 && line_of(src, fr[0].pos) == 3, "and it survives a collection");
+    js_gc_unprotect(vm, &p);
+
+    /* the trace goes with the rejection from promise to promise: through an await two jobs
+     * on, with other errors raised and caught between, and through a then() with no handler */
+    src = "function f() { throw 'kept'; }\n"
+          "async function a() { await 0; f(); }\n"
+          "async function noise() { for (let i = 0; i < 4; i++) { await 0; try { null.x; } catch {} } }\n"
+          "async function b() { await a().finally(() => {}).then(() => 1); }\n"
+          "noise();\n"
+          "const w = b();\n"
+          "await 0; await 0; await 0; await 0; await 0; await 0;\n"
+          "try { undefined.y; } catch {}\n"
+          "await w;\n";
+    run_src(vm, ctx, src, &p);
+    CHECK(js_promise_state(p) == 2, "rejected with the string");
+    n = js_promise_error_stack(ctx, p, fr, JS_TRACE_MAX);
+    CHECK(n == 4, "thrown in f, through a, b and the module");
+    if (n == 4) {
+        CHECK(str_is(fr[0].function, "f") && line_of(src, fr[0].pos) == 1, "thrown in f, line 1");
+        CHECK(str_is(fr[1].function, "a") && line_of(src, fr[1].pos) == 2, "f called in a, line 2");
+        CHECK(str_is(fr[2].function, "b") && line_of(src, fr[2].pos) == 4, "awaited in b, line 4");
+        CHECK(js_is_undefined(fr[3].function) && line_of(src, fr[3].pos) == 9, "awaited on line 9");
+    }
+    js_gc_unprotect(vm, &p);
+
+    /* a finally() whose callback returns a promise hands the trace on when that settles; a
+     * rejection the callback makes instead has its own (here none: nothing threw it) */
+    src = "function f() { throw 'late'; }\n"
+          "async function a() { await 0; f(); }\n"
+          "async function slow() { await 0; try { null.x; } catch {} }\n"
+          "await a().finally(() => slow());\n";
+    run_src(vm, ctx, src, &p);
+    n = js_promise_error_stack(ctx, p, fr, JS_TRACE_MAX);
+    CHECK(n == 3 && str_is(fr[0].function, "f") && line_of(src, fr[0].pos) == 1,
+          "thrown in f, after the finally waited");
+    CHECK(n == 3 && line_of(src, fr[2].pos) == 4, "awaited on line 4");
+    js_gc_unprotect(vm, &p);
+    src = "function f() { throw 'late'; }\n"
+          "async function a() { await 0; f(); }\n"
+          "const w = a().finally(() => Promise.reject('other'));\n"
+          "await 0; await 0; await 0;\n"
+          "await w;\n";
+    run_src(vm, ctx, src, &p);
+    CHECK(str_is(js_promise_result(p), "other"), "the callback's rejection wins");
+    n = js_promise_error_stack(ctx, p, fr, JS_TRACE_MAX);
+    CHECK(n == 1 && line_of(src, fr[0].pos) == 5, "and its place is the await that threw it");
+    js_gc_unprotect(vm, &p);
+
+    /* caught and thrown again, it is a new throw: the place is the last one */
+    src = "function f() { throw 'again'; }\n"
+          "try { f(); } catch (e) {\n"
+          "  throw e;\n"
+          "}\n";
+    run_src(vm, ctx, src, &p);
+    n = js_promise_error_stack(ctx, p, fr, JS_TRACE_MAX);
+    CHECK(n == 1 && line_of(src, fr[0].pos) == 3, "thrown again on line 3");
     js_gc_unprotect(vm, &p);
 
     /* an error whose stack the script took has no frames of its own (as in V8): the trace of

@@ -35,7 +35,7 @@ JsPromise *js_promise_alloc(JsContext *ctx) {
     p->own_proto = js_undefined();
     p->proto_set = false;
     p->handled = false;
-    p->raise = 0;
+    p->trace = NULL;
     return p;
 }
 
@@ -58,7 +58,7 @@ static JsJob *job_alloc(JsVm *vm) {
     job->result = NULL;
     job->fiber = NULL;
     job->is_throw = false;
-    job->raise = 0;
+    job->trace = NULL;
     return job;
 }
 
@@ -117,6 +117,8 @@ void js_gc_mark_jobs(JsVm *vm) {
             js_gc_mark_cell(vm, &j->result->gc);
         if (j->fiber)
             js_gc_mark_cell(vm, &j->fiber->gc);
+        if (j->trace)
+            js_gc_mark_cell(vm, &j->trace->gc);
     }
     /* the running-job stack: every job with a handler still on the C stack */
     for (JsJob *j = vm->running_job; j; j = j->next) {
@@ -127,6 +129,8 @@ void js_gc_mark_jobs(JsVm *vm) {
             js_gc_mark_cell(vm, &j->result->gc);
         if (j->fiber)
             js_gc_mark_cell(vm, &j->fiber->gc);
+        if (j->trace)
+            js_gc_mark_cell(vm, &j->trace->gc);
     }
 }
 
@@ -155,7 +159,7 @@ static void schedule_reaction(JsContext *ctx, JsReaction *rx, const JsPromise *p
     job->kind = rx->kind;
     job->fulfilled = fulfilled;
     job->value = p->value;
-    job->raise = fulfilled ? 0 : p->raise;
+    job->trace = fulfilled ? NULL : p->trace;
     if (rx->kind == RX_THEN) {
         job->on_fulfilled = rx->on_fulfilled;
         job->on_rejected = rx->on_rejected;
@@ -174,10 +178,11 @@ static void settle(JsContext *ctx, JsPromise *p, uint8_t state, JsValue value) {
     p->state = state;
     if (state == JS_PROMISE_REJECTED) {
         /* rejected by the error on its way out of a fiber: the trace of that raise is this
-         * rejection's (js_promise_error_stack) */
-        if (ctx->raise_fresh && js_same_value(value, ctx->error_trace_value))
-            p->raise = ctx->raise_serial;
-        /* HostPromiseRejectionTracker(p, "reject"): after the stamp, so the host can ask where
+         * rejection's to keep (js_promise_error_stack). P and VALUE may have no root but each
+         * other, and making the trace does not collect. */
+        if (!p->trace && ctx->raise_fresh && js_same_value(value, ctx->error_trace_value))
+            p->trace = js_raise_trace(ctx);
+        /* HostPromiseRejectionTracker(p, "reject"): after the trace, so the host can ask where
          * the rejection came from there and then */
         if (!p->handled && ctx->rejection_fn)
             ctx->rejection_fn(ctx, js_value_from_cell(&p->gc), false, ctx->rejection_ud);
@@ -371,6 +376,22 @@ bool js_promise_await(JsContext *ctx, JsPromise *p, JsFiber *fiber) {
 
 /* ---- running microtasks ---- */
 
+/*
+ * A rejection handed on: the raise it came from is on its way out again, through whoever was
+ * waiting. Its trace T is put back as the context's, so a fiber it leaves adds its frames to it
+ * and a promise it rejects takes it, whatever was raised in between. With no trace, nothing is
+ * on its way.
+ */
+static void raise_again(JsContext *ctx, JsTrace *t, JsValue value) {
+    ctx->raise_fresh = t != NULL;
+    if (!t)
+        return;
+    memcpy(ctx->error_trace, t->frames, t->count * sizeof(JsStackFrame));
+    ctx->error_trace_count = t->count;
+    ctx->error_trace_value = value;
+    ctx->raise_trace = t;
+}
+
 static void run_thenable_job(JsContext *ctx, JsJob *job);
 
 static void run_then_job(JsContext *ctx, JsJob *job) {
@@ -413,9 +434,7 @@ again:
          * in-flight job stays rooted across nested drains. */
         job->next = vm->running_job;
         vm->running_job = job;
-        /* a rejection handed on: the raise it came from is still the one the trace is of, when
-         * no other error has left a fiber since */
-        ctx->raise_fresh = job->raise && job->raise == ctx->raise_serial;
+        raise_again(ctx, job->trace, job->value);
         if (job->kind == RX_AWAIT)
             js_resume_fiber(ctx, job->fiber, job->value, job->is_throw);
         else if (job->kind == RX_THENABLE)
@@ -485,9 +504,11 @@ size_t js_promise_error_stack(JsContext *ctx, JsValue promise, JsStackFrame *out
     if (p->state != JS_PROMISE_REJECTED)
         return 0;
     size_t n = js_error_stack(ctx, p->value, out, max);
-    if (n || !p->raise || p->raise != ctx->raise_serial)
+    if (n || !p->trace)
         return n;
-    return js_context_error_stack(ctx, out, max);
+    n = p->trace->count < max ? p->trace->count : max;
+    memcpy(out, p->trace->frames, n * sizeof *out);
+    return n;
 }
 
 /* ===================================================================
@@ -554,11 +575,14 @@ static bool finally_value_passthrough(JsContext *ctx, JsValue bound, JsValue tv,
 }
 
 /* After onFinally's returned thenable fulfills, re-throw the captured original
- * rejection reason. */
+ * rejection reason: BOUND is a rejected promise nothing else sees, which keeps the reason
+ * together with the trace of its raise. */
 static bool finally_reason_rethrow(JsContext *ctx, JsValue bound, JsValue tv,
                                    const JsValue *args, int argc, JsValue *r) {
-    (void)ctx; (void)tv; (void)args; (void)argc;
-    *r = bound; /* the original rejection reason */
+    (void)tv; (void)args; (void)argc;
+    JsPromise *kept = js_value_promise(bound);
+    *r = kept->value; /* the original rejection reason */
+    raise_again(ctx, kept->trace, kept->value);
     return false;
 }
 
@@ -566,8 +590,9 @@ static bool finally_reason_rethrow(JsContext *ctx, JsValue bound, JsValue tv,
  * passing the original settlement along; false if *chain has been set to a
  * derived promise the caller must adopt, or if onFinally threw (in which case
  * *threw is set and *r holds the thrown value). `passthrough` re-emits the
- * original settlement once onFinally's returned thenable settles. */
-static bool finally_run(JsContext *ctx, JsValue bound, JsValue orig,
+ * original settlement once onFinally's returned thenable settles. A rejection (REJECTED) goes
+ * on with the trace of its raise, which onFinally, running in between, would otherwise end. */
+static bool finally_run(JsContext *ctx, JsValue bound, JsValue orig, bool rejected,
                         JsBoundFn passthrough, JsValue *chain,
                         bool *threw, JsValue *r) {
     JsVm *vm = ctx->vm;
@@ -575,23 +600,49 @@ static bool finally_run(JsContext *ctx, JsValue bound, JsValue orig,
     *chain = js_undefined();
     if (!js_is_function(bound))
         return true; /* no onFinally: pass the original settlement straight through */
+    JsTrace *trace = rejected && ctx->raise_fresh ? js_raise_trace(ctx) : NULL;
+    JsValue tracev = trace ? js_value_from_cell(&trace->gc) : js_undefined(); /* only to root it */
+    js_gc_protect(vm, &tracev);
     JsValue result;
     if (!js_call(ctx, bound, js_undefined(), NULL, 0, &result)) {
+        js_gc_unprotect(vm, &tracev);
         *threw = true;
         *r = result; /* onFinally threw — that rejection wins */
         return false;
     }
-    if (!js_is_promise(result))
+    if (!js_is_promise(result)) {
+        js_gc_unprotect(vm, &tracev);
+        if (rejected)
+            raise_again(ctx, trace, orig);
         return true; /* non-thenable return is ignored; pass original through */
+    }
     /* onFinally returned a thenable: wait for it, then re-emit `orig`. */
     js_gc_protect(vm, &result);
     js_gc_protect(vm, &orig);
-    JsValue passer = js_bound_native_new(ctx, passthrough, orig);
+    JsValue kept = orig;
+    if (rejected) {
+        /* the reason and its trace, as a rejected promise of the machinery's own */
+        JsPromise *k = js_promise_alloc(ctx);
+        if (k) {
+            k->handled = true;
+            k->trace = trace;
+            ctx->raise_fresh = false; /* nothing is being raised: the trace is the one given */
+            js_promise_reject(ctx, k, orig);
+            kept = js_value_from_cell(&k->gc);
+        } else {
+            kept = js_undefined();
+        }
+    }
+    js_gc_protect(vm, &kept);
+    JsValue passer = js_is_undefined(kept) && rejected ? js_undefined()
+                                                       : js_bound_native_new(ctx, passthrough, kept);
     JsPromise *chained = js_is_function(passer)
         ? js_promise_then(ctx, js_value_promise(result), passer, js_undefined())
         : NULL;
+    js_gc_unprotect(vm, &kept);
     js_gc_unprotect(vm, &orig);
     js_gc_unprotect(vm, &result);
+    js_gc_unprotect(vm, &tracev);
     if (!chained) {
         JsString *s = js_ascii_cell(vm, "out of memory");
         *threw = true;
@@ -607,7 +658,7 @@ static bool finally_on_fulfill(JsContext *ctx, JsValue bound, JsValue tv,
     (void)tv;
     JsValue chain;
     bool threw;
-    if (finally_run(ctx, bound, ARG(0), finally_value_passthrough, &chain, &threw, r)) {
+    if (finally_run(ctx, bound, ARG(0), false, finally_value_passthrough, &chain, &threw, r)) {
         *r = ARG(0); /* pass the fulfillment value through */
         return true;
     }
@@ -622,7 +673,7 @@ static bool finally_on_reject(JsContext *ctx, JsValue bound, JsValue tv,
     (void)tv;
     JsValue chain;
     bool threw;
-    if (finally_run(ctx, bound, ARG(0), finally_reason_rethrow, &chain, &threw, r)) {
+    if (finally_run(ctx, bound, ARG(0), true, finally_reason_rethrow, &chain, &threw, r)) {
         *r = ARG(0); /* re-throw the rejection reason */
         return false;
     }

@@ -32,6 +32,7 @@ typedef enum JsGcKind {
     JS_KIND_MODULE = 9,
     JS_KIND_BYTECODE = 10, /* opaque module-bytecode buffer (js_bytecode_value) */
     JS_KIND_BIGINT = 11,   /* a BigInt (js_bigint.h); no children */
+    JS_KIND_TRACE = 12,    /* the frames of a raise (JsTrace); never a script's value */
 } JsGcKind;
 
 /* Every GC allocation starts with this header; cells live on vm->cells. */
@@ -420,6 +421,18 @@ struct JsReaction {
     struct JsFiber *fiber;    /* await: fiber to resume */
 };
 
+/*
+ * The frames of one raise, innermost first, as the context's trace had them when a promise was
+ * rejected by it. The context has one trace and the next error to leave a function replaces it;
+ * a rejection is read later (after the jobs, or when nothing turned out to handle it), so what
+ * it needs it keeps. Shared by the promises one raise rejects; never changed once made.
+ */
+typedef struct JsTrace {
+    JsGcCell gc;
+    uint32_t count;
+    JsStackFrame frames[];
+} JsTrace;
+
 typedef struct JsPromise {
     JsGcCell gc;
     uint8_t state;
@@ -430,8 +443,8 @@ typedef struct JsPromise {
                             * JsClosure's; until then Promise.prototype */
     bool proto_set;
     bool handled;          /* [[PromiseIsHandled]]: something has reacted to it */
-    uint32_t raise;        /* rejected by an error leaving a fiber: that raise's serial, while
-                            * the context's trace (error_trace) may still be its; else 0 */
+    struct JsTrace *trace; /* rejected by an error leaving a fiber: where that raise was thrown
+                            * (js_promise_error_stack); else NULL */
 } JsPromise;
 
 /* A queued microtask. Raw allocation; the VM's queue is a GC root. */
@@ -447,7 +460,7 @@ struct JsJob {
     /* await */
     struct JsFiber *fiber;
     bool is_throw;
-    uint32_t raise; /* a rejection's: the promise's (JsPromise.raise) */
+    struct JsTrace *trace; /* a rejection's: the promise's (JsPromise.trace) */
 };
 
 typedef enum JsRunStatus {
@@ -768,13 +781,14 @@ struct JsContext {
     uint32_t error_trace_count;
     JsValue error_trace_value; /* the error those frames belong to: a rethrow of the same value
                                 * (an await resuming with a rejection) appends its frames */
-    /* Which raise the trace is of, and whether that raise is still on its way out: set when an
-     * error leaves a fiber, and when a job hands on a rejection that carries this serial; cleared
-     * as soon as script code runs again (a fiber is entered, a handler catches, a native
-     * returns). A promise rejected meanwhile with the same value was rejected by that raise, and
-     * takes the serial: the trace is its own for as long as the serial stands. */
-    uint32_t raise_serial;
+    /* Whether the raise the trace is of is still on its way out: set when an error leaves a
+     * fiber, and when a job hands on a rejection that has a trace (the trace is put back
+     * first); cleared as soon as script code runs again (a fiber is entered, a handler catches,
+     * a native returns). A promise rejected meanwhile with the same value was rejected by that
+     * raise, and keeps the trace as a cell of its own (raise_trace: the one made for the trace
+     * as it stands, NULL when none was or the trace has changed since). */
     bool raise_fresh;
+    struct JsTrace *raise_trace;
     JsRejectionTracker rejection_fn; /* js_set_rejection_tracker */
     void *rejection_ud;
     uint32_t reentry_depth; /* nested interpreter entries (native re-entry);
@@ -947,6 +961,8 @@ void *js_realloc_internal(JsVm *vm, void *ptr, size_t old_size, size_t new_size)
 
 /* Safe point + allocate: may collect before allocating. */
 JsGcCell *js_gc_new_cell(JsVm *vm, JsGcKind kind, size_t size);
+JsGcCell *js_gc_new_cell_quiet(JsVm *vm, JsGcKind kind, size_t size); /* never collects */
+struct JsTrace *js_raise_trace(JsContext *ctx);
 void js_gc_maybe(JsVm *vm);
 void js_gc_mark_value(JsVm *vm, JsValue v);
 void js_gc_mark_cell(JsVm *vm, JsGcCell *c);

@@ -648,10 +648,15 @@ size_t js_error_stack(JsContext *ctx, JsValue error, JsStackFrame *out, size_t m
 /*
  * Where the error a rejected promise holds is from: js_error_stack of the
  * reason; and when that has nothing (a thrown string or number, an error
- * whose `stack` was read), the frames the reason was thrown in, if the throw
- * is what rejected the promise and no other error has left a function since.
- * V8 has no place at all for those; this one is right when it is given and
- * absent otherwise (0). Returns the number written, at most max.
+ * whose `stack` was read), the frames the reason was thrown in, when a throw
+ * is what rejected the promise. That trace is the rejection's own: the
+ * promise keeps it, and it goes with the rejection to each promise it is
+ * handed on to (through an await, which adds the frames that waited; a
+ * then() or finally() that lets it pass; Promise.all and the like), so it is
+ * there whatever else was thrown before the host asks. V8 has no place at
+ * all for those values. A rejection nothing threw (Promise.reject, a reject
+ * function, a loader's) has none (0) until an await throws it. Returns the
+ * number written, at most max.
  */
 size_t js_promise_error_stack(JsContext *ctx, JsValue promise, JsStackFrame *out, size_t max);
 

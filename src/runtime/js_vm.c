@@ -303,8 +303,8 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->re_legacy_deleted = 0;
     ctx->error_trace_count = 0;
     ctx->error_trace_value = js_undefined();
-    ctx->raise_serial = 0;
     ctx->raise_fresh = false;
+    ctx->raise_trace = NULL;
     ctx->rejection_fn = NULL;
     ctx->rejection_ud = NULL;
     ctx->pending_error = js_undefined();

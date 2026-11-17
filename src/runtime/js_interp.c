@@ -2074,6 +2074,25 @@ size_t js_context_error_stack(const JsContext *ctx, JsStackFrame *out, size_t ma
 }
 
 /*
+ * The context's trace as a cell a rejection can keep: the one made of it already, or a new one.
+ * NULL when the trace has no frames, and when there is no memory for it (the rejection then has
+ * no place, which is all that is lost). It does not collect: a promise is settled with values
+ * nothing may root yet.
+ */
+JsTrace *js_raise_trace(JsContext *ctx) {
+    uint32_t n = ctx->error_trace_count;
+    if (ctx->raise_trace || !n)
+        return ctx->raise_trace;
+    JsTrace *t = (JsTrace *)js_gc_new_cell_quiet(ctx->vm, JS_KIND_TRACE, sizeof *t + (size_t)n * sizeof t->frames[0]);
+    if (!t)
+        return NULL;
+    t->count = n;
+    memcpy(t->frames, ctx->error_trace, (size_t)n * sizeof t->frames[0]);
+    ctx->raise_trace = t;
+    return t;
+}
+
+/*
  * Building the error message allocates, so at the moment it matters most --
  * reporting that allocation failed -- it can fail too. Fall back to the string
  * built at VM startup rather than throwing `undefined`, which told a host that
@@ -3976,8 +3995,8 @@ on_error:
     /* The raise the context's trace is of, going on out through a second fiber — the fiber a
      * native re-entered from, or an awaiting fiber resumed with the rejection — extends the
      * trace outward instead of replacing it, so the frames read: where it was thrown, then who
-     * was waiting. Any other is a raise of its own (raise_serial), whatever value it has: two
-     * throws of the same number are not one error. */
+     * was waiting. Any other is a raise of its own, whatever value it has: two throws of the
+     * same number are not one error. */
     if (ctx->raise_fresh && ctx->error_trace_count > 0 &&
         js_same_value(ctx->error_trace_value, fb->error)) {
         uint32_t room = JS_TRACE_MAX - ctx->error_trace_count;
@@ -3987,9 +4006,8 @@ on_error:
     } else {
         ctx->error_trace_count = fb->trace_count;
         memcpy(ctx->error_trace, fb->trace, fb->trace_count * sizeof fb->trace[0]);
-        if (++ctx->raise_serial == 0)
-            ctx->raise_serial = 1;
     }
+    ctx->raise_trace = NULL; /* the trace has changed: the cell made of it is no longer it */
     ctx->error_trace_value = fb->error;
     ctx->raise_fresh = true;
     return JS_RUN_ERROR;
@@ -4305,17 +4323,22 @@ JsValue js_run_module(JsContext *ctx, JsValue fnv) {
          * outcome in an already-settled promise. */
         JsValue result;
         bool ok = run_closure(ctx, cl, js_undefined(), NULL, 0, &result);
-        uint32_t raise = !ok && ctx->raise_fresh ? ctx->raise_serial : 0;
+        /* where the body threw, kept before the jobs raise anything of their own (a cell, held
+         * as a value only to root it) */
+        JsTrace *thrown = !ok && ctx->raise_fresh ? js_raise_trace(ctx) : NULL;
+        JsValue held = thrown ? js_value_from_cell(&thrown->gc) : js_undefined();
         js_gc_protect(vm, &result); /* the jobs allocate: the completion value must survive them */
+        js_gc_protect(vm, &held);
         js_run_jobs(ctx);
         JsPromise *p = js_promise_alloc(ctx);
+        js_gc_unprotect(vm, &held);
         js_gc_unprotect(vm, &result);
         if (!p)
             return js_undefined();
         if (ok) {
             js_promise_fulfill(ctx, p, result);
         } else {
-            p->raise = raise; /* the body's, whatever the jobs threw after it */
+            p->trace = thrown;
             js_promise_reject(ctx, p, result);
         }
         return js_value_from_cell(&p->gc);

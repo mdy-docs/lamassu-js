@@ -419,11 +419,16 @@ before the host asked:
 - A **syntax error** from compiling a module has one frame, naming the module
   and the offset the parser stopped at.
 - For **anything else** thrown (a string, a number, a plain object, an error
-  whose frames are gone) the answer is the trace of the throw, when that throw
-  is still the last error to have left a function. If another has since, there
-  are no frames: the engine does not guess.
+  whose frames are gone) the answer is the trace of the throw. V8 has no place
+  for these; here the promise the throw rejected keeps the trace, and the
+  trace goes with the rejection to every promise it is handed on to: an
+  `await` it comes out of adds the frames that were waiting, and a `then()` or
+  `finally()` that lets it pass, `Promise.all`, `race` and `any`, and a
+  `reject` function called with it while it is being handled all pass it
+  along. Caught and thrown again, it is a new throw, from the new place.
 - A loader rejection, and a rejection made by `Promise.reject` or a `reject`
-  function with a value that is not an error, have no frames.
+  function with a value that is not an error, have no frames until an `await`
+  throws them; the await is then their place.
 
 A throw inside library code points at the library, so a host walks outward to
 the first frame in the user's own file:

@@ -367,6 +367,10 @@ Tracked so differential testing against Node has a baseline.
 - **Unhandled promise rejections go to the host** — `js_set_rejection_tracker`
   (HostPromiseRejectionTracker); the command line tool reports the first one
   left after the run and exits 1, a host with no tracker hears nothing.
+- **A rejection keeps the trace of its throw** — a `JsTrace` cell on the promise
+  (`js_promise_error_stack`), handed from promise to promise with the rejection
+  (reaction jobs carry it; an await extends it), so a thrown value that is no
+  error still has its place when the host asks, whatever was thrown since.
 - **A top-level-await module awaiting a host promise** returns from
   `js_run_module` still pending; the host settles the promise, calls
   `js_run_jobs`, and reads the completion via the module's result (the

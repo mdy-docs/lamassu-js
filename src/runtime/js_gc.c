@@ -152,9 +152,19 @@ static void js_gc_trace(JsVm *vm) {
             }
             break;
         }
+        case JS_KIND_TRACE: {
+            JsTrace *t = (JsTrace *)c;
+            for (uint32_t i = 0; i < t->count; i++) {
+                js_gc_mark_value(vm, t->frames[i].specifier);
+                js_gc_mark_value(vm, t->frames[i].function);
+            }
+            break;
+        }
         case JS_KIND_PROMISE: {
             JsPromise *p = (JsPromise *)c;
             js_gc_mark_value(vm, p->value);
+            if (p->trace)
+                js_gc_mark_cell(vm, &p->trace->gc);
             if (p->props)
                 js_gc_mark_cell(vm, &p->props->gc);
             js_gc_mark_value(vm, p->own_proto);
@@ -306,6 +316,9 @@ void js_gc_free_cell(JsVm *vm, JsGcCell *c, bool remove_atoms) {
     case JS_KIND_BIGINT:
         size = js_bigint_cell_size((JsBigInt *)c);
         break;
+    case JS_KIND_TRACE:
+        size = sizeof(JsTrace) + (size_t)((JsTrace *)c)->count * sizeof(JsStackFrame);
+        break;
     case JS_KIND_BYTECODE: {
         JsBytecode *bc = (JsBytecode *)c;
         size = sizeof *bc + bc->length;
@@ -379,6 +392,8 @@ void js_gc_collect(JsVm *vm) {
             js_gc_mark_value(vm, ctx->error_trace[i].function);
         }
         js_gc_mark_value(vm, ctx->error_trace_value);
+        if (ctx->raise_trace)
+            js_gc_mark_cell(vm, &ctx->raise_trace->gc);
         js_gc_mark_value(vm, ctx->pending_error);
         if (ctx->error_ctor)
             js_gc_mark_cell(vm, &ctx->error_ctor->gc);
@@ -448,6 +463,20 @@ void js_gc_maybe(JsVm *vm) {
         js_gc_collect(vm);
 }
 
+/* Makes C, SIZE bytes just allocated, a cell of the heap; frees it and gives NULL when the mark
+ * stack cannot take one more. */
+static JsGcCell *adopt_cell(JsVm *vm, JsGcCell *c, JsGcKind kind, size_t size);
+
+/*
+ * A cell made without a collection, for the few places that hold values nothing roots (a
+ * promise being settled). It is counted like any other, so the next safe point collects if it
+ * is time; and where js_gc_new_cell would collect to make room, this gives NULL.
+ */
+JsGcCell *js_gc_new_cell_quiet(JsVm *vm, JsGcKind kind, size_t size) {
+    JsGcCell *c = js_realloc_raw(vm, NULL, 0, size);
+    return c ? adopt_cell(vm, c, kind, size) : NULL;
+}
+
 JsGcCell *js_gc_new_cell(JsVm *vm, JsGcKind kind, size_t size) {
     js_gc_maybe(vm);
     /* The heap limit is now enforced uniformly in js_realloc_raw (which this
@@ -460,6 +489,10 @@ JsGcCell *js_gc_new_cell(JsVm *vm, JsGcKind kind, size_t size) {
         if (!c)
             return NULL;
     }
+    return adopt_cell(vm, c, kind, size);
+}
+
+static JsGcCell *adopt_cell(JsVm *vm, JsGcCell *c, JsGcKind kind, size_t size) {
     /* Room to trace the cell we are about to add, reserved before it exists.
      * Failing here is an ordinary out-of-memory for the allocation the caller
      * asked for, which is the whole point of doing it at this moment: the
