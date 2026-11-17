@@ -1308,6 +1308,13 @@ static JsAstNode *parse_func_common(JsParser *p, uint8_t flags, bool need_name,
     if (!fn)
         return NULL;
     fn->flags = flags;
+    /* `function*` is a generator, which lamassu leaves out. Its head is read as any function's
+     * is, as far as the `(`, so what V8 would refuse in it is refused in V8's words; a head V8
+     * would go on from is the feature, and the error names it. */
+    bool generator = TOK(p).kind == JS_T_STAR;
+    uint32_t star_pos = TOK(p).pos;
+    if (generator && !advance(p))
+        return NULL;
     if (TOK(p).kind == JS_T_IDENT) {
         JsAstNode *name = check_binding_name(p, parse_ident(p, "expected name"));
         if (!name)
@@ -1319,6 +1326,11 @@ static JsAstNode *parse_func_common(JsParser *p, uint8_t flags, bool need_name,
         if (TOK(p).kind == JS_T_LPAREN)
             return perr(p, p->prev_pos, "Function statements require a function name");
         return perr_here(p, unexpected_text(p));
+    }
+    if (generator) {
+        if (TOK(p).kind != JS_T_LPAREN)
+            return perr_here(p, unexpected_text(p));
+        return perr(p, star_pos, "generators are not supported");
     }
     JsNodeVec params = {0};
     bool super_ok = p->super_ok; /* the parameters' defaults are the function's, not the method's around it */
@@ -1532,14 +1544,30 @@ static JsAstNode *parse_object_literal_inner(JsParser *p) {
             JsAstNode *prop = new_node(p, JS_AST_PROPERTY, TOK(p).pos);
             if (!prop)
                 return NULL;
+            /* `get` or `set` before a key is an accessor and `*` before one a generator method,
+             * both of which lamassu leaves out. Either is read as V8 reads it, as far as the
+             * `(` after its key: what V8 would refuse before that is refused in V8's words,
+             * and a head V8 would go on from is the feature, which the error names. */
+            const char *left_out = NULL;
+            uint32_t left_out_pos = TOK(p).pos;
             if ((tok_is_name(&TOK(p), "get") || tok_is_name(&TOK(p), "set")) &&
-                prop_name_follows(p))
-                return perr_here(p, "getter/setter properties are not supported");
-            if (tok_is_name(&TOK(p), "async") && !peek(p).newline_before &&
                 prop_name_follows(p)) {
-                prop->flags |= JS_F_PROP_ASYNC;
+                left_out = "getter/setter properties are not supported";
                 if (!advance(p))
                     return NULL;
+            } else {
+                if (tok_is_name(&TOK(p), "async") && !peek(p).newline_before &&
+                    prop_name_follows(p)) {
+                    prop->flags |= JS_F_PROP_ASYNC;
+                    if (!advance(p))
+                        return NULL;
+                }
+                if (TOK(p).kind == JS_T_STAR) {
+                    left_out = "generators are not supported";
+                    left_out_pos = TOK(p).pos;
+                    if (!advance(p))
+                        return NULL;
+                }
             }
             /* key */
             JsToken keytok = TOK(p);
@@ -1567,6 +1595,11 @@ static JsAstNode *parse_object_literal_inner(JsParser *p) {
                 prop->a = parse_name_any(p, "expected property name");
                 if (!prop->a)
                     return NULL;
+            }
+            if (left_out) {
+                if (TOK(p).kind != JS_T_LPAREN)
+                    return perr_here(p, unexpected_text(p));
+                return perr(p, left_out_pos, left_out);
             }
             /* value */
             if (TOK(p).kind == JS_T_LPAREN) { /* method */

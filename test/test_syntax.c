@@ -872,6 +872,77 @@ static void test_reserved_words(void) {
     check_err("({ m() { return { [super.x]: 1 }; } });", "'super' is not supported", 19);
 }
 
+/* Generators and accessors, which lamassu leaves out, have no word of their own to go by: a
+ * generator is `function*` or a `*` before a method's key, an accessor `get` or `set` before
+ * one. The head is read as V8 reads it and the feature is named once the `(` is reached; before
+ * that the report is V8's. Each line but those of the last group was run in Node. */
+static void test_left_out_functions(void) {
+    /* a generator's head is read as a function's is, as far as the `(` */
+    check_err("function* () {}", "Function statements require a function name", 8);
+    check_err("function* ;", "Unexpected token ';'", 10);
+    check_err("function* 5() {}", "Unexpected number", 10);
+    check_err("function* g {}", "Unexpected token '{'", 12);
+    check_err("function* if() {}", "Unexpected token 'if'", 10);
+    check_err("function* let() {}", "Unexpected strict mode reserved word", 10);
+    check_err("function* yield() {}", "Unexpected strict mode reserved word", 10);
+    check_err("function* await() {}", "Unexpected reserved word", 10);
+    check_err("function* eval() {}", "Unexpected eval or arguments in strict mode", 10);
+    check_err("x = function* ;", "Unexpected token ';'", 14);
+    check_err("x = function* {};", "Unexpected token '{'", 14);
+    check_err("x = function* yield() {};", "Unexpected strict mode reserved word", 14);
+    check_err("async function* () {}", "Function statements require a function name", 14);
+    check_err("async function* ;", "Unexpected token ';'", 16);
+    check_err("x = async function* ;", "Unexpected token ';'", 20);
+    check_err("export function* () {}", "Function statements require a function name", 15);
+    check_err("export default function* ;", "Unexpected token ';'", 25);
+    check_err("if (1) function* g() {}", "In strict mode code, functions can only be declared at top level or inside a block.", 7);
+    /* and a generator method's as far as the `(` after its key */
+    check_err("({ * });", "Unexpected token '}'", 5);
+    check_err("({ *m });", "Unexpected token '}'", 6);
+    check_err("({ *m: 1 });", "Unexpected token ':'", 5);
+    check_err("({ *, a: 1 });", "Unexpected token ','", 4);
+    check_err("({ *m = 1 });", "Unexpected token '='", 6);
+    check_err("({ *[k]: 1 });", "Unexpected token ':'", 7);
+    check_err("({ *async m() {} });", "Unexpected identifier 'm'", 10);
+    check_err("({ async * });", "Unexpected token '}'", 11);
+    check_err("({ async *m });", "Unexpected token '}'", 12);
+    /* an accessor's too */
+    check_err("({ get *m() {} });", "Unexpected token '*'", 7);
+    check_err("({ get ; });", "Unexpected token ';'", 7);
+    check_err("({ get x });", "Unexpected token '}'", 9);
+    check_err("({ get x: 1 });", "Unexpected token ':'", 8);
+    check_err("({ get x, y });", "Unexpected token ','", 8);
+    check_err("({ get x = 1 });", "Unexpected token '='", 9);
+    check_err("({ get \"x\" });", "Unexpected token '}'", 11);
+    check_err("({ get [k]: 1 });", "Unexpected token ':'", 10);
+    check_err("({ set x });", "Unexpected token '}'", 9);
+    check_err("({ get async x() {} });", "Unexpected identifier 'x'", 13);
+    /* yield is a reserved word and nothing more */
+    check_err("yield 1;", "Unexpected strict mode reserved word", 0);
+    check_err("x = yield;", "Unexpected strict mode reserved word", 4);
+    check_err("function f() { yield 1; }", "Unexpected strict mode reserved word", 15);
+    /* what lamassu leaves out, where V8 would go on */
+    check_err("function* g() {}", "generators are not supported", 8);
+    check_err("function *g() { yield 1; }", "generators are not supported", 9);
+    check_err("x = function* () {};", "generators are not supported", 12);
+    check_err("x = function* g() {};", "generators are not supported", 12);
+    check_err("async function* g() {}", "generators are not supported", 14);
+    check_err("x = async function* () {};", "generators are not supported", 18);
+    check_err("export function* g() {}", "generators are not supported", 15);
+    check_err("export default function* () {}", "generators are not supported", 23);
+    check_err("({ *m() {} });", "generators are not supported", 3);
+    check_err("({ *\"m\"() {} });", "generators are not supported", 3);
+    check_err("({ *[k]() {} });", "generators are not supported", 3);
+    check_err("({ *if() {} });", "generators are not supported", 3);
+    check_err("({ async *m() {} });", "generators are not supported", 9);
+    check_err("({ a: 1, *m() {} });", "generators are not supported", 9);
+    check_err("({ get x() { return 1; } });", "getter/setter properties are not supported", 3);
+    check_err("({ set x(v) {} });", "getter/setter properties are not supported", 3);
+    check_err("({ get \"x\"() { return 1; } });", "getter/setter properties are not supported", 3);
+    check_err("({ get [k]() { return 1; } });", "getter/setter properties are not supported", 3);
+    check_err("({ get\nx() {} });", "getter/setter properties are not supported", 3);
+}
+
 static void test_module_clause_errors(void) {
     /* any word is a name where no binding is made */
     check_dump("import {if as x, default as y, let as z} from \"m\";",
@@ -1168,6 +1239,7 @@ int main(void) {
     test_modules();
     test_module_clause_errors();
     test_reserved_words();
+    test_left_out_functions();
     test_asi();
     test_top_level_await();
     test_errors();

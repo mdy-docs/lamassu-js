@@ -34,7 +34,8 @@ so everything left is left out by design:
 
 ## Syntax V8 accepts that lamassu refuses
 
-Each is a compile error that names the feature (`SyntaxError: classes are not supported`), never
+Each is a compile error that names the feature (`SyntaxError: classes are not supported`,
+`generators are not supported`, `getter/setter properties are not supported`), never
 a silent difference. What was not yet implemented has been (2026-11-16); this is what is left out
 by design (see [Supported syntax](/guide/language#explicit-non-goals)): `var`,
 `for...in`, `with`, classes (and with them private names, `#x`), `super` in the methods of an
@@ -172,10 +173,14 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   its `extends` clause are read as V8 reads them, so `x = class;` is `Unexpected token ';'`
   and `class {}` is `Unexpected token '{'`), and `super.x` or `super[x]` in a method of an
   object literal is a reference to `super` (anywhere else it is V8's `'super' keyword
-  unexpected here`). Past that point lamassu has stopped reading, so an error V8 would find
-  further on is not the one reported: `var x y;` is `'var' is not supported` here and
-  `Unexpected identifier 'y'` in V8, and `const [class {}] = []` is `classes are not
-  supported` here and `Invalid destructuring assignment target` in V8;
+  unexpected here`). A generator is `function*`, or `*` before the key of a method, as far as
+  the `(` of its parameters, and an accessor is `get` or `set` before a key as far as the same
+  `(`: `function* g() {}` is `generators are not supported`, at the `*`, and `function* ;` is
+  `Unexpected token ';'`; `({ get x() {} })` is `getter/setter properties are not supported`
+  and `({ get x })` is `Unexpected token '}'`. Past that point lamassu has stopped reading,
+  so an error V8 would find further on is not the one reported: `var x y;` is `'var' is not
+  supported` here and `Unexpected identifier 'y'` in V8, and `const [class {}] = []` is
+  `classes are not supported` here and `Invalid destructuring assignment target` in V8;
   one of V8's own quirks is not copied (a destructured
   parameter given `null` is `'object null'` in V8's message, `'null'` here); an
   operand with no readable name shows its value (`undefined is not a function` for `(void 0)()`
