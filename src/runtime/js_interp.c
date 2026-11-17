@@ -455,6 +455,14 @@ static bool key_to_index(JsValue key, uint32_t *idx) {
         JsString *s = js_value_string(key);
         return units_to_index(s->units, s->length, idx);
     }
+    if (js_is_bigint(key)) { /* a key is its string, and `1n` is "1": the element, as 1 is */
+        const JsBigInt *b = js_value_bigint(key);
+        uint32_t v = b->len ? b->d[0] : 0;
+        if (b->neg || b->len > 1 || v == 0xFFFFFFFF)
+            return false;
+        *idx = v;
+        return true;
+    }
     return false;
 }
 

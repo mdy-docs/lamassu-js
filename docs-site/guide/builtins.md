@@ -295,7 +295,9 @@ unary `+` is `TypeError: Cannot convert a BigInt value to a number`, and mixing 
 number is `TypeError: Cannot mix BigInt and other types, use explicit conversions` (`+` with a
 string concatenates). `==` and `<` compare a BigInt with a number or a numeric string by value
 (`1n == 1`, `2n > 1.5`); `===` does not (`1n === 1` is false); `0n` is falsy. As `Map`/`Set`
-keys, in `includes` and `Object.is`, equal BigInts are the same key.
+keys, in `includes` and `Object.is`, equal BigInts are the same key. As a property key a BigInt
+is its decimal string, written as a literal or computed: `{ 5n: 1 }` has the key `"5"`, as does
+the pattern `{ 5n: x }`, and `list[1n]` is `list[1]`.
 
 - **`BigInt(value)`**: a number must be an integer (`RangeError: The number 1.5 cannot be
   converted to a BigInt because it is not an integer`); a string is parsed as V8 does (`0x`, `0o`,
