@@ -248,6 +248,11 @@ static void test_roundtrip(void) {
        "[o.m, f, g, g(), Math.max].join('|');",
        "m(a) { return a }|async (x) => x|function g() { return function () { return 'e' }; }|"
        "function () { return 'e' }|function max() { [native code] }");
+    /* JS_OP_SET_PROTO: `__proto__: v` in a literal sets the prototype and makes no property */
+    eq("const base = { hi() { return 'hi ' + this.n; } }; const o = { __proto__: base, n: 1 };"
+       "[o.hi(), Object.keys(o).join(), Object.getPrototypeOf(o) === base,"
+       " Object.getPrototypeOf({ __proto__: null })].join('|');",
+       "hi 1|n|true|");
 }
 
 static void test_vs_direct(void) {

@@ -126,9 +126,12 @@ typedef enum JsOp {
      * ToNumeric of v, a postfix expression's value). */
     JS_OP_UPDATE,
     JS_OP_UPDATE_POST,
+    /* An object literal's `__proto__: v`: obj v -> obj, the object's prototype v when v is an
+     * object, a function or null, and as it was for any other value */
+    JS_OP_SET_PROTO,
 } JsOp;
 
-#define JS_OP__COUNT (JS_OP_UPDATE_POST + 1)
+#define JS_OP__COUNT (JS_OP_SET_PROTO + 1)
 
 /*
  * Per-opcode metadata, the single source of truth the bytecode verifier

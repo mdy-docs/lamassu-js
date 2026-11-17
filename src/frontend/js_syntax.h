@@ -164,6 +164,7 @@ typedef enum JsAstKind {
 #define JS_F_METHOD      0x08 /* PROPERTY */
 #define JS_F_COVER_INIT  0x10 /* PROPERTY: shorthand with default ({a = 1}) */
 #define JS_F_PROP_ASYNC  0x20 /* PROPERTY: async method */
+#define JS_F_PROTO       0x40 /* PROPERTY of a literal: `__proto__: v`, which sets the prototype */
 #define JS_F_PREFIX      0x01 /* UPDATE */
 #define JS_F_TRUE        0x01 /* BOOL_LIT */
 #define JS_F_HAS_TLA     0x01 /* MODULE: uses top-level await */

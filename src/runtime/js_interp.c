@@ -485,8 +485,9 @@ static JsString *single_unit_string(JsVm *vm, uint16_t u) {
 }
 
 /* Bound on [[Prototype]] chain walks; script code has no way to construct a
- * cycle (there is no __proto__, and Object.setPrototypeOf refuses one), so this only guards hostile/corrupt
- * bytecode. */
+ * cycle (a literal's `__proto__: v` is set on an object nothing else has yet, there is no
+ * __proto__ accessor, and Object.setPrototypeOf refuses one), so this only guards
+ * hostile/corrupt bytecode. */
 #define JS_PROTO_CHAIN_LIMIT 1000
 
 /* Whether V is an object to the language (typeof "object" or "function", not null): functions and
@@ -3387,6 +3388,16 @@ run:; /* (re)load the top frame */
                     fiber_throw_value(fb, js_error_fmt(ctx, "ReferenceError: %S is not defined", uninit));
                     RT_RAISE();
                 }
+                fb->sp--;
+                break;
+            }
+            case JS_OP_SET_PROTO: {
+                if (!js_is_object(PEEK(1)))
+                    RT_THROW("internal error: object builder on non-object");
+                /* the literal's object is new: nothing can keep it from taking a prototype, or
+                 * be below it (js_set_proto refuses both all the same, for bytecode that lies) */
+                if (is_object_type(PEEK(0)) || js_is_null(PEEK(0)))
+                    (void)js_set_proto(ctx, PEEK(1), PEEK(0));
                 fb->sp--;
                 break;
             }

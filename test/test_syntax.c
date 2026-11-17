@@ -1088,6 +1088,129 @@ static void test_numeric_literal_errors(void) {
     check_err("x = 1_0e1_0n;", "Invalid or unexpected token", 4);
 }
 
+/* `__proto__: v` in an object literal sets the prototype, and a literal may say it once. The key
+ * is a name or a string, however it is spelled; a computed key, a shorthand and a method are
+ * properties like any other. The error is the literal's alone: a pattern may name the key twice,
+ * so the report waits to see what the braces become, and, as V8 reports the earliest error it
+ * found, it stands in front of a later one. Messages and positions from Node. */
+static void test_proto_literal(void) {
+    static const char dup[] = "Duplicate __proto__ fields are not allowed in object literals";
+    check_err("({ __proto__: null, __proto__: null });", dup, 20);
+    check_err("({ a: 1, __proto__: null, __proto__: null });", dup, 26);
+    check_err("({ __proto__: null, \"__proto__\": null });", dup, 20);
+    check_err("({ \"__proto__\": null, '__proto__': null });", dup, 22);
+    check_err("({ __proto__: null, a: 1, __proto__: null, b: 2, __proto__: null });", dup, 26);
+    check_err("({ __proto__: null, \\u005f_proto__: null });", dup, 20);
+    check_err("({ __proto__: null, \"\\u005f_proto__\": null });", dup, 20);
+    check_err("x = { __proto__: null, __proto__: null };", dup, 23);
+    check_err("x = [{ __proto__: null, __proto__: null }];", dup, 24);
+    check_err("f({ __proto__: null, __proto__: null });", dup, 21);
+    check_err("x = { a: { __proto__: null, __proto__: null } };", dup, 28);
+    check_err("let a, b; ({ __proto__: a, __proto__: b }) = {};", dup, 27);
+    check_err("let a, b; ({ __proto__: a, __proto__: b });", dup, 27);
+    check_err("let a, b; ({ __proto__: a, __proto__: b }, 1);", dup, 27);
+    check_err("let a, b; (({ __proto__: a, __proto__: b }) = {});", dup, 28);
+    check_err("let a, b; (({ __proto__: a, __proto__: b }));", dup, 28);
+    check_err("let a, b; ({ __proto__: a, __proto__: b }).x;", dup, 27);
+    check_err("let a, b; ({ __proto__: a, __proto__: b } ? 1 : 2);", dup, 27);
+    check_err("let a, b; ({ __proto__: a, __proto__: b } + 1);", dup, 27);
+    check_err("let a, b; for ({ __proto__: a, __proto__: b }; ;) break;", dup, 31);
+    check_err("let a, b; for ({ __proto__: a, __proto__: b }.x of [{}]) ;", dup, 31);
+    check_err("async({ __proto__: a, __proto__: b });", dup, 22);
+    check_err("const async = () => 1; async({ __proto__: null, __proto__: null });", dup, 48);
+    check_err("(({ __proto__: a, __proto__: b }));", dup, 18);
+    check_err("(({ __proto__: a, __proto__: b }), 1);", dup, 18);
+    check_err("(x = { __proto__: a, __proto__: b }) => 1;", dup, 21);
+    check_err("(x = { __proto__: null, __proto__: null }) => 1;", dup, 24);
+    check_err("({ x = { __proto__: null, __proto__: null } }) => 1;", dup, 26);
+    check_err("({ x = { __proto__: null, __proto__: null } } = {});", dup, 26);
+    check_err("let a, b; ({ __proto__: a, __proto__: b } = {}) + ({ __proto__: null, __proto__: null });", dup, 70);
+    check_err("({ __proto__: null, __proto__: null }) => 1;", "Invalid destructuring assignment target", 14);
+    check_err("({ __proto__: null, __proto__: 1 } = {});", "Invalid destructuring assignment target", 14);
+    check_err("({ __proto__: x, __proto__: y, a: 1 + });", dup, 17);
+    check_err("({ __proto__: x, __proto__: y, a b });", dup, 17);
+    check_err("({ __proto__: x, __proto__: y }; ", dup, 17);
+    check_err("`${{ __proto__: null, __proto__: null }}`;", dup, 22);
+    check_err("x = y ? { __proto__: null, __proto__: null } : 1;", dup, 27);
+    check_err("x = () => ({ __proto__: null, __proto__: null });", dup, 30);
+    check_err("x = { __proto__: null, __proto__: null }.a;", dup, 23);
+    check_err("let a, b; x = [{ __proto__: a, __proto__: b }, 1];", dup, 31);
+    check_err("let a, b; ({ y: [{ __proto__: a, __proto__: b }] });", dup, 33);
+    check_err("let a, b; ({ __proto__: a, __proto__: b } += 1);", "Invalid left-hand side in assignment", 11);
+    check_err("export default { __proto__: null, __proto__: null };", dup, 34);
+    check_err("let a, b; ({ __proto__: a, __proto__: b }\n);", dup, 27);
+    /* with a cover initializer, the earlier of the two; and in other places */
+    check_err("({ __proto__: x, __proto__: y, a = 1 });", dup, 17);
+    check_err("({ a = 1, __proto__: x, __proto__: y });", "Invalid shorthand property initializer", 3);
+    check_err("({ __proto__: x, a = 1, __proto__: y });", "Invalid shorthand property initializer", 17);
+    check_err("({ __proto__: { b = 1 }, __proto__: y });", "Invalid shorthand property initializer", 16);
+    check_err("({ __proto__: { __proto__: 1, __proto__: 2 }, __proto__: y });", dup, 30);
+    check_err("let a, b; ({ __proto__: { __proto__: a, __proto__: b }.x, __proto__: b } = { });", dup, 40);
+    check_err("({ 0: 1, __proto__: null, 1n: 2, __proto__: null });", dup, 33);
+    check_err("({ __proto__: null, ...{ __proto__: null } , __proto__: null});", dup, 45);
+    check_err("[{ __proto__: 1, __proto__: 2 }] = [];", "Invalid destructuring assignment target", 14);
+    check_err("[{ __proto__: 1, __proto__: 2 }.a] = [];", dup, 17);
+    check_err("for (let x of [{ __proto__: 1, __proto__: 2 }]) ;", dup, 31);
+    check_err("for (let x = { __proto__: 1, __proto__: 2 }; ;) ;", dup, 29);
+    check_err("if ({ __proto__: 1, __proto__: 2 }) ;", dup, 20);
+    check_err("function f(x = { __proto__: 1, __proto__: 2 }) {}", dup, 31);
+    check_err("function f({ a = { __proto__: 1, __proto__: 2 } }) {}", dup, 33);
+    check_err("const { a = { __proto__: 1, __proto__: 2 } } = {};", dup, 28);
+    check_err("let a, b; ({ a: { __proto__: a, __proto__: b } = { __proto__: 1, __proto__: 2 } } = {});", dup, 65);
+    check_err("x => ({ __proto__: 1, __proto__: 2 });", dup, 22);
+    check_err("async () => { await { __proto__: 1, __proto__: 2 }; };", dup, 36);
+    check_err("({ __proto__: 1, __proto__: 2 })``;", dup, 17);
+    check_err("new ({ __proto__: 1, __proto__: 2 });", dup, 21);
+    check_err("typeof { __proto__: 1, __proto__: 2 };", dup, 23);
+    check_err("({ __proto__: 1, __proto__: 2 }) = 1;", dup, 17);
+    check_err("({ __proto__: 1, __proto__: 2 })++;", dup, 17);
+    check_err("++{ __proto__: 1, __proto__: 2 };", "Invalid left-hand side expression in prefix operation", 2);
+    check_err("({ __proto__: a.x, __proto__: b }) => 1;", "Illegal property in declaration context", 14);
+    check_err("({ __proto__: a.x, __proto__: b } = {}) => 1;", "Illegal property in declaration context", 14);
+    /* not the literal's key, or not a literal */
+    check_parses("({ __proto__: null, [\"__proto__\"]: null });");
+    check_parses("({ __proto__: null, __proto__() {} });");
+    check_parses("const __proto__ = 1; ({ __proto__: null, __proto__ });");
+    check_parses("const __proto__ = 1; ({ __proto__, __proto__ });");
+    check_parses("({ __proto__() {}, __proto__() {} });");
+    check_parses("({ [\"__proto__\"]: 1, [\"__proto__\"]: 2 });");
+    check_parses("let a, b; ({ __proto__: a, __proto__: b } = {});");
+    check_parses("let a, b; [{ __proto__: a, __proto__: b }] = [{}];");
+    check_parses("let a, b; ({ x: { __proto__: a, __proto__: b } } = { x: {} });");
+    check_parses("let a, b; ({ __proto__: a, __proto__: b } = {}, 1);");
+    check_parses("let a, b; x = { __proto__: a, __proto__: b } = {};");
+    check_parses("let a, b; for ({ __proto__: a, __proto__: b } of [{}]) ;");
+    check_parses("let a, b; for ({ __proto__: a, __proto__: b } of [{}]);");
+    check_parses("(({ __proto__: a, __proto__: b }) => 1)({});");
+    check_parses("(({ __proto__: a, __proto__: b } = {}) => 1)();");
+    check_parses("((x, { __proto__: a, __proto__: b }) => 1)(1, {});");
+    check_parses("(async ({ __proto__: a, __proto__: b }) => 1)({});");
+    check_parses("async ({ __proto__: a, __proto__: b }) => 1;");
+    check_parses("let a, b; ({ __proto__: a = 1, __proto__: b = 2 } = {});");
+    check_parses("let a, b; ({ __proto__: a, __proto__: b, ...c } = {});");
+    check_parses("let a, b; [{ __proto__: a, __proto__: b } = {}] = [];");
+    check_parses("let a, b; ({ __proto__: a, __proto__: b } = {}) => 1;");
+    check_parses("let a, b; [...{ __proto__: a, __proto__: b }] = [];");
+    check_parses("function f({ __proto__: a, __proto__: b }) {} f({});");
+    check_parses("const { __proto__: a, __proto__: b } = {};");
+    check_parses("let a; ({ __proto__: [a], __proto__: { a } } = {});");
+    check_parses("let a, b; ({ __proto__: a, __proto__: b } = {}).x;");
+    check_parses("let a, b; ({ __proto__: a, __proto__: b } = 0) ? 1 : 2;");
+    check_parses("let a, b; [{ __proto__: a, __proto__: b }, a] = [{}];");
+    check_parses("let a, b; ({ y: [{ __proto__: a, __proto__: b }] } = { y: [{}] });");
+    check_parses("let a, b; ({ \"__proto__\": a, \"__proto__\": b } = {});");
+    check_parses("let a, b; ({ \"__proto__\": a, __proto__: b } = {});");
+    check_parses("let a, b; ({ __proto__: a, '__proto__': b } = {});");
+    check_parses("let a, b; ({ a = 1, __proto__: a, __proto__: b } = {});");
+    check_parses("let a, b; ({ __proto__: a, __proto__: b, a = 1 } = {});");
+    check_parses("(({ \"__proto__\": a, \"__proto__\": b }) => 1)({});");
+    check_parses("({ __proto__: null, async __proto__() {} });");
+    check_parses("for (const { __proto__: a, __proto__: b } of []) ;");
+    check_parses("let a, b; ({ a: { __proto__: a, __proto__: b } = {} } = {});");
+    check_parses("let a, b; ({ __proto__: a, __proto__: b }) => 1;");
+    check_parses("let a, b; ({ __proto__: a.x, __proto__: b } = {});");
+}
+
 /* The head of a property, in an object literal and in a pattern, read as V8 reads it: what
  * V8 refuses, where V8 refuses it (messages and positions from Node 26). */
 static void test_property_heads(void) {
@@ -1528,6 +1651,7 @@ int main(void) {
     test_left_out_functions();
     test_property_heads();
     test_numeric_literal_errors();
+    test_proto_literal();
     test_asi();
     test_top_level_await();
     test_errors();

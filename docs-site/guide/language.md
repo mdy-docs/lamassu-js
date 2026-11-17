@@ -57,8 +57,14 @@ supported. `debugger;` is a statement that does nothing (there is no debugger to
   construction, and property lookup walks the chain — the same mechanism
   built-in instance methods (Array, Date, Map, Set, RegExp) use to reach
   their own prototype's methods.
-- `Object.getPrototypeOf` / `Object.setPrototypeOf` are available.
-  `__proto__` as an accessor property is **not**.
+- `Object.getPrototypeOf` / `Object.setPrototypeOf` are available, and `__proto__: v` in an
+  object literal sets the new object's prototype, as in V8: `{ __proto__: base, n: 1 }` inherits
+  from `base` and has one property. `v` is an object, a function or `null` (any other value is
+  ignored), the key is a name or a string (`"__proto__": v`), and a literal may say it once
+  (`SyntaxError: Duplicate __proto__ fields are not allowed in object literals`). A computed key
+  (`["__proto__"]: v`), a shorthand and a method of that name are ordinary properties.
+  `__proto__` as an accessor property is **not** there: `o.__proto__` is `undefined`, and
+  assigning to it makes a property.
 - **Classes are not supported.** Use constructor functions and
   `Ctor.prototype` instead — see the example below. `super` goes with them: V8 also takes
   `super.x` in a method of an object literal, which here is

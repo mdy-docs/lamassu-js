@@ -21,7 +21,10 @@ so everything left is left out by design:
 - `Object.getOwnPropertySymbols`, and everything else that takes or returns a symbol: there
   are no symbols.
 - `__proto__`, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__`:
-  there are no accessors. For the same reason `size` (`Map`, `Set`) and `source`, `flags`,
+  there are no accessors. `o.__proto__` is `undefined`, `o.__proto__ = p` makes a property named
+  `__proto__`, and a pattern's `{ __proto__: p } = o` reads that property; use
+  `Object.getPrototypeOf` and `Object.setPrototypeOf`. (`{ __proto__: p }` in an object literal
+  is syntax, not the accessor, and sets the prototype as in V8.) For the same reason `size` (`Map`, `Set`) and `source`, `flags`,
   `global` and the other flags (`RegExp`) are read from the instance rather than through an
   accessor on the prototype, so they work as in V8 but
   `Object.getOwnPropertyNames(Map.prototype)` does not list `size`.

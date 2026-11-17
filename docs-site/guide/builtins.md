@@ -67,7 +67,8 @@ through `Object.setPrototypeOf(B, A)`, or none with `null`), and a function or p
 another object's prototype (`Object.create(f)` reads `f`'s properties, `name` and statics
 included). A chain may not loop (`TypeError: Cyclic __proto__ value`), and a sealed or frozen
 value keeps its prototype. `instanceof` and `Object.getPrototypeOf` follow such chains. A
-function from `bind` starts with its target's prototype.
+function from `bind` starts with its target's prototype. An object literal names its prototype
+with `{ __proto__: proto }` ([Language](/guide/language)).
 
 `Object.create(proto, props)` makes a plain object whose prototype is `proto` (an object, function
 or promise) or none (`null`); anything else is V8's `TypeError: Object prototype may only be an

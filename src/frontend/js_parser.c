@@ -12,7 +12,8 @@
 #define JS_PARSE_MAX_DEPTH 256
 
 struct JsCoverOpen {
-    uint32_t pos, end; /* the key; the end of its initializer */
+    uint32_t pos, end; /* the key; the end of its initializer (of the key, for a `__proto__`) */
+    bool proto;        /* a second `__proto__: v`, not a cover initializer */
 };
 
 typedef struct JsParser {
@@ -37,10 +38,12 @@ typedef struct JsParser {
     uint32_t label_count, label_cap, label_base;
     uint32_t pending_labels, pending_own;
     /* The object literals read with a cover initializer (`{a = 1}`) that no pattern has claimed
-     * yet, each by the position of its first such key, in source order. Every expression that
-     * can no longer become a pattern must leave the list as long as it found it (cover_closed):
-     * V8's expression scopes, which report the first one left open. cover_base: where the
-     * function being read began, for the check at the end of each statement. */
+     * yet, each by the position of its first such key, in source order; and with them, by its
+     * second such key, each literal that says `__proto__: v` twice, which a pattern may and a
+     * literal may not. Every expression that can no longer become a pattern must leave the list
+     * as long as it found it (cover_closed): V8's expression scopes, which report the first
+     * one left open. cover_base: where the function being read began, for the check at the end
+     * of each statement. */
     struct JsCoverOpen *cover_open;
     uint32_t cover_count, cover_cap, cover_base;
     /* The last octal literal or escape among the tokens read, which strict mode refuses but V8
@@ -92,6 +95,7 @@ static JsAstNode *parse_func_common(JsParser *p, uint8_t flags, bool need_name,
                                     uint32_t pos, uint8_t kind, uint32_t src_start);
 static JsAstNode *expr_to_pattern(JsParser *p, JsAstNode *n, bool binding);
 
+static const char DUPLICATE_PROTO[] = "Duplicate __proto__ fields are not allowed in object literals";
 static bool units_is(const uint16_t *u, uint32_t len, const char *ascii);
 
 /* V8's wording for a parse that stops at the current token: "Unexpected token ';'",
@@ -193,7 +197,7 @@ static void fail_at(JsParser *p, uint32_t pos, const char *msg) {
         return;
     if (p->cover_count && p->cover_open[0].end < pos) {
         pos = p->cover_open[0].pos;
-        msg = "Invalid shorthand property initializer";
+        msg = p->cover_open[0].proto ? DUPLICATE_PROTO : "Invalid shorthand property initializer";
     }
     if (p->lx.late_msg) { /* V8's scanner is at the token being looked at: its octal is the last */
         if (p->lx.late_end < pos) {
@@ -478,7 +482,7 @@ static bool expect_semicolon(JsParser *p) {
     return false;
 }
 
-static bool cover_push(JsParser *p, uint32_t pos, uint32_t end) {
+static bool cover_push(JsParser *p, uint32_t pos, uint32_t end, bool proto) {
     if (p->cover_count == p->cover_cap) {
         uint32_t cap = p->cover_cap ? p->cover_cap * 2 : 8;
         struct JsCoverOpen *v = js_arena_alloc(p->arena, (size_t)cap * sizeof *v);
@@ -491,11 +495,12 @@ static bool cover_push(JsParser *p, uint32_t pos, uint32_t end) {
         p->cover_open = v;
         p->cover_cap = cap;
     }
-    p->cover_open[p->cover_count++] = (struct JsCoverOpen){pos, end};
+    p->cover_open[p->cover_count++] = (struct JsCoverOpen){pos, end, proto};
     return true;
 }
 
-/* The object literal whose first cover initializer is at POS became a pattern */
+/* The object literal whose first cover initializer (or second `__proto__`) is at POS became a
+ * pattern */
 static void cover_drop(JsParser *p, uint32_t pos) {
     for (uint32_t i = p->cover_count; i-- > 0;) {
         if (p->cover_open[i].pos == pos) {
@@ -507,13 +512,15 @@ static void cover_drop(JsParser *p, uint32_t pos) {
     }
 }
 
-/* False, with V8's error at the first of them, when a cover initializer read since MARK (the
- * list's length then) was claimed by no pattern */
+/* False, with V8's error at the first of them, when a cover initializer (or a second
+ * `__proto__`) read since MARK (the list's length then) was claimed by no pattern */
 static bool cover_closed(JsParser *p, uint32_t mark) {
     if (p->err_msg)
         return false;
     if (p->cover_count > mark) {
-        perr(p, p->cover_open[mark].pos, "shorthand property initializer is only valid in destructuring");
+        perr(p, p->cover_open[mark].pos,
+             p->cover_open[mark].proto ? DUPLICATE_PROTO
+                                       : "shorthand property initializer is only valid in destructuring");
         return false;
     }
     return true;
@@ -1038,8 +1045,15 @@ static JsAstNode *expr_to_pattern_inner(JsParser *p, JsAstNode *n, bool binding)
         if (!pat)
             return NULL;
         bool had_cover = false;
+        int protos = 0;
         for (uint32_t i = 0; i < n->count; i++) {
             JsAstNode *prop = n->items[i];
+            if (prop->kind != JS_AST_SPREAD && (prop->flags & JS_F_PROTO)) {
+                /* in a pattern `__proto__` is a key like any other, as often as it likes */
+                prop->flags &= (uint8_t)~JS_F_PROTO;
+                if (++protos == 2) /* the literal's second: the one it is listed by */
+                    cover_drop(p, prop->a->pos);
+            }
             if (prop->kind == JS_AST_SPREAD) {
                 JsAstNode *rest = new_node(p, JS_AST_REST, prop->pos);
                 if (!rest)
@@ -1613,6 +1627,7 @@ static JsAstNode *parse_object_literal_inner(JsParser *p) {
         return NULL;
     JsNodeVec props = {0};
     bool has_cover_init = false;
+    int protos = 0;
     while (TOK(p).kind != JS_T_RBRACE) {
         uint32_t mark = p->cover_count;
         if (TOK(p).kind == JS_T_DOTDOTDOT) {
@@ -1678,6 +1693,7 @@ static JsAstNode *parse_object_literal_inner(JsParser *p) {
                     return perr_here(p, unexpected_text(p));
                 return perr(p, left_out_pos, left_out);
             }
+            uint32_t key_end = p->prev_end;
             /* value */
             if (TOK(p).kind == JS_T_LPAREN) { /* method */
                 prop->flags |= JS_F_METHOD;
@@ -1705,6 +1721,15 @@ static JsAstNode *parse_object_literal_inner(JsParser *p) {
             } else if (prop->flags & JS_F_PROP_ASYNC) {
                 return perr_here(p, "expected '(' after async method name");
             } else if (accept(p, JS_T_COLON)) {
+                /* `__proto__: v`, the key a name or a string and not computed, is no property:
+                 * it sets the prototype. Once in a literal: V8 notes a second where its key is
+                 * and reports it unless the literal turns out to be a pattern. */
+                if (!(prop->flags & JS_F_COMPUTED) && prop->a->kind != JS_AST_NUMBER &&
+                    units_is(prop->a->units, prop->a->len, "__proto__")) {
+                    prop->flags |= JS_F_PROTO;
+                    if (++protos == 2 && !cover_push(p, keytok.pos, key_end, true))
+                        return NULL;
+                }
                 mark = p->cover_count;
                 prop->b = parse_assign(p);
                 if (prop->b && !cover_element(p, mark, prop->b))
@@ -1733,7 +1758,7 @@ static JsAstNode *parse_object_literal_inner(JsParser *p) {
                         return NULL;
                     /* the literal's first is listed, once read (as V8 records it), until a
                      * pattern claims the literal */
-                    if (!has_cover_init && !cover_push(p, prop->a->pos, p->prev_end))
+                    if (!has_cover_init && !cover_push(p, prop->a->pos, p->prev_end, false))
                         return NULL;
                     has_cover_init = true;
                     def->a = val;

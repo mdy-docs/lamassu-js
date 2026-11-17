@@ -1781,6 +1781,11 @@ static bool compile_object(JsCompiler *cx, const JsAstNode *n) {
                 return false;
             continue;
         }
+        if (prop->flags & JS_F_PROTO) { /* `__proto__: v`: no property, and it names no function */
+            if (!compile_expr(cx, prop->b) || !emit_op(cx, JS_OP_SET_PROTO, -1))
+                return false;
+            continue;
+        }
         if (prop->flags & JS_F_COMPUTED) {
             if (!compile_expr(cx, prop->a))
                 return false;
