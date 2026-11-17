@@ -640,8 +640,12 @@ size_t js_context_error_stack(const JsContext *ctx, JsStackFrame *out, size_t ma
  * unless a script changes it), and none once the script has read, assigned
  * or deleted `stack`: the text has taken their place, as in V8. A SyntaxError
  * a module's source gave has one frame, the module and the offset of the
- * error, and keeps it. Any other value has none. Returns the number written,
- * at most max.
+ * error, and keeps it. So has the SyntaxError of a graph that does not link
+ * (an export its source does not provide, conflicting star exports, a cycle
+ * of re-exports): the module whose import or re-export asked for the name,
+ * and the offset of the name there (of the `*` of an `export * from`), from
+ * source and from a bytecode cache alike. Any other value has none. Returns
+ * the number written, at most max.
  */
 size_t js_error_stack(JsContext *ctx, JsValue error, JsStackFrame *out, size_t max);
 

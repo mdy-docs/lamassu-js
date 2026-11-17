@@ -64,7 +64,7 @@ when it has none (`./util`).
 | exit status | the run |
 | --- | --- |
 | `0` | finished |
-| `1` | ended with an error nothing caught, or left a promise rejected with nothing handling it. Reported as `file:line:col: uncaught …`, at the place the error was made (for a syntax error, where the parser stopped; for a thrown value that is not an error, where it was thrown) |
+| `1` | ended with an error nothing caught, or left a promise rejected with nothing handling it. Reported as `file:line:col: uncaught …`, at the place the error was made (for a syntax error, where the parser stopped; for a graph that does not link, the import or re-export that asked for the missing name, in the module that has it; for a thrown value that is not an error, where it was thrown) |
 | `2` | could not start: a file that cannot be read, a bad option |
 | `13` | was left waiting at a top-level `await` that nothing will settle, as Node reports it |
 

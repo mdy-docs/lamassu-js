@@ -384,7 +384,13 @@ Tracked so differential testing against Node has a baseline.
   bindings on holds a copy the owning module rewrites at every write (a
   mirror; the owner holds its mirrors weakly). The compiler writes a
   module's imports and re-exports in the order V8 links them (by local name),
-  so the error reported for a graph with several is V8's.
+  so the error reported for a graph with several is V8's. Each import and
+  re-export keeps the source offset V8 gives its entry (the imported name, the
+  binding of a default import, the local name of `export { a as b } from`, the
+  `*` of `export *`, and the import's for an imported name exported again);
+  `ResolveExport` carries the place of whoever asked down the chain, and a
+  link error has it as its origin (`js_error_stack`), so it is reported at the
+  line Node prints. Module bytecode stores the offsets (format version 20).
 - **Cross-module cycles:** a `let`/`const` export (or an `export default`
   expression) read before the exporting module initialized it throws the TDZ
   error, as real ESM does: the exports object holds `JS_SPECIAL_TDZ` for it

@@ -280,6 +280,7 @@ bool js_bc_serialize_module(JsContext *ctx, JsModule *m, uint8_t **out, size_t *
         out_u8(&b, m->imports[i].kind);
         out_str(&b, m->imports[i].specifier);
         out_opt_str(&b, m->imports[i].imported_name);
+        out_u32(&b, m->imports[i].pos);
     }
     out_u32(&b, m->star_count);
     for (uint32_t i = 0; i < m->star_count; i++) {
@@ -287,6 +288,7 @@ bool js_bc_serialize_module(JsContext *ctx, JsModule *m, uint8_t **out, size_t *
         out_opt_str(&b, m->stars[i].specifier);
         out_opt_str(&b, m->stars[i].imported);
         out_opt_str(&b, m->stars[i].exported);
+        out_u32(&b, m->stars[i].pos);
     }
     out_u32(&b, m->dep_spec_count);
     for (uint32_t i = 0; i < m->dep_spec_count; i++)

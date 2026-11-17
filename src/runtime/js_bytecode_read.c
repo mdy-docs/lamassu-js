@@ -1284,6 +1284,7 @@ bool js_bc_load_module(JsContext *ctx, JsModule *m, const uint8_t *buf, size_t l
                 goto done;
             if (!load_opt_str(ctx, &b, &m->imports[i].imported_name, err))
                 goto done;
+            m->imports[i].pos = in_u32(&b); /* a short buffer is found below (b.bad) */
         }
     }
 
@@ -1313,6 +1314,7 @@ bool js_bc_load_module(JsContext *ctx, JsModule *m, const uint8_t *buf, size_t l
                 !load_opt_str(ctx, &b, &re->imported, err) ||
                 !load_opt_str(ctx, &b, &re->exported, err))
                 goto done;
+            re->pos = in_u32(&b);
             /* the names each kind has: linking reads them unchecked */
             bool shaped = sk == JS_REEXP_ALL     ? re->specifier != NULL
                           : sk == JS_REEXP_NS    ? re->specifier && re->exported

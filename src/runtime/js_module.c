@@ -1365,10 +1365,13 @@ typedef struct ResolvePair {
     JsString *name;
 } ResolvePair;
 
-/* One step of a resolution: the name NAME of M, asked for through SPEC */
+/* One step of a resolution: the name NAME of M, asked for through SPEC by the import or
+ * re-export at AT_POS of AT (V8's MessageLocation: where an error of this step points) */
 typedef struct ResolveFrame {
     JsModule *m;
     JsString *spec, *name;
+    JsModule *at;
+    uint32_t at_pos;
     bool must;
     uint8_t stage; /* RESOLVE_* */
     uint32_t i;    /* the next `export *` to ask */
@@ -1441,18 +1444,21 @@ static int set_add(LinkPass *lp, JsModule *m, JsString *name) {
     return 0;
 }
 
-/* One of V8's three link errors, with the specifier as the module wrote it (its import
- * attributes are not part of it). */
-static int link_error(LinkPass *lp, const char *fmt, JsString *spec, JsString *name,
-                      bool spec_first) {
+/* One of V8's three link errors, of the step F of a resolution, with the specifier as the
+ * module wrote it (its import attributes are not part of it). Its place is the import or
+ * re-export that asked, in the module that has it: the line Node prints above the error. */
+static int link_error(LinkPass *lp, const char *fmt, const ResolveFrame *f, bool spec_first) {
     JsContext *ctx = lp->ctx;
+    JsString *spec = f->spec, *name = f->name;
+    JsModule *at = f->at; /* F is in an array the calls below do not move, but may collect */
+    uint32_t at_pos = f->at_pos;
     JsString *shown = js_string_cell_new(ctx->vm, spec->units, spec_len(spec));
-    if (!shown)
+    if (!shown) {
         *lp->error = js_oom_value(ctx->vm);
-    else if (spec_first)
-        *lp->error = js_error_fmt(ctx, fmt, shown, name);
-    else
-        *lp->error = js_error_fmt(ctx, fmt, name, shown);
+        return -1;
+    }
+    *lp->error = spec_first ? js_error_fmt(ctx, fmt, shown, name) : js_error_fmt(ctx, fmt, name, shown);
+    js_error_set_origin(ctx, *lp->error, at->specifier, at_pos);
     return -1;
 }
 
@@ -1461,8 +1467,9 @@ static int link_oom(LinkPass *lp) {
     return -1;
 }
 
-/* The resolution goes on to NAME of M. False on OOM. */
-static bool resolve_push(LinkPass *lp, JsModule *m, JsString *spec, JsString *name, bool must) {
+/* The resolution goes on to NAME of M, asked for at AT_POS of AT. False on OOM. */
+static bool resolve_push(LinkPass *lp, JsModule *m, JsString *spec, JsString *name, bool must,
+                         JsModule *at, uint32_t at_pos) {
     if (lp->resolve_depth == lp->resolve_cap) {
         uint32_t ncap = lp->resolve_cap ? lp->resolve_cap * 2 : 8;
         ResolveFrame *na = js_realloc_raw(lp->ctx->vm, lp->resolving,
@@ -1477,6 +1484,8 @@ static bool resolve_push(LinkPass *lp, JsModule *m, JsString *spec, JsString *na
     f->m = m;
     f->spec = spec;
     f->name = name;
+    f->at = at;
+    f->at_pos = at_pos;
     f->must = must;
     f->stage = RESOLVE_ENTER;
     f->i = 0;
@@ -1487,8 +1496,9 @@ static bool resolve_push(LinkPass *lp, JsModule *m, JsString *spec, JsString *na
 
 /*
  * V8's ResolveExport, step for step, since its order decides which error a graph gets: the
- * binding M exports as NAME, asked for through the specifier SPEC. 1 with the binding; 0 when
- * there is none and MUST is false; -1 with the error.
+ * binding M exports as NAME, asked for through the specifier SPEC by the import or re-export
+ * at AT_POS of AT. 1 with the binding; 0 when there is none and MUST is false; -1 with the
+ * error, which points at whoever asked the step that failed.
  *
  *  1. a name in the module's table is that binding (its own, or one resolved before);
  *  2. a (module, name) this resolution is in already is a cycle;
@@ -1505,13 +1515,13 @@ static bool resolve_push(LinkPass *lp, JsModule *m, JsString *spec, JsString *na
  * the one that just ended gave the one that asked.
  */
 static int resolve_export(LinkPass *lp, JsModule *m, JsString *spec, JsString *name, bool must,
-                          JsModule **origin, JsString **oname) {
+                          JsModule *at, uint32_t at_pos, JsModule **origin, JsString **oname) {
     JsContext *ctx = lp->ctx;
     int r = 0;
     JsModule *ro = NULL;
     JsString *rn = NULL;
     lp->resolve_depth = 0;
-    if (!resolve_push(lp, m, spec, name, must))
+    if (!resolve_push(lp, m, spec, name, must, at, at_pos))
         return link_oom(lp);
     while (lp->resolve_depth) {
         ResolveFrame *f = &lp->resolving[lp->resolve_depth - 1];
@@ -1533,7 +1543,7 @@ static int resolve_export(LinkPass *lp, JsModule *m, JsString *spec, JsString *n
                 if (seen) {
                     if (f->must)
                         return link_error(lp, "SyntaxError: Detected cycle while resolving name '%S' in '%S'",
-                                          f->spec, f->name, false);
+                                          f, false);
                     r = 0;
                     lp->resolve_depth--;
                     continue;
@@ -1556,7 +1566,8 @@ static int resolve_export(LinkPass *lp, JsModule *m, JsString *spec, JsString *n
                 }
                 if (named) {
                     f->stage = RESOLVE_NAMED;
-                    if (!resolve_push(lp, named->source, named->specifier, named->imported, true))
+                    if (!resolve_push(lp, named->source, named->specifier, named->imported, true,
+                                      m, named->pos))
                         return link_oom(lp);
                     continue;
                 }
@@ -1576,7 +1587,7 @@ static int resolve_export(LinkPass *lp, JsModule *m, JsString *spec, JsString *n
                 f->un = rn;
             } else if (r && (f->uo != ro || f->un != rn)) {
                 return link_error(lp, "SyntaxError: The requested module '%S' contains conflicting star exports for name '%S'",
-                                  f->spec, f->name, true);
+                                  f, true);
             }
             f->stage = RESOLVE_STARS;
         }
@@ -1588,7 +1599,7 @@ static int resolve_export(LinkPass *lp, JsModule *m, JsString *spec, JsString *n
         }
         if (star) {
             f->stage = RESOLVE_STAR;
-            if (!resolve_push(lp, star->source, star->specifier, f->name, false))
+            if (!resolve_push(lp, star->source, star->specifier, f->name, false, m, star->pos))
                 return link_oom(lp);
             continue;
         }
@@ -1600,7 +1611,7 @@ static int resolve_export(LinkPass *lp, JsModule *m, JsString *spec, JsString *n
             r = 1;
         } else if (f->must) {
             return link_error(lp, "SyntaxError: The requested module '%S' does not provide an export named '%S'",
-                              f->spec, f->name, true);
+                              f, true);
         } else {
             r = 0;
         }
@@ -1694,7 +1705,8 @@ static bool link_leave(LinkPass *lp, JsModule *m) {
         if (!src)
             continue;
         set_clear(lp);
-        if (resolve_export(lp, src, imp->specifier, imp->requested, true, &origin, &oname) <= 0)
+        if (resolve_export(lp, src, imp->specifier, imp->requested, true, m, imp->pos, &origin,
+                           &oname) <= 0)
             return false;
         imp->source = origin;
         imp->imported_name = oname;
@@ -1705,7 +1717,8 @@ static bool link_leave(LinkPass *lp, JsModule *m) {
         if (m->stars[i].kind != JS_REEXP_NAMED && m->stars[i].kind != JS_REEXP_NS)
             continue;
         set_clear(lp);
-        if (resolve_export(lp, m, NULL, m->stars[i].exported, true, &origin, &oname) <= 0)
+        if (resolve_export(lp, m, NULL, m->stars[i].exported, true, m, m->stars[i].pos, &origin,
+                           &oname) <= 0)
             return false;
     }
     if (m->dfs_ancestor == m->dfs_index) {

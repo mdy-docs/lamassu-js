@@ -165,7 +165,7 @@ static bool compile_object_pattern_items(JsCompiler *cx, const JsAstNode *pat, b
                                          const JsAstNode *src, bool outer);
 static JsString *intern_atom(JsCompiler *cx, const uint16_t *u, uint32_t len);
 static JsModuleImport *mod_add_import(JsCompiler *cx, JsModule *m, JsString *spec,
-                                      JsString *imported, uint8_t kind);
+                                      JsString *imported, uint8_t kind, uint32_t pos);
 static bool compile_function(JsCompiler *cx, const JsAstNode *fnode);
 /* The hidden local a function keeps new.target in for its arrows: no identifier can name it */
 static const uint16_t new_target_name[] = {'%', 'n', 'e', 'w', '.', 't', 'a', 'r', 'g', 'e', 't'};
@@ -2113,7 +2113,7 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
         if (idx == mod->import_count) {
             static const uint16_t meta_spec[] = {'i', 'm', 'p', 'o', 'r', 't', '.', 'm', 'e', 't', 'a'};
             JsString *spec = intern_atom(cx, meta_spec, 11);
-            if (!spec || !mod_add_import(cx, mod, spec, NULL, JS_IMPORT_META))
+            if (!spec || !mod_add_import(cx, mod, spec, NULL, JS_IMPORT_META, n->pos))
                 return cerr(cx, n->pos, "out of memory");
         }
         if (idx > 0xFFFF)
@@ -3252,7 +3252,7 @@ static bool mod_add_dep(JsCompiler *cx, JsModule *m, JsString *spec) {
 }
 
 static JsModuleImport *mod_add_import(JsCompiler *cx, JsModule *m, JsString *spec,
-                                      JsString *imported, uint8_t kind) {
+                                      JsString *imported, uint8_t kind, uint32_t pos) {
     JsModuleImport *na = js_realloc_raw(cx->vm, m->imports,
                                         (size_t)m->import_count * sizeof(JsModuleImport),
                                         (size_t)(m->import_count + 1) * sizeof(JsModuleImport));
@@ -3265,12 +3265,13 @@ static JsModuleImport *mod_add_import(JsCompiler *cx, JsModule *m, JsString *spe
     imp->kind = kind;
     imp->source = NULL;
     imp->requested = NULL;
+    imp->pos = pos;
     m->import_count++;
     return imp;
 }
 
 static bool mod_add_star(JsCompiler *cx, JsModule *m, JsString *spec, uint8_t kind,
-                         JsString *imported, JsString *exported) {
+                         JsString *imported, JsString *exported, uint32_t pos) {
     JsStarExport *na = js_realloc_raw(cx->vm, m->stars,
                                       (size_t)m->star_count * sizeof(JsStarExport),
                                       (size_t)(m->star_count + 1) * sizeof(JsStarExport));
@@ -3283,6 +3284,7 @@ static bool mod_add_star(JsCompiler *cx, JsModule *m, JsString *spec, uint8_t ki
     s->kind = kind;
     s->imported = imported;
     s->exported = exported;
+    s->pos = pos;
     m->star_count++;
     return true;
 }
@@ -3380,8 +3382,8 @@ static bool intern_pair(JsCompiler *cx, const uint16_t *a, uint32_t alen, const 
  * atoms are traced; only its local name is kept aside, for mod_order_links to place it by. */
 static bool mod_add_reexport(JsCompiler *cx, ModAnalysis *an, const uint16_t *key, uint32_t len,
                              JsModule *mod, JsString *spec, uint8_t kind, JsString *imported,
-                             JsString *exported) {
-    if (!mod_add_star(cx, mod, spec, kind, imported, exported))
+                             JsString *exported, uint32_t pos) {
+    if (!mod_add_star(cx, mod, spec, kind, imported, exported, pos))
         return false;
     if (an->reexport_count == an->reexport_cap) {
         uint32_t ncap = an->reexport_cap ? an->reexport_cap * 2 : 8;
@@ -3540,7 +3542,8 @@ static bool list_export(JsCompiler *cx, ModAnalysis *an, const JsAstNode *module
         JsString *ex = intern_atom(cx, exp, exp_len);
         if (!ex || !mod_add_reexport(cx, an, b->name, b->len, mod, imp->specifier,
                                      b->kind == JS_MB_IMPORT_NS ? JS_REEXP_NS : JS_REEXP_NAMED,
-                                     b->kind == JS_MB_IMPORT_NS ? NULL : imp->imported_name, ex))
+                                     b->kind == JS_MB_IMPORT_NS ? NULL : imp->imported_name, ex,
+                                     imp->pos)) /* V8 points a link error at the import */
             return cerr(cx, sp->pos, "out of memory");
         return true;
     }
@@ -3628,7 +3631,7 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
                 b.len = sp->len2;
                 if (sp->flags & JS_F_SPEC_NS) {
                     b.kind = JS_MB_IMPORT_NS;
-                    if (!mod_add_import(cx, mod, spec, NULL, JS_IMPORT_NS))
+                    if (!mod_add_import(cx, mod, spec, NULL, JS_IMPORT_NS, sp->pos))
                         return cerr(cx, n->pos, "out of memory");
                 } else {
                     b.kind = JS_MB_IMPORT;
@@ -3642,7 +3645,8 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
                     if (!imported ||
                         !mod_add_import(cx, mod, spec, imported,
                                         (sp->flags & JS_F_SPEC_DEFAULT) ? JS_IMPORT_DEFAULT
-                                                                        : JS_IMPORT_NAMED))
+                                                                        : JS_IMPORT_NAMED,
+                                        sp->pos))
                         return cerr(cx, n->pos, "out of memory");
                 }
                 if (mod->import_count > 0x10000)
@@ -3671,7 +3675,7 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
                 uint32_t klen = (uint32_t)(sizeof prefix - 1) + nd;
                 uint16_t *key = js_arena_alloc(&cx->arena, (size_t)klen * sizeof *key);
                 JsString *ns = intern_atom(cx, n->units2, n->len2);
-                if (!key || !ns || !mod_add_import(cx, mod, spec, NULL, JS_IMPORT_NS))
+                if (!key || !ns || !mod_add_import(cx, mod, spec, NULL, JS_IMPORT_NS, n->pos2))
                     return cerr(cx, n->pos, "out of memory");
                 if (mod->import_count > 0x10000)
                     return cerr(cx, n->pos, "too many imports");
@@ -3684,10 +3688,10 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
                 b.kind = JS_MB_IMPORT_NS;
                 b.import_index = (uint16_t)(mod->import_count - 1);
                 if (!mbind_add(cx, &an.cap, b) ||
-                    !mod_add_reexport(cx, &an, key, klen, mod, spec, JS_REEXP_NS, NULL, ns))
+                    !mod_add_reexport(cx, &an, key, klen, mod, spec, JS_REEXP_NS, NULL, ns, n->pos2))
                     return cerr(cx, n->pos, "out of memory");
             } else { /* export * from 'm' */
-                if (!mod_add_star(cx, mod, spec, JS_REEXP_ALL, NULL, NULL))
+                if (!mod_add_star(cx, mod, spec, JS_REEXP_ALL, NULL, NULL, n->pos2))
                     return cerr(cx, n->pos, "out of memory");
             }
             break;
@@ -3712,7 +3716,7 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
                     const JsAstNode *sp = n->items[s];
                     JsString *imp, *exp;
                     if (!intern_pair(cx, sp->units, sp->len, sp->units2, sp->len2, &imp, &exp) ||
-                        !mod_add_star(cx, mod, spec, JS_REEXP_NAMED, imp, exp))
+                        !mod_add_star(cx, mod, spec, JS_REEXP_NAMED, imp, exp, sp->pos))
                         return cerr(cx, n->pos, "out of memory");
                 }
             } /* export { a, b as c } (local): resolved below, once every binding is known */
@@ -3753,7 +3757,7 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
         JsString *one, *other;
         if (!intern_pair(cx, first->export_name, first->export_len, b->export_name,
                          b->export_len, &one, &other) ||
-            !mod_add_star(cx, mod, NULL, JS_REEXP_LOCAL, one, other))
+            !mod_add_star(cx, mod, NULL, JS_REEXP_LOCAL, one, other, 0))
             return cerr(cx, 0, "out of memory");
     }
     return true;

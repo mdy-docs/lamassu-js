@@ -490,6 +490,8 @@ typedef struct JsModuleImport {
     JsModule *source;        /* resolved at link */
     JsString *requested;     /* the name as this module imports it (link may follow re-exports
                               * to another): for the missing-export error */
+    uint32_t pos;            /* where a link error about it points, as V8 has it: the name asked
+                              * for (`a` of `{ a as b }`; the binding of a default import) */
 } JsModuleImport;
 
 /*
@@ -511,6 +513,9 @@ typedef struct JsStarExport {
     uint8_t kind;
     JsString *imported; /* NAMED: source export name; LOCAL: the binding's first export name */
     JsString *exported; /* NS: binding name; NAMED, LOCAL: exported name */
+    uint32_t pos;       /* where a link error about it points, as V8 has it. ALL: the `*`;
+                         * NAMED: the name asked for (`x` of `{ x as y }`), and for an imported
+                         * name exported again, the import's */
 } JsStarExport;
 
 /*

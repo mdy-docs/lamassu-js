@@ -3273,11 +3273,13 @@ static JsAstNode *parse_export(JsParser *p) {
     }
 
     if (TOK(p).kind == JS_T_STAR) {
+        uint32_t star = TOK(p).pos;
         if (!advance(p))
             return NULL;
         JsAstNode *n = new_node(p, JS_AST_EXPORT_ALL, pos);
         if (!n)
             return NULL;
+        n->pos2 = star; /* where a link error about a name it brings points */
         if (tok_is_name(&TOK(p), "as")) {
             if (!advance(p))
                 return NULL;

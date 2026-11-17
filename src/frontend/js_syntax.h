@@ -196,7 +196,8 @@ struct JsAstNode {
     JsAstNode **items; uint32_t count;
     uint32_t src_start, src_end; /* FUNC_*: the source text Function.prototype.toString gives */
     /* Where V8 places the operation, for errors and stack frames: MEMBER the property (its name,
-     * or `[`); CALL the callee's name when it is a name or a member's name, else the `(`. */
+     * or `[`); CALL the callee's name when it is a name or a member's name, else the `(`;
+     * EXPORT_ALL the `*`. */
     uint32_t pos2;
 };
 

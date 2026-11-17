@@ -176,6 +176,9 @@ static bool compile_all(void) {
 /* set for a second pass of the re-export graphs with a collection at every safe point */
 static bool g_gc_stress;
 
+/* where the last graph that failed says its error is from: "module:offset", or "" for nowhere */
+static char g_where[96];
+
 /* Evaluates root `name` through `load`, reads export `exp`, returns ToString. */
 static char *eval_with(JsModuleLoader load, const char *name, const char *exp, bool *ok) {
     CountAlloc ca = {0, 0};
@@ -194,6 +197,15 @@ static char *eval_with(JsModuleLoader load, const char *name, const char *exp, b
     char *out;
     JsValue result = js_promise_result(p);
     if (st != 1) {
+        JsStackFrame at;
+        g_where[0] = 0;
+        if (js_promise_error_stack(ctx, p, &at, 1) == 1) {
+            size_t wl, k = 0;
+            const uint16_t *wv = js_string_units(at.specifier, &wl);
+            for (; k < wl && k < 64; k++)
+                g_where[k] = wv[k] < 128 ? (char)wv[k] : '?';
+            snprintf(g_where + k, sizeof g_where - k, ":%u", (unsigned)at.pos);
+        }
         JsValue s = js_to_string(ctx, result);
         size_t sl;
         const uint16_t *sv = js_string_units(s, &sl);
@@ -273,6 +285,37 @@ static void expect_error(const char *root, const char *expected) {
         fprintf(stderr, "FAIL root=%s%s\n  expected error: %s\n  source:   %s%s\n  bytecode: %s%s\n",
                 root, g_gc_stress ? " (gc stress)" : "", expected, s, sok ? " (no error)" : "", b,
                 bok ? " (no error)" : "");
+    }
+    free(s);
+    free(b);
+    mods_reset();
+}
+
+/* As expect_error(), and the error is from `where` ("module:offset"), the place V8 points at:
+ * the import or the re-export that asked for the name. A cache carries the offsets, so the
+ * graph says the same from bytecode. */
+static void expect_error_at(const char *root, const char *expected, const char *where) {
+    checks_run++;
+    if (!compile_all()) {
+        checks_failed++;
+        fprintf(stderr, "FAIL(compile) root=%s\n", root);
+        mods_reset();
+        return;
+    }
+    bool sok, bok;
+    char sw[sizeof g_where], bw[sizeof g_where];
+    char *s = eval_with(src_loader, root, "r", &sok);
+    memcpy(sw, g_where, sizeof sw);
+    char *b = eval_with(bc_loader, root, "r", &bok);
+    memcpy(bw, g_where, sizeof bw);
+    if (sok || bok || strcmp(s, expected) != 0 || strcmp(s, b) != 0 || strcmp(sw, where) != 0 ||
+        strcmp(bw, where) != 0) {
+        checks_failed++;
+        fprintf(stderr,
+                "FAIL root=%s%s\n  expected error: %s at %s\n  source:   %s at %s%s\n"
+                "  bytecode: %s at %s%s\n",
+                root, g_gc_stress ? " (gc stress)" : "", expected, where, s, sw,
+                sok ? " (no error)" : "", b, bw, bok ? " (no error)" : "");
     }
     free(s);
     free(b);
@@ -427,6 +470,56 @@ static void test_reexports(void) {
     mod_add("m", "export * from 's'; export * from 't';");
     mod_add("main", "import { x } from 'm'; import { x as x2 } from 'u'; export const r = x + x2;");
     expect_error("main", "SyntaxError: The requested module 'u' does not provide an export named 'x'");
+
+    /* where each is from, as V8 points: the name in the import or the re-export that asked for
+     * it, in the module that holds it (Node prints that line above the error) */
+    mod_add("c", "export let x = 1;");
+    mod_add("main", "import { x,\n  nope as q } from 'c'; export const r = q;");
+    expect_error_at("main", "SyntaxError: The requested module 'c' does not provide an export named 'nope'",
+                    "main:14");
+    mod_add("c", "export let x = 1;");
+    mod_add("main", "import d, { x } from 'c'; export const r = d;"); /* the binding, for a default */
+    expect_error_at("main", "SyntaxError: The requested module 'c' does not provide an export named 'default'",
+                    "main:7");
+    mod_add("c", "export let x = 1;");
+    mod_add("main", "import { default as d } from 'c'; export const r = d;");
+    expect_error_at("main", "SyntaxError: The requested module 'c' does not provide an export named 'default'",
+                    "main:9");
+    mod_add("c", "export let x = 1;");
+    mod_add("main", "export { x as y, nope as r } from 'c';");
+    expect_error_at("main", "SyntaxError: The requested module 'c' does not provide an export named 'nope'",
+                    "main:17");
+    mod_add("c", "export let x = 1;"); /* imported and exported again: the import */
+    mod_add("main", "import { x, nope } from 'c';\nexport { nope as r };");
+    expect_error_at("main", "SyntaxError: The requested module 'c' does not provide an export named 'nope'",
+                    "main:12");
+    mod_add("c", "export let x = 1;"); /* another module's re-export, though main asked */
+    mod_add("m", "// m\n  export { nope } from 'c';");
+    mod_add("main", "import { nope } from 'm'; export const r = nope;");
+    expect_error_at("main", "SyntaxError: The requested module 'c' does not provide an export named 'nope'",
+                    "m:16");
+    mod_add("c", "export let x = 1;"); /* ... and with nobody asking: every re-export is resolved */
+    mod_add("m", "export { nope } from 'c';");
+    mod_add("main", "import 'm'; export const r = 1;");
+    expect_error_at("main", "SyntaxError: The requested module 'c' does not provide an export named 'nope'",
+                    "m:9");
+    mod_add("p", "export let x = 'p';");
+    mod_add("q", "export let x = 'q';");
+    mod_add("s", "export * from 'p'; export * from 'q';");
+    mod_add("main", "import { x } from 's'; export const r = x;");
+    expect_error_at("main", "SyntaxError: The requested module 's' contains conflicting star exports for name 'x'",
+                    "main:9");
+    mod_add("p", "export let x = 'p';"); /* through one more `export *`: its `*` */
+    mod_add("q", "export let x = 'q';");
+    mod_add("s", "export * from 'p'; export * from 'q';");
+    mod_add("m", "\n   export * from 's';");
+    mod_add("main", "import { x } from 'm'; export const r = x;");
+    expect_error_at("main", "SyntaxError: The requested module 's' contains conflicting star exports for name 'x'",
+                    "m:11");
+    mod_add("a", "export { x } from 'b';");
+    mod_add("b", "export { x } from 'a';");
+    mod_add("main", "import { x } from 'a'; export const r = x;");
+    expect_error_at("main", "SyntaxError: Detected cycle while resolving name 'x' in 'b'", "a:9");
 
     /* V8 as it is: a conflict one `export *` further down is no conflict for the namespace
      * (the name stays, from the module that has it), yet importing the name reports it */

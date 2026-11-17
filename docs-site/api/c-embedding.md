@@ -418,6 +418,13 @@ before the host asked:
   assigns or deletes `stack`, as V8's are.
 - A **syntax error** from compiling a module has one frame, naming the module
   and the offset the parser stopped at.
+- A **link error** (`The requested module './m.js' does not provide an export
+  named 'x'`, conflicting star exports, a cycle of re-exports) has one frame
+  too: the module whose import or re-export asked for the name, and the
+  offset of that name in it (of the `*` for an `export * from`). That is the
+  line Node prints above the error, and it is often not in the module that
+  was run. A bytecode cache carries these offsets, so the answer is the same
+  without the source.
 - For **anything else** thrown (a string, a number, a plain object, an error
   whose frames are gone) the answer is the trace of the throw. V8 has no place
   for these; here the promise the throw rejected keeps the trace, and the
