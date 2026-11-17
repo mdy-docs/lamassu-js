@@ -155,7 +155,7 @@ bool js_to_primitive(JsContext *ctx, JsValue v, int hint, JsValue *out) {
         bool want_ts = (hint == JS_HINT_STRING) == (i == 0);
         JsValue key = want_ts ? js_atom(vm, ts, 8) : js_atom(vm, vo, 7);
         m = js_undefined();
-        if (!js_is_string(key) || get_property(ctx, v, key, &m) != JS_PROP_OK) {
+        if (!js_is_string(key) || !js_get_property(ctx, v, key, &m)) { /* a namespace's export may throw */
             if (js_is_undefined(ctx->pending_error))
                 ctx->pending_error = js_oom_value(vm);
             done = true;
@@ -182,16 +182,33 @@ bool js_to_primitive(JsContext *ctx, JsValue v, int hint, JsValue *out) {
     return ok;
 }
 
-bool js_get_property(JsContext *ctx, JsValue base, JsValue key, JsValue *out) {
+/* [[Get]] for a native. A module namespace's export that is not yet initialized is the
+ * ReferenceError here, so no native sees the marker a namespace holds for one: in V8's words for
+ * [[Get]], or (OWN) for the [[GetOwnProperty]] that Object.assign and a descriptor make first. */
+static bool native_get(JsContext *ctx, JsValue base, JsValue key, JsValue *out, bool own) {
     *out = js_undefined();
     JsPropStatus st = get_property(ctx, base, key, out);
     if (JS_UNLIKELY(out->bits == JS_SPECIAL_ACCESSOR)) /* base.__proto__ */
         *out = js_get_proto(ctx, base);
+    if (JS_UNLIKELY(out->bits == JS_SPECIAL_TDZ)) {
+        *out = js_undefined();
+        js_set_error(ctx, js_error_fmt(ctx, own ? "ReferenceError: %v is not defined"
+                                                : "ReferenceError: Cannot access '%v' before initialization", key));
+        return false;
+    }
     if (st == JS_PROP_OK)
         return true;
     if (st == JS_PROP_TYPE_ERROR)
         return fail_ascii(ctx, "TypeError: Cannot convert undefined or null to object");
     return false;
+}
+
+bool js_get_property(JsContext *ctx, JsValue base, JsValue key, JsValue *out) {
+    return native_get(ctx, base, key, out, false);
+}
+
+bool js_get_own_property(JsContext *ctx, JsValue base, JsValue key, JsValue *out) {
+    return native_get(ctx, base, key, out, true);
 }
 
 bool js_native_keep(JsContext *ctx, JsValue v) {
@@ -630,6 +647,12 @@ static JsPropStatus method_lookup(JsContext *ctx, JsObject *table, JsValue key,
  * `f.valueOf`). The tables are fixed objects, so the chain is just these two. */
 static JsPropStatus proto_table_lookup(JsContext *ctx, JsObject *table, JsValue key, JsValue *out) {
     JsValue v = js_undefined();
+    if (JS_UNLIKELY(!js_is_string(key))) { /* (5)[0], 'ab'[-1]: the property its string names */
+        JsString *k = to_prop_key(ctx, key);
+        if (!k)
+            return JS_PROP_OOM;
+        key = js_value_from_cell(&k->gc); /* interned: the intern table keeps it */
+    }
     JsPropStatus st = method_lookup(ctx, table, key, &v);
     if (st == JS_PROP_OK && js_is_undefined(v) && table) {
         /* then the table's own [[Prototype]] (Object.prototype unless a script set another);
@@ -1142,15 +1165,13 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
     if (js_is_string(base)) {
         JsString *s = js_value_string(base);
         uint32_t idx;
-        if (key_to_index(key, &idx)) {
-            if (idx < s->length) {
-                JsString *c = single_unit_string(vm, s->units[idx]);
-                if (!c)
-                    return JS_PROP_OOM;
-                *out = js_value_from_cell(&c->gc);
-            }
+        if (key_to_index(key, &idx) && idx < s->length) {
+            JsString *c = single_unit_string(vm, s->units[idx]);
+            if (!c)
+                return JS_PROP_OOM;
+            *out = js_value_from_cell(&c->gc);
             return JS_PROP_OK;
-        }
+        } /* an index past the end is String.prototype's to answer, as any other key */
         if (js_is_string(key) && units_is_ascii_str(js_value_string(key), "length")) {
             *out = js_number(s->length);
             return JS_PROP_OK;
@@ -4813,14 +4834,7 @@ int js_own_property(JsContext *ctx, JsValue v, JsValue key, JsValue *value, uint
         if (k && js_map_get(&mo->props, k, &found).bits == JS_SPECIAL_ACCESSOR)
             return 2;
     }
-    if (!js_get_property(ctx, v, key, value))
-        return -1;
-    if (value->bits == JS_SPECIAL_TDZ) { /* a namespace's uninitialized export */
-        *value = js_undefined();
-        js_set_error(ctx, js_error_fmt(ctx, "ReferenceError: %v is not defined", key));
-        return -1;
-    }
-    return 1;
+    return js_get_own_property(ctx, v, key, value) ? 1 : -1; /* an uninitialized export throws */
 }
 
 static bool same_value(JsValue x, JsValue y) {
@@ -5049,6 +5063,43 @@ bool js_has_property(JsContext *ctx, JsValue base, JsValue key, bool *out) {
     if (st == JS_PROP_TYPE_ERROR)
         return fail_ascii(ctx, "TypeError: Cannot use 'in' operator to search for a key in a non-object");
     return st == JS_PROP_OK;
+}
+
+/* `delete base[key]` for natives (DeletePropertyOrThrow): false with the TypeError pending when
+ * the property may not be deleted, or on OOM. A primitive other than undefined and null has
+ * nothing to delete. BASE and KEY are rooted by the caller. */
+bool js_delete_property(JsContext *ctx, JsValue base, JsValue key) {
+    if (js_is_object(base))
+        return delete_object_prop(ctx, js_value_object(base), base, key);
+    if (js_has_cell_props(base)) {
+        JsValue err;
+        int st = delete_function_prop(ctx, base, key, &err);
+        if (st == 1)
+            js_set_error(ctx, err);
+        return st == 0;
+    }
+    if (is_nullish(base))
+        return fail_ascii(ctx, "TypeError: Cannot convert undefined or null to object");
+    return true;
+}
+
+/* One step of a native's loop that the script sets the length of (an array method on an
+ * array-like whose `length` is 2**53 - 1): charged to the budget as an instruction is, and
+ * stopped by the interrupt flag as the dispatch loop is, with the same two errors and as sticky.
+ * False with the error pending. Outside a fiber (the host calling a native) the turn's budget
+ * pays. */
+bool js_native_charge(JsContext *ctx) {
+    if (ctx->vm->interrupt)
+        return fail_ascii(ctx, JS_MSG_INTERRUPT);
+    uint64_t *fuel = ctx->fiber ? &ctx->fiber->fuel : ctx->fuel ? &ctx->fuel_left : NULL;
+    if (fuel) {
+        if (*fuel <= 1) { /* spent: 1 is where the dispatch loop leaves it too */
+            *fuel = 1;
+            return fail_ascii(ctx, JS_MSG_BUDGET);
+        }
+        --*fuel;
+    }
+    return true;
 }
 
 /* GetTemplateObject's object from COOKED (an array of strings, undefined where an escape does not

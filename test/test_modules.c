@@ -1014,6 +1014,37 @@ static void test_declaration_rules(void) {
               "export const out = [y, ns.z, Object.keys(ns), JSON.stringify(ns)].join(' ');",
               "out", "1 2 y,z {\"y\":1,\"z\":2}");
 
+    /* a native that reads a namespace reads it as the script does: a [[Get]] of an export still
+     * in its TDZ is the first error, a [[GetOwnProperty]] of it the second, and neither sees
+     * the marker. Array methods take a namespace as any object with a length; to-primitive
+     * reads its toString. Then the same reads again, once the exports have their values. */
+    eq_export("import * as me from 'main';" TRY_ALL "const A = Array.prototype;"
+              "const fs = [() => A.join.call(me), () => A.slice.call(me), () => A.push.call(me, 1),"
+              "  () => A.map.call(me, (x) => x), () => A.indexOf.call(me, 1), () => A.sort.call(me),"
+              "  () => ((...x) => x).apply(null, me), () => Array.from(me), () => String(me),"
+              "  () => `${me}`, () => me + '', () => new RegExp(me), () => new Date(me),"
+              "  () => Object.getOwnPropertyDescriptor(me, 'length'),"
+              "  () => Object.assign({}, me).length, () => [].concat(me).length];"
+              "const early = t(fs); export const length = 2; export const toString = () => 'S';"
+              "export const out = early + '\\n' + t(fs);",
+              "out",
+              "ReferenceError: Cannot access 'length' before initialization|"
+              "ReferenceError: Cannot access 'length' before initialization|"
+              "ReferenceError: Cannot access 'length' before initialization|"
+              "ReferenceError: Cannot access 'length' before initialization|"
+              "ReferenceError: Cannot access 'length' before initialization|"
+              "ReferenceError: Cannot access 'length' before initialization|"
+              "ReferenceError: Cannot access 'length' before initialization|"
+              "ReferenceError: Cannot access 'length' before initialization|"
+              "ReferenceError: Cannot access 'toString' before initialization|"
+              "ReferenceError: Cannot access 'toString' before initialization|"
+              "ReferenceError: Cannot access 'toString' before initialization|"
+              "ReferenceError: Cannot access 'toString' before initialization|"
+              "ReferenceError: Cannot access 'toString' before initialization|"
+              "ReferenceError: length is not defined|ReferenceError: length is not defined|1\n"
+              ",|,|TypeError: Cannot assign to property '2' of [object Module]|,|-1|S|,|,|S|S|S|"
+              "/S/|Invalid Date|[object Object]|ReferenceError: out is not defined|1");
+
     /* the exporting module itself: a hoisted function, an assignment, a const */
     eq_export(TRY_ALL "function h() { return e; }"
               "export const out = t([h, () => { e = 2; }, () => { c = 2; }]);"

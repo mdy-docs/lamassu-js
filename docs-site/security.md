@@ -167,7 +167,10 @@ makes all its O(n log n) comparisons for one unit; string concatenation can copy
 rehash a large string in one step; the regex step budget is per call, so a
 loop of cheap-looking `re.test(s)` calls multiplies it. None of these are
 memory-unsafe and all are bounded per operation — but the aggregate is not
-bounded in *time* by fuel alone.
+bounded in *time* by fuel alone. The one builtin loop with no memory behind its
+length is charged: an array method on a receiver that is not an array
+(`Array.prototype.indexOf.call({ length: 2 ** 53 - 1 }, x)`) spends a unit of
+fuel for each index and reads the interrupt there.
 :::
 
 Arm a timer and call

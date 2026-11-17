@@ -118,7 +118,10 @@ all its O(n log n) comparisons for one unit; string concatenation can copy and
 rehash up to `JS_MAX_STRING_UNITS` per instruction; the regex step budget is per
 call, so a loop of cheap-looking `re.test(s)` calls multiplies it. None of these
 are memory-unsafe, and all are bounded per operation — but the aggregate is not
-bounded in *time* by fuel alone. Arm a timer and call `js_vm_interrupt`, which
+bounded in *time* by fuel alone. (The one builtin loop with no memory behind its
+length is charged: an array method on a receiver that is not an array,
+`Array.prototype.indexOf.call({ length: 2 ** 53 - 1 }, x)`, spends a unit of fuel
+for each index and reads the interrupt there.) Arm a timer and call `js_vm_interrupt`, which
 is safe from another thread or a signal handler and stops the run at the next
 dispatch. Keep an outer kill as well if the deadline is hard rather than
 best-effort: the interrupt is read between instructions, so a builtin already

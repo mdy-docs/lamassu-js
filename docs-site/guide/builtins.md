@@ -183,6 +183,26 @@ array of that length; anything else behaves like `Array.of`.
   `undefined` there; `map` leaves `undefined` where V8 leaves a hole). `splice` and `copyWithin`
   move and delete as the spec does, so a sealed or frozen array refuses them at the same write
   V8 does, with V8's message, and keeps the writes made before it.
+- **The methods are generic**, as V8's are. On a receiver that is not an array
+  (`Array.prototype.push.call(obj, v)`, a method assigned to another object, an object that
+  inherits from an array or from `Array.prototype`, a function, a string) they take the
+  specification's steps: `length` through `ToLength` (so `'2'` is 2, a missing or negative one
+  0, and it may be as large as 2<sup>53</sup> - 1), then the same reads, writes and deletes of
+  the receiver's indices in the same order, with the arguments converted where V8 converts
+  them. The errors are V8's, at the write V8 makes them: `Cannot add property 2, object is not
+  extensible`, `Cannot assign to read only property 'length' of object '[object Object]'`, a
+  length past 2<sup>53</sup> - 1, and for `undefined` or `null`
+  `Array.prototype.push called on null or undefined`. A primitive receiver is read as V8 reads
+  its wrapper object (a string has its characters and its `length`; a number, boolean or BigInt
+  has what its prototype has, which is nothing unless a script put it there), and cannot be
+  written (`Cannot assign to read only property '0' of object '[object String]'`). `concat`
+  spreads only arrays, as there is no `Symbol.isConcatSpreadable`: any other receiver or
+  argument is one element. See [Deviations](/guide/deviations#arrays) for the two places the
+  result differs: the copy has no holes, and a primitive receiver stays a primitive.
+- `flat` and `flatMap` go as deep as they are asked, whatever the nesting; an array that holds
+  itself, flattened without a limit, is `RangeError: Maximum call stack size exceeded` as in V8
+  (here after 2000 levels). `join` (and `toString`) of more than 2<sup>26</sup> code units, the
+  longest string there is, is `RangeError: Invalid string length`.
 
 Array elements are a flat `JsValue` vector (no holes/sparse storage), so
 `arr.length = n` or `Array(n)` for a very large `n` throws
@@ -231,7 +251,9 @@ boxed `String` object — this engine has no boxed-primitive type at all).
   number (`Number.prototype.toString requires that 'this' be a Number`), as `String.prototype`'s
   `toString`/`valueOf` need a string; the prototypes themselves stand for `0` and `""`, as V8's
   wrapper objects do. These tables, and functions' and promises', go on to `Object.prototype`
-  (`(1).hasOwnProperty`, `f.valueOf`).
+  (`(1).hasOwnProperty`, `f.valueOf`), and answer for any key the primitive does not have
+  itself, an index included: `(5)[0]` and `'ab'[7]` are `undefined` unless
+  `Number.prototype[0]` or `String.prototype[7]` has been set.
 
 `toString()`/number-to-string prints what V8 prints: the shortest digits that
 read back as the same double, and of those the nearest to its value (ties to
@@ -248,8 +270,9 @@ than correctly rounded — `sqrt`/`floor`/`ceil`/`trunc`/`round` are exact nativ
 Every function value, a script closure or a native, has `call`, `apply`, `bind` and `toString`:
 
 - `f.call(thisArg, ...args)` calls `f` with `this` set to `thisArg`.
-- `f.apply(thisArg, array)` does the same with the arguments in an array (`undefined` or `null`
-  for none; any other non-array is a `TypeError`, as there are no array-like objects here).
+- `f.apply(thisArg, list)` does the same with the arguments in an array, or in any object with
+  a `length`: its `[0, length)`, read as V8 reads them (`undefined` or `null` for none; a
+  primitive is `TypeError: CreateListFromArrayLike called on non-object`).
 - `f.bind(thisArg, ...args)` returns a function that calls `f` with that `this` and those arguments
   first; calling it with another `this` (or through `call`) does not change it. `new` on a bound
   function constructs `f` with the preset arguments and ignores the bound `this`.

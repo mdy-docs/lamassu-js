@@ -223,6 +223,8 @@ bool      js_op_to_number(JsContext *ctx, JsValue v, double *out);
 JsValue   js_take_error(JsContext *ctx);
 /* base[key] as the language reads it (prototype chain, a primitive's methods); false: error pending */
 bool      js_get_property(JsContext *ctx, JsValue base, JsValue key, JsValue *out);
+/* the same read of a key [[GetOwnProperty]] found on BASE; they differ in one error's words */
+bool      js_get_own_property(JsContext *ctx, JsValue base, JsValue key, JsValue *out);
 bool      js_set_property(JsContext *ctx, JsValue base, JsValue key, JsValue val);
 /* A property descriptor (data properties only: there are no accessors). HAS says which fields
  * the descriptor object named. */
@@ -242,6 +244,8 @@ int       js_own_property(JsContext *ctx, JsValue v, JsValue key, JsValue *value
 /* [[DefineOwnProperty]] on V (an object, function or promise): false with the TypeError pending */
 bool      js_define_own_property(JsContext *ctx, JsValue v, JsValue key, const JsPropDesc *d);
 bool      js_has_property(JsContext *ctx, JsValue base, JsValue key, bool *out);
+bool      js_delete_property(JsContext *ctx, JsValue base, JsValue key);
+bool      js_native_charge(JsContext *ctx);
 bool      js_is_extensible(JsContext *ctx, JsValue v);
 bool      js_function_has_own_special(JsValue fn, bool name);
 bool      js_prevent_extensions(JsContext *ctx, JsValue v);

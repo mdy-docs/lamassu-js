@@ -353,8 +353,8 @@ Tracked so differential testing against Node has a baseline.
   ~1e±22**; extreme magnitudes may differ from Node in the last digit
   (shortest-round-trip via float scaling, not a full big-integer dtoa).
 - **`Object.freeze` returns the object but does not enforce immutability.**
-- **`Array.from` supports strings and arrays**, not arbitrary array-likes or
-  iterators.
+- **`Array.from` takes any iterable or array-like**, and the `Array.prototype` methods and
+  `Function.prototype.apply` any object with a `length` (see the guide's Built-ins page).
 - **Regex** (`src/js_regexp.c`): `String.prototype.match/matchAll/search/
   replace/replaceAll/split` accept `RegExp` patterns. Two documented
   simplifications remain — `matchAll` returns an array rather than a lazy

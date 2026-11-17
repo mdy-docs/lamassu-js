@@ -129,6 +129,19 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   `arr.length = n` both throw `RangeError` past a fixed growth cap rather
   than eagerly allocating an attacker-chosen size; see
   [Built-ins → Array](/guide/builtins#array).
+- **An array method on another receiver gives V8's result, but for the holes.** The methods
+  are generic as V8's are (`Array.prototype.map.call({ length: 3, 0: 'a' }, f)`), and where V8's
+  result is an array with a hole for each index the receiver did not have (`map`, `slice`,
+  `splice`'s removed elements, `concat`), the result here has `undefined` there: `1 in result`
+  is `true` and `Object.keys` lists the index. A run of more than 4096 such indices is
+  `RangeError: Invalid array length`, the error writing that far past an array's end is. An
+  object receiver itself is left exactly as V8 leaves it, missing indices included.
+- **`flat` goes 2000 arrays deep**, the depth calls go here: an array nested further (or one
+  that holds itself), flattened all the way, is `RangeError: Maximum call stack size exceeded`.
+  V8 throws the same where its own stack ends, about five times deeper.
+- **A primitive receiver stays a primitive.** `Array.prototype.fill.call('abc', 1, 3)` returns
+  an object in V8 (`Object('abc')`) and `'abc'` here, and a callback's third argument is the
+  string, not its wrapper (no wrapper objects). What is read and what is refused are the same.
 
 ## Numbers
 

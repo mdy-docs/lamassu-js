@@ -587,6 +587,27 @@ static void test_fuel(void) {
     CHECK(st == RUN_OK);
     CHECK(strcmp(out, "4950") == 0);
     free(out);
+
+    /* a native's loop is charged a step at a time, as the script's own would be: an array method
+     * over an object whose length is 2**53 - 1 is not one instruction, and no catch outlasts it */
+    static const char *const loops[] = {
+        "A.indexOf.call(big, 1)",        "A.lastIndexOf.call(big, 1)", "A.includes.call(big, 1)",
+        "A.fill.call(big, 0)",           "A.reverse.call(big)",        "A.forEach.call(big, () => 0)",
+        "A.find.call(big, () => false)", "A.reduce.call(big, (a) => a, 0)", "A.join.call(big, '')",
+        "A.copyWithin.call(big, 1, 0)",  "A.unshift.call({ length: 2 ** 52 }, 1)",
+        "A.shift.call(big)",             "A.splice.call(big, 0, 1)",   "A.sort.call(big)",
+    };
+    opts.fuel = 200000;
+    for (size_t i = 0; i < sizeof loops / sizeof loops[0]; i++) {
+        char src[256];
+        snprintf(src, sizeof src,
+                 "const A = Array.prototype, big = { length: 2 ** 53 - 1 };"
+                 "try { %s; } catch (e) {} 'never';", loops[i]);
+        st = run_src_opts(src, &opts, &out);
+        CHECK(st == RUN_RUNTIME_ERR);
+        CHECK(strstr(out, "budget") != NULL);
+        free(out);
+    }
 }
 
 static void test_heap_limit(void) {
@@ -1097,6 +1118,14 @@ static void test_interrupt(void) {
 
     /* ...and stays stopped through a catch, because the flag does not clear */
     st = run_with_stop("stopNow(); while (true) { try { 1; } catch (e) {} } 'never';",
+                       &out, false);
+    CHECK(st == 2);
+    CHECK(strstr(out, "interrupted") != NULL);
+    free(out);
+
+    /* nor is a native's loop out of its reach: an array method over a length no array has */
+    st = run_with_stop("const big = { length: 2 ** 53 - 1, 0: { valueOf() { stopNow(); return 0; } } };"
+                       "try { Array.prototype.indexOf.call(big, 1, big[0]); } catch (e) {} 'never';",
                        &out, false);
     CHECK(st == 2);
     CHECK(strstr(out, "interrupted") != NULL);
