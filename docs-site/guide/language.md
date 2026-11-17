@@ -63,8 +63,8 @@ supported. `debugger;` is a statement that does nothing (there is no debugger to
   ignored), the key is a name or a string (`"__proto__": v`), and a literal may say it once
   (`SyntaxError: Duplicate __proto__ fields are not allowed in object literals`). A computed key
   (`["__proto__"]: v`), a shorthand and a method of that name are ordinary properties.
-  `__proto__` as an accessor property is **not** there: `o.__proto__` is `undefined`, and
-  assigning to it makes a property.
+  `o.__proto__` reads the prototype and `o.__proto__ = p` sets it, through the accessor on
+  `Object.prototype` ([Built-ins](/guide/builtins)).
 - **Classes are not supported.** Use constructor functions and
   `Ctor.prototype` instead — see the example below. `super` goes with them: V8 also takes
   `super.x` in a method of an object literal, which here is

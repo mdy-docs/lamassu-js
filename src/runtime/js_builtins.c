@@ -3483,7 +3483,7 @@ static bool json_object(JsonS *s, JsValue ov, JsValue key) {
         JsValue v;
         bool found = false;
         if (o) { /* an own data property is what [[Get]] reads; else (deleted meanwhile) the chain */
-            v = js_map_get(&o->props, js_value_string(k), &found);
+            v = js_prop_value(ctx, ov, js_map_get(&o->props, js_value_string(k), &found));
         }
         if (!found && !js_get_property(ctx, ov, k, &v)) {
             ok = false;
@@ -4518,12 +4518,12 @@ static bool obj_keys_impl(JsContext *ctx, JsValue tv, const JsValue *args, int a
                 if (mode == 0) {
                     entry = js_value_from_cell(&e->key->gc);
                 } else if (mode == 1) {
-                    entry = e->value;
+                    entry = js_prop_value(ctx, v, e->value);
                 } else {
                     JsObject *pair = js_array_new_cell(ctx, 2);
                     if (!pair) { ok = false; break; }
                     pair->elems[0] = js_value_from_cell(&e->key->gc);
-                    pair->elems[1] = e->value;
+                    pair->elems[1] = js_prop_value(ctx, v, e->value);
                     pair->elem_count = 2;
                     entry = js_value_from_cell(&pair->gc);
                 }
@@ -4818,7 +4818,8 @@ static bool test_integrity(JsContext *ctx, const JsValue *args, int argc, JsValu
             ok = false;
             break;
         }
-        if (st > 0 && (!(attrs & JS_ATTR_FIXED) || (frozen && !(attrs & JS_ATTR_READONLY))))
+        /* (the __proto__ accessor, st 2, has no [[Writable]] to ask about) */
+        if (st > 0 && (!(attrs & JS_ATTR_FIXED) || (frozen && st != 2 && !(attrs & JS_ATTR_READONLY))))
             result = false;
     }
     js_gc_unprotect(ctx->vm, &value);
@@ -5356,7 +5357,7 @@ static bool to_property_descriptor(JsContext *ctx, JsValue dv, JsPropDesc *d, Js
         return native_throw_fmt(ctx, r, "TypeError: Property description must be an object: %v", dv);
     d->has = 0;
     bool accessor = false;
-    JsValue getter = js_undefined();
+    JsValue getter = js_undefined(), setter = js_undefined();
     for (int i = 0; i < 6; i++) {
         JsString *ks = js_ascii_cell(ctx->vm, names[i]);
         JsValue kv = ks ? js_value_from_cell(&ks->gc) : js_undefined();
@@ -5379,15 +5380,24 @@ static bool to_property_descriptor(JsContext *ctx, JsValue dv, JsPropDesc *d, Js
                 return native_throw_fmt(ctx, r, i == 4 ? "TypeError: Getter must be a function: %v"
                                                        : "TypeError: Setter must be a function: %v", fv);
             accessor = true;
-            getter = fv;
+            *(i == 4 ? &getter : &setter) = fv; /* the engine's own two, if these are they: not collectable */
             break;
         }
     }
-    (void)getter;
     if (accessor && (d->has & (JS_DESC_VALUE | JS_DESC_WRITABLE)))
         return native_throw_fmt(ctx, r, "TypeError: Invalid property descriptor. Cannot both specify accessors and a value or writable attribute, %v", dv);
-    if (accessor)
+    if (accessor) {
+        /* the one accessor there is, restated (a descriptor Object.getOwnPropertyDescriptor gave
+         * for `__proto__`): the marker stands for the pair, and js_define_own_property takes it
+         * under that name only */
+        if (js_is_function(getter) && js_value_cell(getter) == &ctx->proto_getter->gc &&
+            js_is_function(setter) && js_value_cell(setter) == &ctx->proto_setter->gc) {
+            d->has |= JS_DESC_VALUE;
+            d->value.bits = JS_SPECIAL_ACCESSOR;
+            return true;
+        }
         return native_throw(ctx, r, "TypeError: Accessor properties (get, set) are not supported");
+    }
     return true;
 }
 
@@ -5468,14 +5478,17 @@ static bool obj_defineProperties(JsContext *ctx, JsValue tv, const JsValue *args
     return true;
 }
 
-/* FromPropertyDescriptor: {value, writable, enumerable, configurable}, in V8's order */
-static bool descriptor_object(JsContext *ctx, JsValue value, uint8_t attrs, JsValue *out) {
+/* FromPropertyDescriptor: {value, writable, enumerable, configurable}, in V8's order; for the
+ * `__proto__` accessor (ACCESSOR), {get, set, enumerable, configurable} with its two functions */
+static bool descriptor_object(JsContext *ctx, JsValue value, uint8_t attrs, bool accessor, JsValue *out) {
     JsValue o = js_object_new(ctx);
     if (!js_is_object(o))
         return false;
     js_gc_protect(ctx->vm, &o);
-    bool ok = js_object_set_ascii(ctx, js_value_object(o), "value", value) &&
-              js_object_set_ascii(ctx, js_value_object(o), "writable", js_bool(!(attrs & JS_ATTR_READONLY))) &&
+    bool ok = (accessor ? js_object_set_ascii(ctx, js_value_object(o), "get", js_value_from_cell(&ctx->proto_getter->gc)) &&
+                          js_object_set_ascii(ctx, js_value_object(o), "set", js_value_from_cell(&ctx->proto_setter->gc))
+                        : js_object_set_ascii(ctx, js_value_object(o), "value", value) &&
+                          js_object_set_ascii(ctx, js_value_object(o), "writable", js_bool(!(attrs & JS_ATTR_READONLY)))) &&
               js_object_set_ascii(ctx, js_value_object(o), "enumerable", js_bool(!(attrs & JS_ATTR_HIDDEN))) &&
               js_object_set_ascii(ctx, js_value_object(o), "configurable", js_bool(!(attrs & JS_ATTR_FIXED)));
     js_gc_unprotect(ctx->vm, &o);
@@ -5502,7 +5515,7 @@ static bool obj_getOwnPropertyDescriptor(JsContext *ctx, JsValue tv, const JsVal
         return true;
     }
     js_gc_protect(ctx->vm, &value);
-    bool ok = descriptor_object(ctx, value, attrs, r);
+    bool ok = descriptor_object(ctx, value, attrs, st == 2, r);
     js_gc_unprotect(ctx->vm, &value);
     return ok || oom(ctx, r);
 }
@@ -5535,7 +5548,7 @@ static bool obj_getOwnPropertyDescriptors(JsContext *ctx, JsValue tv, const JsVa
         }
         if (st == 0)
             continue;
-        ok = descriptor_object(ctx, value, attrs, &dv) &&
+        ok = descriptor_object(ctx, value, attrs, st == 2, &dv) &&
              js_map_set(ctx->vm, &js_value_object(out)->props, js_value_string(no->elems[i]), dv);
     }
     js_gc_unprotect(ctx->vm, &dv);
@@ -5565,6 +5578,18 @@ static bool obj_isExtensible(JsContext *ctx, JsValue tv, const JsValue *args, in
     return true;
 }
 
+/* [[SetPrototypeOf]] of V (an object, function or promise) for a builtin: false with V8's
+ * TypeError in *R when it is refused */
+static bool set_proto_or_throw(JsContext *ctx, JsValue v, JsValue proto, JsValue *r) {
+    switch (js_set_proto(ctx, v, proto)) {
+    case 0: return true;
+    case 1: return native_throw_fmt(ctx, r, "TypeError: %v is not extensible", v);
+    case 2: return native_throw(ctx, r, "TypeError: Cyclic __proto__ value");
+    default:
+        return native_throw(ctx, r, "TypeError: Immutable prototype object 'Object.prototype' cannot have their prototype set");
+    }
+}
+
 /* Object.setPrototypeOf(v, proto): for an object, function or promise, as V8 (a sealed or frozen
  * one keeps its prototype; a chain may not loop); a primitive is returned as it is. */
 static bool obj_setPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
@@ -5575,15 +5600,31 @@ static bool obj_setPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, 
         return native_throw(ctx, r, "TypeError: Object.setPrototypeOf called on null or undefined");
     if (!is_object_type_arg(proto) && !js_is_null(proto))
         return native_throw_fmt(ctx, r, "TypeError: Object prototype may only be an Object or null: %v", proto);
-    if (is_object_type_arg(v)) {
-        int st = js_set_proto(ctx, v, proto);
-        if (st == 1)
-            return native_throw_fmt(ctx, r, "TypeError: %v is not extensible", v);
-        if (st == 2)
-            return native_throw(ctx, r, "TypeError: Cyclic __proto__ value");
-    }
+    if (is_object_type_arg(v) && !set_proto_or_throw(ctx, v, proto, r))
+        return false;
     *r = v;
     return true;
+}
+
+/* get __proto__ (B.2.2.1.1): the [[Prototype]] of ToObject(this) */
+static bool objp_proto_get(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args;
+    (void)argc;
+    if (js_is_undefined(tv) || js_is_null(tv))
+        return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
+    *r = js_get_proto(ctx, tv);
+    return true;
+}
+
+/* set __proto__ (B.2.2.1.2): as the assignment o.__proto__ = v runs it, called by hand */
+static bool objp_proto_set(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    JsValue proto = ARG(0);
+    if (js_is_undefined(tv) || js_is_null(tv))
+        return native_throw(ctx, r, "TypeError: set Object.prototype.__proto__ called on null or undefined");
+    *r = js_undefined();
+    if ((!is_object_type_arg(proto) && !js_is_null(proto)) || !is_object_type_arg(tv))
+        return true;
+    return set_proto_or_throw(ctx, tv, proto, r);
 }
 
 /* Object(...): callable with or without `new` (see JS_OP_NEW's native-
@@ -6465,6 +6506,24 @@ bool js_builtins_init(JsContext *ctx) {
         {NULL, NULL}};
     if (!install_methods(ctx, ctx->object_proto, object_proto_methods))
         return false;
+    /* __proto__: the one accessor property. Its entry holds the marker, which a read turns into
+     * the receiver's prototype and an assignment into a change of it (js_interp.c); the two
+     * functions are what its descriptor shows. Not enumerable (hide_builtin_keys), configurable. */
+    {
+        JsValue g = js_native_new(ctx, "get __proto__", objp_proto_get, NULL);
+        if (!js_is_function(g))
+            return false;
+        ctx->proto_getter = (JsNative *)js_value_cell(g);
+        JsValue s = js_native_new(ctx, "set __proto__", objp_proto_set, NULL);
+        if (!js_is_function(s))
+            return false;
+        ctx->proto_setter = (JsNative *)js_value_cell(s);
+        ctx->proto_setter->length = 1;
+        JsValue marker;
+        marker.bits = JS_SPECIAL_ACCESSOR;
+        if (!js_object_set_ascii(ctx, ctx->object_proto, "__proto__", marker))
+            return false;
+    }
 
     /* method tables — assign each into ctx before the next allocation so it
      * is a GC root immediately (gc_stress collects at every allocation) */

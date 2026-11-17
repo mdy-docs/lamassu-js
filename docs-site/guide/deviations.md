@@ -20,13 +20,11 @@ so everything left is left out by design:
   is no time zone database; V8 uses the host's zone.
 - `Object.getOwnPropertySymbols`, and everything else that takes or returns a symbol: there
   are no symbols.
-- `__proto__`, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__`:
-  there are no accessors. `o.__proto__` is `undefined`, `o.__proto__ = p` makes a property named
-  `__proto__`, and a pattern's `{ __proto__: p } = o` reads that property; use
-  `Object.getPrototypeOf` and `Object.setPrototypeOf`. (`{ __proto__: p }` in an object literal
-  is syntax, not the accessor, and sets the prototype as in V8.) For the same reason `size` (`Map`, `Set`) and `source`, `flags`,
-  `global` and the other flags (`RegExp`) are read from the instance rather than through an
-  accessor on the prototype, so they work as in V8 but
+- `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__`: a script
+  cannot make an accessor property (see Objects, below). `Object.prototype.__proto__` **is**
+  there and is the one accessor the engine has. For the same reason `size` (`Map`, `Set`) and
+  `source`, `flags`, `global` and the other flags (`RegExp`) are read from the instance rather
+  than through an accessor on the prototype, so they work as in V8 but
   `Object.getOwnPropertyNames(Map.prototype)` does not list `size`.
 - `Function.prototype.constructor`, `arguments` and `caller`: see Functions, below.
 - `Error.prepareStackTrace`: see Errors, below.
@@ -54,10 +52,10 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
 
 ## Objects
 
-- **`Object.prototype` has five methods** — `hasOwnProperty`, `isPrototypeOf`,
+- **`Object.prototype` has five methods and `__proto__`** — `hasOwnProperty`, `isPrototypeOf`,
   `propertyIsEnumerable`, `toString`, `valueOf`. V8 also has `toLocaleString` (left out with the
-  locale methods) and the legacy `__proto__`, `__defineGetter__` (and the rest) accessors (there
-  are no accessors). `toString` gives V8's tags
+  locale methods) and the legacy `__defineGetter__`, `__defineSetter__`, `__lookupGetter__` and
+  `__lookupSetter__` (a script cannot make an accessor). `toString` gives V8's tags
   (`Object.prototype.toString.call(x)` is `[object Array]`, `[object Error]`,
   `[object Null]`, `[object Math]`, `[object AsyncFunction]`, …), and what
   inherits from `Math`, `JSON`, `Promise.prototype`, `AsyncFunction.prototype`, `Map.prototype`,
@@ -65,6 +63,13 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   `Symbol.toStringTag` makes it; there is no
   symbol to set another (there are no symbols). `Array.prototype` is a plain object here, not an
   array, so its tag is `[object Object]` (V8: `[object Array]`).
+- **`__proto__` is the one accessor property.** `Object.prototype.__proto__` reads and sets a
+  value's prototype as in V8 (see [Built-ins](/guide/builtins)), its descriptor has V8's `get`
+  and `set` functions, and it can be deleted, redefined as a data property, or defined on
+  another object under the name `__proto__` with that descriptor. What V8 takes and lamassu
+  refuses (`TypeError: Accessor properties (get, set) are not supported`): a descriptor with
+  any other `get` or `set`, with only one of those two functions, or with them under another
+  name (`Object.defineProperty(o, 'parent', descriptor)`).
 - **`Object(primitiveValue)` returns the primitive unchanged** rather than
   boxing it into a wrapper object — this engine has no boxed-primitive type
   at all. `Object()`/`Object(null)`/`Object(undefined)` (a new empty

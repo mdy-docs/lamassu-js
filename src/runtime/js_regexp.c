@@ -601,6 +601,7 @@ static bool named_groups_obj(JsContext *ctx, JsRegExp *re, const JsString *s,
     JsValue obj = js_object_new(ctx);
     if (!js_is_object(obj))
         return false;
+    js_value_object(obj)->proto = js_undefined(); /* no prototype, as V8: a group may be named anything */
     js_gc_protect(vm, &obj);
     JsValue kv = js_undefined(), vv = js_undefined();
     js_gc_protect(vm, &kv);

@@ -360,6 +360,10 @@ void js_gc_collect(JsVm *vm) {
             js_gc_mark_cell(vm, &ctx->promise_methods->gc);
         if (ctx->object_proto)
             js_gc_mark_cell(vm, &ctx->object_proto->gc);
+        if (ctx->proto_getter)
+            js_gc_mark_cell(vm, &ctx->proto_getter->gc);
+        if (ctx->proto_setter)
+            js_gc_mark_cell(vm, &ctx->proto_setter->gc);
         if (ctx->array_proto)
             js_gc_mark_cell(vm, &ctx->array_proto->gc);
         if (ctx->regexp_proto)

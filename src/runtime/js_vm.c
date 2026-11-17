@@ -256,6 +256,7 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->async_function_proto = NULL;
     ctx->promise_methods = NULL;
     ctx->object_proto = NULL;
+    ctx->proto_getter = ctx->proto_setter = NULL;
     ctx->array_proto = NULL;
     ctx->regexp_proto = NULL;
     ctx->date_proto = NULL;

@@ -163,7 +163,13 @@ JsValue js_object_get(JsVm *vm, JsValue obj, JsValue key) {
     JsValue v = js_map_get(&js_value_object(obj)->props, k, &found);
     /* a namespace's let/const export before its declaration has run: the TDZ marker never
      * leaves the engine, so the host sees it as not there yet */
-    return v.bits == JS_SPECIAL_TDZ ? js_undefined() : v;
+    if (v.bits == JS_SPECIAL_TDZ)
+        return js_undefined();
+    if (v.bits == JS_SPECIAL_ACCESSOR) { /* the `__proto__` accessor: what it reads */
+        JsValue p = js_value_object(obj)->proto;
+        return js_is_undefined(p) ? js_null() : p;
+    }
+    return v;
 }
 
 bool js_object_set(JsVm *vm, JsValue obj, JsValue key, JsValue value) {

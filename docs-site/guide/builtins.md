@@ -68,7 +68,28 @@ another object's prototype (`Object.create(f)` reads `f`'s properties, `name` an
 included). A chain may not loop (`TypeError: Cyclic __proto__ value`), and a sealed or frozen
 value keeps its prototype. `instanceof` and `Object.getPrototypeOf` follow such chains. A
 function from `bind` starts with its target's prototype. An object literal names its prototype
-with `{ __proto__: proto }` ([Language](/guide/language)).
+with `{ __proto__: proto }` ([Language](/guide/language)). `Object.prototype` keeps its `null`
+prototype (`TypeError: Immutable prototype object 'Object.prototype' cannot have their prototype
+set`).
+
+`Object.prototype.__proto__` is V8's accessor. `v.__proto__` is `Object.getPrototypeOf(v)` for
+any value but `null` and `undefined` (a primitive gives its type's prototype), and
+`o.__proto__ = p` sets the prototype of an object, function or promise and makes no property:
+`p` is an object, a function or `null`, any other value is ignored, and so is an assignment on
+a primitive. It throws what `setPrototypeOf` throws (`Cyclic __proto__ value`,
+`#<Object> is not extensible`). Every way of assigning goes through it (`o['__proto__'] = p`,
+a computed key, `Object.assign`), so **copying untrusted keys onto an object with `t[k] = v`
+can change `t`'s prototype**, exactly as in V8; what *defines* a property makes an own one named
+`__proto__` instead: `JSON.parse`, `Object.fromEntries`, `Object.groupBy`, spread and rest, a
+computed key in a literal, `Object.defineProperty`, and a regexp's named `groups` (which have
+no prototype). An object without `Object.prototype` on its chain (`Object.create(null)`, or
+after `o.__proto__ = null`) has no `__proto__`, and an own property of that name shadows it.
+Its descriptor is `{ get, set, enumerable: false, configurable: true }` with the functions
+`get __proto__` and `set __proto__`; `delete Object.prototype.__proto__` removes it, after
+which the name is an ordinary property everywhere, and a frozen `Object.prototype` leaves it
+working. At the top level a bare `__proto__` is the global object's, as any name missing from
+the global scope is looked up on the global object's prototype chain (`typeof toString` is
+`"function"`).
 
 `Object.create(proto, props)` makes a plain object whose prototype is `proto` (an object, function
 or promise) or none (`null`); anything else is V8's `TypeError: Object prototype may only be an
@@ -79,8 +100,10 @@ Object or null`. `props` describes its properties, as `Object.defineProperties` 
 them; a missing one is `false` on a new property and unchanged on an existing one) and validate
 them as V8 does (`TypeError: Cannot redefine property: x` for a change a non-configurable property
 refuses; `Cannot define property x, object is not extensible`). A `get` or `set` is a `TypeError`:
-there are no accessor properties. `getOwnPropertyDescriptor(o, key)` returns `{ value, writable,
-enumerable, configurable }` or `undefined`, and `getOwnPropertyDescriptors(o)` one for each key
+a script cannot make an accessor property (the one exception is `__proto__`'s own pair, see
+[Deviations](/guide/deviations)). `getOwnPropertyDescriptor(o, key)` returns `{ value, writable,
+enumerable, configurable }` (`{ get, set, enumerable, configurable }` for `__proto__`) or
+`undefined`, and `getOwnPropertyDescriptors(o)` one for each key
 `getOwnPropertyNames` lists. Redefining a function's `name` or `length` works as in V8 (it is
 configurable); `prototype` can be given a value or made read-only. What lamassu cannot store
 (attributes on an array element, a read-only array `length` or regexp `lastIndex`) is a

@@ -731,6 +731,9 @@ struct JsContext {
      * Cached here so allocation sites (js_array_new_cell, alloc_mapobj, ...)
      * don't need to look "Ctor.prototype" up through a property read on
      * every single instance they create. */
+    struct JsNative *proto_getter, *proto_setter; /* `get __proto__` and `set __proto__`: what the
+                             * accessor's descriptor shows (Object.getOwnPropertyDescriptor), and
+                             * what Object.defineProperty takes back. GC roots. */
     JsObject *object_proto; /* root of the chain; its own ->proto is undefined
                              * (no [[Prototype]]), matching real JS's `null`.
                              * Created first in js_builtins_init, before

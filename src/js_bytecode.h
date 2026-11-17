@@ -192,6 +192,14 @@ extern const JsOpInfo js_op_info[JS_OP__COUNT];
 
 /* TDZ sentinel: internal special value, never exposed to scripts. */
 #define JS_SPECIAL_TDZ (JS_TAG_SPECIAL | 4)
+/* The `__proto__` accessor, the one accessor property there is: the value of the property named
+ * `__proto__` that Object.prototype has (and of one Object.defineProperty copies elsewhere under
+ * that name). Internal too: a read that finds it gives the receiver's [[Prototype]], an
+ * assignment that finds it sets that, and every reader that hands a property's value to a script
+ * turns it into one or the other first. */
+#define JS_SPECIAL_ACCESSOR (JS_TAG_SPECIAL | 5)
+/* Either of the two: one test where a property's value is about to reach a script */
+static inline bool js_is_marker(JsValue v) { return (v.bits | 1) == JS_SPECIAL_ACCESSOR; }
 
 /* Runs fn on a fresh fiber. False -> *result is the error value. */
 bool js_interp_run(JsContext *ctx, JsFunctionCell *fn, JsValue *result);
@@ -228,7 +236,8 @@ typedef struct JsPropDesc {
     JsValue value;
 } JsPropDesc;
 /* V's own property KEY (a string; V not undefined or null): 1 with its value and JS_ATTR_* bits,
- * 0 when it has none, -1 with an error pending */
+ * 2 (its value undefined) when it is the `__proto__` accessor, 0 when it has none, -1 with an
+ * error pending */
 int       js_own_property(JsContext *ctx, JsValue v, JsValue key, JsValue *value, uint8_t *attrs);
 /* [[DefineOwnProperty]] on V (an object, function or promise): false with the TypeError pending */
 bool      js_define_own_property(JsContext *ctx, JsValue v, JsValue key, const JsPropDesc *d);
@@ -371,8 +380,16 @@ JsObject *js_cell_props(JsContext *ctx, JsValue v, bool create);
  * until a script sets another; a number's, string's and boolean's their methods' table. */
 JsValue js_get_proto(JsContext *ctx, JsValue v);
 /* [[SetPrototypeOf]] of an object, function or promise V to PROTO (one of those, or null):
- * 0 done, 1 refused (V is sealed or frozen), 2 refused (PROTO's chain reaches V). */
+ * 0 done, 1 refused (V is sealed or frozen), 2 refused (PROTO's chain reaches V), 3 refused (V is
+ * Object.prototype, whose prototype is fixed). */
 int js_set_proto(JsContext *ctx, JsValue v, JsValue proto);
+/* The value of V's property that was read as VAL: VAL, or V's [[Prototype]] when VAL is the
+ * `__proto__` accessor's marker. For the readers that take a value out of a property map. */
+static inline JsValue js_prop_value(JsContext *ctx, JsValue v, JsValue val) {
+    return JS_UNLIKELY(val.bits == JS_SPECIAL_ACCESSOR) ? js_get_proto(ctx, v) : val;
+}
+/* Whether KEY (a string value) is "__proto__" */
+bool js_is_proto_key(JsValue key);
 /* Whether V is a function or promise: a value whose own properties are js_cell_props */
 static inline bool js_has_cell_props(JsValue v) { return js_is_function(v) || js_is_promise(v); }
 /* A function value's `name` (closure or native); NULL for none, which reads as "". */
