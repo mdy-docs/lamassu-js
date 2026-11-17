@@ -273,15 +273,23 @@ static void lex_ident(JsLexer *lx) {
 
 /* ---- numbers (double conversion shared via js_number.c) ---- */
 
+/* What may not follow a numeric literal directly: the start of a name (an escape's backslash is
+ * one, whatever it spells) or a digit. V8 reports the literal, at its first character. */
+static bool number_runs_on(const JsLexer *lx) {
+    return is_id_start(cur(lx)) || is_digit(cur(lx)) || cur(lx) == '\\';
+}
+
 /* A numeric separator at lx->pos, inside a run of RADIX digits that has at least one digit: true
- * (and stepped over) when a digit follows, else false with V8's error. */
+ * (and stepped over) when a digit follows, else false with V8's error, which it places after
+ * the separator. */
 static bool lex_separator(JsLexer *lx, int radix) {
     uint16_t next = at(lx, 1);
     if (next == '_')
         return lex_fail(lx, lx->pos + 1, "Only one underscore is allowed as numeric separator");
     int d = hex_val(next);
     if (d < 0 || d >= radix)
-        return lex_fail(lx, lx->pos, "Numeric separators are not allowed at the end of numeric literals");
+        return lex_fail(lx, lx->pos + 1,
+                        "Numeric separators are not allowed at the end of numeric literals");
     lx->pos++;
     return true;
 }
@@ -333,7 +341,7 @@ static bool lex_number(JsLexer *lx) {
                 for (uint32_t k = 1; k < i; k++)
                     value = value * 8 + (at(lx, k) - '0');
                 lx->pos = start + i;
-                if (is_id_start(cur(lx)) || is_digit(cur(lx)))
+                if (number_runs_on(lx))
                     return lex_fail(lx, start, "Invalid or unexpected token");
                 lex_late(lx, start, lx->pos, "Octal literals are not allowed in strict mode.");
                 lx->tok.kind = JS_T_NUM;
@@ -389,7 +397,7 @@ static bool lex_number(JsLexer *lx) {
                 lx->pos++;
             }
             if (!is_digit(cur(lx)))
-                return lex_fail(lx, lx->pos, "Invalid or unexpected token");
+                return lex_fail(lx, start, "Invalid or unexpected token");
             while (is_digit(cur(lx)) || cur(lx) == '_') {
                 if (cur(lx) == '_') {
                     if (!lex_separator(lx, 10))
@@ -419,7 +427,7 @@ static bool lex_number(JsLexer *lx) {
     }
 
     if (leading) {
-        if (cur(lx) == 'n' || is_id_start(cur(lx)) || is_digit(cur(lx)))
+        if (cur(lx) == 'n' || number_runs_on(lx))
             return lex_fail(lx, start, "Invalid or unexpected token");
         lex_late(lx, start, lx->pos, "Decimals with leading zeros are not allowed in strict mode.");
     }
@@ -438,16 +446,16 @@ static bool lex_number(JsLexer *lx) {
             if (lx->src[start + i] != '_')
                 text[k++] = lx->src[start + i];
         lx->pos++; /* n */
-        if (is_id_start(cur(lx)) || is_digit(cur(lx)))
-            return lex_fail(lx, lx->pos, "Invalid or unexpected token");
+        if (number_runs_on(lx))
+            return lex_fail(lx, start, "Invalid or unexpected token");
         lx->tok.kind = JS_T_BIGINT;
         lx->tok.u.str.units = text;
         lx->tok.u.str.len = k;
         lx->tok.u.str.cont = false;
         return true;
     }
-    if (is_id_start(cur(lx)) || is_digit(cur(lx)))
-        return lex_fail(lx, lx->pos, "Invalid or unexpected token");
+    if (number_runs_on(lx))
+        return lex_fail(lx, start, "Invalid or unexpected token");
 
     lx->tok.kind = JS_T_NUM;
     lx->tok.u.number = value;
