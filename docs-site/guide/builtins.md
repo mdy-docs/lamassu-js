@@ -459,6 +459,9 @@ There is no `Symbol`, so what is iterable is the engine's own: strings (by code 
 so `[...map.keys()]` works and a part-consumed iterator spreads what is left), and **any object
 that inherits from `Iterator.prototype`**, which is how a script makes its own iterator: in V8
 `Iterator.prototype[Symbol.iterator]` returns the object itself, so its `next` is what steps it.
+An object that inherits from `Array.prototype` without being an array (`Object.create([1, 2])`)
+is iterated as V8 iterates it, by `Array.prototype.values` over its `length` and indices; an
+array as a prototype passes on its elements and `length` like any other property.
 
 ```js
 const countdown = Object.create(Iterator.prototype);

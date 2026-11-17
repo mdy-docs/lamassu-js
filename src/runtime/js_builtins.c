@@ -5275,6 +5275,13 @@ static bool objp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int a
     return true;
 }
 
+bool js_is_object_to_string(JsValue v) {
+    if (!js_is_function(v) || js_value_cell(v)->kind != JS_KIND_NATIVE)
+        return false;
+    const JsNative *nf = (const JsNative *)js_value_cell(v);
+    return !nf->is_bound && nf->fn == objp_toString;
+}
+
 /* Object.prototype.valueOf: ToObject(this), which for a primitive is the primitive itself here
  * (there are no wrapper objects) */
 static bool objp_valueOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {

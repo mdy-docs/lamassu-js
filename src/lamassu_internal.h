@@ -949,6 +949,8 @@ JsObject *js_iterable_to_array(JsContext *ctx, JsValue v, JsValue *err);
 bool js_split_limit(JsContext *ctx, JsValue limit, uint32_t *lim);
 /* The tag Object.prototype.toString gives V ("Array" for "[object Array]"), as V8's */
 const char *js_to_string_tag(const JsContext *ctx, JsValue v);
+/* V is the Object.prototype.toString the engine made (whatever a script has put in its place) */
+bool js_is_object_to_string(JsValue v);
 bool js_array_set_index(JsVm *vm, JsObject *arr, uint32_t idx, JsValue v);
 
 /* ---- allocator (js_vm.c) ---- */

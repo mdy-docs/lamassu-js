@@ -1001,6 +1001,62 @@ __attribute__((noinline)) static bool special_prop_get(JsContext *ctx, JsObject 
     return handled;
 }
 
+/* The own properties of a prototype PO that live outside its property map, for a read that
+ * reaches it through an inheritor: an array's elements and `length`, an error's `stack`, a
+ * regexp's `lastIndex` (data properties in V8 too, so they are inherited as any other). What V8
+ * reads through an accessor that checks its receiver (a Map's size, a regexp's source) is not
+ * passed on. True when KEY is one: *ST says how the read went. */
+__attribute__((noinline)) static bool exotic_proto_get(JsContext *ctx, JsObject *po, JsValue key,
+                                                       JsValue *out, JsPropStatus *st) {
+    *st = JS_PROP_OK;
+    if (po->obj_kind == JS_OBJ_ARRAY) {
+        uint32_t idx;
+        if (key_to_index(key, &idx)) {
+            if (idx >= po->elem_count)
+                return false;
+            *out = po->elems[idx];
+            return true;
+        }
+        if (is_length_key(key)) {
+            *out = js_number(po->elem_count);
+            return true;
+        }
+        return false;
+    }
+    if (po->obj_kind == JS_OBJ_ERROR) {
+        bool handled = false;
+        if (!js_error_stack_get(ctx, po, key, out, &handled)) {
+            *st = JS_PROP_OOM;
+            return true;
+        }
+        return handled;
+    }
+#ifdef LAMASSU_HAS_REGEX
+    if (po->obj_kind == JS_OBJ_REGEXP && js_is_string(key) &&
+        units_is_ascii_str(js_value_string(key), "lastIndex")) {
+        bool handled = false;
+        if (!js_regexp_prop_get(ctx, po, key, out, &handled))
+            *st = JS_PROP_OOM;
+        return true;
+    }
+#endif
+    return false;
+}
+
+/* HasProperty's share of the same: KEY is one of PO's own properties outside its map */
+__attribute__((noinline)) static bool exotic_proto_has(JsObject *po, JsValue key) {
+    if (po->obj_kind == JS_OBJ_ARRAY) {
+        uint32_t idx;
+        if (key_to_index(key, &idx))
+            return idx < po->elem_count;
+        return is_length_key(key);
+    }
+    if (po->obj_kind == JS_OBJ_ERROR)
+        return js_error_stack_has(po, key);
+    return po->obj_kind == JS_OBJ_REGEXP && js_is_string(key) &&
+           units_is_ascii_str(js_value_string(key), "lastIndex");
+}
+
 __attribute__((noinline)) static JsPropStatus parent_ctor_lookup(JsContext *ctx, JsNative *p, JsValue key,
                                                                JsValue *out);
 
@@ -1135,6 +1191,11 @@ static JsPropStatus get_property(JsContext *ctx, JsValue base, JsValue key,
         JsValue proto = o->proto;
         for (int depth = 0; depth < JS_PROTO_CHAIN_LIMIT && js_is_object(proto); depth++) {
             JsObject *po = js_value_object(proto);
+            if (JS_UNLIKELY(po->obj_kind != JS_OBJ_PLAIN)) { /* an array as a prototype, ... */
+                JsPropStatus st;
+                if (exotic_proto_get(ctx, po, key, out, &st))
+                    return st;
+            }
             bool pfound;
             JsValue pv = js_map_get(&po->props, k, &pfound);
             if (pfound) {
@@ -1542,6 +1603,10 @@ static JsPropStatus has_property(JsContext *ctx, JsValue base, JsValue key,
     JsValue proto = o->proto;
     for (int depth = 0; depth < JS_PROTO_CHAIN_LIMIT && js_is_object(proto); depth++) {
         JsObject *po = js_value_object(proto);
+        if (JS_UNLIKELY(po->obj_kind != JS_OBJ_PLAIN) && exotic_proto_has(po, key)) {
+            *out = true;
+            return JS_PROP_OK;
+        }
         js_map_get(&po->props, k, &found);
         if (found) {
             *out = true;
@@ -2219,6 +2284,15 @@ static void fiber_throw_callee(JsContext *ctx, JsFiber *fb, const JsFunctionCell
 }
 
 /* ---- iteration beyond strings and arrays (js_iter.h), out of the dispatch loop ---- */
+
+/* An array whose [[Prototype]] is still Array.prototype: iterated by its elements with no
+ * further question. Any other array asks js_iter_open, which follows its chain. */
+static inline bool is_plain_array(const JsContext *ctx, JsValue v) {
+    if (!is_array(v))
+        return false;
+    JsValue p = js_value_object(v)->proto;
+    return js_is_object(p) && js_value_object(p) == ctx->array_proto;
+}
 
 /* ITER_NEW for anything but a string or an array: a Map or a Set becomes an iterator over its
  * entries or values, an iterator object is its own iterable, anything else is "x is not
@@ -3350,7 +3424,7 @@ run:; /* (re)load the top frame */
                 if (!is_array(PEEK(1)))
                     RT_THROW("internal error: array builder on non-array");
                 JsObject *a = js_value_object(PEEK(1));
-                if (js_is_object(src) && js_value_object(src)->obj_kind == JS_OBJ_ARRAY) {
+                if (is_plain_array(ctx, src)) {
                     JsObject *s = js_value_object(src);
                     for (uint32_t i = 0; i < s->elem_count; i++) {
                         if (!js_array_append(vm, a, s->elems[i]))
@@ -3500,7 +3574,7 @@ run:; /* (re)load the top frame */
             }
             case JS_OP_ITER_NEW: {
                 JsValue it = PEEK(0);
-                if (!js_is_string(it) && !is_array(it)) {
+                if (!js_is_string(it) && !is_plain_array(ctx, it)) {
                     fr->ip = ip; /* GC-safe point before allocating an iterator */
                     if (!iter_open_slow(ctx, fb, fn, op_ip, &PEEK(0)))
                         RT_RAISE();

@@ -88,6 +88,21 @@ static bool inherits_iterator(JsContext *ctx, JsValue v) {
     return false;
 }
 
+/* V is Array.prototype or inherits from it without being an array: what V8 iterates with
+ * Array.prototype.values, which it finds as V's [Symbol.iterator] */
+static bool inherits_array(JsContext *ctx, JsValue v) {
+    if (!ctx->array_proto || !is_obj(v))
+        return false;
+    const JsGcCell *ap = &ctx->array_proto->gc;
+    JsValue p = v;
+    for (int depth = 0; depth < 10000 && is_obj(p); depth++) {
+        if (js_value_cell(p) == ap)
+            return true;
+        p = js_get_proto(ctx, p);
+    }
+    return false;
+}
+
 /* O[name] for a property name in ASCII. False thrown, *out the error. */
 static bool get_named(JsContext *ctx, JsValue o, const char *name, JsValue *out) {
     JsString *k = js_ascii_cell(ctx->vm, name);
@@ -496,14 +511,16 @@ static bool get_direct(JsContext *ctx, JsValue o, JsValue *src) {
 /* ---- cursors ---- */
 
 bool js_iter_is_iterable(JsContext *ctx, JsValue v) {
-    return js_is_string(v) || is_array(v) || js_iterobj_is(v) || js_mapobj_is(v) ||
-           js_setobj_is(v) || inherits_iterator(ctx, v);
+    return js_is_string(v) || js_iterobj_is(v) || js_mapobj_is(v) || js_setobj_is(v) ||
+           inherits_iterator(ctx, v) || inherits_array(ctx, v);
 }
 
 int js_iter_open(JsContext *ctx, JsValue v, JsIterCursor *c) {
     c->i = 0;
     c->src = v;
-    if (js_is_string(v) || is_array(v))
+    if (js_is_string(v))
+        return 1;
+    if (is_array(v) && inherits_array(ctx, v)) /* not one whose prototype was taken away (as V8) */
         return 1;
     JsValue it = v;
     if (js_mapobj_is(v) || js_setobj_is(v)) {
@@ -513,7 +530,12 @@ int js_iter_open(JsContext *ctx, JsValue v, JsIterCursor *c) {
         if (js_is_undefined(it))
             return -1;
     } else if (!js_iterobj_is(v) && !inherits_iterator(ctx, v)) {
-        return 0;
+        if (!inherits_array(ctx, v))
+            return 0;
+        /* an array's inheritor: the array iterator over its `length` and indices */
+        it = js_iterobj_new(ctx, JS_ITER_ARRAY_VALUES, v, js_undefined(), 0);
+        if (js_is_undefined(it))
+            return -1;
     }
     /* an iterator, or what inherits Iterator.prototype: [Symbol.iterator]() is the object itself,
      * and its next is read once (getting a property runs no guest code here) */
@@ -1134,7 +1156,7 @@ static bool it_from(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     if (!is_obj(o))
         return (*r = js_error_from_ascii(ctx, "TypeError: Iterator.from called on non-object")), false;
     JsValue iter = o;
-    if (is_array(o)) {
+    if (inherits_array(ctx, o)) { /* an array, or what has Array.prototype.values as its iterator */
         iter = js_iterobj_new(ctx, JS_ITER_ARRAY_VALUES, o, js_undefined(), 0);
     } else if (js_mapobj_is(o) || js_setobj_is(o)) {
         iter = js_iterobj_new(ctx, js_mapobj_is(o) ? JS_ITER_MAP_ENTRIES : JS_ITER_SET_VALUES, o,

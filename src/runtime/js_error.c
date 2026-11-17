@@ -221,17 +221,24 @@ static void fb_function(JsContext *ctx, FmtBuf *b, JsValue v) {
 }
 
 static const JsString *type_name_of(JsContext *ctx, JsValue recv, const char **fixed_out, bool frame);
+static const JsString *frame_function_name(JsValue fn);
 static bool chain_get(JsContext *ctx, JsObject *o, const char *key, JsValue *out, bool *found);
 
 /* An error, or what inherits Error.prototype, as V8 names it in a message: "Name: message" (its
  * name if the message is empty, the message if the name is), from string properties only, with
  * no side effects. False when O is no error. */
-static bool fb_error_like(JsContext *ctx, FmtBuf *b, JsObject *o) {
-    bool is_error = o->obj_kind == JS_OBJ_ERROR;
-    JsObject *ep = ctx->error_protos[JS_ERROR_PLAIN];
-    for (JsValue p = o->proto; !is_error && ep && js_is_object(p); p = js_value_object(p)->proto)
-        is_error = js_value_object(p) == ep;
-    if (!is_error)
+static bool errp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r);
+
+static bool is_error_to_string(JsValue v) {
+    if (!js_is_function(v) || js_value_cell(v)->kind != JS_KIND_NATIVE)
+        return false;
+    const JsNative *nf = (const JsNative *)js_value_cell(v);
+    return !nf->is_bound && nf->fn == errp_toString;
+}
+
+/* TS is what O's `toString` reads as (undefined when it has none) */
+static bool fb_error_like(JsContext *ctx, FmtBuf *b, JsObject *o, JsValue ts) {
+    if (o->obj_kind != JS_OBJ_ERROR && !is_error_to_string(ts))
         return false;
     JsValue nv = js_undefined(), mv = js_undefined();
     bool found;
@@ -338,45 +345,51 @@ JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
         } else if (js_is_function(v)) {
             fb_function(ctx, b, v);
         } else if (js_is_object(v)) {
-            if (js_value_object(v)->obj_kind == JS_OBJ_ARRAY)
-                fb_ascii(b, "[object Array]", 14);
-            else if (js_value_object(v)->obj_flags & JS_OBJ_NAMESPACE)
-                fb_ascii(b, "[object Module]", 15);
-            else if (js_value_object(v)->obj_kind == JS_OBJ_ITER &&
-                     ((JsIterObj *)js_value_object(v))->kind != JS_ITER_WRAP) {
-                /* V8 finds no constructor for these, so it names them by their tag */
-                const char *tag = js_to_string_tag(ctx, v);
+            /* V8's NoSideEffectsToString: an error (or what has Error.prototype.toString) as
+             * "Name: message"; what has Object.prototype.toString and a named constructor as
+             * #<Ctor>; anything else by its tag, as [object Tag] */
+            JsObject *vo = js_value_object(v);
+            JsValue ts = js_undefined();
+            bool found;
+            if (!chain_get(ctx, vo, "toString", &ts, &found)) {
+                b->oom = true;
+                continue;
+            }
+            if (fb_error_like(ctx, b, vo, ts))
+                continue; /* an error: "Name: message" */
+            /* V8 finds no constructor for an iterator, nor a constructor or a tag for what else
+             * inherits Iterator.prototype (both are accessors there) */
+            bool iter = vo->obj_kind == JS_OBJ_ITER && ((JsIterObj *)vo)->kind != JS_ITER_WRAP;
+            bool inherits = !iter && inherits_iterator(ctx, v);
+            bool named = js_is_object_to_string(ts) && !(vo->obj_flags & JS_OBJ_NAMESPACE) &&
+                         !iter && !inherits;
+            JsValue cv = js_undefined();
+            if (named && !chain_get(ctx, vo, "constructor", &cv, &found)) {
+                b->oom = true;
+                continue;
+            }
+            const JsString *n = js_is_function(cv) ? frame_function_name(cv) : NULL;
+            if (n) {
+                fb_ascii(b, "#<", 2);
+                fb_piece(b, n->units, n->length);
+                fb_ascii(b, ">", 1);
+            } else {
+                const char *tag = inherits ? "Object" : js_to_string_tag(ctx, v);
                 fb_ascii(b, "[object ", 8);
                 fb_ascii(b, tag, strlen(tag));
                 fb_ascii(b, "]", 1);
-            } else if (inherits_iterator(ctx, v))
-                /* nor for what inherits Iterator.prototype (its constructor is an accessor) */
-                fb_ascii(b, "[object Object]", 15);
-            else if (js_value_object(v)->obj_kind == JS_OBJ_DATE)
-                fb_ascii(b, "[object Date]", 13); /* as V8's NoSideEffectsToString */
-#ifdef LAMASSU_HAS_REGEX
-            else if (js_value_object(v)->obj_kind == JS_OBJ_REGEXP)
-                fb_ascii(b, "[object RegExp]", 15);
-#endif
-            else if (fb_error_like(ctx, b, js_value_object(v)))
-                ; /* an error: "Name: message" */
-            else {
-                /* #<Set>, #<F>: its constructor's name, as V8's GetConstructorName */
-                const char *fixed;
-                const JsString *n = type_name_of(ctx, v, &fixed, false);
-                if (!n && !fixed) {
-                    fb_ascii(b, "[object Object]", 15); /* no prototype */
-                } else {
-                    fb_ascii(b, "#<", 2);
-                    if (n)
-                        fb_piece(b, n->units, n->length);
-                    else
-                        fb_ascii(b, fixed, strlen(fixed));
-                    fb_ascii(b, ">", 1);
-                }
             }
         } else if (js_is_promise(v)) {
-            fb_ascii(b, "#<Promise>", 10);
+            JsValue ts = js_undefined();
+            JsString *tk = key(ctx, "toString");
+            if (!tk || !js_get_property(ctx, v, js_value_from_cell(&tk->gc), &ts)) {
+                b->oom = true;
+                continue;
+            }
+            if (js_is_object_to_string(ts))
+                fb_ascii(b, "#<Promise>", 10);
+            else
+                fb_ascii(b, "[object Promise]", 16);
         } else {
             JsString *s = js_primitive_to_string(vm, v);
             if (s)

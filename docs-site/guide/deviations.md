@@ -142,9 +142,13 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
 ## Iteration
 
 - **There is no `Symbol.iterator`**, so an object of a script's iterates only if it inherits from
-  `Iterator.prototype` (whose `[Symbol.iterator]` returns the object itself in V8): an iterable
+  `Iterator.prototype` (whose `[Symbol.iterator]` returns the object itself in V8) or from
+  `Array.prototype` (whose `[Symbol.iterator]` is `values`: `[...Object.create([1, 2])]` is
+  `[1, 2]`, read through `length` and the indices, as in V8): an iterable
   that is not its own iterator (one whose `[Symbol.iterator]()` makes a fresh iterator each time)
-  cannot be written. `Iterator.from({ next() { ... } })` makes any object with `next` iterable. See
+  cannot otherwise be written. `Iterator.from({ next() { ... } })` makes any object with `next`
+  iterable. An array stops being iterable when its prototype chain no longer reaches
+  `Array.prototype` (`Object.setPrototypeOf([1], null)`), as in V8. See
   [Built-ins → Iteration](/guide/builtins#iteration).
 - **`for...of`, spread and destructuring of an array or a string do not consult the
   `Array Iterator` or `String Iterator` prototype**: a script that replaces their `next` (or adds a
@@ -189,9 +193,11 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   operand with no readable name shows its value (`undefined is not a function` for `(void 0)()`
   and `#<Object> is not iterable` for `[...{}]`, where V8 prints the expression,
   `{(intermediate value)}` for an object literal); an object named in a message is named
-  by its constructor, as V8 names it (`#<Object>`, `#<Set>`, `#<Foo>`; `[object Object]` with no
-  prototype), and so are an array, a module namespace, an iterator (`[object Map Iterator]`) and
-  what inherits from `Iterator.prototype` (`[object Object]`).
+  as V8 names it: by its constructor when its `toString` is `Object.prototype.toString` and its
+  `constructor` a named function (`#<Object>`, `#<Set>`, `#<Foo>`), as `Name: message` when it is
+  an error or has `Error.prototype.toString`, and by its tag otherwise (`[object Array]`,
+  `[object Date]`, `[object Module]`, `[object Map Iterator]`, and `[object Object]` for an object
+  with a `toString` of its own, with no prototype, or inheriting from `Iterator.prototype`).
 - **A `SyntaxError` is V8's, message and position**, including which error is reported when a
   source has several (the earliest, as V8 chooses it: `({a = 1}); 1 +` is `Invalid shorthand
   property initializer`) and where strict mode's octal errors land (at the end of the function
