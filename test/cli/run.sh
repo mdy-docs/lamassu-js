@@ -6,12 +6,15 @@
 # Each is run three ways -- named from the repository's root, from inside its own directory, and
 # by its absolute path -- because where a module is comes from how the entry was named.
 #
+# After the cases, the limits: --fuel ends a run whichever way the program was given.
+#
 #   sh test/cli/run.sh build/lamassu       (make cli-check)
 bin=$1
 case "$bin" in /*) ;; *) bin=$(pwd)/$bin ;; esac
 root=$(pwd)
 err=$(mktemp)
-trap 'rm -f "$err"' EXIT
+tmp=$(mktemp -d)
+trap 'rm -f "$err" "$tmp"/spin.mjs "$tmp"/spin.jsbc; rmdir "$tmp"' EXIT
 failed=0
 count=0
 for dir in test/cli/*/; do
@@ -49,6 +52,36 @@ $want"
     fi
   done
 done
+
+# --fuel is the budget of a source file and of a bytecode cache alike: a cache with an export
+# is a module's (loaded through the module loader), one without is a function's, and each must
+# stop. The loops end by themselves, so a budget that is not armed fails here and does not hang.
+for body in 'export let n = 0; for (let i = 0; i < 5e7; i++) n++;' \
+            'let n = 0; for (let i = 0; i < 5e7; i++) n++;'; do
+  printf '%s\n' "$body" > "$tmp/spin.mjs"
+  for how in source cache; do
+    case $how in
+      source) "$bin" --fuel 100000 "$tmp/spin.mjs" > /dev/null 2> "$err"; status=$? ;;
+      cache) "$bin" --emit-bytecode "$tmp/spin.mjs" "$tmp/spin.jsbc" > /dev/null 2> "$err" &&
+               "$bin" --fuel 100000 --run-bytecode "$tmp/spin.jsbc" > /dev/null 2> "$err"; status=$? ;;
+    esac
+    why=
+    if grep -q 'Sanitizer\|runtime error' "$err"; then
+      why="the sanitizer stopped it"
+    elif [ "$status" != 1 ]; then
+      why="exit status $status, expected 1"
+    elif ! grep -qF 'uncaught RangeError: execution budget exhausted' "$err"; then
+      why="standard error has no 'uncaught RangeError: execution budget exhausted'"
+    fi
+    count=$((count + 1))
+    if [ -n "$why" ]; then
+      failed=$((failed + 1))
+      echo "FAIL --fuel ($how of: $body): $why"
+      sed 's/^/  stderr: /' "$err"
+    fi
+  done
+done
+
 if [ "$failed" != 0 ]; then
   echo "$failed of $count command line runs failed"
   exit 1

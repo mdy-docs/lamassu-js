@@ -870,6 +870,7 @@ static int run_bytecode(const char *path) {
             pathu[pn++] = (uint16_t)(unsigned char)*p;
         size_t sn = spec_base(pathu, pn, spec, 256);
         free(bytes); /* the loader re-reads the root from disk */
+        arm_fuel(ctx);
         JsValue pr = js_eval_module(ctx, spec, sn);
         js_gc_protect(vm, &pr);
         untrack(ctx, vm, pr);
@@ -881,7 +882,7 @@ static int run_bytecode(const char *path) {
             status = unsettled(path);
         } else if (js_promise_state(pr) != 1) {
             JsValue reason = js_promise_result(pr);
-            fprintf(stderr, "%s: ", path);
+            fprintf(stderr, "%s: uncaught ", path);
             JsValue s = js_to_string(ctx, reason);
             size_t sl;
             const uint16_t *su = js_string_units(s, &sl);
