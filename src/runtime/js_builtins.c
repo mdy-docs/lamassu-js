@@ -3642,24 +3642,63 @@ static bool fm_bind(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
         *r = js_oom_value(vm);
         return false;
     }
-    /* named "bound " and the target's name, as in V8 */
+    /* Its length is the target's own `length` less the arguments bound, and its name "bound "
+     * and the target's `name`: both read as properties (20.2.3.2), so what a script defined
+     * them as counts, and a length that is no number is 0, a name that is no string empty. */
     js_gc_protect(vm, &fn);
-    JsString *prefix = js_ascii_cell(vm, "bound ");
-    JsValue pv = prefix ? js_value_from_cell(&prefix->gc) : js_undefined();
-    js_gc_protect(vm, &pv);
-    const JsString *target = js_function_name(tv); /* tv's, so rooted by the caller */
-    JsString *nm = prefix && target && target->length ? js_concat_cells(vm, prefix, target) : prefix;
+    JsValue kv = js_undefined(), lv = js_undefined(), nv = js_undefined(), pv = js_undefined();
+    js_gc_protect(vm, &kv);
+    js_gc_protect(vm, &nv);
+    js_gc_protect(vm, &pv); /* the name's key, then the prefix: neither is held by anything else */
+    uint8_t attrs;
+    JsString *k = js_ascii_cell(vm, "length");
+    k = k ? js_intern_cell(vm, k) : NULL;
+    bool read = k != NULL;
+    int has = 0;
+    if (read) {
+        kv = js_value_from_cell(&k->gc);
+        has = js_own_property(ctx, tv, kv, &lv, &attrs);
+        read = has >= 0 && (!has || js_get_property(ctx, tv, kv, &lv));
+    }
+    double bl = 0;
+    if (read && has && js_is_number(lv)) {
+        double tl = js_get_number(lv), bound = argc > 1 ? (double)(argc - 1) : 0;
+        if (tl == tl) /* ToIntegerOrInfinity; an infinite length stays one */
+            bl = tl - bound > 0 ? __builtin_trunc(tl) - bound : 0;
+    }
+    if (read) {
+        k = js_ascii_cell(vm, "name");
+        if (k)
+            pv = js_value_from_cell(&k->gc);
+        read = k && js_get_property(ctx, tv, pv, &nv);
+    }
+    JsString *nm = NULL;
+    if (read) {
+        JsString *prefix = js_ascii_cell(vm, "bound ");
+        if (prefix)
+            pv = js_value_from_cell(&prefix->gc);
+        nm = prefix && js_is_string(nv) && js_value_string(nv)->length
+                 ? js_concat_cells(vm, prefix, js_value_string(nv)) : prefix;
+        read = nm != NULL;
+    }
+    if (read) {
+        ((JsNative *)js_value_cell(fn))->name = nm;
+        if (bl <= 255) {
+            ((JsNative *)js_value_cell(fn))->length = (uint8_t)bl;
+        } else { /* more than the function's own count holds: as a property defined on it */
+            JsPropDesc d = {JS_DESC_VALUE | JS_DESC_WRITABLE | JS_DESC_ENUMERABLE | JS_DESC_CONFIGURABLE,
+                            false, false, true, js_number(bl)};
+            read = js_define_own_property(ctx, fn, kv, &d);
+        }
+    }
     js_gc_unprotect(vm, &pv);
+    js_gc_unprotect(vm, &nv);
+    js_gc_unprotect(vm, &kv);
     js_gc_unprotect(vm, &fn);
-    if (!nm) {
-        *r = js_oom_value(vm);
+    if (!read) {
+        *r = js_take_error(ctx);
         return false;
     }
-    ((JsNative *)js_value_cell(fn))->name = nm;
-    /* and the target's length less the arguments bound */
-    uint32_t tl = js_function_length(tv), bound = argc > 1 ? (uint32_t)(argc - 1) : 0;
-    uint32_t bl = tl > bound ? tl - bound : 0;
-    ((JsNative *)js_value_cell(fn))->length = (uint8_t)(bl > 255 ? 255 : bl);
     /* its [[Prototype]] is the target's, as it is now (BoundFunctionCreate) */
     JsValue tp = js_get_proto(ctx, tv);
     if (tp.bits != js_value_from_cell(&ctx->function_proto->gc).bits) {
@@ -4365,7 +4404,11 @@ static bool json_object(JsonS *s, JsValue ov, JsValue key) {
         JsValue v;
         bool found = false;
         if (o) { /* an own data property is what [[Get]] reads; else (deleted meanwhile) the chain */
-            v = js_prop_value(ctx, ov, js_map_get(&o->props, js_value_string(k), &found));
+            JsValue raw = js_map_get(&o->props, js_value_string(k), &found);
+            if (!js_prop_value(ctx, ov, raw, &v)) { /* an accessor's getter threw (pending) */
+                ok = false;
+                break;
+            }
         }
         if (!found && !js_get_property(ctx, ov, k, &v)) {
             ok = false;
@@ -5396,16 +5439,23 @@ static bool obj_keys_impl(JsContext *ctx, JsValue tv, const JsValue *args, int a
                         ? native_throw_fmt(ctx, r, "ReferenceError: Cannot access '%S' before initialization", e->key)
                         : native_throw_fmt(ctx, r, "ReferenceError: %S is not defined", e->key);
                 }
-                JsValue entry;
+                JsValue entry, pval = js_undefined();
+                /* an accessor's getter runs here (a builtin's: it leaves the map as it is) */
+                if (mode != 0 && !js_prop_value(ctx, v, e->value, &pval)) {
+                    ok = false;
+                    break;
+                }
                 if (mode == 0) {
                     entry = js_value_from_cell(&e->key->gc);
                 } else if (mode == 1) {
-                    entry = js_prop_value(ctx, v, e->value);
+                    entry = pval;
                 } else {
+                    js_gc_protect(ctx->vm, &pval);
                     JsObject *pair = js_array_new_cell(ctx, 2);
+                    js_gc_unprotect(ctx->vm, &pval);
                     if (!pair) { ok = false; break; }
                     pair->elems[0] = js_value_from_cell(&e->key->gc);
-                    pair->elems[1] = js_prop_value(ctx, v, e->value);
+                    pair->elems[1] = pval;
                     pair->elem_count = 2;
                     entry = js_value_from_cell(&pair->gc);
                 }
@@ -5487,7 +5537,7 @@ static bool append_map_keys(JsContext *ctx, JsObject *out, JsObject *o) {
  *               has one, then a builtin's statics and what else a script wrote onto it; a "name"
  *               or "length" defined again after it was deleted is one of those, and so comes
  *               where it was defined
- *   error       "stack" while it has one, then "message", "cause" and the rest
+ *   error       its map's order: "stack" (made with the error), "message", "cause" and the rest
  *   regexp      "lastIndex", then the rest */
 static bool obj_getOwnPropertyNames(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                                     JsValue *r) {
@@ -5515,10 +5565,6 @@ static bool obj_getOwnPropertyNames(JsContext *ctx, JsValue tv, const JsValue *a
              (!has_length || append_ascii_key(ctx, out, "length")) &&
              (!has_name || append_ascii_key(ctx, out, "name")) &&
              (!js_function_has_own_prototype(v) || append_ascii_key(ctx, out, "prototype"));
-#ifdef LAMASSU_HAS_REGEX
-        if (ok && c == (JsGcCell *)ctx->regexp_ctor) /* RegExp's legacy statics, where V8 lists them */
-            ok = js_regexp_legacy_names(ctx, out);
-#endif
         if (ok && c->kind == JS_KIND_NATIVE && ((JsNative *)c)->statics)
             ok = append_map_keys(ctx, out, ((JsNative *)c)->statics);
         if (ok && own)
@@ -5531,8 +5577,6 @@ static bool obj_getOwnPropertyNames(JsContext *ctx, JsValue tv, const JsValue *a
         JsObject *o = js_value_object(v);
         if (o->obj_kind == JS_OBJ_ARRAY)
             ok = append_index_keys(ctx, out, o->elem_count) && append_ascii_key(ctx, out, "length");
-        else if (o->obj_kind == JS_OBJ_ERROR && js_error_has_stack(o))
-            ok = append_ascii_key(ctx, out, "stack");
 #ifdef LAMASSU_HAS_REGEX
         else if (o->obj_kind == JS_OBJ_REGEXP)
             ok = append_ascii_key(ctx, out, "lastIndex");
@@ -5821,12 +5865,6 @@ static bool value_has_own(JsContext *ctx, JsValue v, JsString *ks, bool *out) {
             *out = true;
             return true;
         }
-#ifdef LAMASSU_HAS_REGEX
-        if (js_value_cell(v) == (JsGcCell *)ctx->regexp_ctor && js_regexp_legacy_index(ctx, kv) >= 0) {
-            *out = true;
-            return true;
-        }
-#endif
         JsGcCell *c = js_value_cell(v);
         maps[0] = js_cell_props(ctx, v, false);
         if (c->kind == JS_KIND_NATIVE)
@@ -5835,9 +5873,8 @@ static bool value_has_own(JsContext *ctx, JsValue v, JsString *ks, bool *out) {
         maps[0] = js_cell_props(ctx, v, false);
     } else if (js_is_object(v)) {
         JsObject *o = js_value_object(v);
-        bool special = (o->obj_kind == JS_OBJ_ARRAY &&
-                        (is_index_below(ks, o->elem_count) || str_is_ascii(kv, "length"))) ||
-                       (o->obj_kind == JS_OBJ_ERROR && js_error_stack_has(o, kv));
+        bool special = o->obj_kind == JS_OBJ_ARRAY &&
+                       (is_index_below(ks, o->elem_count) || str_is_ascii(kv, "length"));
 #ifdef LAMASSU_HAS_REGEX
         special = special || (o->obj_kind == JS_OBJ_REGEXP && str_is_ascii(kv, "lastIndex"));
 #endif
@@ -5919,9 +5956,6 @@ static bool objp_propertyIsEnumerable(JsContext *ctx, JsValue tv, const JsValue 
             found = !str_is_ascii(kv, "length");
         } else if (js_is_function(tv) && (str_is_ascii(kv, "name") || str_is_ascii(kv, "length") ||
                                           str_is_ascii(kv, "prototype"))) {
-            found = false;
-        } else if (js_is_object(tv) && js_value_object(tv)->obj_kind == JS_OBJ_ERROR &&
-                   js_error_stack_has(js_value_object(tv), kv)) {
             found = false;
 #ifdef LAMASSU_HAS_REGEX
         } else if (js_is_object(tv) && js_value_object(tv)->obj_kind == JS_OBJ_REGEXP &&
@@ -6056,6 +6090,16 @@ static const char *inherited_tag(const JsContext *ctx, JsValue p) {
            : o == ctx->iterator_proto                    ? "Iterator" : NULL;
 }
 
+/* The prototypes that are an Array, a String, a Number and a Boolean in V8 (Array.prototype is
+ * an array there, the others wrapper objects), and the global object */
+static const char *exotic_proto_tag(const JsContext *ctx, const JsObject *o) {
+    return o == ctx->array_proto        ? "Array"
+           : o == ctx->string_methods   ? "String"
+           : o == ctx->number_methods   ? "Number"
+           : o == ctx->boolean_methods  ? "Boolean"
+           : o == ctx->globals          ? "global" : NULL;
+}
+
 const char *js_to_string_tag(const JsContext *ctx, JsValue v) {
     if (js_is_object(v) || js_is_function(v) || js_is_promise(v)) {
         /* Get(O, @@toStringTag) first: it overrides the kind's own tag */
@@ -6067,6 +6111,8 @@ const char *js_to_string_tag(const JsContext *ctx, JsValue v) {
                 return t;
         }
     }
+    /* builtinTag (20.1.3.6): what is no array, function, error, boolean, number, string, date
+     * or regular expression is an Object, a Map or a promise cut off its prototype included */
     if (js_is_undefined(v))
         return "Undefined";
     if (js_is_null(v))
@@ -6081,8 +6127,40 @@ const char *js_to_string_tag(const JsContext *ctx, JsValue v) {
         return "BigInt";
     if (js_is_function(v))
         return "Function";
-    if (js_is_promise(v))
-        return "Promise";
+    if (!js_is_object(v))
+        return "Object";
+    const JsObject *o = js_value_object(v);
+    switch (o->obj_kind) {
+    case JS_OBJ_ARRAY: return "Array";
+    case JS_OBJ_ERROR: return "Error";
+    case JS_OBJ_DATE: return "Date";
+#ifdef LAMASSU_HAS_REGEX
+    case JS_OBJ_REGEXP: return "RegExp";
+#endif
+    default: break;
+    }
+    if (o->obj_flags & JS_OBJ_NAMESPACE)
+        return "Module";
+    const char *t = exotic_proto_tag(ctx, o);
+    return t ? t : "Object";
+}
+
+/* The tag that names V in a message (V8's NoSideEffectsToString): a Symbol.toStringTag found as
+ * a data property (Iterator.prototype's is an accessor, so the search ends there), else V8's
+ * class name of the object, which a Map, a Set and an Array, Map or Set Iterator keep whatever
+ * they inherit from */
+const char *js_message_tag(const JsContext *ctx, JsValue v) {
+    int depth = 0;
+    for (JsValue p = v; depth < 1000 && (js_is_object(p) || js_is_function(p) || js_is_promise(p));
+         p = js_get_proto((JsContext *)ctx, p), depth++) {
+        if (js_is_object(p) && js_value_object(p) == ctx->iterator_proto)
+            break;
+        const char *t = inherited_tag(ctx, p);
+        if (t)
+            return t;
+    }
+    if (js_is_function(v))
+        return "Function";
     if (!js_is_object(v))
         return "Object";
     const JsObject *o = js_value_object(v);
@@ -6094,20 +6172,27 @@ const char *js_to_string_tag(const JsContext *ctx, JsValue v) {
     case JS_OBJ_SET: return "Set";
     case JS_OBJ_WEAKMAP: return "WeakMap";
     case JS_OBJ_WEAKSET: return "WeakSet";
-    case JS_OBJ_WEAKREF: return "WeakRef";
-    case JS_OBJ_FINREG: return "FinalizationRegistry";
 #ifdef LAMASSU_HAS_REGEX
     case JS_OBJ_REGEXP: return "RegExp";
 #endif
+    case JS_OBJ_ITER:
+        switch (((const JsIterObj *)o)->kind) {
+        case JS_ITER_ARRAY_KEYS:
+        case JS_ITER_ARRAY_VALUES:
+        case JS_ITER_ARRAY_ENTRIES: return "Array Iterator";
+        case JS_ITER_MAP_KEYS:
+        case JS_ITER_MAP_VALUES:
+        case JS_ITER_MAP_ENTRIES: return "Map Iterator";
+        case JS_ITER_SET_VALUES:
+        case JS_ITER_SET_ENTRIES: return "Set Iterator";
+        default: return "Object";
+        }
     default: break;
     }
     if (o->obj_flags & JS_OBJ_NAMESPACE)
         return "Module";
-    if (o == ctx->math_obj)
-        return "Math";
-    if (o == ctx->json_obj)
-        return "JSON";
-    return "Object";
+    const char *t = exotic_proto_tag(ctx, o);
+    return t ? t : "Object";
 }
 
 JsObject *js_iterable_to_array(JsContext *ctx, JsValue v, JsValue *err) {
@@ -6213,7 +6298,7 @@ static bool obj_create(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     JsValue o = js_object_new(ctx); /* proto is the caller's argument: rooted */
     if (!js_is_object(o))
         return oom(ctx, r);
-    js_value_object(o)->proto = is_object_type_arg(proto) ? proto : js_undefined();
+    js_object_set_proto(js_value_object(o), is_object_type_arg(proto) ? proto : js_undefined());
     if (!js_is_undefined(ARG(1))) {
         js_gc_protect(ctx->vm, &o);
         bool ok = define_properties(ctx, o, ARG(1), r);
@@ -6227,8 +6312,9 @@ static bool obj_create(JsContext *ctx, JsValue tv, const JsValue *args, int argc
 
 /* ToPropertyDescriptor(DV) into *D (D->value rooted by the caller): false with the error in *R.
  * Fields are looked up as V8 does, in order (enumerable, configurable, value, writable, get,
- * set), each a [[HasProperty]] then a [[Get]]. There are no accessor properties, so a get or set
- * is refused once the descriptor is otherwise valid. */
+ * set), each a [[HasProperty]] then a [[Get]]. A script cannot write an accessor, so a get or set
+ * that is not one of the engine's own accessor functions is refused once the descriptor is
+ * otherwise valid. */
 static bool to_property_descriptor(JsContext *ctx, JsValue dv, JsPropDesc *d, JsValue *r) {
     static const char *const names[] = {"enumerable", "configurable", "value", "writable", "get", "set"};
     if (!is_object_type_arg(dv))
@@ -6258,23 +6344,21 @@ static bool to_property_descriptor(JsContext *ctx, JsValue dv, JsPropDesc *d, Js
                 return native_throw_fmt(ctx, r, i == 4 ? "TypeError: Getter must be a function: %v"
                                                        : "TypeError: Setter must be a function: %v", fv);
             accessor = true;
-            *(i == 4 ? &getter : &setter) = fv; /* the engine's own two, if these are they: not collectable */
+            d->has |= i == 4 ? JS_DESC_GET : JS_DESC_SET;
+            *(i == 4 ? &getter : &setter) = fv; /* the engine's own, if they pass: not collectable */
             break;
         }
     }
     if (accessor && (d->has & (JS_DESC_VALUE | JS_DESC_WRITABLE)))
         return native_throw_fmt(ctx, r, "TypeError: Invalid property descriptor. Cannot both specify accessors and a value or writable attribute, %v", dv);
     if (accessor) {
-        /* the one accessor there is, restated (a descriptor Object.getOwnPropertyDescriptor gave
-         * for `__proto__`): the marker stands for the pair, and js_define_own_property takes it
-         * under that name only */
-        if (js_is_function(getter) && js_value_cell(getter) == &ctx->proto_getter->gc &&
-            js_is_function(setter) && js_value_cell(setter) == &ctx->proto_setter->gc) {
-            d->has |= JS_DESC_VALUE;
-            d->value.bits = JS_SPECIAL_ACCESSOR;
-            return true;
-        }
-        return native_throw(ctx, r, "TypeError: Accessor properties (get, set) are not supported");
+        /* only the engine's own accessor functions can be a property's getter or setter (a
+         * descriptor Object.getOwnPropertyDescriptor gave, restated or taken apart): the marker
+         * names the pair, 0 for the one that is undefined or not named */
+        unsigned g = js_accessor_id(ctx, getter), st = js_accessor_id(ctx, setter);
+        if ((!js_is_undefined(getter) && !g) || (!js_is_undefined(setter) && !st))
+            return native_throw(ctx, r, "TypeError: A script function as a getter or setter is not supported");
+        d->value = js_accessor(g, st);
     }
     return true;
 }
@@ -6327,7 +6411,7 @@ static bool define_properties(JsContext *ctx, JsValue o, JsValue props, JsValue 
         js_gc_protect(ctx->vm, &dv);
         js_gc_protect(ctx->vm, &d.value);
         ok = to_property_descriptor(ctx, dv, &d, r);
-        double bits = (double)(d.has | (d.writable ? 16 : 0) | (d.enumerable ? 32 : 0) | (d.configurable ? 64 : 0));
+        double bits = (double)(d.has | (d.writable ? 64 : 0) | (d.enumerable ? 128 : 0) | (d.configurable ? 256 : 0));
         if (ok && !(js_array_append(ctx->vm, dl, d.value) && js_array_append(ctx->vm, dl, js_number(bits))))
             ok = oom(ctx, r);
         js_gc_unprotect(ctx->vm, &d.value);
@@ -6335,7 +6419,7 @@ static bool define_properties(JsContext *ctx, JsValue o, JsValue props, JsValue 
     }
     for (uint32_t i = 0; ok && i < ko->elem_count; i++) {
         uint32_t bits = (uint32_t)js_get_number(dl->elems[2 * i + 1]);
-        JsPropDesc d = {(uint8_t)(bits & 15), (bits & 16) != 0, (bits & 32) != 0, (bits & 64) != 0,
+        JsPropDesc d = {(uint8_t)(bits & 63), (bits & 64) != 0, (bits & 128) != 0, (bits & 256) != 0,
                         dl->elems[2 * i]};
         if (!js_define_own_property(ctx, o, ko->elems[i], &d))
             ok = oom(ctx, r);
@@ -6356,19 +6440,27 @@ static bool obj_defineProperties(JsContext *ctx, JsValue tv, const JsValue *args
     return true;
 }
 
-/* FromPropertyDescriptor: {value, writable, enumerable, configurable}, in V8's order; for the
- * `__proto__` accessor (ACCESSOR), {get, set, enumerable, configurable} with its two functions */
+/* FromPropertyDescriptor: {value, writable, enumerable, configurable}, in V8's order; for an
+ * accessor property (ACCESSOR: VALUE is its marker), {get, set, enumerable, configurable} with
+ * its two functions, undefined for the one it has not */
 static bool descriptor_object(JsContext *ctx, JsValue value, uint8_t attrs, bool accessor, JsValue *out) {
     JsValue o = js_object_new(ctx);
     if (!js_is_object(o))
         return false;
     js_gc_protect(ctx->vm, &o);
-    bool ok = (accessor ? js_object_set_ascii(ctx, js_value_object(o), "get", js_value_from_cell(&ctx->proto_getter->gc)) &&
-                          js_object_set_ascii(ctx, js_value_object(o), "set", js_value_from_cell(&ctx->proto_setter->gc))
-                        : js_object_set_ascii(ctx, js_value_object(o), "value", value) &&
-                          js_object_set_ascii(ctx, js_value_object(o), "writable", js_bool(!(attrs & JS_ATTR_READONLY)))) &&
-              js_object_set_ascii(ctx, js_value_object(o), "enumerable", js_bool(!(attrs & JS_ATTR_HIDDEN))) &&
-              js_object_set_ascii(ctx, js_value_object(o), "configurable", js_bool(!(attrs & JS_ATTR_FIXED)));
+    bool ok;
+    if (accessor) {
+        JsValue f;
+        ok = js_accessor_function(ctx, js_accessor_getter(value), &f) &&
+             js_object_set_ascii(ctx, js_value_object(o), "get", f) &&
+             js_accessor_function(ctx, js_accessor_setter(value), &f) &&
+             js_object_set_ascii(ctx, js_value_object(o), "set", f);
+    } else {
+        ok = js_object_set_ascii(ctx, js_value_object(o), "value", value) &&
+             js_object_set_ascii(ctx, js_value_object(o), "writable", js_bool(!(attrs & JS_ATTR_READONLY)));
+    }
+    ok = ok && js_object_set_ascii(ctx, js_value_object(o), "enumerable", js_bool(!(attrs & JS_ATTR_HIDDEN))) &&
+         js_object_set_ascii(ctx, js_value_object(o), "configurable", js_bool(!(attrs & JS_ATTR_FIXED)));
     js_gc_unprotect(ctx->vm, &o);
     *out = o;
     return ok;
@@ -6484,25 +6576,131 @@ static bool obj_setPrototypeOf(JsContext *ctx, JsValue tv, const JsValue *args, 
     return true;
 }
 
-/* get __proto__ (B.2.2.1.1): the [[Prototype]] of ToObject(this) */
-static bool objp_proto_get(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    (void)args;
-    (void)argc;
-    if (js_is_undefined(tv) || js_is_null(tv))
-        return native_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
-    *r = js_get_proto(ctx, tv);
+/* ---- the engine's accessor functions ----
+ * Every accessor property a built-in has is an entry holding a marker (js_accessor) that names
+ * its getter and setter by number; js_accessor_call is what runs one, for a property read or
+ * write that found the marker on the receiver or up its prototype chain, and for the function a
+ * descriptor shows (accessor_native), which is made the first time it is asked for. */
+
+#define STRICT_FN_PROPS \
+    "TypeError: 'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them"
+
+bool js_accessor_call(JsContext *ctx, unsigned id, JsValue recv, JsValue arg, JsValue *out) {
+    *out = js_undefined();
+    switch (id) {
+    case JS_ACC_PROTO_GET: /* get __proto__ (B.2.2.1.1): the [[Prototype]] of ToObject(this) */
+        if (js_is_undefined(recv) || js_is_null(recv))
+            return native_throw(ctx, out, "TypeError: Cannot convert undefined or null to object");
+        *out = js_get_proto(ctx, recv);
+        return true;
+    case JS_ACC_PROTO_SET: /* set __proto__ (B.2.2.1.2) */
+        if (js_is_undefined(recv) || js_is_null(recv))
+            return native_throw(ctx, out, "TypeError: set Object.prototype.__proto__ called on null or undefined");
+        if ((!is_object_type_arg(arg) && !js_is_null(arg)) || !is_object_type_arg(recv))
+            return true;
+        if (!set_proto_or_throw(ctx, recv, arg, out))
+            return false;
+        *out = js_undefined();
+        return true;
+    case JS_ACC_MAP_SIZE:
+        if (!js_is_object(recv) || js_value_object(recv)->obj_kind != JS_OBJ_MAP)
+            return native_throw_fmt(ctx, out, "TypeError: Method get Map.prototype.size called on incompatible receiver %v", recv);
+        *out = js_number((double)((JsMapObj *)js_value_object(recv))->count);
+        return true;
+    case JS_ACC_SET_SIZE:
+        if (!js_is_object(recv) || js_value_object(recv)->obj_kind != JS_OBJ_SET)
+            return native_throw_fmt(ctx, out, "TypeError: Method get Set.prototype.size called on incompatible receiver %v", recv);
+        *out = js_number((double)((JsSetObj *)js_value_object(recv))->count);
+        return true;
+    case JS_ACC_ITER_CTOR_GET:
+    case JS_ACC_ITER_CTOR_SET:
+        return js_iter_ctor_accessor(ctx, id == JS_ACC_ITER_CTOR_SET, recv, arg, out);
+    case JS_ACC_STACK_GET:
+    case JS_ACC_STACK_SET:
+        return js_error_stack_accessor(ctx, id == JS_ACC_STACK_SET, recv, arg, out);
+    case JS_ACC_FN_ARGUMENTS_GET:
+    case JS_ACC_FN_ARGUMENTS_SET:
+    case JS_ACC_FN_CALLER_GET:
+    case JS_ACC_FN_CALLER_SET:
+        return native_throw_fmt(ctx, out, STRICT_FN_PROPS);
+    default:
+#ifdef LAMASSU_HAS_REGEX
+        if (id >= JS_ACC_RE_DOTALL && id < JS_ACC_ITER_CTOR_GET)
+            return js_regexp_accessor(ctx, id, recv, arg, out);
+#endif
+        return true;
+    }
+}
+
+/* The function a descriptor shows for an accessor: its number is its userdata */
+static bool accessor_native(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    return js_accessor_call(ctx, (unsigned)(uintptr_t)js_native_userdata(ctx), tv, ARG(0), r);
+}
+
+static bool accessor_is_setter(unsigned id) {
+    return id == JS_ACC_PROTO_SET || (id >= JS_ACC_RE_LEGACY_SET && id < JS_ACC_ITER_CTOR_GET) ||
+           id == JS_ACC_ITER_CTOR_SET || id == JS_ACC_STACK_SET || id == JS_ACC_FN_ARGUMENTS_SET ||
+           id == JS_ACC_FN_CALLER_SET;
+}
+
+/* An accessor function's name, as V8 has it: "get size", "set __proto__", and "" for the two of
+ * an error's `stack`. BUF holds the ones that are put together. */
+static const char *accessor_name(unsigned id, char buf[40]) {
+    static const char *const re_getters[] = {"dotAll", "flags", "global", "hasIndices", "ignoreCase",
+                                             "multiline", "source", "sticky", "unicode", "unicodeSets"};
+    const char *prop;
+    switch (id) {
+    case JS_ACC_PROTO_GET: return "get __proto__";
+    case JS_ACC_PROTO_SET: return "set __proto__";
+    case JS_ACC_MAP_SIZE:
+    case JS_ACC_SET_SIZE: return "get size";
+    case JS_ACC_ITER_CTOR_GET: return "get constructor";
+    case JS_ACC_ITER_CTOR_SET: return "set constructor";
+    case JS_ACC_STACK_GET:
+    case JS_ACC_STACK_SET: return "";
+    case JS_ACC_FN_ARGUMENTS_GET: return "get arguments";
+    case JS_ACC_FN_ARGUMENTS_SET: return "set arguments";
+    case JS_ACC_FN_CALLER_GET: return "get caller";
+    case JS_ACC_FN_CALLER_SET: return "set caller";
+    default: break;
+    }
+    if (id >= JS_ACC_RE_DOTALL && id < JS_ACC_RE_LEGACY_GET)
+        prop = re_getters[id - JS_ACC_RE_DOTALL];
+#ifdef LAMASSU_HAS_REGEX
+    else if (id >= JS_ACC_RE_LEGACY_GET && id < JS_ACC_ITER_CTOR_GET)
+        prop = js_regexp_legacy_name((int)(id - JS_ACC_RE_LEGACY_GET) % JS_REGEXP_LEGACY_COUNT);
+#endif
+    else
+        return "";
+    snprintf(buf, 40, "%s %s", accessor_is_setter(id) ? "set" : "get", prop);
+    return buf;
+}
+
+bool js_accessor_function(JsContext *ctx, unsigned id, JsValue *out) {
+    *out = js_undefined();
+    if (id == JS_ACC_NONE || id >= JS_ACC__COUNT)
+        return true;
+    if (!ctx->accessor_fns[id]) {
+        char buf[40];
+        JsValue f = js_native_new(ctx, accessor_name(id, buf), accessor_native, (void *)(uintptr_t)id);
+        if (!js_is_function(f))
+            return false;
+        JsNative *nf = (JsNative *)js_value_cell(f);
+        nf->length = accessor_is_setter(id) ? 1 : 0;
+        nf->builtin = true;
+        nf->ctor = JS_CTOR_NONE;
+        ctx->accessor_fns[id] = nf;
+    }
+    *out = js_value_from_cell(&ctx->accessor_fns[id]->gc);
     return true;
 }
 
-/* set __proto__ (B.2.2.1.2): as the assignment o.__proto__ = v runs it, called by hand */
-static bool objp_proto_set(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    JsValue proto = ARG(0);
-    if (js_is_undefined(tv) || js_is_null(tv))
-        return native_throw(ctx, r, "TypeError: set Object.prototype.__proto__ called on null or undefined");
-    *r = js_undefined();
-    if ((!is_object_type_arg(proto) && !js_is_null(proto)) || !is_object_type_arg(tv))
-        return true;
-    return set_proto_or_throw(ctx, tv, proto, r);
+unsigned js_accessor_id(JsContext *ctx, JsValue fn) {
+    (void)ctx;
+    if (!js_is_function(fn) || js_value_cell(fn)->kind != JS_KIND_NATIVE)
+        return JS_ACC_NONE;
+    JsNative *nf = (JsNative *)js_value_cell(fn);
+    return nf->fn == accessor_native ? (unsigned)(uintptr_t)nf->ud : JS_ACC_NONE;
 }
 
 /* Object(...): callable with or without `new` (see JS_OP_NEW's native-
@@ -7355,11 +7553,14 @@ static void hide_builtin_keys(JsContext *ctx) {
     JsObject *objs[] = {ctx->globals, ctx->object_proto, ctx->array_proto, ctx->function_methods,
                         ctx->number_methods, ctx->boolean_methods, ctx->string_methods, ctx->promise_methods,
                         ctx->regexp_proto, ctx->date_proto, ctx->map_proto, ctx->set_proto,
-                        ctx->math_obj, ctx->json_obj};
+                        ctx->weakmap_proto, ctx->weakset_proto, ctx->weakref_proto, ctx->finreg_proto,
+                        ctx->bigint_methods, ctx->iterator_proto, ctx->math_obj, ctx->json_obj};
     for (size_t i = 0; i < sizeof objs / sizeof objs[0]; i++)
         hide_all(objs[i]);
     for (int k = 0; k < JS_ERROR_KIND_COUNT; k++)
         hide_all(ctx->error_protos[k]);
+    for (int k = 0; k < JS_ITER_PROTO_COUNT; k++)
+        hide_all(ctx->iter_protos[k]);
 }
 
 bool js_builtins_init(JsContext *ctx) {
@@ -7384,24 +7585,11 @@ bool js_builtins_init(JsContext *ctx) {
         {NULL, NULL}};
     if (!install_methods(ctx, ctx->object_proto, object_proto_methods))
         return false;
-    /* __proto__: the one accessor property. Its entry holds the marker, which a read turns into
-     * the receiver's prototype and an assignment into a change of it (js_interp.c); the two
-     * functions are what its descriptor shows. Not enumerable (hide_builtin_keys), configurable. */
-    {
-        JsValue g = js_native_new(ctx, "get __proto__", objp_proto_get, NULL);
-        if (!js_is_function(g))
-            return false;
-        ctx->proto_getter = (JsNative *)js_value_cell(g);
-        JsValue s = js_native_new(ctx, "set __proto__", objp_proto_set, NULL);
-        if (!js_is_function(s))
-            return false;
-        ctx->proto_setter = (JsNative *)js_value_cell(s);
-        ctx->proto_setter->length = 1;
-        JsValue marker;
-        marker.bits = JS_SPECIAL_ACCESSOR;
-        if (!js_object_set_ascii(ctx, ctx->object_proto, "__proto__", marker))
-            return false;
-    }
+    /* __proto__: an accessor, as every accessor a built-in has: its entry holds the marker that
+     * names its getter and setter (js_accessor_call). Not enumerable (hide_builtin_keys),
+     * configurable. */
+    if (!js_object_set_ascii(ctx, ctx->object_proto, "__proto__", js_accessor(JS_ACC_PROTO_GET, JS_ACC_PROTO_SET)))
+        return false;
 
     /* method tables — assign each into ctx before the next allocation so it
      * is a GC root immediately (gc_stress collects at every allocation) */
@@ -7446,7 +7634,7 @@ bool js_builtins_init(JsContext *ctx) {
     JsValue afp = js_object_new(ctx);
     if (!js_is_object(afp))
         return false;
-    js_value_object(afp)->proto = fpv;
+    js_object_set_proto(js_value_object(afp), fpv);
     ctx->async_function_proto = js_value_object(afp);
 
     static const MethodDef string_methods[] = {
@@ -7500,7 +7688,13 @@ bool js_builtins_init(JsContext *ctx) {
         !install_methods(ctx, ctx->array_proto, array_methods) ||
         !install_methods(ctx, ctx->number_methods, number_methods) ||
         !install_methods(ctx, ctx->boolean_methods, boolean_methods) ||
-        !install_methods(ctx, ctx->function_methods, function_methods))
+        !install_methods(ctx, ctx->function_methods, function_methods) ||
+        /* Function.prototype.arguments and caller: the accessors that throw, as for every strict
+         * function in V8 */
+        !js_object_set_ascii(ctx, ctx->function_methods, "arguments",
+                             js_accessor(JS_ACC_FN_ARGUMENTS_GET, JS_ACC_FN_ARGUMENTS_SET)) ||
+        !js_object_set_ascii(ctx, ctx->function_methods, "caller",
+                             js_accessor(JS_ACC_FN_CALLER_GET, JS_ACC_FN_CALLER_SET)))
         return false;
     /* trimLeft and trimRight are the very functions trimStart and trimEnd, as in V8 */
     for (int i = 0; i < 2; i++) {

@@ -21,12 +21,10 @@ so everything left is left out by design:
 - `Object.getOwnPropertySymbols`, and everything else that takes or returns a symbol: there
   are no symbols.
 - `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__`: a script
-  cannot make an accessor property (see Objects, below). `Object.prototype.__proto__` **is**
-  there and is the one accessor the engine has. For the same reason `size` (`Map`, `Set`) and
-  `source`, `flags`, `global` and the other flags (`RegExp`) are read from the instance rather
-  than through an accessor on the prototype, so they work as in V8 but
-  `Object.getOwnPropertyNames(Map.prototype)` does not list `size`.
-- `Function.prototype.constructor`, `arguments` and `caller`: see Functions, below.
+  cannot write a getter or setter of its own (see Objects, below). The accessors of V8's
+  builtins **are** there, on the prototypes and constructors where V8 has them
+  (`Object.prototype.__proto__`, `Map.prototype.size`, `RegExp.prototype.source`, ...).
+- `Function.prototype.constructor`: see Functions, below.
 - `Error.prepareStackTrace`: see Errors, below.
 - `queueMicrotask` and `structuredClone` are the host's (HTML, Node), not V8's; an embedder adds
   them as natives if it wants them.
@@ -62,14 +60,24 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   `Set.prototype` or the weak collections' prototypes reports that tag, as V8's own
   `Symbol.toStringTag` makes it; there is no
   symbol to set another (there are no symbols). `Array.prototype` is a plain object here, not an
-  array, so its tag is `[object Object]` (V8: `[object Array]`).
-- **`__proto__` is the one accessor property.** `Object.prototype.__proto__` reads and sets a
-  value's prototype as in V8 (see [Built-ins](/guide/builtins)), its descriptor has V8's `get`
-  and `set` functions, and it can be deleted, redefined as a data property, or defined on
-  another object under the name `__proto__` with that descriptor. What V8 takes and lamassu
-  refuses (`TypeError: Accessor properties (get, set) are not supported`): a descriptor with
-  any other `get` or `set`, with only one of those two functions, or with them under another
-  name (`Object.defineProperty(o, 'parent', descriptor)`).
+  array (`Array.isArray(Array.prototype)` is `false`), but it reports V8's tag,
+  `[object Array]`.
+- **The builtins' accessors are V8's; a script cannot write one of its own.** Where V8 has an
+  accessor property lamassu has one, on the same object, found by the walk up the prototype
+  chain: `Object.prototype.__proto__`, `size` on `Map.prototype` and `Set.prototype`, `source`,
+  `flags`, `global` and the other flags on `RegExp.prototype`, `RegExp`'s legacy statics
+  (`RegExp.$1`, `lastMatch`, `input`, ...), an error's own `stack`, `Function.prototype`'s
+  `arguments` and `caller` (which only throw) and `Iterator.prototype.constructor`. Each has
+  V8's descriptor (`get size`, no `set`, not enumerable, configurable) and V8's errors
+  (`Method get Map.prototype.size called on incompatible receiver #<Set>`, `Cannot set property
+  size of #<Map> which has only a getter`), is inherited by what has the prototype in its chain
+  (`Object.create(new Map()).size` throws as in V8), and can be shadowed, deleted, redefined as
+  a data property, or defined on any object, function or promise under any name, alone or as a
+  pair (`Object.defineProperty(o, 'count', Object.getOwnPropertyDescriptor(Map.prototype,
+  'size'))`). What V8 takes and lamassu refuses: a descriptor whose `get` or `set` is a
+  function of the script's (`TypeError: A script function as a getter or setter is not
+  supported`; there is no getter or setter syntax either), and an accessor as an array element
+  (`Cannot redefine property: 0 (an array element cannot be an accessor in lamassu)`).
 - **`Object(primitiveValue)` returns the primitive unchanged** rather than
   boxing it into a wrapper object — this engine has no boxed-primitive type
   at all. `Object()`/`Object(null)`/`Object(undefined)` (a new empty
@@ -86,10 +94,9 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   `TypeError: Cannot redefine property` that says so: an **array element** cannot be made
   read-only, non-enumerable or non-configurable (elements are a flat vector with no attribute
   storage; a frozen or sealed array's elements are), nor can an **array's `length`** or a
-  **regexp's `lastIndex`** be made read-only (outside `freeze`). An error's **`stack`** is a data
-  property here where V8 has an accessor; it reads, writes and redefines as V8's does, but its
-  descriptor has `value`/`writable` rather than `get`/`set`. The same goes for RegExp's legacy
-  statics (`RegExp.$1`, `lastMatch`, `input`, ...).
+  **regexp's `lastIndex`** be made read-only (outside `freeze`). The **`stack`** that
+  `Error.captureStackTrace(o)` gives an object that is not an error is a data property here
+  where V8 has an accessor (an error's own `stack` is V8's accessor).
 - **`Object.getOwnPropertyNames` of a builtin gives V8's names, not V8's order.** What V8 makes
   non-enumerable (a builtin prototype's methods, a function's `prototype.constructor`, an
   error's `message`) is non-enumerable here too: left out of `Object.keys`, JSON, spread and
@@ -106,8 +113,8 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   `Function.prototype.toString.call(x)` is written `(() => {}).toString.call(x)`, and
   `Object.getPrototypeOf(() => {})` is `Function.prototype`. For the same reason
   `Function.prototype` has no `constructor`, and `AsyncFunction.prototype`
-  (`Object.getPrototypeOf(async () => {})`) none either. `Function.prototype` has no
-  `arguments` or `caller` (in V8, accessors that only throw).
+  (`Object.getPrototypeOf(async () => {})`) none either, so `f.constructor` is `Object` here
+  and `Function` in V8.
 
 ## Conversions
 
@@ -173,9 +180,6 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   `return`) changes what `[].values().next()` does, but not how `for...of` walks an array. (They do
   read `next` from a `Map`, `Set` or other iterator object, as V8 does, so replacing it there takes
   effect.)
-- **`Iterator.prototype.constructor` is a plain property**: in V8 it is an accessor whose setter
-  refuses an assignment to `Iterator.prototype.constructor` itself (there are no accessors here),
-  so that assignment succeeds here.
 
 ## Errors
 

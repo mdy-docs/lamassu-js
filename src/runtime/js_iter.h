@@ -121,6 +121,8 @@ size_t js_iterobj_release(JsVm *vm, JsObject *o);
 /* The prototypes, the Iterator global and its helpers (called from js_builtins_init, before
  * Map and Set exist). */
 bool js_iter_builtins_init(JsContext *ctx);
+/* The getter (SET false) and setter of Iterator.prototype.constructor, for js_accessor_call */
+bool js_iter_ctor_accessor(JsContext *ctx, bool set, JsValue recv, JsValue arg, JsValue *out);
 
 /* Array.prototype keys/values/entries (JS_ITER_ARRAY_*): an Array Iterator over ToObject(this). */
 bool js_array_iter_method(JsContext *ctx, JsValue tv, JsIterKind kind, JsValue *r);

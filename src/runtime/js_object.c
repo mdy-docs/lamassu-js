@@ -165,7 +165,12 @@ JsValue js_object_get(JsVm *vm, JsValue obj, JsValue key) {
      * leaves the engine, so the host sees it as not there yet */
     if (v.bits == JS_SPECIAL_TDZ)
         return js_undefined();
-    if (v.bits == JS_SPECIAL_ACCESSOR) { /* the `__proto__` accessor: what it reads */
+    if (js_is_accessor(v)) {
+        /* an accessor property: there is no context here to run its getter in, so the host sees
+         * what the `__proto__` accessor reads and undefined for any other (an error's `stack`:
+         * js_error_stack gives its frames) */
+        if (js_accessor_getter(v) != JS_ACC_PROTO_GET)
+            return js_undefined();
         JsValue p = js_value_object(obj)->proto;
         return js_is_undefined(p) ? js_null() : p;
     }

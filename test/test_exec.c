@@ -403,7 +403,9 @@ static void test_functions(void) {
                   "3");
     expect_result("function C() { this.n = arguments.length; } new C(1, 2).n;", "2");
     expect_result("async function f(a) { return arguments.length; } await f(1, 2, 3);", "3");
-    expect_result("function f() {} typeof f.arguments;", "undefined");
+    /* Function.prototype.arguments is V8's accessor, which throws for a strict function */
+    expect_error("function f() {} typeof f.arguments;", RUN_RUNTIME_ERR,
+                 "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions");
     expect_error("arguments;", RUN_RUNTIME_ERR, "arguments is not defined");
     expect_error("(() => arguments.length)();", RUN_RUNTIME_ERR, "arguments is not defined");
     expect_error("function f(arguments) {}", RUN_COMPILE_ERR, "Unexpected eval or arguments in strict mode");

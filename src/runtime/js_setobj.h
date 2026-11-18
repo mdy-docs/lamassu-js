@@ -31,9 +31,6 @@ static inline bool js_setobj_is(JsValue v) {
 void   js_setobj_mark(JsVm *vm, JsObject *o);
 size_t js_setobj_release(JsVm *vm, JsObject *o);
 
-/* Synthesized `size` property (js_interp.c get_property), mirroring Map's. */
-bool js_setobj_prop_get(JsObject *o, JsValue key, JsValue *out, bool *handled);
-
 /* Installs the Set global and a real, script-visible Set.prototype (every
  * instance's [[Prototype]] points there — see js_setobj.c). Called from
  * js_builtins_init. */

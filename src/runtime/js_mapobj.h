@@ -39,11 +39,6 @@ static inline bool js_mapobj_is(JsValue v) {
 void   js_mapobj_mark(JsVm *vm, JsObject *o);
 size_t js_mapobj_release(JsVm *vm, JsObject *o);
 
-/* Synthesized `size` property (js_interp.c get_property), mirroring how
- * RegExp's source/flags/lastIndex are synthesized rather than stored in
- * the props map. *handled is false for any other key. */
-bool js_mapobj_prop_get(JsObject *o, JsValue key, JsValue *out, bool *handled);
-
 /* Installs the Map global and a real, script-visible Map.prototype (every
  * instance's [[Prototype]] points there — see js_mapobj.c). Called from
  * js_builtins_init. */

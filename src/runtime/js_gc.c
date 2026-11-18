@@ -360,10 +360,9 @@ void js_gc_collect(JsVm *vm) {
             js_gc_mark_cell(vm, &ctx->promise_methods->gc);
         if (ctx->object_proto)
             js_gc_mark_cell(vm, &ctx->object_proto->gc);
-        if (ctx->proto_getter)
-            js_gc_mark_cell(vm, &ctx->proto_getter->gc);
-        if (ctx->proto_setter)
-            js_gc_mark_cell(vm, &ctx->proto_setter->gc);
+        for (int i = 0; i < JS_ACC__COUNT; i++)
+            if (ctx->accessor_fns[i])
+                js_gc_mark_cell(vm, &ctx->accessor_fns[i]->gc);
         if (ctx->array_proto)
             js_gc_mark_cell(vm, &ctx->array_proto->gc);
         if (ctx->regexp_proto)
@@ -376,6 +375,8 @@ void js_gc_collect(JsVm *vm) {
             js_gc_mark_cell(vm, &ctx->set_proto->gc);
         if (ctx->iterator_proto)
             js_gc_mark_cell(vm, &ctx->iterator_proto->gc);
+        if (ctx->iterator_ctor)
+            js_gc_mark_cell(vm, &ctx->iterator_ctor->gc);
         for (int k = 0; k < JS_ITER_PROTO_COUNT; k++) {
             if (ctx->iter_protos[k])
                 js_gc_mark_cell(vm, &ctx->iter_protos[k]->gc);

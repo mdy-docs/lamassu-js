@@ -244,21 +244,6 @@ static bool map_entries(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     return map_iterator(ctx, tv, r, JS_ITER_MAP_ENTRIES);
 }
 
-/* ---- synthesized `size` (js_interp.c get_property) ---- */
-
-bool js_mapobj_prop_get(JsObject *o, JsValue key, JsValue *out, bool *handled) {
-    *handled = false;
-    if (!js_is_string(key))
-        return true;
-    JsString *ks = js_value_string(key);
-    if (ks->length == 4 && ks->units[0] == 's' && ks->units[1] == 'i' &&
-        ks->units[2] == 'z' && ks->units[3] == 'e') {
-        *out = js_number(((JsMapObj *)o)->count);
-        *handled = true;
-    }
-    return true;
-}
-
 /* ---- GC ---- */
 
 void js_mapobj_mark(JsVm *vm, JsObject *o) {
@@ -380,11 +365,13 @@ bool js_mapobj_builtins_init(JsContext *ctx) {
     } methods[] = {
         {"set", map_set}, {"get", map_get}, {"has", map_has}, {"delete", map_delete},
         {"clear", map_clear}, {"forEach", map_forEach},
-        {"keys", map_keys}, {"values", map_values}, {"entries", map_entries},
+        {"keys", map_keys}, {"size", NULL}, {"values", map_values}, {"entries", map_entries},
         {"getOrInsert", map_getOrInsert}, {"getOrInsertComputed", map_getOrInsertComputed},
     };
     for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
-        if (!def_method(ctx, ctx->map_proto, methods[i].name, methods[i].fn))
+        /* `size` is an accessor, a getter alone, as the spec has it (js_accessor_call) */
+        if (!(methods[i].fn ? def_method(ctx, ctx->map_proto, methods[i].name, methods[i].fn)
+                            : js_object_set_accessor(ctx, ctx->map_proto, methods[i].name, JS_ACC_MAP_SIZE, 0)))
             return false;
     }
 

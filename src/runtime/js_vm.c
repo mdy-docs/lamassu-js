@@ -256,13 +256,14 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->async_function_proto = NULL;
     ctx->promise_methods = NULL;
     ctx->object_proto = NULL;
-    ctx->proto_getter = ctx->proto_setter = NULL;
+    memset(ctx->accessor_fns, 0, sizeof ctx->accessor_fns);
     ctx->array_proto = NULL;
     ctx->regexp_proto = NULL;
     ctx->date_proto = NULL;
     ctx->map_proto = NULL;
     ctx->set_proto = NULL;
     ctx->iterator_proto = NULL;
+    ctx->iterator_ctor = NULL;
     for (int k = 0; k < JS_ITER_PROTO_COUNT; k++)
         ctx->iter_protos[k] = NULL;
     for (int k = 0; k < JS_ERROR_KIND_COUNT; k++)
@@ -301,7 +302,6 @@ JsContext *js_context_new(JsVm *vm) {
     for (int i = 0; i < 20; i++)
         ctx->re_caps[i] = -1;
     ctx->re_last_paren[0] = ctx->re_last_paren[1] = -1;
-    ctx->re_legacy_deleted = 0;
     ctx->error_trace_count = 0;
     ctx->error_trace_value = js_undefined();
     ctx->raise_fresh = false;

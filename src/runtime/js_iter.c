@@ -664,8 +664,8 @@ bool js_collection_fill(JsContext *ctx, JsValue coll, JsValue iterable, bool pai
     if (!get_named(ctx, coll, name, &adder))
         return (*r = adder), false;
     if (!js_is_function(adder))
-        return (*r = js_error_fmt(ctx, "TypeError: '%v' returned for property '%s' of object '#<%s>' is not a function",
-                                  adder, name, pairs ? "Map" : "Set")),
+        return (*r = js_error_fmt(ctx, "TypeError: '%v' returned for property '%s' of object '%v' is not a function",
+                                  adder, name, coll)),
                false;
     js_gc_protect(vm, &adder);
     bool fast = is_builtin(adder, builtin);
@@ -1227,6 +1227,62 @@ static bool def_method(JsContext *ctx, JsObject *o, const char *name, JsNativeFn
     return js_is_function(nf) && js_object_set_hidden(ctx, o, name, nf);
 }
 
+/* Iterator.prototype.constructor: an accessor, as the spec has it (27.1.4.1), whose getter and
+ * setter these are (js_accessor_call). The getter gives Iterator whatever its receiver; the
+ * setter is the spec's SetterThatIgnoresPrototypeProperties: it refuses Iterator.prototype
+ * itself, and on any other object makes or sets an own `constructor`, so an assignment to
+ * what inherits from Iterator.prototype shadows the accessor as it would a data property.
+ * False with the error in *OUT. */
+bool js_iter_ctor_accessor(JsContext *ctx, bool set, JsValue recv, JsValue arg, JsValue *out) {
+    JsVm *vm = ctx->vm;
+    if (!set) {
+        *out = ctx->iterator_ctor ? js_value_from_cell(&ctx->iterator_ctor->gc) : js_undefined();
+        return true;
+    }
+    *out = js_undefined();
+    if (!js_is_object(recv) && !js_is_function(recv) && !js_is_promise(recv)) {
+        *out = js_error_fmt(ctx, "TypeError: set Iterator.prototype.constructor called on non-object");
+        return false;
+    }
+    if (js_is_object(recv) && js_value_object(recv) == ctx->iterator_proto) {
+        *out = js_error_fmt(ctx, "TypeError: Cannot assign to read only property 'constructor' of object '%v'", recv);
+        return false;
+    }
+    js_gc_protect(vm, &recv);
+    js_gc_protect(vm, &arg);
+    JsString *k = js_ascii_cell(vm, "constructor");
+    JsValue kv = k ? js_value_from_cell(&k->gc) : js_undefined();
+    js_gc_protect(vm, &kv);
+    bool ok = k != NULL;
+    if (ok) {
+        JsValue cur;
+        uint8_t attrs;
+        int st = js_own_property(ctx, recv, kv, &cur, &attrs);
+        if (st < 0)
+            ok = false;
+        else if (st == 0) { /* CreateDataPropertyOrThrow */
+            JsPropDesc d = {JS_DESC_VALUE | JS_DESC_WRITABLE | JS_DESC_ENUMERABLE | JS_DESC_CONFIGURABLE,
+                            true, true, true, arg};
+            ok = js_define_own_property(ctx, recv, kv, &d);
+        } else if (st == 2 && js_accessor_setter(cur) == JS_ACC_ITER_CTOR_SET) {
+            /* its own `constructor` is this accessor again (Object.defineProperty put it there):
+             * the Set the spec asks for would call this setter without end, which V8 does, to
+             * the same error */
+            js_set_error(ctx, js_error_fmt(ctx, "RangeError: Maximum call stack size exceeded"));
+            ok = false;
+        } else
+            ok = js_set_property(ctx, recv, kv, arg);
+    }
+    js_gc_unprotect(vm, &kv);
+    js_gc_unprotect(vm, &arg);
+    js_gc_unprotect(vm, &recv);
+    if (!ok) {
+        *out = js_is_undefined(ctx->pending_error) ? js_oom_value(vm) : js_take_error(ctx);
+        return false;
+    }
+    return true;
+}
+
 bool js_iter_builtins_init(JsContext *ctx) {
     JsVm *vm = ctx->vm;
     /* %IteratorPrototype%, Iterator.prototype: each family's prototype chains to it */
@@ -1273,8 +1329,11 @@ bool js_iter_builtins_init(JsContext *ctx) {
         ((JsNative *)js_value_cell(ctor))->statics = js_value_object(statics);
         ok = def_method(ctx, js_value_object(statics), "from", it_from) &&
              def_method(ctx, js_value_object(statics), "concat", it_concat) &&
-             js_object_set_hidden(ctx, ctx->iterator_proto, "constructor", ctor) &&
+             js_object_set_accessor(ctx, ctx->iterator_proto, "constructor", JS_ACC_ITER_CTOR_GET,
+                                    JS_ACC_ITER_CTOR_SET) &&
              js_object_set_ascii(ctx, ctx->globals, "Iterator", ctor);
+        if (ok)
+            ctx->iterator_ctor = (JsNative *)js_value_cell(ctor); /* reachable from the globals */
     }
     js_gc_unprotect(vm, &ctor);
     return ok;

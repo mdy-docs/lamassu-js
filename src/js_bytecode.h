@@ -192,14 +192,27 @@ extern const JsOpInfo js_op_info[JS_OP__COUNT];
 
 /* TDZ sentinel: internal special value, never exposed to scripts. */
 #define JS_SPECIAL_TDZ (JS_TAG_SPECIAL | 4)
-/* The `__proto__` accessor, the one accessor property there is: the value of the property named
- * `__proto__` that Object.prototype has (and of one Object.defineProperty copies elsewhere under
- * that name). Internal too: a read that finds it gives the receiver's [[Prototype]], an
- * assignment that finds it sets that, and every reader that hands a property's value to a script
- * turns it into one or the other first. */
-#define JS_SPECIAL_ACCESSOR (JS_TAG_SPECIAL | 5)
+/* An accessor property's value in a property map: a marker naming its getter and its setter, two
+ * of the engine's own accessor functions (JsAccessorId, lamassu_internal.h; 0 for none: a script
+ * cannot write an accessor of its own). Object.prototype's `__proto__`, Map.prototype's `size`, a
+ * regexp's `source`, an error's `stack` are such entries, as they are accessors in V8, and
+ * Object.defineProperty copies them elsewhere. Internal too: a read that finds one runs the
+ * getter with the receiver the read began at, an assignment that finds one runs the setter, and
+ * every reader that hands a property's value to a script does one or the other first. It holds no
+ * pointer, so the collector has nothing to follow. */
+#define JS_ACCESSOR_BASE (JS_TAG_SPECIAL | 0x10000)
+static inline bool js_is_accessor(JsValue v) { return v.bits - JS_ACCESSOR_BASE < 0x10000; }
+static inline JsValue js_accessor(unsigned getter, unsigned setter) {
+    JsValue v;
+    v.bits = JS_ACCESSOR_BASE | (uint64_t)setter << 8 | getter;
+    return v;
+}
+static inline unsigned js_accessor_getter(JsValue v) { return (unsigned)(v.bits & 0xFF); }
+static inline unsigned js_accessor_setter(JsValue v) { return (unsigned)(v.bits >> 8 & 0xFF); }
 /* Either of the two: one test where a property's value is about to reach a script */
-static inline bool js_is_marker(JsValue v) { return (v.bits | 1) == JS_SPECIAL_ACCESSOR; }
+static inline bool js_is_marker(JsValue v) {
+    return v.bits - JS_SPECIAL_TDZ <= JS_ACCESSOR_BASE + 0xFFFF - JS_SPECIAL_TDZ;
+}
 
 /* Runs fn on a fresh fiber. False -> *result is the error value. */
 bool js_interp_run(JsContext *ctx, JsFunctionCell *fn, JsValue *result);
@@ -226,19 +239,23 @@ bool      js_get_property(JsContext *ctx, JsValue base, JsValue key, JsValue *ou
 /* the same read of a key [[GetOwnProperty]] found on BASE; they differ in one error's words */
 bool      js_get_own_property(JsContext *ctx, JsValue base, JsValue key, JsValue *out);
 bool      js_set_property(JsContext *ctx, JsValue base, JsValue key, JsValue val);
-/* A property descriptor (data properties only: there are no accessors). HAS says which fields
- * the descriptor object named. */
+/* A property descriptor. HAS says which fields the descriptor object named. An accessor
+ * descriptor (JS_DESC_GET or JS_DESC_SET) has the two functions as an accessor marker in VALUE,
+ * 0 for the one it does not name or names as undefined: only the engine's own accessor functions
+ * can be named, there being no others. */
 #define JS_DESC_VALUE 1u
 #define JS_DESC_WRITABLE 2u
 #define JS_DESC_ENUMERABLE 4u
 #define JS_DESC_CONFIGURABLE 8u
+#define JS_DESC_GET 16u
+#define JS_DESC_SET 32u
 typedef struct JsPropDesc {
     uint8_t has;
     bool writable, enumerable, configurable;
     JsValue value;
 } JsPropDesc;
 /* V's own property KEY (a string; V not undefined or null): 1 with its value and JS_ATTR_* bits,
- * 2 (its value undefined) when it is the `__proto__` accessor, 0 when it has none, -1 with an
+ * 2 with its accessor marker when it is an accessor property, 0 when it has none, -1 with an
  * error pending */
 int       js_own_property(JsContext *ctx, JsValue v, JsValue key, JsValue *value, uint8_t *attrs);
 /* [[DefineOwnProperty]] on V (an object, function or promise): false with the TypeError pending */
@@ -387,15 +404,49 @@ JsValue js_get_proto(JsContext *ctx, JsValue v);
  * 0 done, 1 refused (V is sealed or frozen), 2 refused (PROTO's chain reaches V), 3 refused (V is
  * Object.prototype, whose prototype is fixed). */
 int js_set_proto(JsContext *ctx, JsValue v, JsValue proto);
-/* The value of V's property that was read as VAL: VAL, or V's [[Prototype]] when VAL is the
- * `__proto__` accessor's marker. For the readers that take a value out of a property map. */
-static inline JsValue js_prop_value(JsContext *ctx, JsValue v, JsValue val) {
-    return JS_UNLIKELY(val.bits == JS_SPECIAL_ACCESSOR) ? js_get_proto(ctx, v) : val;
+/* The engine's accessor functions (js_builtins.c). js_accessor_call runs the one numbered ID
+ * (a JsAccessorId) with RECV as its receiver and ARG as its argument (undefined for a getter):
+ * false with the error value in *OUT, as a native. js_accessor_function gives the function a
+ * descriptor shows for it (made on first use; undefined for 0), false when it could not be made
+ * (out of memory, pending), js_accessor_id the number of such a function (0 for any other
+ * value). */
+bool js_accessor_call(JsContext *ctx, unsigned id, JsValue recv, JsValue arg, JsValue *out);
+bool js_accessor_function(JsContext *ctx, unsigned id, JsValue *out);
+unsigned js_accessor_id(JsContext *ctx, JsValue fn);
+/* What reading the accessor property MARKER on RECV gives (undefined when it has no getter):
+ * false with the error value in *OUT */
+static inline bool js_accessor_read(JsContext *ctx, JsValue marker, JsValue recv, JsValue *out) {
+    unsigned id = js_accessor_getter(marker);
+    if (!id) {
+        *out = js_undefined();
+        return true;
+    }
+    return js_accessor_call(ctx, id, recv, js_undefined(), out);
+}
+/* The value of V's property that was read as VAL: VAL, or what its getter gives when VAL is an
+ * accessor's marker. False with the getter's error pending. For the readers that take a value
+ * out of a property map. */
+static inline bool js_prop_value(JsContext *ctx, JsValue v, JsValue val, JsValue *out) {
+    if (JS_UNLIKELY(js_is_accessor(val))) {
+        if (js_accessor_read(ctx, val, v, out))
+            return true;
+        js_set_error(ctx, *out);
+        return false;
+    }
+    *out = val;
+    return true;
 }
 /* Whether KEY (a string value) is "__proto__" */
 bool js_is_proto_key(JsValue key);
 /* Whether V is a function or promise: a value whose own properties are js_cell_props */
 static inline bool js_has_cell_props(JsValue v) { return js_is_function(v) || js_is_promise(v); }
+/* O's [[Prototype]] becomes P (undefined: none), wherever P may be a function or a promise: that
+ * is JS_OBJ_PROTO_CELL, which a write to O or to an object inheriting from it looks for. */
+static inline void js_object_set_proto(JsObject *o, JsValue p) {
+    o->proto = p;
+    o->obj_flags = js_has_cell_props(p) ? (uint8_t)(o->obj_flags | JS_OBJ_PROTO_CELL)
+                                        : (uint8_t)(o->obj_flags & ~JS_OBJ_PROTO_CELL);
+}
 /* A function value's `name` (closure or native); NULL for none, which reads as "". */
 JsString *js_function_source(JsContext *ctx, JsValue fn); /* Function.prototype.toString */
 JsString *js_function_name(JsValue fn);
@@ -419,6 +470,9 @@ bool js_is_constructor(JsValue v);
 bool js_function_has_own_prototype(JsValue fn);
 /* js_object_set_ascii, the property not enumerable (JS_ATTR_HIDDEN), as V8 makes a built-in one */
 bool js_object_set_hidden(JsContext *ctx, JsObject *obj, const char *key, JsValue v);
+/* The same for an accessor property, as a built-in has them: not enumerable, its getter and
+ * setter the engine's accessor functions numbered GETTER and SETTER (JsAccessorId; 0 for none) */
+bool js_object_set_accessor(JsContext *ctx, JsObject *obj, const char *key, unsigned getter, unsigned setter);
 
 /* js_mathkernel.c — freestanding transcendentals (~1e-12 accuracy). */
 double js_k_exp(double x);

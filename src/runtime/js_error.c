@@ -24,33 +24,79 @@ static JsString *key(JsContext *ctx, const char *k) {
     return s ? js_intern_cell(ctx->vm, s) : NULL;
 }
 
-/* Own-or-inherited property by ASCII key — the ordinary chain walk. */
-static bool chain_get(JsContext *ctx, JsObject *o, const char *k, JsValue *out, bool *found) {
+/* Own-or-inherited property by ASCII key, from START (an object, a function or a promise) up
+ * its chain — the ordinary walk; an accessor property's marker comes back as it is. */
+static bool chain_find_from(JsContext *ctx, JsValue start, const char *k, JsValue *out, bool *found) {
     *out = js_undefined();
     *found = false;
     JsString *ik = key(ctx, k);
     if (!ik)
         return false;
-    for (JsObject *cur = o; cur;) {
-        JsValue v = js_map_get(&cur->props, ik, found);
-        if (*found && v.bits == JS_SPECIAL_TDZ) { /* a namespace's uninitialized export */
-            *found = false;
-            return true;
+    JsValue p = start, kv = js_value_from_cell(&ik->gc);
+    js_gc_protect(ctx->vm, &kv); /* an atom is held weakly, and a function's own property may be
+                                  * made as it is read */
+    bool ok = true;
+    for (int depth = 0; depth < 10000; depth++) {
+        if (js_is_object(p)) {
+            JsObject *cur = js_value_object(p);
+            JsValue v = js_map_get(&cur->props, ik, found);
+            if (*found && v.bits == JS_SPECIAL_TDZ) /* a namespace's uninitialized export */
+                *found = false;
+            else if (*found)
+                *out = v;
+            if (*found || v.bits == JS_SPECIAL_TDZ)
+                break;
+            p = cur->proto;
+        } else if (js_is_function(p) || js_is_promise(p)) { /* the chain goes on through one */
+            uint8_t attrs;
+            int st = js_own_property(ctx, p, kv, out, &attrs);
+            ok = st >= 0;
+            *found = st > 0;
+            if (st)
+                break;
+            p = js_get_proto(ctx, p);
+        } else {
+            break;
         }
-        if (*found) {
-            *out = v;
-            return true;
+    }
+    js_gc_unprotect(ctx->vm, &kv);
+    return ok;
+}
+
+static bool chain_find(JsContext *ctx, JsObject *o, const char *k, JsValue *out, bool *found) {
+    return chain_find_from(ctx, js_value_from_cell(&o->gc), k, out, found);
+}
+
+/* [[Get]] by ASCII key: an accessor's getter runs with O as its receiver. False: failed, with
+ * what the getter threw pending (nothing pending: out of memory). */
+static bool chain_get(JsContext *ctx, JsObject *o, const char *k, JsValue *out, bool *found) {
+    if (!chain_find(ctx, o, k, out, found))
+        return false;
+    if (*found && js_is_accessor(*out)) {
+        JsValue v;
+        if (!js_accessor_read(ctx, *out, js_value_from_cell(&o->gc), &v)) {
+            js_set_error(ctx, v);
+            return false;
         }
-        if (js_is_function(cur->proto) || js_is_promise(cur->proto)) { /* the chain goes on through one */
-            JsValue p = cur->proto;
-            if (!js_get_property(ctx, p, js_value_from_cell(&ik->gc), out))
-                return false;
-            *found = !js_is_undefined(*out);
-            return true;
-        }
-        cur = js_is_object(cur->proto) ? js_value_object(cur->proto) : NULL;
+        *out = v;
     }
     return true;
+}
+
+/* V8's GetDataProperty, for what must not run code (a message being written, a stack trace):
+ * an accessor is passed over as if the property were not there */
+static bool chain_data_from(JsContext *ctx, JsValue start, const char *k, JsValue *out, bool *found) {
+    if (!chain_find_from(ctx, start, k, out, found))
+        return false;
+    if (*found && js_is_accessor(*out)) {
+        *found = false;
+        *out = js_undefined();
+    }
+    return true;
+}
+
+static bool chain_data(JsContext *ctx, JsObject *o, const char *k, JsValue *out, bool *found) {
+    return chain_data_from(ctx, js_value_from_cell(&o->gc), k, out, found);
 }
 
 /* "TypeError: x" -> (JS_ERROR_TYPE, "x"); anything else -> (PLAIN, whole). */
@@ -198,20 +244,6 @@ static void fb_piece(FmtBuf *b, const uint16_t *u, size_t n) {
 }
 
 /* A function in a message, as V8 shows one: its source text (Function.prototype.toString) */
-/* V's [[Prototype]] chain reaches Iterator.prototype */
-static bool inherits_iterator(JsContext *ctx, JsValue v) {
-    if (!ctx->iterator_proto)
-        return false;
-    JsValue p = js_get_proto(ctx, v);
-    for (int depth = 0; depth < 10000 && (js_is_object(p) || js_is_function(p) || js_is_promise(p));
-         depth++) {
-        if (js_value_cell(p) == &ctx->iterator_proto->gc)
-            return true;
-        p = js_get_proto(ctx, p);
-    }
-    return false;
-}
-
 static void fb_function(JsContext *ctx, FmtBuf *b, JsValue v) {
     JsString *s = js_function_source(ctx, v); /* v is rooted by the caller */
     if (s)
@@ -222,7 +254,7 @@ static void fb_function(JsContext *ctx, FmtBuf *b, JsValue v) {
 
 static const JsString *type_name_of(JsContext *ctx, JsValue recv, const char **fixed_out, bool frame);
 static const JsString *frame_function_name(JsValue fn);
-static bool chain_get(JsContext *ctx, JsObject *o, const char *key, JsValue *out, bool *found);
+static bool chain_data(JsContext *ctx, JsObject *o, const char *key, JsValue *out, bool *found);
 
 /* An error, or what inherits Error.prototype, as V8 names it in a message: "Name: message" (its
  * name if the message is empty, the message if the name is), from string properties only, with
@@ -236,31 +268,51 @@ static bool is_error_to_string(JsValue v) {
     return !nf->is_bound && nf->fn == errp_toString;
 }
 
-/* TS is what O's `toString` reads as (undefined when it has none) */
-static bool fb_error_like(JsContext *ctx, FmtBuf *b, JsObject *o, JsValue ts) {
-    if (o->obj_kind != JS_OBJ_ERROR && !is_error_to_string(ts))
-        return false;
+/* How V8's NoSideEffectsToString shows V, an object or a promise: an error (or what has
+ * Error.prototype.toString) as "Name: message"; what has Object.prototype.toString and a
+ * constructor with a name as #<Ctor>; anything else by its tag, as [object Tag]. Each is looked
+ * up as a data property, so an accessor (Iterator.prototype's constructor) ends the search. */
+typedef enum { FORM_FAILED, FORM_ERROR, FORM_CTOR, FORM_TAG } ObjectForm;
+
+static ObjectForm object_form(JsContext *ctx, JsValue v, const JsString **ctor) {
+    JsValue ts = js_undefined(), cv = js_undefined();
+    bool found;
+    *ctor = NULL;
+    if (!chain_data_from(ctx, v, "toString", &ts, &found))
+        return FORM_FAILED;
+    if ((js_is_object(v) && js_value_object(v)->obj_kind == JS_OBJ_ERROR) || is_error_to_string(ts))
+        return FORM_ERROR;
+    if (js_is_object_to_string(ts) && !chain_data_from(ctx, v, "constructor", &cv, &found))
+        return FORM_FAILED;
+    *ctor = js_is_function(cv) ? frame_function_name(cv) : NULL; /* the function's, which V keeps */
+    return *ctor ? FORM_CTOR : FORM_TAG;
+}
+
+/* An error's "Name: message" (its name if the message is empty, the message if the name is),
+ * from string data properties only: what is no string counts as empty */
+static void fb_error_like(JsContext *ctx, FmtBuf *b, JsValue v) {
     JsValue nv = js_undefined(), mv = js_undefined();
     bool found;
-    if (!chain_get(ctx, o, "name", &nv, &found) || !chain_get(ctx, o, "message", &mv, &found)) {
+    if (!chain_data_from(ctx, v, "name", &nv, &found) ||
+        !chain_data_from(ctx, v, "message", &mv, &found)) {
         b->oom = true;
-        return true;
+        return;
     }
     const JsString *name = js_is_string(nv) ? js_value_string(nv) : NULL;
     const JsString *msg = js_is_string(mv) ? js_value_string(mv) : NULL;
-    bool has_name = name ? name->length > 0 : js_is_undefined(nv);
+    bool has_name = name && name->length > 0;
     bool has_msg = msg && msg->length > 0;
-    if (has_name) {
-        if (name)
-            fb_piece(b, name->units, name->length);
-        else
-            fb_ascii(b, "Error", 5);
-    }
+    if (has_name)
+        fb_piece(b, name->units, name->length);
     if (has_name && has_msg)
         fb_ascii(b, ": ", 2);
     if (has_msg)
         fb_piece(b, msg->units, msg->length);
-    return true;
+}
+
+bool js_message_names(JsContext *ctx, JsValue v) {
+    const JsString *ctor;
+    return (!js_is_object(v) && !js_is_promise(v)) || object_form(ctx, v, &ctor) != FORM_TAG;
 }
 
 JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
@@ -344,52 +396,23 @@ JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
             fb_piece(b, s->units, s->length);
         } else if (js_is_function(v)) {
             fb_function(ctx, b, v);
-        } else if (js_is_object(v)) {
-            /* V8's NoSideEffectsToString: an error (or what has Error.prototype.toString) as
-             * "Name: message"; what has Object.prototype.toString and a named constructor as
-             * #<Ctor>; anything else by its tag, as [object Tag] */
-            JsObject *vo = js_value_object(v);
-            JsValue ts = js_undefined();
-            bool found;
-            if (!chain_get(ctx, vo, "toString", &ts, &found)) {
+        } else if (js_is_object(v) || js_is_promise(v)) {
+            const JsString *n;
+            ObjectForm form = object_form(ctx, v, &n);
+            if (form == FORM_FAILED) {
                 b->oom = true;
-                continue;
-            }
-            if (fb_error_like(ctx, b, vo, ts))
-                continue; /* an error: "Name: message" */
-            /* V8 finds no constructor for an iterator, nor a constructor or a tag for what else
-             * inherits Iterator.prototype (both are accessors there) */
-            bool iter = vo->obj_kind == JS_OBJ_ITER && ((JsIterObj *)vo)->kind != JS_ITER_WRAP;
-            bool inherits = !iter && inherits_iterator(ctx, v);
-            bool named = js_is_object_to_string(ts) && !(vo->obj_flags & JS_OBJ_NAMESPACE) &&
-                         !iter && !inherits;
-            JsValue cv = js_undefined();
-            if (named && !chain_get(ctx, vo, "constructor", &cv, &found)) {
-                b->oom = true;
-                continue;
-            }
-            const JsString *n = js_is_function(cv) ? frame_function_name(cv) : NULL;
-            if (n) {
+            } else if (form == FORM_ERROR) {
+                fb_error_like(ctx, b, v);
+            } else if (form == FORM_CTOR) {
                 fb_ascii(b, "#<", 2);
                 fb_piece(b, n->units, n->length);
                 fb_ascii(b, ">", 1);
             } else {
-                const char *tag = inherits ? "Object" : js_to_string_tag(ctx, v);
+                const char *tag = js_message_tag(ctx, v);
                 fb_ascii(b, "[object ", 8);
                 fb_ascii(b, tag, strlen(tag));
                 fb_ascii(b, "]", 1);
             }
-        } else if (js_is_promise(v)) {
-            JsValue ts = js_undefined();
-            JsString *tk = key(ctx, "toString");
-            if (!tk || !js_get_property(ctx, v, js_value_from_cell(&tk->gc), &ts)) {
-                b->oom = true;
-                continue;
-            }
-            if (js_is_object_to_string(ts))
-                fb_ascii(b, "#<Promise>", 10);
-            else
-                fb_ascii(b, "[object Promise]", 16);
         } else {
             JsString *s = js_primitive_to_string(vm, v);
             if (s)
@@ -519,19 +542,6 @@ done:
 
 /* ---- e.stack ---- */
 
-static bool key_is(JsValue key, const char *a) {
-    if (!js_is_string(key))
-        return false;
-    const JsString *s = js_value_string(key);
-    size_t n = strlen(a);
-    if (s->length != n)
-        return false;
-    for (size_t i = 0; i < n; i++)
-        if (s->units[i] != (uint16_t)(unsigned char)a[i])
-            return false;
-    return true;
-}
-
 /* Error.stackTraceLimit as V8 reads it: false when it is not a number (no stack at all) */
 static bool stack_trace_limit(JsContext *ctx, uint32_t *limit) {
     *limit = 10;
@@ -540,7 +550,7 @@ static bool stack_trace_limit(JsContext *ctx, uint32_t *limit) {
     JsObject *own = js_cell_props(ctx, js_value_from_cell(&ctx->error_ctor->gc), false);
     JsValue v;
     bool found = false;
-    if (own && !chain_get(ctx, own, "stackTraceLimit", &v, &found))
+    if (own && !chain_data(ctx, own, "stackTraceLimit", &v, &found))
         return false;
     if (!found || !js_is_number(v))
         return false;
@@ -740,7 +750,7 @@ static const JsString *type_name_of(JsContext *ctx, JsValue recv, const char **f
         else {
             JsValue cv;
             bool found;
-            if (chain_get(ctx, o, "constructor", &cv, &found) && found && js_is_function(cv)) {
+            if (chain_data(ctx, o, "constructor", &cv, &found) && found && js_is_function(cv)) {
                 const JsString *n = frame_function_name(cv);
                 if (n)
                     return n;
@@ -904,54 +914,41 @@ static JsString *stack_text(JsContext *ctx, JsObject *o, const JsErrorFrame *fra
     return s;
 }
 
-/* `stack` on an error: an own property, not enumerable, that a script may assign or delete.
- * Each sets *handled when KEY is `stack` and the error has one; false only on OOM. */
-bool js_error_stack_get(JsContext *ctx, JsObject *o, JsValue key, JsValue *out, bool *handled) {
-    *handled = false;
+/* An error's `stack`: an own accessor property, not enumerable, as V8 has it (the entry
+ * error_object_new makes), whose getter and setter these are (js_accessor_call). What they read
+ * and write is the error's own: the frames it captured, or what a script assigned. As V8's, they
+ * answer for the first error on the receiver's prototype chain (so for what inherits from an
+ * error, and still for an error whose `stack` property was deleted or redefined) and give
+ * undefined for anything else, a primitive included. False with the error in *OUT. */
+bool js_error_stack_accessor(JsContext *ctx, bool set, JsValue recv, JsValue arg, JsValue *out) {
+    *out = js_undefined();
+    JsValue h = recv;
+    for (int depth = 0;; depth++) {
+        if (js_is_object(h) && js_value_object(h)->obj_kind == JS_OBJ_ERROR)
+            break;
+        if (depth >= 1000 || !(js_is_object(h) || js_is_function(h) || js_is_promise(h)))
+            return true;
+        h = js_get_proto(ctx, h);
+    }
+    JsObject *o = js_value_object(h);
     JsErrorObject *e = (JsErrorObject *)o;
-    if (e->stack_state == JS_STACK_NONE || !key_is(key, "stack"))
+    if (set) {
+        drop_frames(ctx, e);
+        e->stack = arg;
+        e->stack_state = JS_STACK_VALUE;
         return true;
-    *handled = true;
+    }
     if (e->stack_state != JS_STACK_VALUE) {
-        JsValue ov = js_value_from_cell(&o->gc);
-        js_gc_protect(ctx->vm, &ov);
+        js_gc_protect(ctx->vm, &h);
         JsString *s = stack_text(ctx, o, e->frames, e->stack_state == JS_STACK_FRAMES ? e->frame_count : 0);
-        js_gc_unprotect(ctx->vm, &ov);
+        js_gc_unprotect(ctx->vm, &h);
         if (!s)
-            return false;
+            return nthrow(ctx, out, "out of memory");
         drop_frames(ctx, e);
         e->stack = js_value_from_cell(&s->gc);
         e->stack_state = JS_STACK_VALUE;
     }
     *out = e->stack;
-    return true;
-}
-
-bool js_error_stack_set(JsContext *ctx, JsObject *o, JsValue key, JsValue val) {
-    if (!key_is(key, "stack"))
-        return false;
-    JsErrorObject *e = (JsErrorObject *)o;
-    drop_frames(ctx, e);
-    e->stack = val;
-    e->stack_state = JS_STACK_VALUE;
-    return true;
-}
-
-bool js_error_has_stack(const JsObject *o) {
-    return ((const JsErrorObject *)o)->stack_state != JS_STACK_NONE;
-}
-
-bool js_error_stack_has(JsObject *o, JsValue key) {
-    return ((JsErrorObject *)o)->stack_state != JS_STACK_NONE && key_is(key, "stack");
-}
-
-bool js_error_stack_delete(JsContext *ctx, JsObject *o, JsValue key) {
-    if (!key_is(key, "stack"))
-        return false;
-    JsErrorObject *e = (JsErrorObject *)o;
-    drop_frames(ctx, e);
-    e->stack = js_undefined();
-    e->stack_state = JS_STACK_NONE;
     return true;
 }
 
@@ -969,7 +966,7 @@ static JsValue error_object_new(JsContext *ctx, JsErrorKind kind, JsString *mess
         JsErrorObject *eo = (JsErrorObject *)c;
         JsObject *e = &eo->obj;
         e->obj_kind = JS_OBJ_ERROR;
-        e->obj_flags = 0;
+        e->obj_flags = 0; /* js_object_set_accessor marks it as holding an accessor */
         js_map_init(&e->props);
         e->elems = NULL;
         e->elem_count = e->elem_cap = 0;
@@ -985,9 +982,10 @@ static JsValue error_object_new(JsContext *ctx, JsErrorKind kind, JsString *mess
         eo->origin_spec = NULL;
         ev = js_value_from_cell(c);
         js_gc_protect(vm, &ev);
-        if (message) {
+        /* `stack` first, then `message`: the order V8 lists them in */
+        ok = js_object_set_accessor(ctx, e, "stack", JS_ACC_STACK_GET, JS_ACC_STACK_SET);
+        if (ok && message)
             ok = js_object_set_hidden(ctx, e, "message", mv);
-        }
         if (ok && js_in_native(ctx))
             ok = js_error_capture(ctx, e, skip);
         js_gc_unprotect(vm, &ev);
@@ -1064,6 +1062,10 @@ static bool error_ctor(JsContext *ctx, JsErrorKind kind, const JsValue *args, in
         bool ok = chain_get(ctx, js_value_object(opts), "cause", &cause, &found) &&
                   (!found || js_object_set_hidden(ctx, js_value_object(ev), "cause", cause));
         js_gc_unprotect(vm, &ev);
+        if (!ok && !js_is_undefined(ctx->pending_error)) { /* what a getter of `cause` threw */
+            *r = js_take_error(ctx);
+            return false;
+        }
         if (!ok)
             return nthrow(ctx, r, "out of memory");
     }
@@ -1117,8 +1119,10 @@ static bool errp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int a
 }
 
 /* Error.captureStackTrace(object, fn?): gives OBJECT a `stack` of the frames running now, below
- * FN's call when it is given, as V8 does. On an error it is the error's own, unenumerated
- * `stack`; on any other object an ordinary property (there are no property attributes). */
+ * FN's call when it is given, as V8 does. On an error it is the error's own `stack` accessor,
+ * defined again (so one a script deleted or redefined is back; V8 refuses an error that is not
+ * extensible even when it has one, and so does this); on any other object an ordinary data
+ * property holding the text, where V8 defines the same accessor over storage of its own. */
 static bool err_captureStackTrace(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     JsValue target = ARG(0);
@@ -1128,13 +1132,20 @@ static bool err_captureStackTrace(JsContext *ctx, JsValue tv, const JsValue *arg
                    : ctx->running_native ? js_value_from_cell(&ctx->running_native->gc) : js_undefined();
     JsObject *o = js_value_object(target);
     *r = js_undefined();
+    if (o->obj_flags & JS_OBJ_NO_ADD)
+        return (*r = js_error_fmt(ctx, "TypeError: Cannot define property stack, object is not extensible")), false;
     if (o->obj_kind == JS_OBJ_ERROR) {
+        JsString *k = key(ctx, "stack"); /* the target and SKIP are the caller's arguments: rooted */
+        if (!k)
+            return nthrow(ctx, r, "out of memory");
+        JsPropDesc d = {JS_DESC_GET | JS_DESC_SET | JS_DESC_ENUMERABLE | JS_DESC_CONFIGURABLE, false, false, true,
+                        js_accessor(JS_ACC_STACK_GET, JS_ACC_STACK_SET)};
+        if (!js_define_own_property(ctx, target, js_value_from_cell(&k->gc), &d))
+            return (*r = js_take_error(ctx)), false;
         if (!js_error_capture(ctx, o, skip))
             return nthrow(ctx, r, "out of memory");
         return true;
     }
-    if (o->obj_flags & JS_OBJ_NO_ADD)
-        return (*r = js_error_fmt(ctx, "TypeError: Cannot define property stack, object is not extensible")), false;
     uint32_t limit;
     if (!stack_trace_limit(ctx, &limit))
         return true;

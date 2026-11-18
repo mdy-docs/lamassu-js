@@ -4,10 +4,10 @@
  * compiler rejects regex literals with a clear message when it's off.
  *
  * A regexp is a JS_KIND_OBJECT cell with obj_kind == JS_OBJ_REGEXP whose
- * cell embeds the compiled Program. source/flags/lastIndex and the flag
- * booleans are synthesized properties (js_regexp_prop_get/_set), not
- * entries in the props map — so Object.keys(/a/g) is empty and only
- * lastIndex is writable, matching the spec's prototype-accessor shape.
+ * cell embeds the compiled Program. lastIndex is its one own property, kept
+ * in the cell (js_regexp_prop_get/_set), not in the props map; source, flags
+ * and the flag booleans are RegExp.prototype's accessors (js_regexp_accessor),
+ * found by the ordinary prototype walk, as the spec has them.
  * Scripts may still add their own expando properties via the normal map.
  */
 #ifndef JS_REGEXP_H
@@ -82,10 +82,6 @@ static inline bool js_regexp_is(JsValue v) {
 JsValue js_regexp_new(JsContext *ctx, const uint16_t *pat, uint32_t pat_len,
                       const uint16_t *flags, uint32_t flags_len, const char **err);
 
-/* A write to a RegExp's source, flags, global, ...: set_property words it with the key as V8
- * does ("Cannot set property source of [object Object] which has only a getter") */
-#define JS_REGEXP_GETTER_ONLY "TypeError: Cannot set property of a RegExp which has only a getter"
-
 /* The flags error both constructors report (compared by text) */
 #define JS_REGEXP_FLAGS_ERROR "SyntaxError: invalid regular expression flags"
 
@@ -102,20 +98,18 @@ const char *js_regexp_validate(JsVm *vm, const uint16_t *pat, uint32_t pat_len,
 
 /* GC hooks (js_gc.c). Release frees the engine-owned class string buffers,
  * decrements the live count, and returns the true cell size. */
-/* RegExp's legacy statics (RegExp.$1, lastMatch, input, ...), the 19 names V8 has (js_regexp.c) */
-#define JS_REGEXP_LEGACY_COUNT 19
-int  js_regexp_legacy_index(JsContext *ctx, JsValue key); /* 0..18, or -1 (or deleted) */
-bool js_regexp_legacy_get(JsContext *ctx, int idx, JsValue *out);  /* false on OOM */
-bool js_regexp_legacy_set(JsContext *ctx, int idx, JsValue v);     /* false, error pending */
-void js_regexp_legacy_delete(JsContext *ctx, int idx);
-bool js_regexp_legacy_names(JsContext *ctx, JsObject *out);        /* appends the names */
+/* RegExp.prototype's accessors and the RegExp constructor's legacy statics (RegExp.$1,
+ * lastMatch, input, ...: the JS_REGEXP_LEGACY_COUNT names V8 has), for js_accessor_call: ID a
+ * JsAccessorId of theirs. js_regexp_legacy_name is the name of the legacy static numbered IDX. */
+bool js_regexp_accessor(JsContext *ctx, unsigned id, JsValue recv, JsValue arg, JsValue *out);
+const char *js_regexp_legacy_name(int idx);
 
 void   js_regexp_mark(JsVm *vm, JsObject *o);
 size_t js_regexp_release(JsVm *vm, JsObject *o);
 
-/* Synthesized-property hooks (js_interp.c get_property/set_property).
- * Get: false = OOM; *handled says whether the key was a builtin name.
- * Set: false = read-only violation with *errmsg set. */
+/* lastIndex, the own property a regexp keeps in its cell (js_interp.c get_property and
+ * set_property). *handled says whether the key was it. Set: false with *errmsg NULL when the
+ * conversion threw (pending). */
 bool js_regexp_prop_get(JsContext *ctx, JsObject *o, JsValue key, JsValue *out,
                         bool *handled);
 bool js_regexp_prop_set(JsContext *ctx, JsObject *o, JsValue key, JsValue val,

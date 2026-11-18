@@ -40,12 +40,8 @@ bool js_error_capture_pending(JsContext *ctx, JsValue v);
 /* A syntax error in a module's source: where it is (js_error_stack), and no frames, as V8 makes
  * it. V is left alone unless it is an error object. */
 void js_error_set_origin(JsContext *ctx, JsValue v, JsString *specifier, uint32_t pos);
-bool js_error_stack_get(JsContext *ctx, JsObject *o, JsValue key, JsValue *out, bool *handled);
-bool js_error_stack_set(JsContext *ctx, JsObject *o, JsValue key, JsValue val);
-bool js_error_stack_has(JsObject *o, JsValue key);
-/* Whether the error O has its own `stack` (not deleted) */
-bool js_error_has_stack(const JsObject *o);
-bool js_error_stack_delete(JsContext *ctx, JsObject *o, JsValue key);
+/* The getter (SET false) and setter of an error's `stack` accessor, for js_accessor_call */
+bool js_error_stack_accessor(JsContext *ctx, bool set, JsValue recv, JsValue arg, JsValue *out);
 
 /* New error object of `kind`; `message` may be NULL (inherits ""). Roots
  * `message` itself. undefined on OOM. */
@@ -70,6 +66,9 @@ JsValue js_error_from_cell(JsContext *ctx, JsString *msg);
  * most 6 arguments; a %S or %v
  * longer than 120 units is cut short with "...". Allocates; the arguments need no rooting. */
 JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...);
+/* Whether V8 names V in a message that quotes a property key: an object it could only show by
+ * its tag ([object Tag]) it leaves out, with the words around it */
+bool js_message_names(JsContext *ctx, JsValue v);
 
 /* V8's error for a built-in method called on the wrong kind of value: "Method Map.prototype.get
  * called on incompatible receiver 5". The method's name is the running native's. */

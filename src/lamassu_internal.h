@@ -129,6 +129,11 @@ typedef enum JsObjKind {
 /* The flags that refuse a new property */
 #define JS_OBJ_NO_ADD (JS_OBJ_SEALED | JS_OBJ_FROZEN | JS_OBJ_NOEXT | JS_OBJ_NAMESPACE)
 #define JS_OBJ_RAW_JSON 8u /* made by JSON.rawJSON (always frozen too): JSON.stringify writes its rawJSON */
+/* Its [[Prototype]] is a function or a promise (Object.create(f), Object.setPrototypeOf, `new` of
+ * a function whose prototype is one). A write to it, or through an object that inherits from
+ * it, looks up the chain as a write past a prototype with attributes does; nothing else reads
+ * it. Kept by js_object_set_proto. */
+#define JS_OBJ_PROTO_CELL 64u
 
 /* JsErrorKind (lamassu.h) indexes JsContext.error_protos (js_error.c). */
 
@@ -154,9 +159,9 @@ typedef struct JsObject {
     /* JS_OBJ_ARRAY: dense elements; sparse writes fall back to props. */
     JsValue *elems;
     uint32_t elem_count, elem_cap;
-    /* [[Prototype]]: undefined = none. Only ever an object (see `new` in
-     * js_interp.c); there is no script-facing way to set it to anything
-     * else or to create a cycle. */
+    /* [[Prototype]]: undefined = none, else an object, a function or a promise (the last two
+     * through js_object_set_proto, which marks the object JS_OBJ_PROTO_CELL). Never a cycle
+     * (js_set_proto refuses one). */
     JsValue proto;
 } JsObject;
 
@@ -176,7 +181,26 @@ typedef struct JsErrorFrame {
 #define JS_EF_CONSTRUCT 1u /* entered through `new` */
 #define JS_EF_ASYNC 2u     /* an async function waiting on the one above it */
 
-enum { JS_STACK_NONE, JS_STACK_PENDING, JS_STACK_FRAMES, JS_STACK_VALUE };
+enum { JS_STACK_PENDING, JS_STACK_FRAMES, JS_STACK_VALUE };
+
+/* The engine's accessor functions: what V8 has as getters and setters, by number. A property that
+ * is an accessor holds a marker naming two of them (js_accessor, js_bytecode.h); js_accessor_call
+ * runs one. The RegExp legacy statics (input, $_, lastMatch, ..., $9: JS_REGEXP_LEGACY_COUNT of
+ * them, in V8's order) have a getter and a setter each, as V8 gives each its own. */
+#define JS_REGEXP_LEGACY_COUNT 19
+typedef enum {
+    JS_ACC_NONE,
+    JS_ACC_PROTO_GET, JS_ACC_PROTO_SET,   /* Object.prototype.__proto__ */
+    JS_ACC_MAP_SIZE, JS_ACC_SET_SIZE,
+    JS_ACC_RE_DOTALL, JS_ACC_RE_FLAGS, JS_ACC_RE_GLOBAL, JS_ACC_RE_HASINDICES, JS_ACC_RE_IGNORECASE,
+    JS_ACC_RE_MULTILINE, JS_ACC_RE_SOURCE, JS_ACC_RE_STICKY, JS_ACC_RE_UNICODE, JS_ACC_RE_UNICODESETS,
+    JS_ACC_RE_LEGACY_GET,
+    JS_ACC_RE_LEGACY_SET = JS_ACC_RE_LEGACY_GET + JS_REGEXP_LEGACY_COUNT,
+    JS_ACC_ITER_CTOR_GET = JS_ACC_RE_LEGACY_SET + JS_REGEXP_LEGACY_COUNT, JS_ACC_ITER_CTOR_SET,
+    JS_ACC_STACK_GET, JS_ACC_STACK_SET,   /* an error's `stack` */
+    JS_ACC_FN_ARGUMENTS_GET, JS_ACC_FN_ARGUMENTS_SET, JS_ACC_FN_CALLER_GET, JS_ACC_FN_CALLER_SET,
+    JS_ACC__COUNT
+} JsAccessorId;
 
 typedef struct JsErrorObject {
     JsObject obj;
@@ -735,9 +759,9 @@ struct JsContext {
      * Cached here so allocation sites (js_array_new_cell, alloc_mapobj, ...)
      * don't need to look "Ctor.prototype" up through a property read on
      * every single instance they create. */
-    struct JsNative *proto_getter, *proto_setter; /* `get __proto__` and `set __proto__`: what the
-                             * accessor's descriptor shows (Object.getOwnPropertyDescriptor), and
-                             * what Object.defineProperty takes back. GC roots. */
+    struct JsNative *accessor_fns[JS_ACC__COUNT]; /* the accessor functions as a descriptor shows
+                             * them (`get __proto__`, `get size`, ...), each made when first asked
+                             * for (js_accessor_function). GC roots. */
     JsObject *object_proto; /* root of the chain; its own ->proto is undefined
                              * (no [[Prototype]]), matching real JS's `null`.
                              * Created first in js_builtins_init, before
@@ -752,6 +776,8 @@ struct JsContext {
      * Iterator, Iterator Helper and %WrapForValidIteratorPrototype% prototypes that chain to it
      * (js_iter.h; indexed by JS_ITER_PROTO_*) */
     JsObject *iterator_proto;
+    struct JsNative *iterator_ctor; /* `Iterator`: what Iterator.prototype.constructor's getter
+                                     * gives. GC root. */
     JsObject *iter_protos[JS_ITER_PROTO_COUNT];
     JsObject *error_protos[JS_ERROR_KIND_COUNT]; /* Error.prototype and subclasses */
     /* persistent REPL lexical scope: top-level let/const/function bindings
@@ -813,15 +839,14 @@ struct JsContext {
     JsObject *weakmap_proto, *weakset_proto, *weakref_proto, *finreg_proto; /* GC roots */
     JsObject *weak_kept; /* WeakRef targets kept alive to the end of the job (an array); GC root */
     /* RegExp's legacy statics (RegExp.$1, lastMatch, input, ...): the last successful match's
-     * subject and groups 0-9 ([start, end], -1 for none), its last group, RegExp.input (which a
-     * script may set), and which of the 22 names a script deleted. GC roots: re_subject,
+     * subject and groups 0-9 ([start, end], -1 for none), its last group, and RegExp.input
+     * (which a script may set): what the constructor's accessors read. GC roots: re_subject,
      * re_input. */
     struct JsNative *regexp_ctor;
     JsString *re_subject;
     JsValue re_input;
     int32_t re_caps[20];
     int32_t re_last_paren[2];
-    uint32_t re_legacy_deleted;
     /* What the last failed conversion threw (js_op_to_string and friends), until js_take_error
      * hands it on; undefined otherwise. GC root. */
     JsValue pending_error;
@@ -956,6 +981,7 @@ JsObject *js_iterable_to_array(JsContext *ctx, JsValue v, JsValue *err);
 bool js_split_limit(JsContext *ctx, JsValue limit, uint32_t *lim);
 /* The tag Object.prototype.toString gives V ("Array" for "[object Array]"), as V8's */
 const char *js_to_string_tag(const JsContext *ctx, JsValue v);
+const char *js_message_tag(const JsContext *ctx, JsValue v);
 /* V is the Object.prototype.toString the engine made (whatever a script has put in its place) */
 bool js_is_object_to_string(JsValue v);
 bool js_array_set_index(JsVm *vm, JsObject *arr, uint32_t idx, JsValue v);

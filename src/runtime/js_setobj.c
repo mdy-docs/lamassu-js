@@ -509,21 +509,6 @@ static bool set_isDisjointFrom(JsContext *ctx, JsValue tv, const JsValue *args, 
     return set_op(ctx, tv, args, argc, r, SETOP_DISJOINT);
 }
 
-/* ---- synthesized `size` (js_interp.c get_property) ---- */
-
-bool js_setobj_prop_get(JsObject *o, JsValue key, JsValue *out, bool *handled) {
-    *handled = false;
-    if (!js_is_string(key))
-        return true;
-    JsString *ks = js_value_string(key);
-    if (ks->length == 4 && ks->units[0] == 's' && ks->units[1] == 'i' &&
-        ks->units[2] == 'z' && ks->units[3] == 'e') {
-        *out = js_number(((JsSetObj *)o)->count);
-        *handled = true;
-    }
-    return true;
-}
-
 /* ---- GC ---- */
 
 void js_setobj_mark(JsVm *vm, JsObject *o) {
@@ -566,10 +551,12 @@ bool js_setobj_builtins_init(JsContext *ctx) {
         {"union", set_union}, {"intersection", set_intersection},
         {"difference", set_difference}, {"symmetricDifference", set_symmetricDifference},
         {"isSubsetOf", set_isSubsetOf}, {"isSupersetOf", set_isSupersetOf},
-        {"isDisjointFrom", set_isDisjointFrom},
+        {"isDisjointFrom", set_isDisjointFrom}, {"size", NULL},
     };
     for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
-        if (!def_method(ctx, ctx->set_proto, methods[i].name, methods[i].fn))
+        /* `size` is an accessor, a getter alone, as the spec has it (js_accessor_call) */
+        if (!(methods[i].fn ? def_method(ctx, ctx->set_proto, methods[i].name, methods[i].fn)
+                            : js_object_set_accessor(ctx, ctx->set_proto, methods[i].name, JS_ACC_SET_SIZE, 0)))
             return false;
     }
     /* keys is the very same function as values, as the spec has it */

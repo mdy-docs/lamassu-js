@@ -99,10 +99,11 @@ Object or null`. `props` describes its properties, as `Object.defineProperties` 
 `writable`, `enumerable`, `configurable`, each looked up through the prototype chain, as V8 reads
 them; a missing one is `false` on a new property and unchanged on an existing one) and validate
 them as V8 does (`TypeError: Cannot redefine property: x` for a change a non-configurable property
-refuses; `Cannot define property x, object is not extensible`). A `get` or `set` is a `TypeError`:
-a script cannot make an accessor property (the one exception is `__proto__`'s own pair, see
+refuses; `Cannot define property x, object is not extensible`). A `get` or `set` must be a builtin's accessor function (the `get` or `set` of a
+descriptor `getOwnPropertyDescriptor` returned, such as `Map.prototype.size`'s): a function of the
+script's is a `TypeError`, as a script cannot write a getter or setter (see
 [Deviations](/guide/deviations)). `getOwnPropertyDescriptor(o, key)` returns `{ value, writable,
-enumerable, configurable }` (`{ get, set, enumerable, configurable }` for `__proto__`) or
+enumerable, configurable }` (`{ get, set, enumerable, configurable }` for an accessor) or
 `undefined`, and `getOwnPropertyDescriptors(o)` one for each key
 `getOwnPropertyNames` lists. Redefining a function's `name` or `length` works as in V8 (it is
 configurable); `prototype` can be given a value or made read-only. What lamassu cannot store
@@ -459,9 +460,9 @@ Each subclass constructor's `[[Prototype]]` is `Error`, so `TypeError.captureSta
 Both need `new` (`Map()` is `TypeError: Constructor Map requires 'new'`, as in V8). Both accept
 any iterable to seed from — `new Map([["a", 1]])`, `new Map(otherMap)`, `new Set("abc")` — each
 value going through the collection's own `set` or `add`, as V8 does (a Map's entries can be any
-object with `0` and `1`). Both expose a synthesized `.size` property
-(not a regular own property; it shadows a same-named data property the way `RegExp.lastIndex`
-does).
+object with `0` and `1`). `size` is the accessor `Map.prototype.size` (`Set.prototype.size`), as
+in V8: not an own property of the collection, and a `TypeError` on a receiver that is not one
+(`Method get Map.prototype.size called on incompatible receiver #<Set>`).
 
 - **`Map`**: `Map.groupBy(items, fn)` (a Map of arrays, keyed by what `fn(value, index)`
   returns). **`Map.prototype`**: `set`, `get`, `has`, `delete`, `clear`, `forEach`,
@@ -586,8 +587,7 @@ protocol, named capture groups, and `/d` (indices) all work.
   (`$+`), `leftContext` (`` $` ``), `rightContext` (`$'`) and `$1`–`$9` describe the last
   successful match of any regexp (`exec`, `test`, and the string methods), and stay as they were
   after one that fails. `input` can be set (to a string); writing the others does nothing, as
-  V8's setters do. Each can be deleted or redefined. V8 has them as accessors; here they are
-  answered by the constructor itself, so a descriptor shows a `value`.
+  V8's setters do. Each is an accessor property of `RegExp`, as in V8, and can be deleted or redefined.
 - Consumed by `String.prototype.match`/`matchAll`/`search`/`replace`/
   `replaceAll`/`split` when given a `RegExp` argument.
 - Catastrophic backtracking is bounded by an engine-side step budget — see

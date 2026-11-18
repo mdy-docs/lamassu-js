@@ -288,25 +288,16 @@ size_t js_regexp_release(JsVm *vm, JsObject *o) {
     return sizeof *re;
 }
 
-/* ---- synthesized properties ---- */
+/* ---- properties ---- */
 
+/* lastIndex, a regexp's one own property (a data property kept in the cell, not in its map) */
 bool js_regexp_prop_get(JsContext *ctx, JsObject *o, JsValue key, JsValue *out,
                         bool *handled) {
     (void)ctx;
     JsRegExp *re = (JsRegExp *)o;
-    *handled = true;
-    if (key_is(key, "source")) { *out = js_value_from_cell(&re->source->gc); return true; }
-    if (key_is(key, "flags")) { *out = js_value_from_cell(&re->flags->gc); return true; }
-    if (key_is(key, "lastIndex")) { *out = js_number(re->last_index); return true; }
-    if (key_is(key, "global")) { *out = js_bool(re->global); return true; }
-    if (key_is(key, "ignoreCase")) { *out = js_bool(re->prog.ignore_case); return true; }
-    if (key_is(key, "multiline")) { *out = js_bool(re->prog.multiline); return true; }
-    if (key_is(key, "dotAll")) { *out = js_bool(re->prog.dot_all); return true; }
-    if (key_is(key, "sticky")) { *out = js_bool(re->prog.sticky); return true; }
-    if (key_is(key, "unicode")) { *out = js_bool(re->prog.unicode); return true; }
-    if (key_is(key, "unicodeSets")) { *out = js_bool(re->prog.unicode_sets); return true; }
-    if (key_is(key, "hasIndices")) { *out = js_bool(re->prog.has_indices); return true; }
-    *handled = false;
+    *handled = key_is(key, "lastIndex");
+    if (*handled)
+        *out = js_number(re->last_index);
     return true;
 }
 
@@ -321,14 +312,83 @@ bool js_regexp_prop_set(JsContext *ctx, JsObject *o, JsValue key, JsValue val,
         *errmsg = NULL; /* not a refused write: the conversion threw (pending) */
         return false;
     }
-    if (key_is(key, "source") || key_is(key, "flags") || key_is(key, "global") ||
-        key_is(key, "ignoreCase") || key_is(key, "multiline") || key_is(key, "dotAll") ||
-        key_is(key, "sticky") || key_is(key, "unicode") || key_is(key, "unicodeSets") ||
-        key_is(key, "hasIndices")) {
-        *errmsg = JS_REGEXP_GETTER_ONLY;
+    *handled = false;
+    return true;
+}
+
+static bool re_legacy_get(JsContext *ctx, int idx, JsValue *out);
+static bool re_legacy_set(JsContext *ctx, int idx, JsValue v);
+
+/* RegExp.prototype's accessors (dotAll, flags, global, hasIndices, ignoreCase, multiline, source,
+ * sticky, unicode, unicodeSets: getters only) and the RegExp constructor's (the legacy statics:
+ * a getter and a setter each), for js_accessor_call. A flag's getter answers for a regexp and,
+ * as the spec has it, for RegExp.prototype itself (undefined; "(?:)" for source), and throws
+ * for anything else; `flags` reads the others from its receiver, whatever object that is, so a
+ * regexp whose `global` a script redefined shows it in `flags` too. */
+bool js_regexp_accessor(JsContext *ctx, unsigned id, JsValue recv, JsValue arg, JsValue *out) {
+    static const char *const names[] = {"dotAll", "flags", "global", "hasIndices", "ignoreCase",
+                                        "multiline", "source", "sticky", "unicode", "unicodeSets"};
+    *out = js_undefined();
+    if (id >= JS_ACC_RE_LEGACY_SET) {
+        if (re_legacy_set(ctx, (int)(id - JS_ACC_RE_LEGACY_SET), arg))
+            return true;
+        return re_oom(ctx, out);
+    }
+    if (id >= JS_ACC_RE_LEGACY_GET)
+        return re_legacy_get(ctx, (int)(id - JS_ACC_RE_LEGACY_GET), out) || re_oom(ctx, out);
+    if (id == JS_ACC_RE_FLAGS) {
+        if (!js_is_object(recv) && !js_is_function(recv) && !js_is_promise(recv)) {
+            *out = js_error_fmt(ctx, "TypeError: RegExp.prototype.flags getter called on non-object %v", recv);
+            return false;
+        }
+        /* the order the spec reads them in, which is the order of the letters */
+        static const char *const order[] = {"hasIndices", "global", "ignoreCase", "multiline",
+                                            "dotAll", "unicode", "unicodeSets", "sticky"};
+        static const char letters[] = "dgimsuvy";
+        uint16_t buf[8];
+        uint32_t n = 0;
+        bool ok = true;
+        js_gc_protect(ctx->vm, &recv);
+        for (int i = 0; ok && i < 8; i++) {
+            JsString *k = js_ascii_cell(ctx->vm, order[i]);
+            JsValue v;
+            ok = k && js_get_property(ctx, recv, js_value_from_cell(&k->gc), &v);
+            if (ok && js_to_boolean(v))
+                buf[n++] = (uint16_t)letters[i];
+        }
+        js_gc_unprotect(ctx->vm, &recv);
+        JsValue sv = ok ? js_string_new(ctx->vm, buf, n) : js_undefined();
+        if (!js_is_string(sv))
+            return re_oom(ctx, out);
+        *out = sv;
+        return true;
+    }
+    if (!js_regexp_is(recv)) {
+        if (js_is_object(recv) && js_value_object(recv) == ctx->regexp_proto) {
+            if (id != JS_ACC_RE_SOURCE)
+                return true;
+            JsString *e = js_ascii_cell(ctx->vm, "(?:)");
+            if (!e)
+                return re_oom(ctx, out);
+            *out = js_value_from_cell(&e->gc);
+            return true;
+        }
+        *out = js_error_fmt(ctx, "TypeError: RegExp.prototype.%s getter called on non-RegExp object",
+                            names[id - JS_ACC_RE_DOTALL]);
         return false;
     }
-    *handled = false;
+    JsRegExp *re = (JsRegExp *)js_value_object(recv);
+    switch (id) {
+    case JS_ACC_RE_DOTALL: *out = js_bool(re->prog.dot_all); break;
+    case JS_ACC_RE_GLOBAL: *out = js_bool(re->global); break;
+    case JS_ACC_RE_HASINDICES: *out = js_bool(re->prog.has_indices); break;
+    case JS_ACC_RE_IGNORECASE: *out = js_bool(re->prog.ignore_case); break;
+    case JS_ACC_RE_MULTILINE: *out = js_bool(re->prog.multiline); break;
+    case JS_ACC_RE_SOURCE: *out = js_value_from_cell(&re->source->gc); break;
+    case JS_ACC_RE_STICKY: *out = js_bool(re->prog.sticky); break;
+    case JS_ACC_RE_UNICODE: *out = js_bool(re->prog.unicode && !re->prog.unicode_sets); break;
+    default: *out = js_bool(re->prog.unicode_sets); break;
+    }
     return true;
 }
 
@@ -1499,29 +1559,19 @@ static bool re_escape(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
 /* ---- RegExp's legacy statics (Annex B, as V8 has them) ----
  *
  * RegExp.input ($_), lastMatch ($&), lastParen ($+), leftContext ($`), rightContext ($'), $1-$9:
- * V8's accessors on the constructor, read from the last successful match (re_record). There are
- * no accessors here, so reads, writes and deletes of these names on the RegExp constructor are
- * answered by these functions: input takes a string, the others ignore a write, as V8's setters
- * do; each is configurable. */
+ * accessors on the constructor as V8 has them (js_regexp_accessor), read from the last
+ * successful match (re_record) whatever their receiver. input takes a string, the others ignore
+ * a write, as V8's setters do; each is configurable. */
 
 static const char *const legacy_names[JS_REGEXP_LEGACY_COUNT] = {
     "input", "$_", "lastMatch", "$&", "lastParen", "$+", "leftContext", "$`", "rightContext", "$'",
     "$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8", "$9"};
 
-int js_regexp_legacy_index(JsContext *ctx, JsValue key) {
-    if (!js_is_string(key))
-        return -1;
-    const JsString *k = js_value_string(key);
-    if (k->length < 2 || k->length > 12 || (k->units[0] != '$' && k->units[0] != 'i' && k->units[0] != 'l' &&
-                                            k->units[0] != 'r'))
-        return -1;
-    for (int i = 0; i < JS_REGEXP_LEGACY_COUNT; i++)
-        if (key_is(key, legacy_names[i]))
-            return (ctx->re_legacy_deleted & (1u << i)) ? -1 : i;
-    return -1;
+const char *js_regexp_legacy_name(int idx) {
+    return legacy_names[idx];
 }
 
-bool js_regexp_legacy_get(JsContext *ctx, int idx, JsValue *out) {
+static bool re_legacy_get(JsContext *ctx, int idx, JsValue *out) {
     if (idx <= 1) {
         if (!js_is_undefined(ctx->re_input)) {
             *out = ctx->re_input;
@@ -1556,28 +1606,13 @@ bool js_regexp_legacy_get(JsContext *ctx, int idx, JsValue *out) {
     return true;
 }
 
-bool js_regexp_legacy_set(JsContext *ctx, int idx, JsValue v) {
+static bool re_legacy_set(JsContext *ctx, int idx, JsValue v) {
     if (idx > 1)
         return true; /* V8's setter does nothing */
     JsString *str = js_op_to_string(ctx, v);
     if (!str)
         return false;
     ctx->re_input = js_value_from_cell(&str->gc);
-    return true;
-}
-
-void js_regexp_legacy_delete(JsContext *ctx, int idx) {
-    ctx->re_legacy_deleted |= 1u << idx;
-}
-
-bool js_regexp_legacy_names(JsContext *ctx, JsObject *out) {
-    for (int i = 0; i < JS_REGEXP_LEGACY_COUNT; i++) {
-        if (ctx->re_legacy_deleted & (1u << i))
-            continue;
-        JsString *k = js_ascii_cell(ctx->vm, legacy_names[i]);
-        if (!k || !js_array_append(ctx->vm, out, js_value_from_cell(&k->gc)))
-            return false;
-    }
     return true;
 }
 
@@ -1624,11 +1659,7 @@ bool js_regexp_builtins_init(JsContext *ctx) {
     if (!js_is_object(t))
         return false;
     ctx->regexp_proto = js_value_object(t); /* rooted via the context now */
-    if (!def_method(ctx, ctx->regexp_proto, "exec", rexp_exec) ||
-        !def_method(ctx, ctx->regexp_proto, "test", rexp_test) ||
-        !def_method(ctx, ctx->regexp_proto, "toString", rexp_toString) ||
-        !def_method(ctx, ctx->regexp_proto, "compile", rexp_compile))
-        return false;
+    /* its properties in V8's order: constructor, exec, the accessors, compile, toString, test */
     JsValue ctor = js_native_new(ctx, "RegExp", g_RegExp, NULL);
     if (!js_is_function(ctor) ||
         !js_object_set_ascii(ctx, ctx->regexp_proto, "constructor", ctor) ||
@@ -1636,11 +1667,27 @@ bool js_regexp_builtins_init(JsContext *ctx) {
         return false;
     js_native_builtin_ctor(ctor, ctx->regexp_proto);
     ctx->regexp_ctor = (JsNative *)js_value_cell(ctor); /* reachable from the globals */
+    static const char *const getters[] = {"dotAll", "flags", "global", "hasIndices", "ignoreCase",
+                                          "multiline", "source", "sticky", "unicode", "unicodeSets"};
+    if (!def_method(ctx, ctx->regexp_proto, "exec", rexp_exec))
+        return false;
+    for (unsigned i = 0; i < 10; i++)
+        if (!js_object_set_accessor(ctx, ctx->regexp_proto, getters[i], JS_ACC_RE_DOTALL + i, 0))
+            return false;
+    if (!def_method(ctx, ctx->regexp_proto, "compile", rexp_compile) ||
+        !def_method(ctx, ctx->regexp_proto, "toString", rexp_toString) ||
+        !def_method(ctx, ctx->regexp_proto, "test", rexp_test))
+        return false;
     JsValue st = js_object_new(ctx);
     if (!js_is_object(st))
         return false;
-    ((JsNative *)js_value_cell(ctor))->statics = js_value_object(st);
-    return def_method(ctx, js_value_object(st), "escape", re_escape);
+    JsObject *statics = js_value_object(st);
+    ((JsNative *)js_value_cell(ctor))->statics = statics;
+    for (unsigned i = 0; i < JS_REGEXP_LEGACY_COUNT; i++)
+        if (!js_object_set_accessor(ctx, statics, legacy_names[i], JS_ACC_RE_LEGACY_GET + i,
+                                    JS_ACC_RE_LEGACY_SET + i))
+            return false;
+    return def_method(ctx, statics, "escape", re_escape);
 }
 
 #else /* !LAMASSU_HAS_REGEX: keep the translation unit non-empty */
