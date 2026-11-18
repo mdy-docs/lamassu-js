@@ -551,6 +551,17 @@ throws (`Array.from`'s map function, a Map's `set`). A throw from `next()` itsel
 Destructuring steps the iterator only as far as the pattern needs, and an assignment pattern's
 target (`[o.x] = it`) is evaluated before the iterator steps, as in V8.
 
+An array and a string follow the same protocol, through the `Array Iterator` and the
+`String Iterator` (their prototypes are `Object.getPrototypeOf([].values())` and
+`Object.getPrototypeOf(Iterator.from(''))`). A `next` a script puts on one of them is what steps
+`for...of`, spread, destructuring and the natives above over every array or string from then on
+(a loop already running keeps the `next` it started with), and a `return` put there, on
+`Iterator.prototype` or on `Object.prototype` is called, on an iterator standing where the
+iteration stopped, whenever one stops early. As in V8, `Object.groupBy` and `Map.groupBy` are the
+exception: over an array that still has `Array.prototype` and the built-in `next`, a callback
+that throws closes nothing. While the two prototypes are as the engine made them, no iterator
+object is made for an array or a string.
+
 The iterators' prototypes (`Map Iterator`, `Set Iterator`, `Array Iterator`, `String Iterator`,
 `RegExp String Iterator`, `Iterator Helper`) chain to `Iterator.prototype`, which has V8's
 **Iterator helpers**:

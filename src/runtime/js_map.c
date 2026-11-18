@@ -21,6 +21,7 @@ void js_map_init(JsMap *m) {
     m->index_cap = 0;
     m->unsorted = false;
     m->by_name = false;
+    m->gained = false;
 }
 
 /* Bytes of an entries allocation with room for CAP entries: the entries, then an attribute byte
@@ -238,6 +239,7 @@ bool js_map_set(JsVm *vm, JsMap *m, JsString *key, JsValue value) {
     dst->key = key;
     dst->value = value;
     m->count++;
+    m->gained = true;
     return true;
 }
 

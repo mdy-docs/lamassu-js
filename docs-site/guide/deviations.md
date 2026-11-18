@@ -196,11 +196,11 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   iterable. An array stops being iterable when its prototype chain no longer reaches
   `Array.prototype` (`Object.setPrototypeOf([1], null)`), as in V8. See
   [Built-ins → Iteration](/guide/builtins#iteration).
-- **`for...of`, spread and destructuring of an array or a string do not consult the
-  `Array Iterator` or `String Iterator` prototype**: a script that replaces their `next` (or adds a
-  `return`) changes what `[].values().next()` does, but not how `for...of` walks an array. (They do
-  read `next` from a `Map`, `Set` or other iterator object, as V8 does, so replacing it there takes
-  effect.)
+- **A spread whose iterator has a `next` that is not a function says so**
+  (`TypeError: undefined is not a function`, as `for...of` and destructuring say in both engines).
+  V8 words the error after the expression around the spread: `[...a]` is `a is not iterable` and
+  `f(...a)` is `f is not a function`. It takes a script that deletes or replaces the `next` of a
+  built-in iterator prototype to see either.
 
 ## Errors
 

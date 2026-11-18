@@ -82,6 +82,9 @@ typedef struct JsMap {
     uint32_t index_cap;  /* length of `index`: power of two, or 0 */
     bool unsorted;       /* entries are not in enumeration order (see above) */
     bool by_name;        /* a module namespace's: enumerated by name (code units), as V8 does */
+    bool gained;         /* a key was appended since this was last cleared. Only the close of an
+                          * array's or a string's iteration clears it, on the three prototypes
+                          * where a script could put a `return` (js_iter.c, close_direct). */
 } JsMap;
 
 #define JS_MAP_EMPTY UINT32_MAX
@@ -204,7 +207,9 @@ typedef enum {
 
 /*
  * The builtin properties a builtin algorithm reads from the object it works on, where V8 reads
- * them: RegExp.prototype's `exec`, `flags` and the flag getters, `constructor`, `source`. A
+ * them: RegExp.prototype's `exec`, `flags` and the flag getters, `constructor`, `source`;
+ * Array.prototype's `constructor`; the `next` of the iterator an array or a string is iterated
+ * with. A
  * script may replace any of them, and the algorithm then goes through the replacement
  * (RegExpExec calls whatever `exec` is; split constructs whatever `constructor` names), which is
  * the slow, general path. While one is still the value the engine put there ("intact"), reading
@@ -220,6 +225,8 @@ enum {
     JS_INTACT_RE_CONSTRUCTOR,
     JS_INTACT_RE_SOURCE,
     JS_INTACT_ARRAY_CONSTRUCTOR, /* Array.prototype.constructor */
+    JS_INTACT_ARRAY_ITER_NEXT,   /* the Array Iterator prototype's next */
+    JS_INTACT_STRING_ITER_NEXT,  /* the String Iterator prototype's next */
     JS_INTACT__COUNT
 };
 

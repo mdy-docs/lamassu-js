@@ -518,12 +518,19 @@ bool js_iter_is_iterable(JsContext *ctx, JsValue v) {
 int js_iter_open(JsContext *ctx, JsValue v, JsIterCursor *c) {
     c->i = 0;
     c->src = v;
-    if (js_is_string(v))
-        return 1;
-    if (is_array(v) && inherits_array(ctx, v)) /* not one whose prototype was taken away (as V8) */
-        return 1;
     JsValue it = v;
-    if (js_mapobj_is(v) || js_setobj_is(v)) {
+    if (js_is_string(v) || (is_array(v) && inherits_array(ctx, v))) {
+        /* (an array whose prototype was taken away is not iterable, as in V8.) The iterator V8
+         * makes here is stepped by the `next` it reads from it once. While that is still the
+         * Array Iterator's (the String Iterator's) own, stepping the cursor over V is what calling
+         * it would do, and no iterator object is made; a `next` a script put there is called. */
+        bool str = js_is_string(v);
+        if (js_intact(ctx, str ? JS_INTACT_STRING_ITER_NEXT : JS_INTACT_ARRAY_ITER_NEXT))
+            return 1;
+        it = js_iterobj_new(ctx, str ? JS_ITER_STRING : JS_ITER_ARRAY_VALUES, v, js_undefined(), 0);
+        if (js_is_undefined(it))
+            return -1;
+    } else if (js_mapobj_is(v) || js_setobj_is(v)) {
         /* a Map's default iterator is its entries, a Set's its values */
         it = js_iterobj_new(ctx, js_mapobj_is(v) ? JS_ITER_MAP_ENTRIES : JS_ITER_SET_VALUES, v,
                             js_undefined(), 0);
@@ -608,13 +615,58 @@ static bool close_object(JsContext *ctx, JsValue obj, bool throwing, bool syntax
     return true;
 }
 
+/* O's [[Prototype]] is P (NULL: O has none) */
+static bool proto_is(const JsObject *o, const JsObject *p) {
+    if (!p)
+        return !is_obj(o->proto);
+    return js_is_object(o->proto) && js_value_object(o->proto) == p;
+}
+
+/* IteratorClose for a cursor straight over an array or a string (SRC, stopped at I), for which
+ * no iterator object was made. V8 reads `return` from the Array Iterator (the String Iterator)
+ * it made, and so finds one a script put on that prototype, on Iterator.prototype or on
+ * Object.prototype. The engine puts none on any of the three: while they are still the chain
+ * and none has gained a key since `return` was last looked for (JsMap.gained), there is nothing
+ * to call. Otherwise the iterator V8 would have had is made here, at the cursor's position, and
+ * closed as any other. SRC is rooted by the caller. */
+static bool close_direct(JsContext *ctx, JsValue src, uint32_t i, bool throwing, bool syntax,
+                         JsValue *err) {
+    JsVm *vm = ctx->vm;
+    bool str = js_is_string(src);
+    JsObject *chain[3] = {ctx->iter_protos[str ? JS_ITER_PROTO_STRING : JS_ITER_PROTO_ARRAY],
+                          ctx->iterator_proto, ctx->object_proto};
+    if (proto_is(chain[0], chain[1]) && proto_is(chain[1], chain[2]) && proto_is(chain[2], NULL)) {
+        if (!chain[0]->props.gained && !chain[1]->props.gained && !chain[2]->props.gained)
+            return true;
+        JsString *k = js_ascii_cell(vm, "return");
+        k = k ? js_intern_cell(vm, k) : NULL;
+        bool absent = k != NULL;
+        for (int n = 0; k && n < 3; n++) {
+            if (js_map_position(&chain[n]->props, k) == JS_MAP_EMPTY)
+                chain[n]->props.gained = false;
+            else
+                absent = false;
+        }
+        if (absent)
+            return true;
+    }
+    JsValue it = js_iterobj_new(ctx, str ? JS_ITER_STRING : JS_ITER_ARRAY_VALUES, src, js_undefined(), i);
+    if (js_is_undefined(it))
+        return throwing || ((*err = js_oom_value(vm)), false);
+    js_gc_protect(vm, &it);
+    bool ok = close_object(ctx, it, throwing, syntax, err);
+    js_gc_unprotect(vm, &it);
+    return ok;
+}
+
 bool js_iter_close(JsContext *ctx, JsIterCursor *c, bool throwing, bool syntax, JsValue *err) {
     if (c->i == JS_ITER_DONE_INDEX)
         return true;
+    uint32_t at = c->i;
     c->i = JS_ITER_DONE_INDEX;
     JsValue src = c->src;
     if (!js_iterobj_is(src))
-        return true; /* an array's or a string's iterator has no return */
+        return close_direct(ctx, src, at, throwing, syntax, err);
     JsIterObj *it = (JsIterObj *)js_value_object(src);
     if (it->kind == JS_ITER_RECORD) {
         if (js_is_undefined(it->target))
@@ -1302,6 +1354,10 @@ bool js_iter_builtins_init(JsContext *ctx) {
     if (!def_method(ctx, ctx->iter_protos[JS_ITER_PROTO_HELPER], "return", helper_return) ||
         !def_method(ctx, ctx->iter_protos[JS_ITER_PROTO_WRAP], "return", wrap_return))
         return false;
+    /* an array or a string is iterated without an iterator object while these are untouched */
+    if (!js_intact_watch(ctx, JS_INTACT_ARRAY_ITER_NEXT, ctx->iter_protos[JS_ITER_PROTO_ARRAY], "next") ||
+        !js_intact_watch(ctx, JS_INTACT_STRING_ITER_NEXT, ctx->iter_protos[JS_ITER_PROTO_STRING], "next"))
+        return false;
 
     static const struct {
         const char *name;
@@ -1387,9 +1443,14 @@ bool js_group_by(JsContext *ctx, JsValue items, JsValue cb, bool property_keys, 
         k++;
     }
     if (thrown) {
+        /* V8 groups an array that still has Array.prototype (and the Array Iterator's own next)
+         * by a path of its own, with no iterator to close: a `return` a script put where
+         * close_direct looks is not called for one, though the specification would call it */
+        bool plain = is_array(cur.src) && proto_is(js_value_object(cur.src), ctx->array_proto);
         js_gc_protect(vm, r);
         JsValue ignored;
-        (void)js_iter_close(ctx, &cur, true, false, &ignored);
+        if (!plain)
+            (void)js_iter_close(ctx, &cur, true, false, &ignored);
         js_gc_unprotect(vm, r);
         ok = false;
     }

@@ -2367,17 +2367,30 @@ static void fiber_throw_callee(JsContext *ctx, JsFiber *fb, const JsFunctionCell
 
 /* ---- iteration beyond strings and arrays (js_iter.h), out of the dispatch loop ---- */
 
-/* An array whose [[Prototype]] is still Array.prototype: iterated by its elements with no
- * further question. Any other array asks js_iter_open, which follows its chain. */
-static inline bool is_plain_array(const JsContext *ctx, JsValue v) {
+/* The Array Iterator's (STRING: the String Iterator's) `next` is the engine's own. Out of the
+ * dispatch loop: the watch's code inline there slows the whole loop down. */
+static JS_NOINLINE bool iter_next_intact(JsContext *ctx, bool string) {
+    return js_intact(ctx, string ? JS_INTACT_STRING_ITER_NEXT : JS_INTACT_ARRAY_ITER_NEXT);
+}
+
+/* An array whose [[Prototype]] is still Array.prototype, while the Array Iterator's `next` is the
+ * engine's own: iterated by its elements with no further question. Any other array asks
+ * js_iter_open, which follows its chain and calls a `next` a script put there. */
+static inline bool is_plain_array(JsContext *ctx, JsValue v) {
     if (!is_array(v))
         return false;
     JsValue p = js_value_object(v)->proto;
-    return js_is_object(p) && js_value_object(p) == ctx->array_proto;
+    return js_is_object(p) && js_value_object(p) == ctx->array_proto && iter_next_intact(ctx, false);
 }
 
-/* ITER_NEW for anything but a string or an array: a Map or a Set becomes an iterator over its
- * entries or values, an iterator object is its own iterable, anything else is "x is not
+/* A string, while the String Iterator's `next` is the engine's own: iterated by its code points */
+static inline bool is_plain_string(JsContext *ctx, JsValue v) {
+    return js_is_string(v) && iter_next_intact(ctx, true);
+}
+
+/* ITER_NEW for anything but a plain string or a plain array: a Map or a Set becomes an iterator
+ * over its entries or values, an iterator object is its own iterable, and so does an array or a
+ * string once a script has replaced the `next` it is stepped with; anything else is "x is not
  * iterable". False raised. */
 JS_COLD static bool iter_open_slow(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip,
                                    JsValue *slot) {
@@ -2480,13 +2493,13 @@ JS_COLD static bool iter_close(JsContext *ctx, JsFiber *fb, JsValue it, JsValue 
         fiber_throw(ctx, fb, "internal error: bad iterator operands");
         return false;
     }
-    if (js_is_string(it) || is_array(it) || i == JS_ITER_DONE_INDEX)
+    if (i == JS_ITER_DONE_INDEX)
         return true;
-    if (!js_iterobj_is(it)) {
+    if (!(js_is_string(it) || is_array(it) || js_iterobj_is(it))) {
         fiber_throw(ctx, fb, "internal error: bad iterator operands");
         return false;
     }
-    JsIterCursor c = {it, i};
+    JsIterCursor c = {it, i}; /* a string's or an array's own cursor: closed where it stopped */
     JsValue err;
     if (js_iter_close(ctx, &c, throwing, true, &err))
         return true;
@@ -2513,8 +2526,8 @@ static JS_NOINLINE bool iter_close_op(JsContext *ctx, JsFiber *fb, uint8_t op) {
     return true;
 }
 
-/* ARRAY_SPREAD (or a call's ARGS_SPREAD, CALL) of a Map, a Set or an iterator object onto the
- * array ARR. False raised. */
+/* ARRAY_SPREAD (or a call's ARGS_SPREAD, CALL) of a Map, a Set, an iterator object, or an array
+ * or a string that is not plain (above), onto the array ARR. False raised. */
 JS_COLD static bool spread_slow(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip,
                                 JsObject *arr, JsValue src, bool call) {
     JsVm *vm = ctx->vm;
@@ -3551,7 +3564,7 @@ run:; /* (re)load the top frame */
                         if (!js_array_append(vm, a, s->elems[i]))
                             RT_THROW("out of memory");
                     }
-                } else if (js_is_string(src)) {
+                } else if (is_plain_string(ctx, src)) {
                     JsString *s = js_value_string(src);
                     for (uint32_t i = 0; i < s->length;) {
                         uint32_t n = 1;
@@ -3691,7 +3704,7 @@ run:; /* (re)load the top frame */
             }
             case JS_OP_ITER_NEW: {
                 JsValue it = PEEK(0);
-                if (!js_is_string(it) && !is_plain_array(ctx, it)) {
+                if (!is_plain_string(ctx, it) && !is_plain_array(ctx, it)) {
                     fr->ip = ip; /* GC-safe point before allocating an iterator */
                     if (!iter_open_slow(ctx, fb, fn, op_ip, &PEEK(0)))
                         RT_RAISE();
