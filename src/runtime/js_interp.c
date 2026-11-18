@@ -2471,12 +2471,12 @@ static JS_NOINLINE bool iter_rest(JsContext *ctx, JsFiber *fb) {
     return true;
 }
 
-/* ITER_CLOSE / ITER_CLOSE_THROW / ITER_CLOSE_LOCAL: IteratorClose of IT (as ITER_NEW left it)
- * at position IDX, unless that is done; LOCAL has no position (a for-of's body is running, so it
- * is not done). THROWING: an exception is leaving, which stays the one thrown. False raised. */
+/* ITER_CLOSE / ITER_CLOSE_THROW / ITER_CLOSE_KEEP: IteratorClose of IT (as ITER_NEW left it)
+ * at position IDX, unless that is done. THROWING: an exception is leaving, which stays the one
+ * thrown. False raised. */
 JS_COLD static bool iter_close(JsContext *ctx, JsFiber *fb, JsValue it, JsValue idx, bool throwing) {
     uint32_t i = 0;
-    if (!js_is_undefined(idx) && !value_to_index(idx, &i)) {
+    if (!value_to_index(idx, &i)) {
         fiber_throw(ctx, fb, "internal error: bad iterator operands");
         return false;
     }
@@ -2496,10 +2496,8 @@ JS_COLD static bool iter_close(JsContext *ctx, JsFiber *fb, JsValue it, JsValue 
 
 /* The three close ops, out of the dispatch loop (cases of their own there cost the loop's
  * register allocation a fifth of its speed): ITER_CLOSE [it i] -> [], ITER_CLOSE_THROW
- * [it i exc] -> [exc], ITER_CLOSE_LOCAL the iterator in stack slot AT. False raised. */
-static JS_NOINLINE bool iter_close_op(JsContext *ctx, JsFiber *fb, uint8_t op, uint32_t at) {
-    if (op == JS_OP_ITER_CLOSE_LOCAL)
-        return iter_close(ctx, fb, fb->stack[at], js_undefined(), false);
+ * [it i exc] -> [exc] and ITER_CLOSE_KEEP [it i v] -> [v]. False raised. */
+static JS_NOINLINE bool iter_close_op(JsContext *ctx, JsFiber *fb, uint8_t op) {
     JsValue *top = &fb->stack[fb->sp - 1];
     if (op == JS_OP_ITER_CLOSE) {
         /* both stay on the stack, rooted, while return() runs */
@@ -2508,7 +2506,7 @@ static JS_NOINLINE bool iter_close_op(JsContext *ctx, JsFiber *fb, uint8_t op, u
         fb->sp -= 2;
         return true;
     }
-    if (!iter_close(ctx, fb, top[-2], top[-1], true))
+    if (!iter_close(ctx, fb, top[-2], top[-1], op == JS_OP_ITER_CLOSE_THROW))
         return false;
     fb->stack[fb->sp - 3] = fb->stack[fb->sp - 1];
     fb->sp -= 2;
@@ -3767,10 +3765,9 @@ run:; /* (re)load the top frame */
             }
             case JS_OP_ITER_CLOSE:
             case JS_OP_ITER_CLOSE_THROW:
-            case JS_OP_ITER_CLOSE_LOCAL: {
-                uint32_t at = op == JS_OP_ITER_CLOSE_LOCAL ? base + READ_U16() : 0;
+            case JS_OP_ITER_CLOSE_KEEP: {
                 fr->ip = ip;
-                if (!iter_close_op(ctx, fb, op, at))
+                if (!iter_close_op(ctx, fb, op))
                     RT_RAISE();
                 break;
             }

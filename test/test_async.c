@@ -251,6 +251,19 @@ static void test_async_await(void) {
     eq("async function bad() { throw 'fail'; }"
        " async function f() { try { await bad(); } catch (e) { return 'caught ' + e; } } await f();",
        "caught fail");
+    /* a finally that awaits, entered by break, continue and return, and left by continue: the
+     * loops outside find their iterators where they left them (Node's output) */
+    eq("const f = async (a) => { let s = ''; for (const x of a) { try { for (const y of a) { try {"
+       " await null; if (y === 2) break; if (x === 3) return s + 'R'; s += x + ':' + y + ' '; }"
+       " finally { await null; s += 'f'; if (x === 2) continue; } s += '.'; } } finally { s += '|'; await 0; } }"
+       " return s; }; await f([1, 2, 3]);",
+       "1:1 f.f|2:1 ff2:3 f|R");
+    eq("const f = async () => { for (const x of [1, 2]) { try { return await Promise.resolve(x); }"
+       " finally { await null; if (x === 1) continue; } } return 'end'; };"
+       " const g = async () => { try { try { throw 1; } catch (e) { throw await Promise.resolve(e + 1); }"
+       " finally { await null; } } catch (e) { return 'caught' + e; } };"
+       " String(await Promise.all([f(), g()]));",
+       "2,caught2");
 }
 
 static void test_host_defer(void) {

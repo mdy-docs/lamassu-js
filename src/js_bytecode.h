@@ -115,12 +115,12 @@ typedef enum JsOp {
     /* stack [v, C] -> [v instanceof C] */
     JS_OP_INSTANCEOF,
     /* IteratorClose (js_iter_close) of an iterator ITER_NEW opened, unless it is done (the index
-     * says so): destructuring that stopped early, for-of left by break, continue or return
-     * (ITER_CLOSE_LOCAL, from the hidden local the loop keeps it in), and a throw out of either
+     * says so): destructuring that stopped early, for-of left by break or continue (ITER_CLOSE)
+     * or by return (ITER_CLOSE_KEEP, under the value returned), and a throw out of either
      * (ITER_CLOSE_THROW, which ignores whatever return() does) */
     JS_OP_ITER_CLOSE,        /* it i -> */
     JS_OP_ITER_CLOSE_THROW,  /* it i exc -> exc */
-    JS_OP_ITER_CLOSE_LOCAL,  /* u16 slot holding the iterator */
+    JS_OP_ITER_CLOSE_KEEP,   /* it i v -> v */
     /* ++ and -- (u8: 0 increment, 1 decrement): ToNumeric of the value, then one added or taken
      * away in its own type (1 or 1n). UPDATE: v -> v'. UPDATE_POST: v -> old new (old the
      * ToNumeric of v, a postfix expression's value). */

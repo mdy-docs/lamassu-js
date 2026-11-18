@@ -136,7 +136,7 @@ const JsOpInfo js_op_info[JS_OP__COUNT] = {
     OP(JS_OP_INSTANCEOF, OPF_NONE, CF_NEXT, -1, 2, 0),
     OP(JS_OP_ITER_CLOSE, OPF_NONE, CF_NEXT, -2, 2, 0),
     OP(JS_OP_ITER_CLOSE_THROW, OPF_NONE, CF_NEXT, -2, 3, 0),
-    OP(JS_OP_ITER_CLOSE_LOCAL, OPF_LOCAL, CF_NEXT, 0, 0, 2),
+    OP(JS_OP_ITER_CLOSE_KEEP, OPF_NONE, CF_NEXT, -2, 3, 0),
     OP(JS_OP_UPDATE, OPF_U8, CF_NEXT, 0, 1, 1),
     OP(JS_OP_UPDATE_POST, OPF_U8, CF_NEXT, +1, 1, 1),
     OP(JS_OP_SET_PROTO, OPF_NONE, CF_NEXT, -1, 2, 0),
@@ -797,13 +797,14 @@ static uint32_t branch_target(const uint8_t *code, uint32_t op_off) {
 /*
  * Distinct operand-stack depths one instruction may be reached at. Straight-
  * line code reaches each offset at exactly one depth; the exception is a
- * finally block, which the compiler lowers to a GOSUB/RET_SUB subroutine
- * entered at different depths depending on the exit path (normal completion
- * vs. unwinding an exception or a pending return value) — the classic jsr/ret
- * polymorphism. The verifier therefore tracks a small SET of depths per
- * offset; K bounds it (nested finally blocks add depths). Real compiler output
- * uses very few; input that drives an offset past K distinct depths is
- * rejected rather than executed.
+ * finally block, lowered to a GOSUB/RET_SUB subroutine that different exit
+ * paths may enter at different depths — the classic jsr/ret polymorphism. The
+ * compiler no longer does that (every exit pops down to the try statement
+ * first, so its finally body starts at [pending, return address]: leaving it
+ * by break or continue would otherwise pop the wrong number of slots), but the
+ * verifier does not rely on it: it tracks a small SET of depths per offset; K
+ * bounds it. Input that drives an offset past K distinct depths is rejected
+ * rather than executed.
  */
 #define JSBC_DEPTHS_PER_OFF 8
 

@@ -23,12 +23,16 @@
  * path (normal, exception, break/continue/return) routes through.
  *
  * What an exit has to undo is kept on one stack of cleanups, innermost last: a
- * try handler that is installed (TRY_POP, then GOSUB its finally if it has
- * one) and a for-of's iterator (TRY_POP the handler that closes it on a throw,
- * then ITER_CLOSE_LOCAL). break, continue and return unwind it down to their
+ * try's handlers that are installed (TRY_POP each, then GOSUB its finally if it
+ * has one) and a for-of's iterator (TRY_POP the handler that closes it on a
+ * throw, then ITER_CLOSE). break, continue and return unwind it down to their
  * target in that order, so a finally runs with its own handler gone (a throw
  * in it is not caught by its own try) and nothing is left installed after the
- * jump.
+ * jump. Each cleanup runs with the operand stack popped down to where its
+ * statement keeps it (under a return's value), so a for-of finds its [it i] on
+ * top and a finally body always starts at one depth: [pending, return address],
+ * the pending value being what is thrown or returned through it, or undefined.
+ * A break or a continue inside the finally then pops exactly what is there.
  */
 
 #define JS_MAX_LOCALS 60000
@@ -59,9 +63,11 @@ typedef struct JsLoopInfo {
 enum { CLEANUP_TRY, CLEANUP_ITER };
 
 typedef struct JsCleanup {
-    uint8_t kind;              /* CLEANUP_TRY: a handler is installed; CLEANUP_ITER: a for-of */
-    bool has_finally;          /* CLEANUP_TRY: GOSUB its finally after the TRY_POP */
-    uint16_t iter_slot;        /* CLEANUP_ITER: the hidden local holding the iterator */
+    uint8_t kind;              /* CLEANUP_TRY: handlers are installed; CLEANUP_ITER: a for-of */
+    bool has_finally;          /* CLEANUP_TRY: GOSUB its finally after the TRY_POPs */
+    uint8_t handlers;          /* how many are installed: 2 in a try block with a catch and a finally */
+    int depth;                 /* the operand depth its statement runs at: a try's as it began, a
+                                * for-of's with its [it i] on top */
     JsPatchList gosubs;        /* GOSUB operand offsets to patch to the finally body */
 } JsCleanup;
 
@@ -880,13 +886,13 @@ static JsLoopInfo *find_loop(JsCompiler *cx, const uint16_t *label, uint32_t len
     return NULL;
 }
 
-static bool emit_pops_to(JsCompiler *cx, int to_depth) {
-    int save = cx->cur->depth;
-    while (cx->cur->depth > to_depth) {
-        if (!emit_op(cx, JS_OP_POP, -1))
+/* Pops the operand stack down to TO_DEPTH; with KEEP the value on top stays on top of it. The
+ * depth follows: an exit path's caller puts it back for the code after the jump. */
+static bool emit_pops_to(JsCompiler *cx, int to_depth, bool keep) {
+    while (cx->cur->depth > to_depth + (keep ? 1 : 0)) {
+        if ((keep && !emit_op(cx, JS_OP_SWAP, 0)) || !emit_op(cx, JS_OP_POP, -1))
             return false;
     }
-    cx->cur->depth = save;
     return true;
 }
 
@@ -898,24 +904,34 @@ static bool emit_gosub(JsCompiler *cx, JsPatchList *pl) {
     return emit_u32(cx, 0xFFFFFFFF) && patch_list_add(cx, pl, off);
 }
 
-/* Unwinds the cleanups [floor, cleanup_count) for an exit, innermost first. */
-static bool emit_cleanups(JsCompiler *cx, int floor) {
+/* Unwinds the cleanups [floor, cleanup_count) for an exit, innermost first, popping the operand
+ * stack down to each as it goes; KEEP: a return's value is on top and stays there. The depth
+ * follows (see emit_pops_to). */
+static bool emit_cleanups(JsCompiler *cx, int floor, bool keep) {
     JsFuncState *fs = cx->cur;
     for (int i = fs->cleanup_count; i-- > floor;) {
         JsCleanup *c = &fs->cleanups[i];
-        if (!emit_op(cx, JS_OP_TRY_POP, 0))
+        if (!emit_pops_to(cx, c->depth, keep))
             return false;
-        if (c->kind == CLEANUP_ITER) {
-            if (!emit_op_u16(cx, JS_OP_ITER_CLOSE_LOCAL, c->iter_slot, 0))
+        for (int h = 0; h < c->handlers; h++) {
+            if (!emit_op(cx, JS_OP_TRY_POP, 0))
                 return false;
-        } else if (c->has_finally && !emit_gosub(cx, &c->gosubs)) {
-            return false;
+        }
+        if (c->kind == CLEANUP_ITER) {
+            if (!emit_op(cx, keep ? JS_OP_ITER_CLOSE_KEEP : JS_OP_ITER_CLOSE, -2))
+                return false;
+        } else if (c->has_finally) {
+            /* [pending]: the value returned through it, or nothing */
+            if ((!keep && !emit_op(cx, JS_OP_UNDEFINED, +1)) || !emit_gosub(cx, &c->gosubs) ||
+                (!keep && !emit_op(cx, JS_OP_POP, -1)))
+                return false;
         }
     }
     return true;
 }
 
 /* Pushes a cleanup (zeroed); NULL when they nest too deep */
+/* A cleanup for the statement beginning here, at the current depth, with one handler. */
 static JsCleanup *cleanup_push(JsCompiler *cx, uint32_t pos, uint8_t kind) {
     JsFuncState *fs = cx->cur;
     if (fs->cleanup_count >= JS_MAX_CLEANUPS) {
@@ -925,6 +941,8 @@ static JsCleanup *cleanup_push(JsCompiler *cx, uint32_t pos, uint8_t kind) {
     JsCleanup *c = &fs->cleanups[fs->cleanup_count++];
     memset(c, 0, sizeof *c);
     c->kind = kind;
+    c->handlers = 1;
+    c->depth = fs->depth;
     return c;
 }
 
@@ -2705,14 +2723,8 @@ static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const JsAstNode *
     note_text(cx, n->b, false);
     if (!emit_op(cx, JS_OP_ITER_NEW, +1))
         return false;
-    /* [it i]; the iterator is also kept in a hidden local, where an exit that leaves the loop
-     * (break, a labelled continue, return) finds it to close it */
-    uint16_t iter_slot;
-    if (!declare_local(cx, NULL, 0, false, n->pos, m.local_count, &iter_slot) ||
-        !emit_op(cx, JS_OP_SWAP, 0) || !emit_op_u16(cx, JS_OP_SET_LOCAL, iter_slot, 0) ||
-        !emit_op(cx, JS_OP_SWAP, 0))
-        return false;
-
+    /* [it i], where an exit that leaves the loop (break, a labelled continue, return) finds
+     * them to close the iterator: emit_cleanups pops down to them first */
     JsLoopInfo *loop = loop_push(cx, true, labels, nlabels);
     if (!loop)
         return false;
@@ -2722,7 +2734,6 @@ static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const JsAstNode *
     JsCleanup *cl = cleanup_push(cx, n->pos, CLEANUP_ITER);
     if (!cl)
         return false;
-    cl->iter_slot = iter_slot;
     loop->continue_floor = ci + 1;
 
     /* a throw out of the body (or its binding) closes the iterator; one from next() finds it
@@ -2917,19 +2928,26 @@ static bool compile_try(JsCompiler *cx, const JsAstNode *n) {
     bool has_finally = n->d != NULL;
     int start_depth = fs->depth;
 
-    /* the try block's handler, and the catch block's when a finally follows it */
+    /* the try block's handler; under it, with both a catch and a finally, the one that runs
+     * the finally for a throw out of the catch block. Both are installed here, at the depth the
+     * statement begins at, so either finds the stack as it was and its exception on top */
     int ci = fs->cleanup_count;
     JsCleanup *cl = cleanup_push(cx, n->pos, CLEANUP_TRY);
     if (!cl)
         return false;
     cl->has_finally = has_finally;
 
-    uint32_t handler_patch;
+    uint32_t handler_patch, catch_handler = 0;
+    if (has_catch && has_finally) {
+        if (!emit_jump(cx, JS_OP_TRY_PUSH, 0, &catch_handler))
+            return false;
+        cl->handlers = 2;
+    }
     if (!emit_jump(cx, JS_OP_TRY_PUSH, 0, &handler_patch))
         return false;
     if (!compile_stmt(cx, n->a)) /* try block */
         return false;
-    if (!emit_cleanups(cx, ci)) /* TRY_POP, and the finally */
+    if (!emit_cleanups(cx, ci, false)) /* TRY_POP, and the finally */
         return false;
     uint32_t end_normal;
     if (!emit_jump(cx, JS_OP_JUMP, 0, &end_normal))
@@ -2941,15 +2959,12 @@ static bool compile_try(JsCompiler *cx, const JsAstNode *n) {
 
     JsPatchList catch_ends = {0};
     if (has_catch) {
-        uint32_t inner_handler = 0;
-        if (has_finally) {
-            /* the catch block is guarded so that a throw from it runs the finally; the
-             * cleanup now stands for that handler */
-            if (!emit_jump(cx, JS_OP_TRY_PUSH, 0, &inner_handler))
-                return false;
-        } else {
-            fs->cleanup_count = ci; /* nothing is installed while the catch block runs */
-        }
+        /* a throw from the catch block (its parameter's pattern too) runs the finally: the
+         * cleanup now stands for that one handler. Without a finally nothing is installed */
+        if (has_finally)
+            fs->cleanups[ci].handlers = 1;
+        else
+            fs->cleanup_count = ci;
         JsScopeMark cm = scope_enter(cx);
         if (n->b) { /* catch binding */
             if (!pattern_declare(cx, n->b, false, cm.local_count, false) ||
@@ -2970,7 +2985,7 @@ static bool compile_try(JsCompiler *cx, const JsAstNode *n) {
         }
         if (!scope_leave(cx, cm))
             return false;
-        if (has_finally && !emit_cleanups(cx, ci))
+        if (has_finally && !emit_cleanups(cx, ci, false))
             return false;
         uint32_t ce;
         if (!emit_jump(cx, JS_OP_JUMP, 0, &ce) || !patch_list_add(cx, &catch_ends, ce))
@@ -2979,7 +2994,7 @@ static bool compile_try(JsCompiler *cx, const JsAstNode *n) {
         if (has_finally) {
             /* exception during catch: run finally, rethrow */
             set_depth(cx, start_depth + 1);
-            patch_here(cx, inner_handler);
+            patch_here(cx, catch_handler);
         }
     }
 
@@ -2995,7 +3010,7 @@ static bool compile_try(JsCompiler *cx, const JsAstNode *n) {
         uint32_t body = FN->code_len;
         for (uint32_t i = 0; i < gosubs.count; i++)
             patch_at(cx, gosubs.offs[i], body);
-        set_depth(cx, start_depth + 1); /* return address occupies one slot */
+        set_depth(cx, start_depth + 2); /* [pending, return address], whichever way it is entered */
         if (!compile_stmt(cx, n->d) || !emit_op(cx, JS_OP_RET_SUB, -1))
             return false;
     }
@@ -3094,18 +3109,18 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
             return cerr(cx, n->pos, is_break ? "no matching loop or switch for 'break'"
                                              : "no matching loop for 'continue'");
         note_pos(cx, n->pos);
-        if (!emit_cleanups(cx, is_break ? l->cleanup_floor : l->continue_floor))
+        int depth = cx->cur->depth;
+        bool unwound = emit_cleanups(cx, is_break ? l->cleanup_floor : l->continue_floor, false) &&
+                       emit_pops_to(cx, is_break ? l->entry_depth : l->continue_depth, false);
+        cx->cur->depth = depth; /* what follows the jump is where the statement was */
+        if (!unwound)
             return false;
         if (is_break) {
-            if (!emit_pops_to(cx, l->entry_depth))
-                return false;
             uint32_t patch;
             if (!emit_jump(cx, JS_OP_JUMP, 0, &patch))
                 return false;
             return patch_list_add(cx, &l->breaks, patch);
         }
-        if (!emit_pops_to(cx, l->continue_depth))
-            return false;
         if (l->continue_target != 0xFFFFFFFF) {
             /* A direct-jump continue (for-of/for-in) bypasses the body scope's
              * scope_leave, which is where the per-iteration loop binding is
@@ -3133,8 +3148,13 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
         } else if (!emit_op(cx, JS_OP_UNDEFINED, +1)) {
             return false;
         }
-        if (!emit_cleanups(cx, 0))
-            return false;
+        if (cx->cur->cleanup_count) {
+            int depth = cx->cur->depth;
+            bool unwound = emit_cleanups(cx, 0, true);
+            cx->cur->depth = depth;
+            if (!unwound)
+                return false;
+        }
         return emit_op(cx, JS_OP_RETURN, -1);
     case JS_AST_THROW:
         note_pos(cx, n->pos);

@@ -26,7 +26,7 @@
  *
  * Natives step any iterable through a JsIterCursor, and close it (IteratorClose: call `return`)
  * when they stop before the end; the interpreter does the same for for-of, spread and
- * destructuring (ITER_CLOSE, ITER_CLOSE_THROW, ITER_CLOSE_LOCAL).
+ * destructuring (ITER_CLOSE, ITER_CLOSE_THROW, ITER_CLOSE_KEEP).
  */
 #ifndef JS_ITER_H
 #define JS_ITER_H
