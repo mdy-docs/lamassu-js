@@ -1698,7 +1698,8 @@ static JsAstNode *parse_func_common(JsParser *p, uint8_t flags, bool need_name,
         return NULL;
     /* A declaration declares its name where it is read, before the parameters and the body;
      * V8 points a clash at `function` (or `async`). `export default function` without a name
-     * declares the hidden binding of the default export there. */
+     * declares the hidden binding of the default export there. A generator declares nothing:
+     * lamassu leaves them out, and says so (below) whatever else is wrong with one. */
     bool declares = kind == JS_AST_FUNC_DECL || p->default_fn;
     bool default_fn = p->default_fn;
     int8_t bind = p->bind_kind;
@@ -1710,9 +1711,9 @@ static JsAstNode *parse_func_common(JsParser *p, uint8_t flags, bool need_name,
             return NULL;
         fn->units = name->units;
         fn->len = name->len;
-        if (declares && !declare(p, name->units, name->len, src_start, function_kind(p)))
+        if (declares && !generator && !declare(p, name->units, name->len, src_start, function_kind(p)))
             return NULL;
-    } else if (default_fn) {
+    } else if (default_fn && !generator) {
         static const uint16_t dot_default[] = {'.', 'd', 'e', 'f', 'a', 'u', 'l', 't'};
         if (!declare(p, dot_default, sizeof dot_default / sizeof dot_default[0], src_start, JS_BIND_LEX))
             return NULL;

@@ -1074,7 +1074,11 @@ static const Row rows[] = {
     {"\"\\01\"08\n", "Unexpected number", 5},
     {"x = 08 +\n", "Decimals with leading zeros are not allowed in strict mode.", 4},
     {"x = 08+\n", "Decimals with leading zeros are not allowed in strict mode.", 4},
-    {"x = [08\n", "Decimals with leading zeros are not allowed in strict mode.", 5},    /* Declarations, checked where V8 checks them: a clash where the second name is read and
+    {"x = [08\n", "Decimals with leading zeros are not allowed in strict mode.", 5},    /* a generator is the feature lamassu leaves out, even where V8 would report a clash */
+    {"let g;\nfunction* g() {}\n", "generators are not supported", 15},
+    {"export default 1;\nexport default function* () {}\n", "generators are not supported", 41},
+    {"function* g() {}\nlet g;\n", "generators are not supported", 8},
+    /* Declarations, checked where V8 checks them: a clash where the second name is read and
      * before anything after it (a catch parameter's at the end of its block), duplicate
      * parameters once the list is read, regular expressions where they are read, and the
      * exports (twice, then not declared) once the module is read, in V8's order */

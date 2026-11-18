@@ -222,8 +222,9 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   object literal is a reference to `super` (anywhere else it is V8's `'super' keyword
   unexpected here`). A generator is `function*`, or `*` before the key of a method, as far as
   the `(` of its parameters, and an accessor is `get` or `set` before a key as far as the same
-  `(`: `function* g() {}` is `generators are not supported`, at the `*`, and `function* ;` is
-  `Unexpected token ';'`; `({ get x() {} })` is `getter/setter properties are not supported`
+  `(`: `function* g() {}` is `generators are not supported`, at the `*` (also where its name
+  clashes with another declaration, `let g; function* g() {}`, which V8 reports as the clash),
+  and `function* ;` is `Unexpected token ';'`; `({ get x() {} })` is `getter/setter properties are not supported`
   and `({ get x })` is `Unexpected token '}'`. Past that point lamassu has stopped reading,
   so an error V8 would find further on is not the one reported: `var x y;` is `'var' is not
   supported` here and `Unexpected identifier 'y'` in V8, and `const [class {}] = []` is
