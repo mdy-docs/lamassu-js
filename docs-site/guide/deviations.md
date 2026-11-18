@@ -194,11 +194,6 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   being iterable when its prototype chain no longer reaches one of those five
   (`Object.setPrototypeOf([1], null)`, a `Map` whose prototype was replaced), as in V8. See
   [Built-ins → Iteration](/guide/builtins#iteration).
-- **A spread whose iterator has a `next` that is not a function says so**
-  (`TypeError: undefined is not a function`, as `for...of` and destructuring say in both engines).
-  V8 words the error after the expression around the spread: `[...a]` is `a is not iterable` and
-  `f(...a)` is `f is not a function`. It takes a script that deletes or replaces the `next` of a
-  built-in iterator prototype to see either.
 
 ## Errors
 
@@ -236,10 +231,15 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   supported` here and `Unexpected identifier 'y'` in V8, and `const [class {}] = []` is
   `classes are not supported` here and `Invalid destructuring assignment target` in V8;
   one of V8's own quirks is not copied (a destructured
-  parameter given `null` is `'object null'` in V8's message, `'null'` here); an
-  operand with no readable name shows its value (`undefined is not a function` for `(void 0)()`
-  and `#<Object> is not iterable` for `[...{}]`, where V8 prints the expression,
-  `{(intermediate value)}` for an object literal); an object named in a message is named
+  parameter given `null` is `'object null'` in V8's message, `'null'` here, and array
+  destructuring names its source only when V8 does: V8 prints `number 5 is not iterable (cannot
+  read property Symbol(Symbol.iterator))` for `const [a] = o.x` with `o.x` 5, where lamassu
+  prints `o.x is not iterable`, because V8's printer finds a name or a literal there but not a
+  property read or a call); an expression named in a message is printed as V8's call printer
+  prints it, literals folded as V8's parser folds them (`(x + y) is not a function`,
+  `(1 % 2)()` is `1 is not a function`, `x + "a" + "b"` shows as `(x + "ab")`, `o["f"]` as `o.f`,
+  `(a?.b)()` as `(intermediate value)`), except that a text longer than 120 characters or
+  nested more than 32 deep shows the value instead; an object named in a message is named
   as V8 names it: by its constructor when its `toString` is `Object.prototype.toString` and its
   `constructor` a named function (`#<Object>`, `#<Set>`, `#<Foo>`), as `Name: message` when it is
   an error or has `Error.prototype.toString`, and by its tag otherwise (`[object Array]`,

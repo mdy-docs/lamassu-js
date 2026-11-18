@@ -115,7 +115,7 @@ const JsOpInfo js_op_info[JS_OP__COUNT] = {
     OP(JS_OP_CALL_VARARGS, OPF_NONE, CF_NEXT, -2, 3, 0),
     OP(JS_OP_NEW, OPF_U8, CF_NEXT, 0, 0, 1),   /* delta/min_in: special (== CALL) */
     OP(JS_OP_NEW_VARARGS, OPF_NONE, CF_NEXT, -2, 3, 0),
-    OP(JS_OP_OPT_CALL_CHECK, OPF_JUMP, CF_BRANCH, 0, 2, 4), /* taken: -2 */
+    OP(JS_OP_OPT_CALL_CHECK, OPF_JUMP, CF_BRANCH, 0, 2, 4), /* taken: -1 */
     OP(JS_OP_TRY_PUSH, OPF_JUMP, CF_BRANCH, 0, 0, 4),       /* handler: +1 */
     OP(JS_OP_TRY_POP, OPF_NONE, CF_NEXT, 0, 0, 0),
     OP(JS_OP_GOSUB, OPF_JUMP, CF_GOSUB, 0, 0, 4), /* target: +1 */
@@ -962,13 +962,14 @@ static bool verify_pass2(JsVm *fn_vm, JsFunctionCell *fn, const uint8_t *boundar
         case CF_BRANCH: {
             SEED(next, ft, ft_try); /* fall-through edge */
             /* Taken edge. Most branches carry the fall-through delta; the
-             * asymmetric ones override it: CASE/OPT_CALL_CHECK/ITER_NEXT pop
-             * two on the taken path, TRY_PUSH's handler is entered with the
-             * thrown value pushed. */
+             * asymmetric ones override it: CASE/ITER_NEXT pop two on the
+             * taken path, OPT_CALL_CHECK leaves undefined for its [callee this],
+             * TRY_PUSH's handler is entered with the thrown value pushed. */
             int32_t taken;
-            if (opb == JS_OP_CASE || opb == JS_OP_OPT_CALL_CHECK ||
-                opb == JS_OP_ITER_NEXT)
+            if (opb == JS_OP_CASE || opb == JS_OP_ITER_NEXT)
                 taken = d - 2;
+            else if (opb == JS_OP_OPT_CALL_CHECK)
+                taken = d - 1;
             else if (opb == JS_OP_TRY_PUSH)
                 taken = d + 1;
             else

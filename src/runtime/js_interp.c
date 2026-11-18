@@ -2497,24 +2497,54 @@ static JS_NOINLINE bool iter_close_op(JsContext *ctx, JsFiber *fb, uint8_t op) {
     return true;
 }
 
+/* "<text><what>" with TEXT (LEN units) when there is one, else with VALUE as V8 shows it */
+static void fiber_throw_text(JsContext *ctx, JsFiber *fb, const uint16_t *text, uint32_t len,
+                             JsValue value, const char *what) {
+    if (len)
+        fiber_throw_units(ctx, fb, "TypeError: ", text, len, what);
+    else
+        fiber_throw_value(fb, js_error_fmt(ctx, "TypeError: %v%s", value, what));
+}
+
 /* ARRAY_SPREAD (or a call's ARGS_SPREAD, CALL) of a Map, a Set, an iterator object, or an array
- * or a string that is not plain (above), onto the array ARR. False raised. */
+ * or a string that is not plain (above), onto the array ARR. CALLEE: the call's callee (a call's
+ * spread only). False raised. */
 JS_COLD static bool spread_slow(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip,
-                                JsObject *arr, JsValue src, bool call) {
+                                JsObject *arr, JsValue src, bool call, JsValue callee) {
     JsVm *vm = ctx->vm;
+    /* the texts the compiler recorded: a call's spread has the callee's first (note_spread_arg) */
+    const uint16_t *u = NULL, *cu = NULL;
+    uint32_t len = 0, clen = 0;
+    if (find_note(fn, ip, &u, &len) && call && len && u[0] < len) {
+        clen = u[0];
+        cu = u + 1;
+        u += 1 + clen;
+        len -= 1 + clen;
+    } else if (call) {
+        len = 0;
+    }
     JsIterCursor c;
     int rc = js_iter_open(ctx, src, &c);
     if (rc <= 0) {
         if (rc < 0)
             fiber_throw_value(fb, js_take_error(ctx)); /* what opening it threw, or out of memory */
         else if (!call)
-            fiber_throw_operand(ctx, fb, fn, ip, src, " is not iterable");
+            fiber_throw_text(ctx, fb, u, len, src, " is not iterable");
         else if (js_is_undefined(src)) /* V8's spread call words these two its own way */
-            fiber_throw_operand(ctx, fb, fn, ip, src, " is not iterable (cannot read property undefined)");
+            fiber_throw_text(ctx, fb, u, len, src, " is not iterable (cannot read property undefined)");
         else if (js_is_null(src))
-            fiber_throw_operand(ctx, fb, fn, ip, src, " is not iterable (cannot read property null)");
+            fiber_throw_text(ctx, fb, u, len, src, " is not iterable (cannot read property null)");
         else
             fiber_throw(ctx, fb, "TypeError: Spread syntax requires ...iterable[Symbol.iterator] to be a function");
+        return false;
+    }
+    if (js_iter_next_uncallable(&c)) {
+        /* V8 words this after the expression around the spread: the array's element (`a is not
+         * iterable`) or the call's callee (`f is not a function`) */
+        if (call)
+            fiber_throw_text(ctx, fb, cu, clen, callee, " is not a function");
+        else
+            fiber_throw_text(ctx, fb, u, len, src, " is not iterable");
         return false;
     }
     js_gc_protect(vm, &c.src); /* a Map's or Set's new iterator is held nowhere else */
@@ -3451,8 +3481,9 @@ run:; /* (re)load the top frame */
             }
             case JS_OP_OPT_CALL_CHECK: {
                 uint32_t t = READ_U32();
-                if (is_nullish(PEEK(1))) { /* callee under this */
-                    fb->sp -= 2;
+                if (is_nullish(PEEK(1))) { /* callee under this: undefined is the call's result */
+                    fb->sp--;
+                    PEEK(0) = js_undefined();
                     ip = t;
                 }
                 break;
@@ -3550,7 +3581,9 @@ run:; /* (re)load the top frame */
                     }
                 } else {
                     fr->ip = ip; /* GC-safe point before allocating */
-                    if (!spread_slow(ctx, fb, fn, op_ip, a, src, op == JS_OP_ARGS_SPREAD))
+                    /* a call's stack is [callee this args src] (compile_args) */
+                    bool call = op == JS_OP_ARGS_SPREAD;
+                    if (!spread_slow(ctx, fb, fn, op_ip, a, src, call, call ? PEEK(3) : js_undefined()))
                         RT_RAISE();
                 }
                 fb->sp--;

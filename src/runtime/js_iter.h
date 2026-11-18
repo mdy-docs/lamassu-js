@@ -152,6 +152,10 @@ bool js_iter_is_iterable(JsContext *ctx, JsValue v);
  * V's iterator method threw is pending (js_take_error; out of memory when nothing is). Opening
  * runs script only for an object that inherits from String.prototype (its toString). */
 int js_iter_open(JsContext *ctx, JsValue v, JsIterCursor *c);
+
+/* An opened cursor whose first step would call a `next` that is not a function (the record's
+ * `next` is read once, when it opens). A spread words that error as V8 does. */
+bool js_iter_next_uncallable(const JsIterCursor *c);
 /* As js_iterobj_step; a cursor that ends (0) or throws (-1) is left done. */
 int js_iter_next(JsContext *ctx, JsIterCursor *c, JsValue *out);
 

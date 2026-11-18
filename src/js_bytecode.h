@@ -74,7 +74,8 @@ typedef enum JsOp {
     JS_OP_CALL_VARARGS,    /* callee this argsArray -> result */
     JS_OP_NEW,             /* u8 argc; callee this(ignored) args... -> result */
     JS_OP_NEW_VARARGS,     /* callee this(ignored) argsArray -> result */
-    JS_OP_OPT_CALL_CHECK,  /* u32; if callee (under this) nullish: pop2, push undefined, jump */
+    JS_OP_OPT_CALL_CHECK,  /* u32; if callee (under this) nullish: pop2, push undefined, jump
+                            * (to its chain's end, as OPT_CHAIN does) */
     JS_OP_TRY_PUSH,        /* u32 handler ip */
     JS_OP_TRY_POP,
     JS_OP_GOSUB,           /* u32; pushes return ip, jumps */
@@ -151,7 +152,7 @@ typedef enum JsOp {
  *   JS_OP_NEW        same shape as JS_OP_CALL (argc = u8 operand)
  *   JS_OP_NEW_ARRAY  delta = 1-count,    min_in = count     (count = u16)
  * Asymmetric branches (taken-edge delta differs from fall-through):
- *   OPT_CALL_CHECK taken -2 · ITER_NEXT taken -2 · TRY_PUSH/GOSUB target +1.
+ *   OPT_CALL_CHECK taken -1 · ITER_NEXT taken -2 · TRY_PUSH/GOSUB target +1.
  */
 typedef enum JsOpForm {
     OPF_NONE = 0,   /* no operands */

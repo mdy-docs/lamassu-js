@@ -719,6 +719,13 @@ bool js_iter_close(JsContext *ctx, JsIterCursor *c, bool throwing, bool syntax, 
     return close_object(ctx, src, throwing, syntax, err);
 }
 
+bool js_iter_next_uncallable(const JsIterCursor *c) {
+    if (!js_iterobj_is(c->src))
+        return false;
+    const JsIterObj *it = (const JsIterObj *)js_value_object(c->src);
+    return it->kind == JS_ITER_RECORD && !js_is_undefined(it->target) && !js_is_function(it->subject);
+}
+
 /* ---- natives that take an iterable ---- */
 
 JsValue js_iter_not_iterable(JsContext *ctx, JsValue v) {

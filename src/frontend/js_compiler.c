@@ -310,12 +310,300 @@ static void cb_ascii(CalleeBuf *b, const char *s) {
     }
 }
 
-/* The callee as the source would show it: identifiers, this, property chains, literal or
- * identifier subscripts, calls as f(...); anything else is "(intermediate value)" as V8 says. */
-static void render_callee(CalleeBuf *b, const JsAstNode *n, int depth) {
+/* ---- V8's call printer ----
+ *
+ * An error about an expression ("x is not a function", "x is not iterable", "Cannot destructure
+ * property 'a' of 'x'") shows the expression as V8's CallPrinter prints it from V8's AST. That
+ * AST is the parser's, which folds literals as it goes (ShortcutLiteralBinaryExpression,
+ * BuildUnaryExpression), so the printer folds them here the same way: `(1 % 2)` shows as 1,
+ * `!0` as true, `"a" + "b"` as "ab". What V8 does not print shows as "(intermediate value)": a
+ * function, a `new` expression, a conditional (one for each of its three parts), each property
+ * of an object literal, a BigInt, `await`, `import.meta`, and an optional chain that is part of
+ * what is printed rather than the chain the failing call belongs to. */
+
+/* A literal, after folding */
+typedef enum { LIT_NONE, LIT_NUMBER, LIT_STRING, LIT_BOOL, LIT_NULL, LIT_BIGINT } LitKind;
+
+typedef struct Lit {
+    LitKind kind;
+    double num;               /* NUMBER */
+    bool truthy;              /* BOOL; a BIGINT's truthiness */
+    const uint16_t *su;       /* STRING: its units, NULL when longer than JS_CALLEE_MAX after folding */
+    uint32_t sn;              /* STRING: its length */
+    uint16_t buf[JS_CALLEE_MAX]; /* STRING: a concatenation's units */
+} Lit;
+
+static bool lit_truthy(const Lit *l) {
+    switch (l->kind) {
+    case LIT_NUMBER: return l->num == l->num && l->num != 0.0;
+    case LIT_STRING: return l->sn != 0;
+    case LIT_BOOL: case LIT_BIGINT: return l->truthy;
+    default: return false;
+    }
+}
+
+static bool fold_lit(const JsAstNode *n, Lit *l, int depth);
+
+/* X op Y for two number literals, as V8's parser folds them; false for an op it leaves alone */
+static bool fold_numbers(uint8_t op, double x, double y, double *r) {
+    switch (op) {
+    case JS_T_PLUS: *r = x + y; return true;
+    case JS_T_MINUS: *r = x - y; return true;
+    case JS_T_STAR: *r = x * y; return true;
+    case JS_T_SLASH: *r = x / y; return true;
+    case JS_T_PERCENT: *r = js_fmod(x, y); return true;
+    case JS_T_POW: *r = js_pow_op(x, y); return true;
+    case JS_T_BAR: *r = (double)(js_to_int32(x) | js_to_int32(y)); return true;
+    case JS_T_AMP: *r = (double)(js_to_int32(x) & js_to_int32(y)); return true;
+    case JS_T_CARET: *r = (double)(js_to_int32(x) ^ js_to_int32(y)); return true;
+    case JS_T_SHL: *r = (double)(int32_t)((uint32_t)js_to_int32(x) << (js_to_uint32(y) & 31)); return true;
+    case JS_T_SHR: *r = (double)(js_to_int32(x) >> (js_to_uint32(y) & 31)); return true;
+    case JS_T_USHR: *r = (double)(js_to_uint32(x) >> (js_to_uint32(y) & 31)); return true;
+    default: return false;
+    }
+}
+
+/* A string literal L followed by R's units, into L */
+static void lit_concat(Lit *l, const Lit *r) {
+    uint32_t n = l->sn + r->sn;
+    if (!l->su || !r->su || n > JS_CALLEE_MAX) {
+        l->su = NULL; /* too long to print: only its truthiness is left */
+        l->sn = n;
+        return;
+    }
+    if (l->su != l->buf)
+        for (uint32_t i = 0; i < l->sn; i++)
+            l->buf[i] = l->su[i];
+    for (uint32_t i = 0; i < r->sn; i++)
+        l->buf[l->sn + i] = r->su[i];
+    l->su = l->buf;
+    l->sn = n;
+}
+
+static bool bigint_truthy(const JsAstNode *n) {
+    uint32_t i = n->len > 1 && n->units[0] == '0' && n->units[1] > '9' ? 2 : 0; /* 0x, 0o, 0b */
+    for (; i < n->len; i++)
+        if (n->units[i] != '0' && n->units[i] != '_')
+            return true;
+    return false;
+}
+
+/* N as a literal, folded as V8's parser folds it; false when it is not one */
+static bool fold_lit(const JsAstNode *n, Lit *l, int depth) {
+    if (depth > 32)
+        return false;
+    switch (n->kind) {
+    case JS_AST_NUMBER:
+        l->kind = LIT_NUMBER;
+        l->num = n->number;
+        return true;
+    case JS_AST_STRING:
+        l->kind = LIT_STRING;
+        l->su = n->units;
+        l->sn = n->len;
+        return true;
+    case JS_AST_TEMPLATE: /* one without substitutions is a string literal */
+        if (n->count != 1 || (n->items[0]->flags & JS_F_BAD_COOK))
+            return false;
+        l->kind = LIT_STRING;
+        l->su = n->items[0]->units;
+        l->sn = n->items[0]->len;
+        return true;
+    case JS_AST_BOOL_LIT:
+        l->kind = LIT_BOOL;
+        l->truthy = (n->flags & JS_F_TRUE) != 0;
+        return true;
+    case JS_AST_NULL_LIT:
+        l->kind = LIT_NULL;
+        return true;
+    case JS_AST_BIGINT:
+        l->kind = LIT_BIGINT;
+        l->truthy = bigint_truthy(n);
+        return true;
+    case JS_AST_UNARY: {
+        if (n->op != JS_T_NOT && n->op != JS_T_MINUS && n->op != JS_T_PLUS && n->op != JS_T_TILDE)
+            return false;
+        if (!fold_lit(n->a, l, depth + 1))
+            return false;
+        if (n->op == JS_T_NOT) {
+            l->truthy = !lit_truthy(l);
+            l->kind = LIT_BOOL;
+            return true;
+        }
+        if (l->kind != LIT_NUMBER)
+            return false;
+        if (n->op == JS_T_MINUS)
+            l->num = -l->num;
+        else if (n->op == JS_T_TILDE)
+            l->num = (double)~js_to_int32(l->num);
+        return true;
+    }
+    case JS_AST_BINARY: {
+        Lit r;
+        if (!fold_lit(n->a, l, depth + 1) || !fold_lit(n->b, &r, depth + 1))
+            return false;
+        if (l->kind == LIT_NUMBER && r.kind == LIT_NUMBER)
+            return fold_numbers(n->op, l->num, r.num, &l->num);
+        if (l->kind == LIT_STRING && r.kind == LIT_STRING && n->op == JS_T_PLUS) {
+            lit_concat(l, &r);
+            return true;
+        }
+        return false;
+    }
+    default:
+        return false;
+    }
+}
+
+static void cb_intermediate(CalleeBuf *b) {
+    cb_ascii(b, "(intermediate value)");
+}
+
+static void cb_number(CalleeBuf *b, double d) {
+    JsString *s = b->vm ? js_number_to_string(b->vm, d) : NULL;
+    if (s)
+        cb_units(b, s->units, s->length);
+    else
+        b->ok = false;
+}
+
+/* A literal as V8 prints it: a string in double quotes, its units as they are */
+static void cb_lit(CalleeBuf *b, const Lit *l) {
+    switch (l->kind) {
+    case LIT_NUMBER: cb_number(b, l->num); break;
+    case LIT_STRING:
+        if (!l->su) {
+            b->ok = false;
+            break;
+        }
+        cb_ascii(b, "\"");
+        cb_units(b, l->su, l->sn);
+        cb_ascii(b, "\"");
+        break;
+    case LIT_BOOL: cb_ascii(b, l->truthy ? "true" : "false"); break;
+    case LIT_NULL: cb_ascii(b, "null"); break;
+    default: cb_intermediate(b); break; /* a BigInt */
+    }
+}
+
+static const char *op_text(uint8_t op) {
+    switch (op) {
+    case JS_T_PLUS: return "+";
+    case JS_T_MINUS: return "-";
+    case JS_T_STAR: return "*";
+    case JS_T_SLASH: return "/";
+    case JS_T_PERCENT: return "%";
+    case JS_T_POW: return "**";
+    case JS_T_SHL: return "<<";
+    case JS_T_SHR: return ">>";
+    case JS_T_USHR: return ">>>";
+    case JS_T_AMP: return "&";
+    case JS_T_BAR: return "|";
+    case JS_T_CARET: return "^";
+    case JS_T_ANDAND: return "&&";
+    case JS_T_OROR: return "||";
+    case JS_T_QUESQUES: return "??";
+    case JS_T_EQEQ: return "==";
+    case JS_T_EQEQEQ: return "===";
+    case JS_T_LT: return "<";
+    case JS_T_GT: return ">";
+    case JS_T_LE: return "<=";
+    case JS_T_GE: return ">=";
+    case JS_T_INSTANCEOF: return "instanceof";
+    case JS_T_IN: return "in";
+    case JS_T_NOT: return "!";
+    case JS_T_TILDE: return "~";
+    case JS_T_TYPEOF: return "typeof ";
+    case JS_T_VOID: return "void ";
+    case JS_T_DELETE: return "delete ";
+    case JS_T_INC: return "++";
+    case JS_T_DEC: return "--";
+    default: return NULL;
+    }
+}
+
+/* A comparison is a CompareOperation in V8, printed as it stands; the other binary operators
+ * are BinaryOperations, which collapse into one n-ary operation along their left operands */
+static bool is_compare(uint8_t op) {
+    switch (op) {
+    case JS_T_EQEQ: case JS_T_NE: case JS_T_EQEQEQ: case JS_T_STRICT_NE: case JS_T_LT:
+    case JS_T_GT: case JS_T_LE: case JS_T_GE: case JS_T_INSTANCEOF: case JS_T_IN:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Whether N, a member or a call, is an optional chain of its own: a `?.` in its links, as far as
+ * the chain goes (a parenthesized object or callee is a separate expression) */
+static bool chain_optional(const JsAstNode *n) {
+    for (const JsAstNode *c = n;;) {
+        if (c->flags & JS_F_OPTIONAL)
+            return true;
+        const JsAstNode *p = c->a;
+        if (!p || (p->kind != JS_AST_MEMBER && p->kind != JS_AST_CALL) || (p->flags & JS_F_PAREN))
+            return false;
+        c = p;
+    }
+}
+
+static void render_expr(CalleeBuf *b, const JsAstNode *n, int depth, bool in_chain);
+
+/* The object of a member or the callee of a call: the same chain unless parenthesized */
+static void render_link(CalleeBuf *b, const JsAstNode *n, int depth) {
+    render_expr(b, n, depth + 1, !(n->flags & JS_F_PAREN));
+}
+
+/* The operands of an n-ary operation ending in N (op OP), left to right; a string literal that
+ * follows another is joined to it, as V8's parser joins `x + "a" + "b"` into (x + "ab") */
+static void render_nary(CalleeBuf *b, const JsAstNode *n, uint8_t op, int depth, Lit *last, bool *first) {
+    if (depth > 32) {
+        b->ok = false;
+        return;
+    }
+    Lit l;
+    if ((n->kind == JS_AST_BINARY || n->kind == JS_AST_LOGICAL) && n->op == op && !fold_lit(n, &l, 0)) {
+        render_nary(b, n->a, op, depth + 1, last, first);
+        Lit r;
+        if (fold_lit(n->b, &r, 0) && r.kind == LIT_STRING && op == JS_T_PLUS && last->kind == LIT_STRING) {
+            lit_concat(last, &r); /* printed when the run ends */
+            return;
+        }
+        if (last->kind != LIT_NONE) {
+            cb_lit(b, last);
+            last->kind = LIT_NONE;
+        }
+        cb_ascii(b, " ");
+        cb_ascii(b, op_text(op));
+        cb_ascii(b, " ");
+        if (fold_lit(n->b, &r, 0) && r.kind == LIT_STRING && op == JS_T_PLUS)
+            *last = r; /* may be joined by what follows */
+        else
+            render_expr(b, n->b, depth + 1, false);
+        return;
+    }
+    /* the first operand */
+    *first = false;
+    if (fold_lit(n, &l, 0) && l.kind == LIT_STRING && op == JS_T_PLUS)
+        *last = l;
+    else
+        render_expr(b, n, depth + 1, false);
+}
+
+/* N as V8's call printer prints it. IN_CHAIN: N is a link of the chain the failing operation
+ * belongs to (the callee of `a?.b()`), not an optional chain printed as a whole. */
+static void render_expr(CalleeBuf *b, const JsAstNode *n, int depth, bool in_chain) {
     if (!b->ok)
         return;
-    if (depth > 16) { b->ok = false; return; }
+    if (depth > 32) {
+        b->ok = false;
+        return;
+    }
+    Lit l;
+    if (fold_lit(n, &l, 0)) {
+        cb_lit(b, &l);
+        return;
+    }
     switch (n->kind) {
     case JS_AST_IDENT:
         cb_units(b, n->units, n->len);
@@ -326,65 +614,154 @@ static void render_callee(CalleeBuf *b, const JsAstNode *n, int depth) {
     case JS_AST_NEW_TARGET:
         cb_ascii(b, "new.target");
         return;
-    case JS_AST_IMPORT_META:
-        cb_ascii(b, "import.meta");
-        return;
-    case JS_AST_NULL_LIT:
-        cb_ascii(b, "null");
-        return;
-    case JS_AST_BOOL_LIT:
-        cb_ascii(b, (n->flags & JS_F_TRUE) ? "true" : "false");
-        return;
-    case JS_AST_STRING:
-        cb_ascii(b, "\"");
+    case JS_AST_REGEX:
+        cb_ascii(b, "/");
         cb_units(b, n->units, n->len);
-        cb_ascii(b, "\"");
+        cb_ascii(b, "/");
+        cb_units(b, n->units2, n->len2);
         return;
-    case JS_AST_NUMBER: {
-        /* as V8 prints it: the value, not the spelling (0x10 shows as 16) */
-        JsString *s = b->vm ? js_number_to_string(b->vm, n->number) : NULL;
-        if (s)
-            cb_units(b, s->units, s->length);
-        else
-            b->ok = false;
+    case JS_AST_TEMPLATE: /* its substitutions, one after another */
+        for (uint32_t i = 1; i < n->count; i += 2)
+            render_expr(b, n->items[i], depth + 1, false);
         return;
-    }
-    case JS_AST_CALL:
-        render_callee(b, n->a, depth + 1);
-        cb_ascii(b, "(...)");
-        return;
-    case JS_AST_MEMBER: {
-        render_callee(b, n->a, depth + 1);
-        if (!(n->flags & JS_F_COMPUTED)) {
-            cb_ascii(b, (n->flags & JS_F_OPTIONAL) ? "?." : ".");
-            cb_units(b, n->units, n->len);
-            return;
-        }
-        cb_ascii(b, (n->flags & JS_F_OPTIONAL) ? "?.[" : "[");
-        const JsAstNode *k = n->b;
-        if (k->kind == JS_AST_IDENT) {
-            cb_units(b, k->units, k->len);
-        } else if (k->kind == JS_AST_STRING) {
-            cb_ascii(b, "\"");
-            cb_units(b, k->units, k->len);
-            cb_ascii(b, "\"");
-        } else if (k->kind == JS_AST_NUMBER && k->number >= 0 && k->number < 1e9 &&
-                   k->number == (double)(uint32_t)k->number) {
-            char num[16];
-            uint32_t v = (uint32_t)k->number, i = 0;
-            char rev[16];
-            do { rev[i++] = (char)('0' + v % 10); v /= 10; } while (v);
-            for (uint32_t j = 0; j < i; j++) num[j] = rev[i - 1 - j];
-            num[i] = 0;
-            cb_ascii(b, num);
-        } else {
-            cb_ascii(b, "...");
+    case JS_AST_ARRAY:
+    case JS_AST_ARRAY_PATTERN:
+        cb_ascii(b, "[");
+        for (uint32_t i = 0; i < n->count; i++) {
+            const JsAstNode *e = n->items[i];
+            if (i)
+                cb_ascii(b, ",");
+            if (e->kind == JS_AST_HOLE)
+                continue;
+            if (e->kind == JS_AST_SPREAD || e->kind == JS_AST_REST) {
+                cb_ascii(b, "(...");
+                render_expr(b, e->a, depth + 1, false);
+                cb_ascii(b, ")");
+            } else if (e->kind == JS_AST_DEFAULT) { /* `[x = 1] = ...`: an assignment, its target */
+                render_expr(b, e->a, depth + 1, false);
+            } else {
+                render_expr(b, e, depth + 1, false);
+            }
         }
         cb_ascii(b, "]");
         return;
+    case JS_AST_OBJECT:
+    case JS_AST_OBJECT_PATTERN:
+        cb_ascii(b, "{");
+        for (uint32_t i = 0; i < n->count; i++)
+            cb_intermediate(b);
+        cb_ascii(b, "}");
+        return;
+    case JS_AST_COND:
+        cb_intermediate(b);
+        cb_intermediate(b);
+        cb_intermediate(b);
+        return;
+    case JS_AST_CALL:
+        if (!in_chain && chain_optional(n)) {
+            cb_intermediate(b);
+            return;
+        }
+        render_link(b, n->a, depth);
+        cb_ascii(b, "(...)");
+        return;
+    case JS_AST_TAGGED_TEMPLATE:
+        render_expr(b, n->a, depth + 1, false);
+        cb_ascii(b, "(...)");
+        return;
+    case JS_AST_MEMBER: {
+        if (!in_chain && chain_optional(n)) {
+            cb_intermediate(b);
+            return;
+        }
+        render_link(b, n->a, depth);
+        bool opt = (n->flags & JS_F_OPTIONAL) != 0;
+        if (!(n->flags & JS_F_COMPUTED)) {
+            cb_ascii(b, opt ? "?." : ".");
+            cb_units(b, n->units, n->len);
+            return;
+        }
+        /* a string as written is a property name: o["a b"] shows as o.a b; one folded from a
+         * concatenation is not (o["a" + "b"] shows as o["ab"]) */
+        Lit k;
+        if ((n->b->kind == JS_AST_STRING || n->b->kind == JS_AST_TEMPLATE) && fold_lit(n->b, &k, 0)) {
+            cb_ascii(b, opt ? "?." : ".");
+            cb_units(b, k.su, k.sn);
+            return;
+        }
+        cb_ascii(b, opt ? "?.[" : "[");
+        render_expr(b, n->b, depth + 1, false);
+        cb_ascii(b, "]");
+        return;
     }
-    default:
-        cb_ascii(b, "(intermediate value)");
+    case JS_AST_UNARY: {
+        const char *t = op_text(n->op);
+        if (!t) {
+            cb_intermediate(b);
+            return;
+        }
+        cb_ascii(b, "(");
+        cb_ascii(b, t);
+        render_expr(b, n->a, depth + 1, false);
+        cb_ascii(b, ")");
+        return;
+    }
+    case JS_AST_UPDATE:
+        cb_ascii(b, "(");
+        if (n->flags & JS_F_PREFIX)
+            cb_ascii(b, op_text(n->op));
+        render_expr(b, n->a, depth + 1, false);
+        if (!(n->flags & JS_F_PREFIX))
+            cb_ascii(b, op_text(n->op));
+        cb_ascii(b, ")");
+        return;
+    case JS_AST_BINARY:
+    case JS_AST_LOGICAL: {
+        if (n->op == JS_T_NE || n->op == JS_T_STRICT_NE) { /* !(a == b), as V8 parses it */
+            cb_ascii(b, "(!(");
+            render_expr(b, n->a, depth + 1, false);
+            cb_ascii(b, n->op == JS_T_NE ? " == " : " === ");
+            render_expr(b, n->b, depth + 1, false);
+            cb_ascii(b, "))");
+            return;
+        }
+        const char *t = op_text(n->op);
+        if (!t) {
+            cb_intermediate(b);
+            return;
+        }
+        cb_ascii(b, "(");
+        if (is_compare(n->op)) {
+            render_expr(b, n->a, depth + 1, false);
+            cb_ascii(b, " ");
+            cb_ascii(b, t);
+            cb_ascii(b, " ");
+            render_expr(b, n->b, depth + 1, false);
+        } else {
+            Lit last;
+            bool first = true;
+            last.kind = LIT_NONE;
+            render_nary(b, n, n->op, depth + 1, &last, &first);
+            if (last.kind != LIT_NONE)
+                cb_lit(b, &last);
+        }
+        cb_ascii(b, ")");
+        return;
+    }
+    case JS_AST_SEQUENCE:
+        cb_ascii(b, "(");
+        for (uint32_t i = 0; i < n->count; i++) {
+            if (i)
+                cb_ascii(b, " , ");
+            render_expr(b, n->items[i], depth + 1, false);
+        }
+        cb_ascii(b, ")");
+        return;
+    case JS_AST_ASSIGN: /* its target */
+        render_expr(b, n->a, depth + 1, false);
+        return;
+    default: /* a function, `new`, `await`, `import.meta`, `import()` */
+        cb_intermediate(b);
         return;
     }
 }
@@ -428,28 +805,23 @@ static void note_units(JsCompiler *cx, const uint16_t *u, uint32_t n) {
         f->callee_text[f->callee_text_len++] = u[i];
 }
 
-static void note_text(JsCompiler *cx, const JsAstNode *n, bool empty_ok) {
+static void note_text_as(JsCompiler *cx, const JsAstNode *n, bool empty_ok, bool in_chain) {
     CalleeBuf b;
     b.n = 0;
     b.ok = true;
     b.vm = cx->vm;
-    if (n) {
-        switch (n->kind) {
-        case JS_AST_IDENT: case JS_AST_MEMBER: case JS_AST_THIS: case JS_AST_CALL:
-        case JS_AST_NULL_LIT: case JS_AST_BOOL_LIT: case JS_AST_STRING: case JS_AST_NUMBER:
-            render_callee(&b, n, 0);
-            break;
-        default:
-            b.ok = false;
-            break;
-        }
-    }
-    if (!b.ok || !b.n) {
+    if (n)
+        render_expr(&b, n, 0, in_chain);
+    if (!n || !b.ok || !b.n) {
         if (empty_ok)
             note_units(cx, NULL, 0);
         return;
     }
     note_units(cx, b.u, b.n);
+}
+
+static void note_text(JsCompiler *cx, const JsAstNode *n, bool empty_ok) {
+    note_text_as(cx, n, empty_ok, false);
 }
 
 /* As note_text for a destructuring's first read, where V8 names the whole value and no property
@@ -460,21 +832,42 @@ static void note_whole(JsCompiler *cx, const JsAstNode *n) {
     b.ok = true;
     b.vm = cx->vm;
     b.u[b.n++] = 0;
-    if (n) {
-        switch (n->kind) {
-        case JS_AST_IDENT: case JS_AST_MEMBER: case JS_AST_THIS: case JS_AST_CALL:
-        case JS_AST_NULL_LIT: case JS_AST_BOOL_LIT: case JS_AST_STRING: case JS_AST_NUMBER:
-            render_callee(&b, n, 0);
-            break;
-        default:
-            break;
-        }
-    }
+    if (n)
+        render_expr(&b, n, 0, false);
     note_units(cx, b.u, b.ok ? b.n : 1);
 }
 
+/* The callee of a call: a link of the call's own chain unless parenthesized (`a?.b()` shows as
+ * a?.b, `(a?.b)()` as (intermediate value)) */
 static void note_callee(JsCompiler *cx, const JsAstNode *callee) {
-    note_text(cx, callee, false);
+    note_text_as(cx, callee, false, !(callee->flags & JS_F_PAREN));
+}
+
+/* The text of N as note_text renders it into B (left empty when it fails) */
+static void render_text(CalleeBuf *b, JsVm *vm, const JsAstNode *n, bool in_chain) {
+    b->n = 0;
+    b->ok = true;
+    b->vm = vm;
+    if (n)
+        render_expr(b, n, 0, in_chain);
+    if (!b->ok)
+        b->n = 0;
+}
+
+/* A call's spread argument: one unit holding the length of the callee's text, that text, then
+ * the spread expression's (either may be empty). V8 names the callee when the iterator's `next`
+ * cannot be called (`f is not a function`) and the expression when it is null or undefined. */
+static void note_spread_arg(JsCompiler *cx, const JsAstNode *operand, const JsAstNode *callee) {
+    CalleeBuf c, o;
+    render_text(&c, cx->vm, callee, !(callee->flags & JS_F_PAREN));
+    render_text(&o, cx->vm, operand, false);
+    uint16_t u[1 + 2 * JS_CALLEE_MAX];
+    u[0] = (uint16_t)c.n;
+    for (uint32_t i = 0; i < c.n; i++)
+        u[1 + i] = c.u[i];
+    for (uint32_t i = 0; i < o.n; i++)
+        u[1 + c.n + i] = o.u[i];
+    note_units(cx, u, 1 + c.n + o.n);
 }
 
 /* ---- constants ---- */
@@ -1105,11 +1498,28 @@ static bool compile_ident_store(JsCompiler *cx, const JsAstNode *target) {
 
 /* ---- member chains (optional chaining aware) ---- */
 
+static bool compile_call_link(JsCompiler *cx, const JsAstNode *n, JsPatchList *opt);
+static bool compile_member_chain(JsCompiler *cx, const JsAstNode *n, JsPatchList *opt);
+static bool compile_method_callee(JsCompiler *cx, const JsAstNode *callee, JsPatchList *opt);
+
+/* The object or callee of a link in an optional chain: a member or a call that goes on with the
+ * same chain (its short-circuits jump to OPT's end), or anything else as an expression of its own.
+ * Parentheses end a chain: `(a?.b).c` reads `c` of undefined, and `(a?.b)()` calls it. */
+static bool compile_chain_part(JsCompiler *cx, const JsAstNode *n, JsPatchList *opt) {
+    if (!(n->flags & JS_F_PAREN)) {
+        if (n->kind == JS_AST_MEMBER)
+            return compile_member_chain(cx, n, opt);
+        if (n->kind == JS_AST_CALL)
+            return compile_call_link(cx, n, opt);
+    }
+    return compile_expr(cx, n);
+}
+
 static bool compile_member_chain(JsCompiler *cx, const JsAstNode *n,
                                  JsPatchList *opt) {
     if (n->kind != JS_AST_MEMBER)
         return compile_expr(cx, n);
-    if (!compile_member_chain(cx, n->a, opt))
+    if (!compile_chain_part(cx, n->a, opt))
         return false;
     note_pos(cx, n->pos2 ? n->pos2 : n->pos); /* V8's: the property */
     if (n->flags & JS_F_OPTIONAL) {
@@ -1857,8 +2267,8 @@ static bool compile_array(JsCompiler *cx, const JsAstNode *n) {
 
 /* ---- calls ---- */
 
-static bool compile_args(JsCompiler *cx, JsAstNode *const *args, uint32_t count,
-                         bool *varargs) {
+static bool compile_args(JsCompiler *cx, const JsAstNode *callee, JsAstNode *const *args,
+                         uint32_t count, bool *varargs) {
     *varargs = false;
     for (uint32_t i = 0; i < count; i++) {
         if (args[i]->kind == JS_AST_SPREAD) {
@@ -1880,7 +2290,7 @@ static bool compile_args(JsCompiler *cx, JsAstNode *const *args, uint32_t count,
         if (args[i]->kind == JS_AST_SPREAD) {
             if (!compile_expr(cx, args[i]->a))
                 return false;
-            note_text(cx, args[i]->a, false);
+            note_spread_arg(cx, args[i]->a, callee);
             if (!emit_op(cx, JS_OP_ARGS_SPREAD, -1))
                 return false;
         } else {
@@ -1927,18 +2337,8 @@ static bool compile_tagged_template(JsCompiler *cx, const JsAstNode *n) {
     const JsAstNode *callee = n->a, *tpl = n->b;
     note_pos(cx, n->pos);
     if (callee->kind == JS_AST_MEMBER) {
-        if (!compile_expr(cx, callee->a) || !emit_op(cx, JS_OP_DUP, +1))
-            return false;
-        if (callee->flags & JS_F_COMPUTED) {
-            if (!compile_expr(cx, callee->b) || !emit_op(cx, JS_OP_GET_PROP, -1))
-                return false;
-        } else {
-            uint16_t c;
-            if (!atom_const(cx, callee->units, callee->len, callee->pos, &c) ||
-                !emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0))
-                return false;
-        }
-        if (!emit_op(cx, JS_OP_SWAP, 0))
+        /* an optional chain here is parenthesized (`a?.b```` is a SyntaxError): it ends there */
+        if (!compile_method_callee(cx, callee, NULL))
             return false;
     } else if (!compile_expr(cx, callee) || !emit_op(cx, JS_OP_UNDEFINED, +1)) {
         return false;
@@ -1957,55 +2357,74 @@ static bool compile_tagged_template(JsCompiler *cx, const JsAstNode *n) {
     return emit_op(cx, JS_OP_CALL, -(int)argc) && emit8(cx, (uint8_t)argc);
 }
 
-static bool compile_call(JsCompiler *cx, const JsAstNode *n) {
-    const JsAstNode *callee = n->a;
-    note_pos(cx, n->pos);
-    JsPatchList opt = {0};
-    bool method = callee->kind == JS_AST_MEMBER;
-
-    if (method) {
-        /* leave [receiver, method] then swap -> [method, receiver] as this */
-        if (!compile_member_chain(cx, callee->a, &opt))
+/* [method recv] for a call of the member CALLEE (`a.b()`, `a?.b()`, `a.b?.()`), its short-circuits
+ * jumping to OPT's end with the chain. A parenthesized callee (or OPT NULL: a tagged template's)
+ * ends its own chain: short-circuited, it is undefined with an undefined receiver, and the call
+ * goes ahead, as `(a?.b)()` throws in V8. */
+static bool compile_method_callee(JsCompiler *cx, const JsAstNode *callee, JsPatchList *opt) {
+    JsPatchList own = {0};
+    JsPatchList *links = (!opt || (callee->flags & JS_F_PAREN)) ? &own : opt;
+    if (!compile_chain_part(cx, callee->a, links))
+        return false;
+    if (callee->flags & JS_F_OPTIONAL) {
+        uint32_t patch;
+        if (!emit_jump(cx, JS_OP_OPT_CHAIN, 0, &patch) || !patch_list_add(cx, links, patch))
             return false;
-        if (callee->flags & JS_F_OPTIONAL) {
-            uint32_t patch;
-            if (!emit_jump(cx, JS_OP_OPT_CHAIN, 0, &patch) ||
-                !patch_list_add(cx, &opt, patch))
-                return false;
-        }
-        if (!emit_op(cx, JS_OP_DUP, +1)) /* [recv recv] */
-            return false;
-        if (callee->pos2)
-            note_pos(cx, callee->pos2);
-        if (callee->flags & JS_F_COMPUTED) {
-            if (!compile_expr(cx, callee->b) || !emit_op(cx, JS_OP_GET_PROP, -1))
-                return false;
-        } else {
-            uint16_t c;
-            if (!atom_const(cx, callee->units, callee->len, callee->pos, &c) ||
-                !emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0))
-                return false;
-        }
-        /* [recv method] -> [method recv] */
-        if (!emit_op(cx, JS_OP_SWAP, 0))
+    }
+    if (!emit_op(cx, JS_OP_DUP, +1)) /* [recv recv] */
+        return false;
+    if (callee->pos2)
+        note_pos(cx, callee->pos2);
+    if (callee->flags & JS_F_COMPUTED) {
+        if (!compile_expr(cx, callee->b) || !emit_op(cx, JS_OP_GET_PROP, -1))
             return false;
     } else {
-        if (!compile_member_chain(cx, callee, &opt)) /* value = callee */
+        uint16_t c;
+        if (!atom_const(cx, callee->units, callee->len, callee->pos, &c) ||
+            !emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0))
+            return false;
+    }
+    /* [recv method] -> [method recv] */
+    if (!emit_op(cx, JS_OP_SWAP, 0))
+        return false;
+    if (!own.count)
+        return true;
+    uint32_t after;
+    if (!emit_jump(cx, JS_OP_JUMP, 0, &after))
+        return false;
+    for (uint32_t i = 0; i < own.count; i++)
+        patch_here(cx, own.offs[i]);
+    set_depth(cx, cx->cur->depth - 1); /* [undefined] where the receiver goes */
+    if (!emit_op(cx, JS_OP_UNDEFINED, +1))
+        return false;
+    patch_here(cx, after);
+    return true;
+}
+
+/* A call as a link of the optional chain whose short-circuits jump to OPT's end (`a?.b()`,
+ * `f?.()`, and the calls inside `a?.b().c` and `a?.()()`, which the short-circuit skips too). */
+static bool compile_call_link(JsCompiler *cx, const JsAstNode *n, JsPatchList *opt) {
+    const JsAstNode *callee = n->a;
+    note_pos(cx, n->pos);
+    if (callee->kind == JS_AST_MEMBER) {
+        if (!compile_method_callee(cx, callee, opt))
+            return false;
+    } else {
+        if (!compile_chain_part(cx, callee, opt)) /* value = callee */
             return false;
         if (!emit_op(cx, JS_OP_UNDEFINED, +1)) /* this = undefined */
             return false;
     }
 
-    /* optional call: `f?.()` */
-    uint32_t opt_call_patch = 0;
-    bool has_opt_call = (n->flags & JS_F_OPTIONAL) != 0;
-    if (has_opt_call) {
-        if (!emit_jump(cx, JS_OP_OPT_CALL_CHECK, 0, &opt_call_patch))
+    /* optional call: `f?.()`; a nullish callee leaves undefined where the result goes */
+    if (n->flags & JS_F_OPTIONAL) {
+        uint32_t patch;
+        if (!emit_jump(cx, JS_OP_OPT_CALL_CHECK, 0, &patch) || !patch_list_add(cx, opt, patch))
             return false;
     }
 
     bool varargs;
-    if (!compile_args(cx, n->items, n->count, &varargs))
+    if (!compile_args(cx, callee, n->items, n->count, &varargs))
         return false;
     note_callee(cx, callee);
     note_pos(cx, n->pos2 ? n->pos2 : n->pos); /* the call itself, where V8 places it */
@@ -2019,18 +2438,13 @@ static bool compile_call(JsCompiler *cx, const JsAstNode *n) {
             !emit8(cx, (uint8_t)n->count))
             return false;
     }
+    return true;
+}
 
-    if (has_opt_call) {
-        uint32_t after;
-        if (!emit_jump(cx, JS_OP_JUMP, 0, &after))
-            return false;
-        patch_at(cx, opt_call_patch, FN->code_len);
-        if (!emit_op(cx, JS_OP_UNDEFINED, +1)) /* nullish callee -> undefined */
-            return false;
-        set_depth(cx, cx->cur->depth - 1); /* both paths converge at same depth */
-        patch_here(cx, after);
-        set_depth(cx, cx->cur->depth + 1);
-    }
+static bool compile_call(JsCompiler *cx, const JsAstNode *n) {
+    JsPatchList opt = {0};
+    if (!compile_call_link(cx, n, &opt))
+        return false;
     for (uint32_t i = 0; i < opt.count; i++)
         patch_here(cx, opt.offs[i]);
     return true;
@@ -2043,7 +2457,7 @@ static bool compile_new(JsCompiler *cx, const JsAstNode *n) {
     if (!emit_op(cx, JS_OP_UNDEFINED, +1)) /* this placeholder; NEW overwrites it */
         return false;
     bool varargs;
-    if (!compile_args(cx, n->items, n->count, &varargs))
+    if (!compile_args(cx, n->a, n->items, n->count, &varargs))
         return false;
     note_callee(cx, n->a);
     note_pos(cx, n->pos); /* `new` */
@@ -2250,7 +2664,7 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
             /* `delete a?.b`, `delete a?.b.c`: a nullish link anywhere in the chain makes the whole
              * expression true, as V8 has it; OPT_CHAIN leaves undefined where the result goes */
             JsPatchList opt = {0};
-            if (!compile_member_chain(cx, m->a, &opt))
+            if (!compile_chain_part(cx, m->a, &opt))
                 return false;
             if (m->flags & JS_F_OPTIONAL) {
                 uint32_t patch;
