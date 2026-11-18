@@ -300,6 +300,9 @@ void js_promise_reject(JsContext *ctx, JsPromise *p, JsValue reason);
 void js_promise_resolve_with(JsContext *ctx, JsPromise *p, JsValue value);
 JsPromise *js_promise_then(JsContext *ctx, JsPromise *p, JsValue on_f, JsValue on_r);
 bool js_promise_await(JsContext *ctx, JsPromise *p, JsFiber *fiber);
+/* Await(V): FIBER resumes with what V settles to. 1 waiting, 0 thrown (the error is in
+ * fiber->error), -1 out of memory */
+int js_promise_await_value(JsContext *ctx, JsValue v, JsFiber *fiber);
 void js_gc_mark_jobs(JsVm *vm);   /* mark the microtask queue */
 void js_jobs_free_all(JsVm *vm);  /* free queue + recycled nodes at teardown */
 bool js_promise_builtins_init(JsContext *ctx);

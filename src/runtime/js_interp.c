@@ -4049,18 +4049,13 @@ run:; /* (re)load the top frame */
                 JsValue awaited = PEEK(0);
                 fr->ip = ip; /* resume just after AWAIT */
                 fb->err_pos = lookup_pos(fn, op_ip);
-                JsPromise *pr;
-                if (js_is_promise(awaited)) {
-                    pr = js_value_promise(awaited);
-                } else {
-                    pr = js_promise_alloc(ctx);
-                    if (!pr)
-                        RT_THROW("out of memory");
-                    js_promise_resolve_with(ctx, pr, awaited); /* a thenable is adopted */
-                }
-                if (!js_promise_await(ctx, pr, fb))
+                int waiting = js_promise_await_value(ctx, awaited, fb);
+                if (waiting > 0)
+                    return JS_RUN_SUSPENDED;
+                if (waiting < 0)
                     RT_THROW("out of memory");
-                return JS_RUN_SUSPENDED;
+                fb->failed = true; /* reading the promise's `constructor` threw: fb->error */
+                RT_RAISE();
             }
             case JS_OP_GET_EXPORT: {
                 JsString *name = js_value_string(K[READ_U16()]);

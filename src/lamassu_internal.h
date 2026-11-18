@@ -227,6 +227,8 @@ enum {
     JS_INTACT_ARRAY_CONSTRUCTOR, /* Array.prototype.constructor */
     JS_INTACT_ARRAY_ITER_NEXT,   /* the Array Iterator prototype's next */
     JS_INTACT_STRING_ITER_NEXT,  /* the String Iterator prototype's next */
+    JS_INTACT_PROMISE_THEN,        /* Promise.prototype.then */
+    JS_INTACT_PROMISE_CONSTRUCTOR, /* Promise.prototype.constructor */
     JS_INTACT__COUNT
 };
 

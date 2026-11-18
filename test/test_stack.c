@@ -534,6 +534,23 @@ static void test_rejection_tracker(void) {
     g_unhandled[0] = js_undefined();
     g_unhandled_n = 0;
 
+    /* a reaction whose promise is another constructor's settles it through that constructor's
+     * functions: one that throws has no promise left to reject, and the host hears of the error */
+    run_src(vm, ctx,
+            "function P(ex) { return new Promise((res, rej) => ex(() => { throw new Error('lost'); }, rej)); }\n"
+            "Object.setPrototypeOf(P, Promise);\n"
+            "const p = Promise.resolve(1);\n"
+            "p.constructor = P;\n"
+            "p.then((v) => v + 1);\n", &p);
+    CHECK(js_promise_state(p) == 1, "the module is fulfilled");
+    CHECK(g_unhandled_n == 1 && str_is(js_to_string(ctx, js_promise_result(g_unhandled[0])), "Error: lost"),
+          "what a capability's resolve threw is reported");
+    CHECK(g_unhandled_n == 1 && js_promise_error_stack(ctx, g_unhandled[0], fr, JS_TRACE_MAX) >= 1,
+          "with the place it was thrown at");
+    js_gc_unprotect(vm, &p);
+    g_unhandled[0] = js_undefined();
+    g_unhandled_n = 0;
+
     /* a rejection nothing threw has no place, though the same value was thrown before it */
     run_src(vm, ctx, "try { throw 7; } catch (e) {}\nPromise.reject(7);\n", &p);
     CHECK(g_unhandled_n == 1 && js_promise_state(g_unhandled[0]) == 2, "Promise.reject(7) is unhandled");

@@ -596,11 +596,46 @@ engine's subset, callable **without** `new` too.
   with an `AggregateError` (`All promises were rejected`) whose `errors` are the reasons in
   input order.
 - **`Promise.prototype`**: `then`, `catch`, `finally`.
-- Resolving with a thenable (any object or function with a callable `then`) adopts it, as V8
-  does: `Promise.resolve`, an executor's `resolve`, `await`, an async function's return value and
-  the combinators' inputs call its `then` in a job of its own. An executor's `resolve` and
-  `reject` act once between them: the first call wins, even while a thenable it was given is
-  still pending.
+- Resolving with a thenable (any object or function with a callable `then`, a promise among
+  them) adopts it, as V8 does: `Promise.resolve`, an executor's `resolve`, `await`, an async
+  function's return value and the combinators' inputs call its `then` in a job of its own. An
+  executor's `resolve` and `reject` act once between them: the first call wins, even while a
+  thenable it was given is still pending. A promise resolved with itself is rejected with
+  `TypeError: Chaining cycle detected for promise #<Promise>`.
+- **`then` is called as a property**, as in V8, so the one a script put there is the one that
+  runs: an own `then` on one promise, a replaced `Promise.prototype.then`, one inherited through
+  `Object.setPrototypeOf`. `catch(f)` is `this.then(undefined, f)` and `finally(f)` is
+  `this.then(...)` on any object that has a `then`, not only on promises
+  (`Promise.prototype.catch.call(thenable, f)`); the combinators call the `then` of what
+  `this.resolve(value)` gave them; and a promise used to resolve another has its `then` called
+  with that promise's resolving functions. `Promise.prototype.then` itself takes promises only
+  (`TypeError: Method Promise.prototype.then called on incompatible receiver #<Object>`).
+- **`constructor` chooses what `then`, `catch` and `finally` return**: the promise is made with
+  `new C(executor)` when the receiver's `constructor` is a constructor with a species
+  ([Deviations](/guide/deviations#conversions) has what stands in for `Symbol.species`): `Promise`
+  itself, or one that inherits from it (`Object.setPrototypeOf(P, Promise)`, what
+  `class P extends Promise` does). It is a plain promise when `constructor` is `undefined` or an
+  object without a species, and `TypeError: The .constructor property is not an object` when it
+  is a primitive or `null`.
+  `Promise.resolve(p)` and `await p` take a promise as it is only when its `constructor` is the
+  constructor they were called on (`Promise` for `await`), and `await` then waits on it without
+  calling `then`; any other promise is resolved into a new one through its `then`.
+- **The statics build on `this`**: `P.resolve`, `P.reject`, `P.all`, `P.allSettled`, `P.any`,
+  `P.race`, `P.try` and `P.withResolvers` make their promise with `new P(executor)` and settle it
+  through the two functions the executor was handed, so they work for a constructor that
+  inherits from `Promise` and for any function that plays the part. The errors are V8's:
+  `Promise.all called on non-object` (`PromiseResolve` and `PromiseReject` for those two),
+  `#<Object> is not a constructor`, `Promise resolve or reject function is not callable`,
+  `Promise executor has already been invoked with non-undefined arguments`. The combinators read
+  `this.resolve` once, before the first value (a promise rejected with
+  `TypeError: resolve is not a function` when it is not callable), call it and then the result's
+  `then` for each value in turn, and close the iterator when either throws. The functions they
+  pass to `then` act once each, whatever a thenable does with them.
+- **Jobs run in V8's order**, to the tick: a promise resolved with another promise settles two
+  jobs after it (one calls its `then`, one runs the reaction), which is what an async function
+  returning a promise, `resolve(p)` in an executor and a `then` handler returning a promise all
+  do; `await p` of a plain promise takes one; `finally` passes the settlement on two jobs after
+  its callback ran.
 - A promise holds properties as any object does (`p.label = 'load'`): reads, `in`, `delete`,
   `Object.keys`, spread, `Object.assign`, `JSON.stringify` and `freeze`/`seal` see them, and one
   can shadow `then`.

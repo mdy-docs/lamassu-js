@@ -139,10 +139,11 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   from one (`Object.setPrototypeOf(C, Array)`, which is what `class C extends Array` does), and
   any other function or object has none. Where V8 reads `constructor[Symbol.species]` the answer
   is therefore the same as V8's for everything a script here can build: the array methods that
-  make an array (`map`, `filter`, `slice`, `splice`, `concat`, `flat`, `flatMap`) and the regexp
-  ones call `new constructor(...)` for a constructor with a species, make the default for one
-  without, and refuse a `constructor` that is not an object
-  (`TypeError: object.constructor[Symbol.species] is not a constructor`).
+  make an array (`map`, `filter`, `slice`, `splice`, `concat`, `flat`, `flatMap`), the regexp
+  ones and a promise's `then`, `catch` and `finally` call `new constructor(...)` for a
+  constructor with a species, make the default for one without, and refuse a `constructor` that
+  is not an object (`TypeError: object.constructor[Symbol.species] is not a constructor`, and of
+  a promise `TypeError: The .constructor property is not an object`).
 - **`Object.prototype.valueOf.call(5)`** gives `5`, not a `Number` object (no wrapper objects).
 
 ## Arrays
@@ -278,6 +279,13 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   HostPromiseRejectionTracker); a host that sets no tracker hears nothing. The `lamassu`
   command line tool reports the first one still unhandled when the run is over and exits with
   status 1, as Node does. There is no `unhandledrejection` event for a script to listen to.
+- **A settling function that throws inside a job is reported as an unhandled rejection.** When
+  `then` made its result with another constructor (see
+  [`Promise`](/guide/builtins#promise)) and the `resolve` or `reject` that constructor handed
+  over throws while a reaction is settling the result, there is no promise left to reject. V8
+  reports an uncaught exception; lamassu gives the error to the host's rejection tracker as a
+  rejected promise nothing holds. Under Node and under the `lamassu` command line tool the
+  outcome is the same: the error is printed and the exit status is 1.
 - **A pending top-level-await module** returns from the host's run call
   still pending — see [Async & host calls](/guide/async#top-level-await).
 - **`Array.fromAsync` closes an iterator once.** When a value it awaits rejects, V8 calls the
