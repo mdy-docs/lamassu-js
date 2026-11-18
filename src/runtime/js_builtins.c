@@ -7872,6 +7872,175 @@ static void hide_all(JsObject *o) {
             attrs[i] |= JS_ATTR_HIDDEN;
 }
 
+/* ---- V8's property order ----
+ *
+ * Object.getOwnPropertyNames lists a builtin's names in the order V8 has them (Node 26's), not
+ * the order this file happens to make them in: each list below is V8's, cut down to the names
+ * lamassu has. A builtin not listed is already in V8's order; test_builtins checks every one. */
+static const char *const ord_globalThis[] = {
+    "Object", "Array", "Number", "parseFloat", "parseInt", "Infinity", "NaN",
+    "undefined", "Boolean", "String", "Date", "Promise", "RegExp", "Error",
+    "AggregateError", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError",
+    "globalThis", "JSON", "Math", "Map", "BigInt", "Set", "Iterator",
+    "WeakMap", "WeakSet", "FinalizationRegistry", "WeakRef", "decodeURI", "decodeURIComponent", "encodeURI",
+    "encodeURIComponent", "escape", "unescape", "isFinite", "isNaN"};
+static const char *const ord_Object[] = {
+    "length", "name", "prototype", "assign", "getOwnPropertyDescriptor", "getOwnPropertyDescriptors", "getOwnPropertyNames",
+    "hasOwn", "is", "preventExtensions", "seal", "create", "defineProperties", "defineProperty",
+    "freeze", "getPrototypeOf", "setPrototypeOf", "isExtensible", "isFrozen", "isSealed", "keys",
+    "entries", "fromEntries", "values", "groupBy"};
+static const char *const ord_Object_prototype[] = {
+    "constructor", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toString", "valueOf", "__proto__"};
+static const char *const ord_Array[] = {
+    "length", "name", "prototype", "isArray", "from", "fromAsync", "of"};
+static const char *const ord_Array_prototype[] = {
+    "length", "constructor", "at", "concat", "copyWithin", "fill", "find",
+    "findIndex", "findLast", "findLastIndex", "lastIndexOf", "pop", "push", "reverse",
+    "shift", "unshift", "slice", "sort", "splice", "includes", "indexOf",
+    "join", "keys", "entries", "values", "forEach", "filter", "flat",
+    "flatMap", "map", "every", "some", "reduce", "reduceRight", "toReversed",
+    "toSorted", "toSpliced", "with", "toString"};
+static const char *const ord_String_prototype[] = {
+    "length", "constructor", "anchor", "at", "big", "blink", "bold",
+    "charAt", "charCodeAt", "codePointAt", "concat", "endsWith", "fontcolor", "fontsize",
+    "fixed", "includes", "indexOf", "isWellFormed", "italics", "lastIndexOf", "link",
+    "match", "matchAll", "normalize", "padEnd", "padStart", "repeat", "replace",
+    "replaceAll", "search", "slice", "small", "split", "strike", "sub",
+    "substr", "substring", "sup", "startsWith", "toString", "toWellFormed", "trim",
+    "trimStart", "trimLeft", "trimEnd", "trimRight", "toLowerCase", "toUpperCase", "valueOf"};
+static const char *const ord_Number[] = {
+    "length", "name", "prototype", "isFinite", "isInteger", "isNaN", "isSafeInteger",
+    "parseFloat", "parseInt", "MAX_VALUE", "MIN_VALUE", "NaN", "NEGATIVE_INFINITY", "POSITIVE_INFINITY",
+    "MAX_SAFE_INTEGER", "MIN_SAFE_INTEGER", "EPSILON"};
+static const char *const ord_Number_prototype[] = {
+    "constructor", "toExponential", "toFixed", "toPrecision", "toString", "valueOf"};
+static const char *const ord_Boolean_prototype[] = {
+    "constructor", "toString", "valueOf"};
+static const char *const ord_Math[] = {
+    "abs", "acos", "acosh", "asin", "asinh", "atan", "atanh",
+    "atan2", "ceil", "cbrt", "expm1", "clz32", "cos", "cosh",
+    "exp", "floor", "fround", "hypot", "imul", "log", "log1p",
+    "log2", "log10", "max", "min", "pow", "random", "round",
+    "sign", "sin", "sinh", "sqrt", "tan", "tanh", "trunc",
+    "E", "LN10", "LN2", "LOG10E", "LOG2E", "PI", "SQRT1_2",
+    "SQRT2", "f16round"};
+static const char *const ord_Date[] = {
+    "length", "name", "prototype", "now", "parse", "UTC"};
+static const char *const ord_Date_prototype[] = {
+    "constructor", "toString", "toDateString", "toTimeString", "toISOString", "toUTCString", "toGMTString",
+    "getDate", "setDate", "getDay", "getFullYear", "setFullYear", "getHours", "setHours",
+    "getMilliseconds", "setMilliseconds", "getMinutes", "setMinutes", "getMonth", "setMonth", "getSeconds",
+    "setSeconds", "getTime", "setTime", "getTimezoneOffset", "getUTCDate", "setUTCDate", "getUTCDay",
+    "getUTCFullYear", "setUTCFullYear", "getUTCHours", "setUTCHours", "getUTCMilliseconds", "setUTCMilliseconds", "getUTCMinutes",
+    "setUTCMinutes", "getUTCMonth", "setUTCMonth", "getUTCSeconds", "setUTCSeconds", "valueOf", "getYear",
+    "setYear", "toJSON"};
+static const char *const ord_Map_prototype[] = {
+    "constructor", "get", "set", "has", "delete", "clear", "entries",
+    "forEach", "keys", "size", "values", "getOrInsert", "getOrInsertComputed"};
+static const char *const ord_Set_prototype[] = {
+    "constructor", "has", "add", "delete", "difference", "clear", "entries",
+    "forEach", "intersection", "isSubsetOf", "isSupersetOf", "isDisjointFrom", "size", "symmetricDifference",
+    "union", "values", "keys"};
+static const char *const ord_Promise[] = {
+    "length", "name", "prototype", "all", "allSettled", "any", "race",
+    "resolve", "reject", "withResolvers", "try"};
+static const char *const ord_Promise_prototype[] = {
+    "constructor", "then", "catch", "finally"};
+static const char *const ord_Error_prototype[] = {
+    "constructor", "name", "message", "toString"};
+static const char *const ord_Iterator_prototype[] = {
+    "constructor", "reduce", "toArray", "forEach", "some", "every", "find",
+    "map", "filter", "take", "drop", "flatMap"};
+/* TypeError.prototype and the other kinds' own prototypes */
+static const char *const ord_error_kind_prototype[] = {"constructor", "name", "message"};
+
+/* Puts O's own properties in ORDER's order (the names it has), then the rest in the order they
+ * had: each is taken out and put back at the end with its attributes. The keys are found (which
+ * allocates) before any is taken out; nothing after that makes a cell, so nothing is collected
+ * while a key is out of the map. */
+static bool v8_order(JsContext *ctx, JsObject *o, const char *const *order, size_t n) {
+    if (!o || !o->props.count)
+        return true;
+    JsVm *vm = ctx->vm;
+    JsMap *m = &o->props;
+    uint32_t total = m->count, k = 0;
+    JsString **ks = js_realloc_raw(vm, NULL, 0, (size_t)total * sizeof *ks);
+    if (!ks)
+        return false;
+    bool ok = true;
+    for (size_t i = 0; ok && i < n && k < total; i++) {
+        JsString *s = js_ascii_cell(vm, order[i]);
+        JsString *ik = s ? js_intern_cell(vm, s) : NULL;
+        ok = ik != NULL;
+        if (ok && js_map_position(m, ik) != JS_MAP_EMPTY)
+            ks[k++] = ik; /* the map's own key: kept alive by it */
+    }
+    uint32_t listed = k;
+    for (uint32_t i = 0; ok && i < m->used && k < total; i++) {
+        JsString *key = m->entries[i].key;
+        if (!key || key == JS_MAP_TOMBSTONE)
+            continue;
+        bool seen = false;
+        for (uint32_t j = 0; j < listed && !seen; j++)
+            seen = ks[j] == key;
+        if (!seen)
+            ks[k++] = key;
+    }
+    for (uint32_t i = 0; ok && i < k; i++) {
+        bool found;
+        JsValue v = js_map_get(m, ks[i], &found);
+        uint8_t attrs = js_map_get_attrs(m, ks[i]);
+        js_map_delete(m, ks[i]);
+        ok = js_map_set(vm, m, ks[i], v);
+        if (ok)
+            js_map_put_attrs(m, ks[i], attrs);
+    }
+    js_realloc_raw(vm, ks, (size_t)total * sizeof *ks, 0);
+    return ok;
+}
+
+static bool v8_property_order(JsContext *ctx) {
+    struct { JsObject *obj; const char *ctor; const char *const *order; size_t n; } rows[] = {
+        {ctx->globals, NULL, ord_globalThis, sizeof ord_globalThis / sizeof ord_globalThis[0]},
+        {NULL, "Object", ord_Object, sizeof ord_Object / sizeof ord_Object[0]},
+        {ctx->object_proto, NULL, ord_Object_prototype, sizeof ord_Object_prototype / sizeof ord_Object_prototype[0]},
+        {NULL, "Array", ord_Array, sizeof ord_Array / sizeof ord_Array[0]},
+        {ctx->array_proto, NULL, ord_Array_prototype, sizeof ord_Array_prototype / sizeof ord_Array_prototype[0]},
+        {ctx->string_methods, NULL, ord_String_prototype, sizeof ord_String_prototype / sizeof ord_String_prototype[0]},
+        {NULL, "Number", ord_Number, sizeof ord_Number / sizeof ord_Number[0]},
+        {ctx->number_methods, NULL, ord_Number_prototype, sizeof ord_Number_prototype / sizeof ord_Number_prototype[0]},
+        {ctx->boolean_methods, NULL, ord_Boolean_prototype, sizeof ord_Boolean_prototype / sizeof ord_Boolean_prototype[0]},
+        {ctx->math_obj, NULL, ord_Math, sizeof ord_Math / sizeof ord_Math[0]},
+        {NULL, "Date", ord_Date, sizeof ord_Date / sizeof ord_Date[0]},
+        {ctx->date_proto, NULL, ord_Date_prototype, sizeof ord_Date_prototype / sizeof ord_Date_prototype[0]},
+        {ctx->map_proto, NULL, ord_Map_prototype, sizeof ord_Map_prototype / sizeof ord_Map_prototype[0]},
+        {ctx->set_proto, NULL, ord_Set_prototype, sizeof ord_Set_prototype / sizeof ord_Set_prototype[0]},
+        {NULL, "Promise", ord_Promise, sizeof ord_Promise / sizeof ord_Promise[0]},
+        {ctx->promise_methods, NULL, ord_Promise_prototype, sizeof ord_Promise_prototype / sizeof ord_Promise_prototype[0]},
+        {ctx->error_protos[JS_ERROR_PLAIN], NULL, ord_Error_prototype, sizeof ord_Error_prototype / sizeof ord_Error_prototype[0]},
+        {ctx->iterator_proto, NULL, ord_Iterator_prototype, sizeof ord_Iterator_prototype / sizeof ord_Iterator_prototype[0]},
+    };
+    for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+        JsObject *o = rows[i].obj;
+        if (rows[i].ctor) { /* a constructor's statics (JsNative.statics) */
+            JsString *s = js_ascii_cell(ctx->vm, rows[i].ctor);
+            JsString *ik = s ? js_intern_cell(ctx->vm, s) : NULL;
+            if (!ik)
+                return false;
+            bool found;
+            JsValue c = js_map_get(&ctx->globals->props, ik, &found);
+            o = found && js_is_function(c) && js_value_cell(c)->kind == JS_KIND_NATIVE
+                    ? ((JsNative *)js_value_cell(c))->statics : NULL;
+        }
+        if (!v8_order(ctx, o, rows[i].order, rows[i].n))
+            return false;
+    }
+    for (int k = 0; k < JS_ERROR_KIND_COUNT; k++)
+        if (k != JS_ERROR_PLAIN && !v8_order(ctx, ctx->error_protos[k], ord_error_kind_prototype, 3))
+            return false;
+    return true;
+}
+
 /* The properties the engine made on the global object, the builtin prototypes and Math and JSON
  * are not enumerable (Object.keys(Map.prototype) and Object.keys(globalThis) are [], as in V8);
  * ones a script or the host adds later are. */
@@ -8244,6 +8413,8 @@ bool js_builtins_init(JsContext *ctx) {
         ctx->species_ctors[i] = found && js_is_function(c) && js_value_cell(c)->kind == JS_KIND_NATIVE
                                     ? (JsNative *)js_value_cell(c) : NULL;
     }
+    if (!v8_property_order(ctx))
+        return false;
     if (!js_intact_watch(ctx, JS_INTACT_ARRAY_CONSTRUCTOR, ctx->array_proto, "constructor"))
         return false;
     hide_builtin_keys(ctx);

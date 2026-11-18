@@ -92,13 +92,13 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   read-only, non-enumerable or non-configurable (elements are a flat vector with no attribute
   storage; a frozen or sealed array's elements are), nor can an **array's `length`** be made
   read-only (outside `freeze`).
-- **`Object.getOwnPropertyNames` of a builtin gives V8's names, not V8's order.** What V8 makes
-  non-enumerable (a builtin prototype's methods, a function's `prototype.constructor`, an
-  error's `message`) is non-enumerable here too: left out of `Object.keys`, JSON, spread and
-  `Object.assign`, and listed by `Object.getOwnPropertyNames`. The names of a builtin are V8's
-  but for what is left out (see the list at the top), in the order lamassu defines them rather
-  than V8's (`Math` starts `abs, floor, ceil` here and `abs, acos, acosh` in V8).
-  `arguments` (an array here) has no `callee`.
+- **`Object.getOwnPropertyNames` of a builtin gives V8's names in V8's order**, but for what is
+  left out (see the list at the top): `Math` starts `abs, acos, acosh`, `Array.prototype`
+  `length, constructor, at`, as in Node. What V8 makes non-enumerable (a builtin prototype's
+  methods, a function's `prototype.constructor`, an error's `message`) is non-enumerable here
+  too: left out of `Object.keys`, JSON, spread and `Object.assign`, and listed by
+  `Object.getOwnPropertyNames`. A host's own globals come after V8's. `arguments` (an array
+  here) has no `callee`.
 
 ## Functions
 

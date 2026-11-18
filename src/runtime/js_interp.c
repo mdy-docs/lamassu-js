@@ -402,6 +402,27 @@ __attribute__((noinline)) static int js_compare_values(JsContext *ctx, JsValue a
     return da == db ? 0 : 1;
 }
 
+static int number_operands(JsContext *ctx, JsFiber *fb, uint32_t ip, double *a, double *b);
+
+/* MOD and POW on the stack's two operands, out of the dispatch loop: two calls of their own
+ * there moved its register allocation (array_sum, which has neither, ran 6% slower). False
+ * with the conversion's error pending. */
+static JS_NOINLINE bool mod_pow_op(JsContext *ctx, JsFiber *fb, uint32_t ip, uint8_t op) {
+    double a, b;
+    JsValue x = fb->stack[fb->sp - 2], y = fb->stack[fb->sp - 1];
+    if (js_is_number(x) && js_is_number(y)) {
+        a = js_get_number(x);
+        b = js_get_number(y);
+    } else {
+        int k = number_operands(ctx, fb, ip, &a, &b);
+        if (k != 1)
+            return k != 0; /* 0 thrown; else done there (BigInt) */
+    }
+    fb->sp--;
+    fb->stack[fb->sp - 1] = js_number(op == JS_OP_MOD ? js_fmod(a, b) : js_pow_op(a, b));
+    return true;
+}
+
 /* X ** Y and Math.pow(X, Y), one function as in V8 (`2 ** -1074 === Math.pow(2, -1074)`). C's pow
  * answers 1 for `1 ** NaN` and `(-1) ** Infinity`; Number::exponentiate (and V8) answer NaN for an
  * exponent that is NaN, and for a base of 1 or -1 with an infinite one. */
@@ -3265,8 +3286,11 @@ run:; /* (re)load the top frame */
                     RT_THROW_PENDING();
                 break;
             }
-            case JS_OP_SUB: case JS_OP_MUL: case JS_OP_DIV:
-            case JS_OP_MOD: case JS_OP_POW: {
+            case JS_OP_MOD: case JS_OP_POW:
+                if (!mod_pow_op(ctx, fb, ip, op))
+                    RT_THROW_PENDING();
+                break;
+            case JS_OP_SUB: case JS_OP_MUL: case JS_OP_DIV: {
                 double a, b;
                 if (js_is_number(PEEK(1)) && js_is_number(PEEK(0))) {
                     a = js_get_number(PEEK(1));
@@ -3283,9 +3307,7 @@ run:; /* (re)load the top frame */
                 switch (op) {
                 case JS_OP_SUB: r = a - b; break;
                 case JS_OP_MUL: r = a * b; break;
-                case JS_OP_DIV: r = a / b; break;
-                case JS_OP_MOD: r = js_fmod(a, b); break;
-                default: r = js_pow_op(a, b); break;
+                default: r = a / b; break;
                 }
                 fb->sp--;
                 PEEK(0) = js_number(r);

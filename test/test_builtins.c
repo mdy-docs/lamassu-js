@@ -1576,6 +1576,94 @@ static void test_exotic_prototypes(void) {
          "Method Map.prototype.entries called on incompatible receiver #<Map> | a+b | Iterator.concat called on non-object | made | Method Set.prototype.values called on incompatible receiver #<Set> | #<Object> is not iterable | Method Map.prototype.entries called on incompatible receiver #<Map> | Method Map.prototype.entries called on incompatible receiver #<Map> | Method Map.prototype.entries called on incompatible receiver #<Map> | Method Map.prototype.entries called on incompatible receiver #<Map> | Method Map.prototype.entries called on incompatible receiver #<Map> | Method Map.prototype.entries called on incompatible receiver #<Map> | Method Map.prototype.entries called on incompatible receiver #<Map>");
 }
 
+static void test_v8_property_order(void) {
+    /* Object.getOwnPropertyNames of each builtin: V8's order (Node 26), as far as lamassu has the names */
+    eq_s("Object.getOwnPropertyNames(globalThis).join();",
+         "Object,Array,Number,parseFloat,parseInt,Infinity,NaN,undefined,Boolean,String,Date,Promise,RegExp,Error,AggregateError,EvalError,RangeError,ReferenceError,SyntaxError,TypeError,URIError,globalThis,JSON,Math,Map,BigInt,Set,Iterator,WeakMap,WeakSet,FinalizationRegistry,WeakRef,decodeURI,decodeURIComponent,encodeURI,encodeURIComponent,escape,unescape,isFinite,isNaN");
+    eq_s("Object.getOwnPropertyNames(Object).join();",
+         "length,name,prototype,assign,getOwnPropertyDescriptor,getOwnPropertyDescriptors,getOwnPropertyNames,hasOwn,is,preventExtensions,seal,create,defineProperties,defineProperty,freeze,getPrototypeOf,setPrototypeOf,isExtensible,isFrozen,isSealed,keys,entries,fromEntries,values,groupBy");
+    eq_s("Object.getOwnPropertyNames(Object.prototype).join();",
+         "constructor,hasOwnProperty,isPrototypeOf,propertyIsEnumerable,toString,valueOf,__proto__");
+    eq_s("Object.getOwnPropertyNames(Object.getPrototypeOf(() => 0)).join();",
+         "length,name,apply,bind,call,toString,arguments,caller");
+    eq_s("Object.getOwnPropertyNames(Array).join();",
+         "length,name,prototype,isArray,from,fromAsync,of");
+    eq_s("Object.getOwnPropertyNames(Array.prototype).join();",
+         "length,constructor,at,concat,copyWithin,fill,find,findIndex,findLast,findLastIndex,lastIndexOf,pop,push,reverse,shift,unshift,slice,sort,splice,includes,indexOf,join,keys,entries,values,forEach,filter,flat,flatMap,map,every,some,reduce,reduceRight,toReversed,toSorted,toSpliced,with,toString");
+    eq_s("Object.getOwnPropertyNames(String).join();",
+         "length,name,prototype,fromCharCode,fromCodePoint,raw");
+    eq_s("Object.getOwnPropertyNames(String.prototype).join();",
+         "length,constructor,anchor,at,big,blink,bold,charAt,charCodeAt,codePointAt,concat,endsWith,fontcolor,fontsize,fixed,includes,indexOf,isWellFormed,italics,lastIndexOf,link,match,matchAll,normalize,padEnd,padStart,repeat,replace,replaceAll,search,slice,small,split,strike,sub,substr,substring,sup,startsWith,toString,toWellFormed,trim,trimStart,trimLeft,trimEnd,trimRight,toLowerCase,toUpperCase,valueOf");
+    eq_s("Object.getOwnPropertyNames(Number).join();",
+         "length,name,prototype,isFinite,isInteger,isNaN,isSafeInteger,parseFloat,parseInt,MAX_VALUE,MIN_VALUE,NaN,NEGATIVE_INFINITY,POSITIVE_INFINITY,MAX_SAFE_INTEGER,MIN_SAFE_INTEGER,EPSILON");
+    eq_s("Object.getOwnPropertyNames(Number.prototype).join();",
+         "constructor,toExponential,toFixed,toPrecision,toString,valueOf");
+    eq_s("Object.getOwnPropertyNames(Boolean.prototype).join();",
+         "constructor,toString,valueOf");
+    eq_s("Object.getOwnPropertyNames(BigInt).join();",
+         "length,name,prototype,asUintN,asIntN");
+    eq_s("Object.getOwnPropertyNames(BigInt.prototype).join();",
+         "constructor,toString,valueOf");
+    eq_s("Object.getOwnPropertyNames(Math).join();",
+         "abs,acos,acosh,asin,asinh,atan,atanh,atan2,ceil,cbrt,expm1,clz32,cos,cosh,exp,floor,fround,hypot,imul,log,log1p,log2,log10,max,min,pow,random,round,sign,sin,sinh,sqrt,tan,tanh,trunc,E,LN10,LN2,LOG10E,LOG2E,PI,SQRT1_2,SQRT2,f16round");
+    eq_s("Object.getOwnPropertyNames(JSON).join();",
+         "parse,stringify,rawJSON,isRawJSON");
+    eq_s("Object.getOwnPropertyNames(Date).join();",
+         "length,name,prototype,now,parse,UTC");
+    eq_s("Object.getOwnPropertyNames(Date.prototype).join();",
+         "constructor,toString,toDateString,toTimeString,toISOString,toUTCString,toGMTString,getDate,setDate,getDay,getFullYear,setFullYear,getHours,setHours,getMilliseconds,setMilliseconds,getMinutes,setMinutes,getMonth,setMonth,getSeconds,setSeconds,getTime,setTime,getTimezoneOffset,getUTCDate,setUTCDate,getUTCDay,getUTCFullYear,setUTCFullYear,getUTCHours,setUTCHours,getUTCMilliseconds,setUTCMilliseconds,getUTCMinutes,setUTCMinutes,getUTCMonth,setUTCMonth,getUTCSeconds,setUTCSeconds,valueOf,getYear,setYear,toJSON");
+    eq_s("Object.getOwnPropertyNames(RegExp).join();",
+         "length,name,prototype,input,$_,lastMatch,$&,lastParen,$+,leftContext,$`,rightContext,$',$1,$2,$3,$4,$5,$6,$7,$8,$9,escape");
+    eq_s("Object.getOwnPropertyNames(RegExp.prototype).join();",
+         "constructor,exec,dotAll,flags,global,hasIndices,ignoreCase,multiline,source,sticky,unicode,unicodeSets,compile,toString,test");
+    eq_s("Object.getOwnPropertyNames(Map).join();",
+         "length,name,prototype,groupBy");
+    eq_s("Object.getOwnPropertyNames(Map.prototype).join();",
+         "constructor,get,set,has,delete,clear,entries,forEach,keys,size,values,getOrInsert,getOrInsertComputed");
+    eq_s("Object.getOwnPropertyNames(Set).join();",
+         "length,name,prototype");
+    eq_s("Object.getOwnPropertyNames(Set.prototype).join();",
+         "constructor,has,add,delete,difference,clear,entries,forEach,intersection,isSubsetOf,isSupersetOf,isDisjointFrom,size,symmetricDifference,union,values,keys");
+    eq_s("Object.getOwnPropertyNames(WeakMap.prototype).join();",
+         "constructor,delete,get,set,has,getOrInsert,getOrInsertComputed");
+    eq_s("Object.getOwnPropertyNames(WeakSet.prototype).join();",
+         "constructor,delete,has,add");
+    eq_s("Object.getOwnPropertyNames(WeakRef.prototype).join();",
+         "constructor,deref");
+    eq_s("Object.getOwnPropertyNames(FinalizationRegistry.prototype).join();",
+         "constructor,register,unregister");
+    eq_s("Object.getOwnPropertyNames(Promise).join();",
+         "length,name,prototype,all,allSettled,any,race,resolve,reject,withResolvers,try");
+    eq_s("Object.getOwnPropertyNames(Promise.prototype).join();",
+         "constructor,then,catch,finally");
+    eq_s("Object.getOwnPropertyNames(Error).join();",
+         "length,name,prototype,captureStackTrace,isError,stackTraceLimit");
+    eq_s("Object.getOwnPropertyNames(Error.prototype).join();",
+         "constructor,name,message,toString");
+    eq_s("Object.getOwnPropertyNames(TypeError).join();",
+         "length,name,prototype");
+    eq_s("Object.getOwnPropertyNames(TypeError.prototype).join();",
+         "constructor,name,message");
+    eq_s("Object.getOwnPropertyNames(AggregateError.prototype).join();",
+         "constructor,name,message");
+    eq_s("Object.getOwnPropertyNames(Iterator).join();",
+         "length,name,prototype,from,concat");
+    eq_s("Object.getOwnPropertyNames(Iterator.prototype).join();",
+         "constructor,reduce,toArray,forEach,some,every,find,map,filter,take,drop,flatMap");
+    eq_s("Object.getOwnPropertyNames(Object.getPrototypeOf([].values())).join();",
+         "next");
+    eq_s("Object.getOwnPropertyNames(Object.getPrototypeOf(new Map().entries())).join();",
+         "next");
+    eq_s("Object.getOwnPropertyNames(Object.getPrototypeOf(new Set().values())).join();",
+         "next");
+    eq_s("Object.getOwnPropertyNames(Object.getPrototypeOf('a'.matchAll(/a/g))).join();",
+         "next");
+    eq_s("Object.getOwnPropertyNames(Object.getPrototypeOf([].values().map(x => x))).join();",
+         "next,return");
+    eq_s("Object.getOwnPropertyNames(Object.getPrototypeOf(async () => {})).join();",
+         "");
+}
+
 /* Error.prepareStackTrace and the CallSites it is given; expectations are Node's output (file
  * names aside: a test's module has none), and for the position and the script hash (a SHA-256
  * of the source's UTF-8) what they are for the source given. */
@@ -2703,6 +2791,7 @@ int main(void) {
     test_number_ops();
     test_chains_and_call_printer();
     test_prepare_stack_trace();
+    test_v8_property_order();
     test_builtin_accessors();
     test_array_generic();
     test_function_prototype();
