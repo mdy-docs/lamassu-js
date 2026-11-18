@@ -46,9 +46,9 @@ static const struct { const char *body; const char *message; } CASES[] = {
     { "const foo = 3; foo();", "foo is not a function" },
     { "const a = { b: { c: 1 } }; a.b.c();", "a.b.c is not a function" },
     { "const a = [1]; a[0]();", "a[0] is not a function" },
-    { "const a = {}; a[\"k\"]();", "a[\"k\"] is not a function" },
+    { "const a = {}; a[\"k\"]();", "a.k is not a function" }, /* a string key is a name in V8 */
     { "const a = {}, k = 'x'; a[k]();", "a[k] is not a function" },
-    { "const a = {}, k = 1; a[k + 1]();", "a[...] is not a function" },
+    { "const a = {}, k = 1; a[k + 1]();", "a[(k + 1)] is not a function" },
     { "const f = () => 1; f()();", "f(...) is not a function" },
     { "const g = () => ({}); g().x();", "g(...).x is not a function" },
     { "const o = { go: 1, run: function () { return this.go(); } }; o.run();", "this.go is not a function" },
