@@ -744,6 +744,13 @@ struct JsFiber {
     JsStackFrame trace[JS_TRACE_MAX];
     uint32_t trace_count;
     uint64_t fuel; /* 0 = unlimited */
+    /* An async function called from the interpreter runs in its caller's loop (run_fiber), not
+     * on a nested one, until its first await, its return or its throw: the caller to go back to
+     * then, with its promise; NULL otherwise. It is also `caller` while it is set. */
+    JsFiber *inline_parent;
+    /* The frames of its inline callers below it: they count toward JS_MAX_FRAMES, as the frames
+     * of a synchronous call do (0 once it has gone back) */
+    uint32_t depth_base;
 };
 
 /* Weak set of interned strings, content-keyed. Sweep removes dead entries. */

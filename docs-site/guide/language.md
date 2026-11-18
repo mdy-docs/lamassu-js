@@ -137,7 +137,12 @@ function stands for its target; a function is an instance of `Object`, a promise
 
 `async`/`await`, including top-level await in a module. See
 [Async & host calls](/guide/async) for how this connects to native/host
-functions.
+functions. An async function called from script runs in its caller's interpreter loop until
+its first `await`, its return or its throw, so nested async calls count toward the same 2000
+frames as synchronous ones (`async function f(n) { return n && f(n - 1) }` goes as deep as its
+synchronous twin) and `RangeError: Maximum call stack size exceeded` rejects the call that does
+not fit. One called by a native (an `Array.prototype.map` callback, a host call) still nests on
+the C stack, within the 200 native re-entries.
 
 ## Modules
 

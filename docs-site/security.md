@@ -60,7 +60,9 @@ expression recursion — separately, because a left-associative chain like
 `a+b+c+…` parses iteratively but produces a deep tree the compiler walks
 recursively. Call frames are capped, and native re-entry into the interpreter
 is capped on top of that, since each re-entry spawns a fresh fiber the
-per-fiber frame limit cannot see.
+per-fiber frame limit cannot see. An async call made from script does not
+re-enter: it runs in the caller's loop, and its frames count toward the
+caller's cap.
 
 **An execution budget.** One unit per dispatched bytecode instruction. It
 covers a *turn*, it is shared rather than per-fiber or per-job, and exhaustion

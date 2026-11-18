@@ -2920,7 +2920,7 @@ static int frame_setup(JsContext *ctx, JsFiber *fb, JsClosure *cl, uint32_t base
                        uint32_t argc, bool is_construct) {
     JsVm *vm = ctx->vm;
     JsFunctionCell *fn = cl->fn;
-    if (fb->frame_count >= JS_MAX_FRAMES)
+    if (fb->frame_count + fb->depth_base >= JS_MAX_FRAMES)
         return -2;
     if (!stack_ensure(vm, fb, base + fn->n_locals + fn->max_stack + 8))
         return -1;
@@ -2990,6 +2990,11 @@ static bool call_async(JsContext *ctx, JsClosure *cl, JsValue this_val,
 /* Aligned so its speed does not depend on code elsewhere: the loop's branch targets sit at fixed
  * offsets from here, and when its start fell on a 16-byte rather than a 64-byte boundary, because
  * an unrelated file grew, the benchmarks lost up to 22%. */
+static JS_NOINLINE JsFiber *async_inline_start(JsContext *ctx, JsFiber *parent, JsClosure *cl,
+                                               JsValue this_val, const JsValue *args, uint32_t argc,
+                                               const char **err);
+static JS_NOINLINE JsFiber *async_inline_leave(JsContext *ctx, JsFiber *child, int how, JsValue v);
+
 __attribute__((aligned(64))) static JsRunStatus run_fiber(JsContext *ctx, JsFiber *fb, JsValue *result) {
     JsVm *vm = ctx->vm;
 
@@ -3881,15 +3886,17 @@ run:; /* (re)load the top frame */
                         JsClosure *callee_cl = (JsClosure *)cc;
                         fr->ip = ip;
                         if (callee_cl->fn->fn_flags & JS_FN_ASYNC) {
-                            /* async call: run on its own fiber, return a
-                             * promise, keep executing this frame */
-                            JsValue promise;
-                            if (!call_async(ctx, callee_cl, S[nb - 1], &S[nb],
-                                            (int)argc, &promise))
-                                RT_THROW("out of memory");
-                            fb->sp = nb - 2;
-                            PUSH(promise);
-                            break;
+                            /* async call: its own fiber and promise, run here in this loop
+                             * until it awaits, returns or throws (async_inline_leave), and
+                             * this frame then goes on with the promise */
+                            const char *err;
+                            JsFiber *child = async_inline_start(ctx, fb, callee_cl, S[nb - 1], &S[nb],
+                                                                argc, &err);
+                            if (!child)
+                                RT_THROW(err);
+                            fb->sp = nb - 2; /* the child has its arguments */
+                            fb = child;
+                            goto run;
                         }
                         int rc = frame_setup(ctx, fb, callee_cl, nb, argc, false);
                         if (rc == -1)
@@ -4076,8 +4083,13 @@ run:; /* (re)load the top frame */
                 fr->ip = ip; /* resume just after AWAIT */
                 fb->err_pos = lookup_pos(fn, op_ip);
                 int waiting = js_promise_await_value(ctx, awaited, fb);
-                if (waiting > 0)
+                if (waiting > 0) {
+                    if (fb->inline_parent) { /* back to the caller, with the promise */
+                        fb = async_inline_leave(ctx, fb, 0, js_undefined());
+                        goto run;
+                    }
                     return JS_RUN_SUSPENDED;
+                }
                 if (waiting < 0)
                     RT_THROW("out of memory");
                 fb->failed = true; /* reading the promise's `constructor` threw: fb->error */
@@ -4186,6 +4198,10 @@ run:; /* (re)load the top frame */
                     fb->try_count--;
                 fb->frame_count--;
                 if (fb->frame_count == 0) {
+                    if (fb->inline_parent) { /* resolved, and back to the caller */
+                        fb = async_inline_leave(ctx, fb, 1, ret);
+                        goto run;
+                    }
                     *result = ret;
                     return JS_RUN_DONE;
                 }
@@ -4253,6 +4269,10 @@ on_error:
     ctx->raise_trace = NULL; /* the trace has changed: the cell made of it is no longer it */
     ctx->error_trace_value = fb->error;
     ctx->raise_fresh = true;
+    if (fb->inline_parent) { /* rejected, and back to the caller */
+        fb = async_inline_leave(ctx, fb, 2, fb->error);
+        goto run;
+    }
     return JS_RUN_ERROR;
 
 #undef S
@@ -4341,6 +4361,65 @@ static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
 done:
     js_gc_unprotect(vm, &fb_val);
     return result;
+}
+
+/* An async call from the interpreter loop: the callee gets a fiber and a promise, and becomes
+ * the fiber that loop runs, PARENT's frames and its own counting together toward
+ * JS_MAX_FRAMES. Nothing nests on the C stack, so async recursion goes as deep as synchronous
+ * recursion, where a call through advance_fiber stopped at JS_MAX_REENTRY. NULL with *ERR
+ * (out of memory; V8's RangeError when PARENT's chain is already as deep as that, which is
+ * thrown in the caller, as a call that does not fit throws in V8). */
+static JS_NOINLINE JsFiber *async_inline_start(JsContext *ctx, JsFiber *parent, JsClosure *cl,
+                                               JsValue this_val, const JsValue *args, uint32_t argc,
+                                               const char **err) {
+    JsVm *vm = ctx->vm;
+    if (parent->depth_base + parent->frame_count >= JS_MAX_FRAMES) {
+        *err = "RangeError: Maximum call stack size exceeded";
+        return NULL;
+    }
+    JsPromise *p = js_promise_alloc(ctx);
+    if (!p) {
+        *err = "out of memory";
+        return NULL;
+    }
+    JsValue pv = js_value_from_cell(&p->gc);
+    js_gc_protect(vm, &pv);
+    /* ctx->fiber is PARENT: the arguments are rooted on its stack, and the child starts with
+     * its fuel */
+    JsFiber *child = spawn_fiber(ctx, cl, this_val, args, (int)argc, false, err);
+    if (child) {
+        child->result_promise = js_value_promise(pv);
+        child->is_async = true;
+        child->depth_base = parent->depth_base + parent->frame_count;
+        child->inline_parent = parent;
+        child->caller = parent;
+        ctx->fiber = child; /* roots it, and PARENT through it */
+        ctx->raise_fresh = false;
+    }
+    js_gc_unprotect(vm, &pv);
+    return child;
+}
+
+/* The inline async fiber CHILD stops running in its caller's loop: HOW 0 it awaits, 1 it
+ * returned V (its promise resolved with it), 2 it threw V (rejected). As advance_fiber and
+ * call_async leave it: the caller is the running fiber again, with the fuel left, and goes on
+ * with the promise on its stack (where the call's callee was). */
+static JS_NOINLINE JsFiber *async_inline_leave(JsContext *ctx, JsFiber *child, int how, JsValue v) {
+    JsFiber *parent = child->inline_parent;
+    JsPromise *p = child->result_promise;
+    js_gc_protect(ctx->vm, &v); /* off every stack now */
+    if (how == 1)
+        js_promise_resolve_with(ctx, p, v);
+    else if (how == 2)
+        js_promise_reject(ctx, p, v);
+    js_gc_unprotect(ctx->vm, &v);
+    child->inline_parent = NULL;
+    child->depth_base = 0;
+    parent->fuel = child->fuel;
+    ctx->fiber = parent;
+    parent->stack[parent->sp++] = js_value_from_cell(&p->gc);
+    ctx->raise_fresh = false; /* what it threw is in the promise: the caller goes on */
+    return parent;
 }
 
 /*

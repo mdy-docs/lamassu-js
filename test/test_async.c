@@ -209,6 +209,27 @@ static void err(const char *src, const char *substr) {
 
 static void test_then(void) {
     eq("let r = 0; Promise.resolve(41).then(v => { r = v + 1; }); r;", "0"); /* sync: not yet run */
+    /* An async call runs in its caller's loop until it awaits, returns or throws: async recursion
+     * goes as deep as synchronous recursion (it stopped at 200 before), in V8's order; results
+     * are Node's */
+    eq("async function f(n) { return n === 0 ? 0 : 1 + await f(n - 1); } const r = await f(1500); r;",
+       "1500");
+    eq("async function g(n) { if (n === 0) return 'bottom'; return g(n - 1); } const r = await g(1800); r;",
+       "bottom");
+    eq("const order = []; async function a(n) { order.push('a' + n); if (n > 0) await a(n - 1); order.push('a' + n + 'end'); } const p = a(3); order.push('sync'); await p; const r = order.join(); r;",
+       "a3,a2,a1,a0,a0end,sync,a1end,a2end,a3end");
+    eq("const log = []; async function t(n) { log.push('t' + n); if (n === 2) throw new RangeError('at ' + n); await t(n + 1); log.push('after' + n); } try { await t(0); } catch (e) { log.push(e.name + ':' + e.message); } const r = log.join(); r;",
+       "t0,t1,t2,RangeError:at 2");
+    eq("function syncDepth(n) { try { return syncDepth(n + 1); } catch (e) { return n; } } async function asyncDepth(n) { try { return await asyncDepth(n + 1); } catch (e) { return n; } } const s = syncDepth(0); const d = await asyncDepth(0); const r = [d > 1000, s > 1000].join(); r;",
+       "true,true");
+    eq("const out = []; async function x() { out.push(1); await null; out.push(3); } async function y() { out.push(0); await x(); out.push(4); } y(); out.push(2); await Promise.resolve().then(() => out.push('m')).then(() => out.push('m2')).then(() => out.push('m3')); const r = out.join(); r;",
+       "0,1,2,3,m,4,m2,m3");
+    eq("async function thrower() { throw new TypeError('sync throw'); } const pr = thrower(); let caught = 'no'; await pr.catch(e => { caught = e.message; }); const r = caught + ' ' + typeof pr.then; r;",
+       "sync throw function");
+    eq("async function h() { return new Error('e').stack.split(String.fromCharCode(10)).slice(1, 4).map(l => l.trim().split(' ')[1]).join(); } async function k() { return h(); } async function m() { return await k(); } const r = await m(); r;",
+       "h,k,m");
+    eq("let depth = 0; async function deep(n) { depth = n; return deep(n + 1); } let msg; try { await deep(0); } catch (e) { msg = e.constructor.name + ': ' + e.message; } const r = msg + ' ' + (depth > 1000); r;",
+       "RangeError: Maximum call stack size exceeded true");
     /* Error.prepareStackTrace's CallSites for an error made after an await: the async callers, as
      * in Node */
     eq("async function af() { await null; return new Error('async'); } async function caller() { return await af(); } Error.prepareStackTrace = (er, cs) => cs.map(c => [c.getFunctionName(), c.isAsync(), c.isToplevel()].join('/')).join(' ; '); const e = await caller(); const s = e.stack; Error.prepareStackTrace = undefined; s;",
