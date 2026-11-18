@@ -241,6 +241,11 @@ bool js_map_set(JsVm *vm, JsMap *m, JsString *key, JsValue value) {
     return true;
 }
 
+uint32_t js_map_position(const JsMap *m, const JsString *key) {
+    JsMapEntry *e = js_map_find(m, key);
+    return e ? (uint32_t)(e - m->entries) : JS_MAP_EMPTY;
+}
+
 JsValue js_map_get(const JsMap *m, const JsString *key, bool *found) {
     JsMapEntry *e = js_map_find(m, key);
     *found = e != NULL;

@@ -93,8 +93,8 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   is strict-mode throughout, so a refused write throws a `TypeError`. The exceptions, each a
   `TypeError: Cannot redefine property` that says so: an **array element** cannot be made
   read-only, non-enumerable or non-configurable (elements are a flat vector with no attribute
-  storage; a frozen or sealed array's elements are), nor can an **array's `length`** or a
-  **regexp's `lastIndex`** be made read-only (outside `freeze`). The **`stack`** that
+  storage; a frozen or sealed array's elements are), nor can an **array's `length`** be made
+  read-only (outside `freeze`). The **`stack`** that
   `Error.captureStackTrace(o)` gives an object that is not an error is a data property here
   where V8 has an accessor (an error's own `stack` is V8's accessor).
 - **`Object.getOwnPropertyNames` of a builtin gives V8's names, not V8's order.** What V8 makes
@@ -125,8 +125,14 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
 - **A stack trace through an object key's `toString`** (`o[k]`, `k in o`, `delete o[k]`) shows the
   calling frame at its previous call rather than at the access. Keeping that position exact costs
   the hot property path about a quarter of its speed; operators and templates are exact.
-- **`regexp.lastIndex = v` converts `v` to a number when it is set**; V8 keeps the value and
-  converts it at the next match.
+- **There is no `Symbol.match`, `matchAll`, `replace`, `search` or `split`** (no symbols), so
+  `String.prototype`'s methods of those names hand the work to the regexp side when their argument
+  has `RegExp.prototype` in its prototype chain, which is where V8 finds those methods; a script
+  cannot replace them, or give them to an object that does not inherit from `RegExp.prototype`.
+  Everything they read from the regexp is a script's to redefine, as in V8: `exec`, `flags` (and
+  through it `global`, `unicode` and the other flags), `constructor` (there is no
+  `Symbol.species`: the constructor itself is the one `split` and `matchAll` copy the regexp
+  with) and `lastIndex`. See [`RegExp`](/guide/builtins#regexp).
 - **`Object.prototype.valueOf.call(5)`** gives `5`, not a `Number` object (no wrapper objects).
 
 ## Arrays

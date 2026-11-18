@@ -257,6 +257,8 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->promise_methods = NULL;
     ctx->object_proto = NULL;
     memset(ctx->accessor_fns, 0, sizeof ctx->accessor_fns);
+    memset(ctx->intact, 0, sizeof ctx->intact);
+    memset(ctx->species_ctors, 0, sizeof ctx->species_ctors);
     ctx->array_proto = NULL;
     ctx->regexp_proto = NULL;
     ctx->date_proto = NULL;

@@ -1366,6 +1366,11 @@ JS_NOINLINE static const char *write_blocked_slow(JsContext *ctx, JsObject *o, J
     }
     if (js_obj_attrs(o, a) & JS_ATTR_READONLY)
         return SET_READ_ONLY;
+#ifdef LAMASSU_HAS_REGEX
+    if (o->obj_kind == JS_OBJ_REGEXP && js_regexp_last_index_readonly(o) && js_is_string(key) &&
+        units_is_ascii_str(js_value_string(key), "lastIndex"))
+        return SET_READ_ONLY; /* Object.defineProperty made it so: its attribute is in the cell */
+#endif
     return NULL;
 }
 
@@ -1509,10 +1514,7 @@ static JsPropStatus set_property(JsContext *ctx, JsValue base, JsValue key,
     }
 #ifdef LAMASSU_HAS_REGEX
     if (o->obj_kind == JS_OBJ_REGEXP) {
-        bool handled = false;
-        if (!js_regexp_prop_set(ctx, o, key, val, &handled, errmsg))
-            return *errmsg ? JS_PROP_TYPE_ERROR : JS_PROP_OOM;
-        if (handled)
+        if (js_regexp_prop_set(o, key, val))
             return JS_PROP_OK;
     }
 #endif
@@ -2041,6 +2043,8 @@ __attribute__((noinline)) static bool delete_object_prop(JsContext *ctx, JsObjec
     }
     if ((o->obj_kind == JS_OBJ_ARRAY && js_is_string(key) &&
          units_is_ascii_str(js_value_string(key), "length")) ||
+        (o->obj_kind == JS_OBJ_REGEXP && js_is_string(key) &&
+         units_is_ascii_str(js_value_string(key), "lastIndex")) || /* not configurable either */
         ((o->obj_flags & (JS_OBJ_SEALED | JS_OBJ_FROZEN | JS_OBJ_ATTRS)) &&
          own_prop_present(ctx, o, key) && (own_prop_attrs(ctx, o, key) & JS_ATTR_FIXED))) {
         js_set_error(ctx, js_error_fmt(ctx, "TypeError: Cannot delete property '%v' of %v", key, b));
@@ -4243,7 +4247,7 @@ static uint64_t fiber_start_fuel(JsContext *ctx) {
 
 /* Allocates a fiber and sets up frame 0 for a call; NULL + *err set on OOM. */
 static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
-                            const JsValue *args, int argc, const char **err) {
+                            const JsValue *args, int argc, bool construct, const char **err) {
     JsVm *vm = ctx->vm;
     *err = NULL;
 
@@ -4297,7 +4301,7 @@ static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
     for (int i = 0; i < argc; i++)
         fb->stack[2 + i] = args[i];
     fb->sp = (uint32_t)(2 + argc);
-    int rc = frame_setup(ctx, fb, cl, 2, (uint32_t)argc, false);
+    int rc = frame_setup(ctx, fb, cl, 2, (uint32_t)argc, construct);
     if (rc != 0) {
         *err = rc == -2 ? "RangeError: Maximum call stack size exceeded" : "out of memory";
         goto done;
@@ -4360,7 +4364,7 @@ static bool call_async(JsContext *ctx, JsClosure *cl, JsValue this_val,
     JsValue pv = js_value_from_cell(&p->gc);
     js_gc_protect(vm, &pv); /* keep the result promise alive across spawn/run */
     const char *err;
-    JsFiber *fb = spawn_fiber(ctx, cl, this_val, args, argc, &err);
+    JsFiber *fb = spawn_fiber(ctx, cl, this_val, args, argc, false, &err);
     if (!fb) {
         js_gc_unprotect(vm, &pv);
         return false;
@@ -4389,12 +4393,12 @@ void js_resume_fiber(JsContext *ctx, JsFiber *fb, JsValue value, bool is_throw) 
 
 /* Synchronous call: cl must not be async. Returns false with *result=error. */
 static bool run_closure(JsContext *ctx, JsClosure *cl, JsValue this_val,
-                        const JsValue *args, int argc, JsValue *result) {
+                        const JsValue *args, int argc, bool construct, JsValue *result) {
     /* RESULT may be the very slot that roots an argument (`item = f(item)` in a native), so it is
      * not written until the fiber has the arguments: spawning allocates, and a collection there
      * with the slot already cleared freed the argument under the callee. */
     const char *err;
-    JsFiber *fb = spawn_fiber(ctx, cl, this_val, args, argc, &err);
+    JsFiber *fb = spawn_fiber(ctx, cl, this_val, args, argc, construct, &err);
     if (!fb) {
         JsString *s = js_ascii_cell(ctx->vm, err);
         *result = s ? js_value_from_cell(&s->gc) : js_undefined();
@@ -4411,7 +4415,7 @@ bool js_interp_run(JsContext *ctx, JsFunctionCell *fn, JsValue *result) {
         *result = js_undefined();
         return false;
     }
-    return run_closure(ctx, cl, js_undefined(), NULL, 0, result);
+    return run_closure(ctx, cl, js_undefined(), NULL, 0, false, result);
 }
 
 bool js_call(JsContext *ctx, JsValue fn, JsValue this_val, const JsValue *args,
@@ -4439,7 +4443,132 @@ bool js_call(JsContext *ctx, JsValue fn, JsValue this_val, const JsValue *args,
     /* Calling an async function yields a promise, not a synchronous result. */
     if (cl->fn->fn_flags & JS_FN_ASYNC)
         return call_async(ctx, cl, this_val, args, argc, result);
-    return run_closure(ctx, cl, this_val, args, argc, result);
+    return run_closure(ctx, cl, this_val, args, argc, false, result);
+}
+
+/* Construct(F, args) for natives: what `new F(...args)` gives. F and ARGS are rooted by the
+ * caller. False thrown, *result the error. */
+bool js_construct(JsContext *ctx, JsValue fn, const JsValue *args, int argc, JsValue *result) {
+    JsVm *vm = ctx->vm;
+    JsValue *own = NULL; /* the arguments behind a bound function's presets: copies of values the
+                          * bound functions hold, and FN holds those */
+    size_t own_n = 0;
+    bool ok = false;
+    if (argc < 0)
+        argc = 0;
+    while (js_is_function(fn) && js_value_cell(fn)->kind == JS_KIND_NATIVE &&
+           ((JsNative *)js_value_cell(fn))->is_bound &&
+           ((JsNative *)js_value_cell(fn))->bound_fn == js_bind_call) {
+        JsObject *b = js_value_object(((JsNative *)js_value_cell(fn))->bound);
+        uint32_t extra = b->elem_count - 2;
+        if (extra) {
+            JsValue *na = (uint32_t)argc + extra > JS_MAX_CALL_ARGS ? NULL
+                          : js_realloc_raw(vm, NULL, 0, ((size_t)argc + extra) * sizeof(JsValue));
+            if (!na) {
+                *result = (uint32_t)argc + extra > JS_MAX_CALL_ARGS
+                              ? js_error_from_ascii(ctx, "RangeError: too many function arguments")
+                              : js_oom_value(vm);
+                goto done;
+            }
+            memcpy(na, b->elems + 2, extra * sizeof(JsValue));
+            if (argc)
+                memcpy(na + extra, args, (size_t)argc * sizeof(JsValue));
+            js_realloc_raw(vm, own, own_n * sizeof(JsValue), 0);
+            own = na;
+            own_n = (size_t)argc + extra;
+            args = na;
+            argc += (int)extra;
+        }
+        fn = b->elems[0];
+    }
+    if (!js_is_constructor(fn)) {
+        *result = js_error_fmt(ctx, "TypeError: %v is not a constructor", fn);
+        goto done;
+    }
+    JsGcCell *c = js_value_cell(fn);
+    if (c->kind == JS_KIND_NATIVE && ((JsNative *)c)->ctor != JS_CTOR_ORDINARY) {
+        /* a builtin makes its own object */
+        ok = call_native(ctx, ctx->fiber, (JsNative *)c, js_undefined(), args, argc, true, result);
+        goto done;
+    }
+    JsValue thisv = construct_this(ctx, c);
+    if (!js_is_object(thisv)) {
+        *result = js_oom_value(vm);
+        goto done;
+    }
+    js_gc_protect(vm, &thisv);
+    if (c->kind == JS_KIND_NATIVE) {
+        ok = call_native(ctx, ctx->fiber, (JsNative *)c, thisv, args, argc, true, result);
+        if (ok && !is_object_type(*result))
+            *result = thisv;
+    } else {
+        /* the frame is a construct frame: its return gives `this` unless it returns an object */
+        ok = run_closure(ctx, (JsClosure *)c, thisv, args, argc, true, result);
+    }
+    js_gc_unprotect(vm, &thisv);
+done:
+    js_realloc_raw(vm, own, own_n * sizeof(JsValue), 0);
+    return ok;
+}
+
+/*
+ * SpeciesConstructor(O, DFLT) (7.3.22) for a builtin constructor DFLT, without Symbol: the
+ * [Symbol.species] V8 would read from O.constructor is the getter Array, Map, Set, Promise and
+ * RegExp have, which gives its receiver. So the species is O.constructor itself when that is one
+ * of the five or inherits from one (a function whose prototype a script set to RegExp), and
+ * there is none (the default) for any other object. 0: construct the default. 1: *out is the
+ * constructor to use, unrooted. -1: thrown, *out the error. O is rooted by the caller.
+ */
+int js_species(JsContext *ctx, JsValue o, const JsNative *dflt, JsValue *out) {
+    JsString *k = js_ascii_cell(ctx->vm, "constructor");
+    JsValue c;
+    if (!k)
+        return (*out = js_oom_value(ctx->vm)), -1;
+    if (!js_get_property(ctx, o, js_value_from_cell(&k->gc), &c))
+        return (*out = js_take_error(ctx)), -1;
+    if (js_is_undefined(c))
+        return 0;
+    if (!is_object_type(c))
+        return (*out = js_error_from_ascii(ctx, "TypeError: The .constructor property is not an object")), -1;
+    if (js_value_cell(c) == &dflt->gc)
+        return 0;
+    bool has = false;
+    for (JsValue p = c; !has && is_object_type(p); p = js_get_proto(ctx, p)) {
+        for (int i = 0; i < JS_SPECIES__COUNT; i++)
+            has = has || (ctx->species_ctors[i] && js_is_function(p) &&
+                          js_value_cell(p) == &ctx->species_ctors[i]->gc);
+    }
+    if (!has)
+        return 0;
+    if (!js_is_constructor(c))
+        return (*out = js_error_from_ascii(ctx, "TypeError: object.constructor[Symbol.species] is not a constructor")), -1;
+    *out = c;
+    return 1;
+}
+
+bool js_intact_watch(JsContext *ctx, unsigned id, JsObject *holder, const char *name) {
+    JsString *k = js_ascii_cell(ctx->vm, name);
+    k = k ? js_intern_cell(ctx->vm, k) : NULL;
+    uint32_t pos = k ? js_map_position(&holder->props, k) : JS_MAP_EMPTY;
+    if (pos == JS_MAP_EMPTY)
+        return false;
+    JsIntact *w = &ctx->intact[id];
+    w->holder = holder;
+    w->value = holder->props.entries[pos].value;
+    w->pos = pos;
+    w->key = k; /* last: the collector marks a watch once it has its key */
+    return true;
+}
+
+/* js_intact when the property is not where it was: the map was rebuilt, or the property was
+ * deleted (and perhaps made again) */
+JS_COLD bool js_intact_moved(JsContext *ctx, unsigned id) {
+    JsIntact *w = &ctx->intact[id];
+    uint32_t pos = js_map_position(&w->holder->props, w->key);
+    if (pos == JS_MAP_EMPTY)
+        return false;
+    w->pos = pos;
+    return w->holder->props.entries[pos].value.bits == w->value.bits;
 }
 
 /* ---- public API ---- */
@@ -4456,7 +4585,7 @@ JsFiber *js_module_instantiate_body(JsContext *ctx, JsFunctionCell *body, JsValu
     JsFiber *fb = NULL;
     const char *err = "out of memory";
     if (cl)
-        fb = spawn_fiber(ctx, cl, js_undefined(), NULL, 0, &err);
+        fb = spawn_fiber(ctx, cl, js_undefined(), NULL, 0, false, &err);
     if (!fb) {
         JsString *s = js_ascii_cell(vm, err);
         *error = s ? js_value_from_cell(&s->gc) : js_undefined();
@@ -4533,7 +4662,7 @@ JsValue js_run_module(JsContext *ctx, JsValue fnv) {
          * (e.g. Promise.resolve().then(...) at top level), and wrap the
          * outcome in an already-settled promise. */
         JsValue result;
-        bool ok = run_closure(ctx, cl, js_undefined(), NULL, 0, &result);
+        bool ok = run_closure(ctx, cl, js_undefined(), NULL, 0, false, &result);
         /* where the body threw, kept before the jobs raise anything of their own (a cell, held
          * as a value only to root it) */
         JsTrace *thrown = !ok && ctx->raise_fresh ? js_raise_trace(ctx) : NULL;
@@ -4571,7 +4700,7 @@ JsValue js_run_module(JsContext *ctx, JsValue fnv) {
     js_gc_protect(vm, &pv);
     const char *err;
     JsFiber *fb = spawn_fiber(ctx, (JsClosure *)js_value_cell(clv), js_undefined(),
-                              NULL, 0, &err);
+                              NULL, 0, false, &err);
     if (!fb) {
         js_gc_unprotect(vm, &clv);
         JsString *s = js_ascii_cell(vm, err);
@@ -4792,7 +4921,7 @@ static OwnKind own_prop_find(JsContext *ctx, JsValue v, JsValue key, uint8_t *at
     }
 #ifdef LAMASSU_HAS_REGEX
     if (o->obj_kind == JS_OBJ_REGEXP && units_is_ascii_str(ks, "lastIndex")) {
-        *attrs = JS_ATTR_HIDDEN | JS_ATTR_FIXED | ((o->obj_flags & JS_OBJ_FROZEN) ? JS_ATTR_READONLY : 0);
+        *attrs = JS_ATTR_HIDDEN | JS_ATTR_FIXED | (js_regexp_last_index_readonly(o) ? JS_ATTR_READONLY : 0);
         return OWN_LAST_INDEX;
     }
 #endif
@@ -4920,9 +5049,9 @@ static bool define_fail(JsContext *ctx, const char *fmt, JsValue key) {
 
 static const char REDEFINE[] = "TypeError: Cannot redefine property: %v";
 /* What lamassu cannot store: attributes on the properties that have no attribute byte */
-static const char NO_ATTRS[] = "TypeError: Cannot redefine property: %v (an array element, an "
-                               "array's length and a regexp's lastIndex stay writable, and an "
-                               "element enumerable and configurable, in lamassu)";
+static const char NO_ATTRS[] = "TypeError: Cannot redefine property: %v (an array element and an "
+                               "array's length stay writable, and an element enumerable and "
+                               "configurable, in lamassu)";
 static const char NO_ELEMENT_ACCESSOR[] = "TypeError: Cannot redefine property: %v (an array element "
                                           "cannot be an accessor in lamassu)";
 
@@ -5050,12 +5179,16 @@ bool js_define_own_property(JsContext *ctx, JsValue v, JsValue key, const JsProp
             js_value_object(v)->elems[idx] = nv;
         break;
     case OWN_ARRAY_LENGTH:
-    case OWN_LAST_INDEX:
         if (na != cur) {
             ok = define_fail(ctx, NO_ATTRS, key);
             break;
         }
         ok = js_set_property(ctx, v, key, nv);
+        break;
+    case OWN_LAST_INDEX: /* all that can change is its value, and writable to read-only */
+#ifdef LAMASSU_HAS_REGEX
+        js_regexp_define_last_index(js_value_object(v), nv, (na & JS_ATTR_READONLY) != 0);
+#endif
         break;
     case OWN_FN_PROTO: {
         JsGcCell *c = js_value_cell(v);

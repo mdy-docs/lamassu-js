@@ -363,6 +363,15 @@ void js_gc_collect(JsVm *vm) {
         for (int i = 0; i < JS_ACC__COUNT; i++)
             if (ctx->accessor_fns[i])
                 js_gc_mark_cell(vm, &ctx->accessor_fns[i]->gc);
+        for (int i = 0; i < JS_INTACT__COUNT; i++) {
+            if (ctx->intact[i].key) {
+                js_gc_mark_cell(vm, &ctx->intact[i].key->gc);
+                js_gc_mark_value(vm, ctx->intact[i].value);
+            }
+        }
+        for (int i = 0; i < JS_SPECIES__COUNT; i++)
+            if (ctx->species_ctors[i])
+                js_gc_mark_cell(vm, &ctx->species_ctors[i]->gc);
         if (ctx->array_proto)
             js_gc_mark_cell(vm, &ctx->array_proto->gc);
         if (ctx->regexp_proto)

@@ -202,6 +202,37 @@ typedef enum {
     JS_ACC__COUNT
 } JsAccessorId;
 
+/*
+ * The builtin properties a builtin algorithm reads from the object it works on, where V8 reads
+ * them: RegExp.prototype's `exec`, `flags` and the flag getters, `constructor`, `source`. A
+ * script may replace any of them, and the algorithm then goes through the replacement
+ * (RegExpExec calls whatever `exec` is; split constructs whatever `constructor` names), which is
+ * the slow, general path. While one is still the value the engine put there ("intact"), reading
+ * it has no effect a script could see, and the algorithm takes its direct path. A watch
+ * remembers where the property sits in its holder's map, so asking is two compares (js_intact);
+ * nothing is hooked into property writes.
+ */
+enum {
+    JS_INTACT_RE_EXEC,
+    JS_INTACT_RE_FLAGS,
+    JS_INTACT_RE_HASINDICES, JS_INTACT_RE_GLOBAL, JS_INTACT_RE_IGNORECASE, JS_INTACT_RE_MULTILINE,
+    JS_INTACT_RE_DOTALL, JS_INTACT_RE_UNICODE, JS_INTACT_RE_UNICODESETS, JS_INTACT_RE_STICKY,
+    JS_INTACT_RE_CONSTRUCTOR,
+    JS_INTACT_RE_SOURCE,
+    JS_INTACT__COUNT
+};
+
+typedef struct JsIntact {
+    struct JsObject *holder; /* the builtin object that has the property (a GC root itself) */
+    JsString *key;           /* interned */
+    JsValue value;           /* what the engine put there */
+    uint32_t pos;            /* the entry's position in holder->props when last looked up */
+} JsIntact;
+
+/* The constructors V8 gives a [Symbol.species] getter (js_species; JsContext.species_ctors) */
+enum { JS_SPECIES_ARRAY, JS_SPECIES_MAP, JS_SPECIES_SET, JS_SPECIES_PROMISE, JS_SPECIES_REGEXP,
+       JS_SPECIES__COUNT };
+
 typedef struct JsErrorObject {
     JsObject obj;
     JsValue stack;         /* JS_STACK_VALUE: the text, or whatever a script assigned */
@@ -854,6 +885,10 @@ struct JsContext {
      * and joins as "", as in V8. On the C stack's behalf; its entries are rooted by their callers. */
     JsObject **join_stack;
     uint32_t join_len, join_cap;
+    /* Last, so that what the interpreter reads on every call stays where it was */
+    JsIntact intact[JS_INTACT__COUNT]; /* js_intact's watches. GC roots (key, value). */
+    struct JsNative *species_ctors[JS_SPECIES__COUNT]; /* Array, Map, Set, Promise, RegExp: the
+                             * constructors with a [Symbol.species] in V8 (js_species). GC roots. */
 };
 
 struct JsVm {
@@ -1013,6 +1048,25 @@ void js_gc_free_cell(JsVm *vm, JsGcCell *c, bool remove_atoms);
 void    js_map_init(JsMap *m);
 bool    js_map_set(JsVm *vm, JsMap *m, JsString *key, JsValue value);
 JsValue js_map_get(const JsMap *m, const JsString *key, bool *found);
+/* Where KEY (interned) sits in the entries, or JS_MAP_EMPTY: it stays there until the map is
+ * rebuilt (a grow, a sort) or the key is deleted */
+uint32_t js_map_position(const JsMap *m, const JsString *key);
+
+/* SpeciesConstructor(O, DFLT) for a builtin DFLT: 0 construct the default, 1 *out is the
+ * constructor to use (unrooted), -1 thrown with *out the error. O rooted by the caller. */
+int js_species(JsContext *ctx, JsValue o, const struct JsNative *dflt, JsValue *out);
+
+/* Watches HOLDER's own property NAME (which it has) as intact-id ID. False on OOM. */
+bool js_intact_watch(JsContext *ctx, unsigned id, JsObject *holder, const char *name);
+bool js_intact_moved(JsContext *ctx, unsigned id);
+/* Whether the watched property still holds what the engine put there */
+static inline bool js_intact(JsContext *ctx, unsigned id) {
+    const JsIntact *w = &ctx->intact[id];
+    const JsMap *m = &w->holder->props;
+    if (JS_UNLIKELY(w->pos >= m->used || m->entries[w->pos].key != w->key))
+        return js_intact_moved(ctx, id);
+    return m->entries[w->pos].value.bits == w->value.bits;
+}
 /* js_map_get, but *found is false for a JS_ATTR_READONLY entry too */
 JsValue js_map_get_writable(const JsMap *m, const JsString *key, bool *found);
 bool    js_map_delete(JsMap *m, const JsString *key);

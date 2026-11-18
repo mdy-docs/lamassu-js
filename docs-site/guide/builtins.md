@@ -107,7 +107,7 @@ enumerable, configurable }` (`{ get, set, enumerable, configurable }` for an acc
 `undefined`, and `getOwnPropertyDescriptors(o)` one for each key
 `getOwnPropertyNames` lists. Redefining a function's `name` or `length` works as in V8 (it is
 configurable); `prototype` can be given a value or made read-only. What lamassu cannot store
-(attributes on an array element, a read-only array `length` or regexp `lastIndex`) is a
+(attributes on an array element, a read-only array `length`) is a
 `TypeError`; see [Deviations](/guide/deviations).
 
 `Object.assign` writes each property with `[[Set]]`, as V8: onto a read-only property, a frozen or
@@ -579,7 +579,8 @@ ECMAScript-flavored, via the bundled
 engine. Regex literals and `new RegExp(pattern, flags)`, the `lastIndex`
 protocol, named capture groups, and `/d` (indices) all work.
 
-- **`RegExp.prototype`**: `exec`, `test`, `toString`. **`RegExp.escape(s)`** escapes what a
+- **`RegExp.prototype`**: `exec`, `test`, `toString`, and the accessors `source`, `flags`,
+  `global`, `ignoreCase` and the other flags. **`RegExp.escape(s)`** escapes what a
   pattern could read as syntax, as V8 does (`RegExp.escape("a.b")` is `"\\x61\\.b"`).
 - **`RegExp.prototype.compile(pattern, flags)`** (Annex B) recompiles the regexp in place and sets
   its `lastIndex` to 0.
@@ -589,7 +590,23 @@ protocol, named capture groups, and `/d` (indices) all work.
   after one that fails. `input` can be set (to a string); writing the others does nothing, as
   V8's setters do. Each is an accessor property of `RegExp`, as in V8, and can be deleted or redefined.
 - Consumed by `String.prototype.match`/`matchAll`/`search`/`replace`/
-  `replaceAll`/`split` when given a `RegExp` argument.
+  `replaceAll`/`split` when given a `RegExp` argument, or any object with `RegExp.prototype` in
+  its prototype chain. `includes`, `startsWith` and `endsWith` refuse one (`TypeError: First
+  argument to String.prototype.includes must not be a regular expression`).
+- **What those methods and `test` read from the regexp, they read as properties**, up the
+  prototype chain, as V8 does, so a script's own are the ones used: `exec` (called for every
+  match; it must return an object or `null`), `flags`, `constructor` (which makes the copy
+  `split` and `matchAll` work on) and `lastIndex`. `RegExp.prototype.test.call({ exec })` and
+  `RegExp.prototype.toString.call({ source, flags })` work on any object. A regexp nothing has
+  been redefined for takes a path that does the same without the lookups.
+- **`lastIndex`** holds whatever value is written to it, and a match converts it (`ToLength`):
+  `re.lastIndex = '3'` reads back as `'3'` and the next `exec` starts at 3. It is writable, not
+  enumerable and not configurable; `Object.defineProperty(re, 'lastIndex', { writable: false })`
+  or `Object.freeze(re)` makes it read-only, after which whatever would write it throws
+  (`TypeError: Cannot assign to read only property 'lastIndex' of object '[object RegExp]'`:
+  `exec` and `test` on a global or sticky regexp, `match` and `replace` on a global one,
+  `compile`). `RegExp(re)` without `new` and without flags returns `re` itself when
+  `re.constructor` is `RegExp`.
 - Catastrophic backtracking is bounded by an engine-side step budget — see
   [Supported syntax](/guide/language#regular-expressions).
 

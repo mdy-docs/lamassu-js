@@ -382,6 +382,10 @@ static bool sm_includes(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
+#ifdef LAMASSU_HAS_REGEX
+    if (js_regexp_isregexp(ctx, ARG(0)))
+        return native_throw(ctx, r, "TypeError: First argument to String.prototype.includes must not be a regular expression");
+#endif
     JsString *n = arg_string(ctx, ARG(0));
     if (!n)
         return oom(ctx, r);
@@ -393,6 +397,10 @@ static bool sm_startsWith(JsContext *ctx, JsValue tv, const JsValue *args, int a
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
+#ifdef LAMASSU_HAS_REGEX
+    if (js_regexp_isregexp(ctx, ARG(0)))
+        return native_throw(ctx, r, "TypeError: First argument to String.prototype.startsWith must not be a regular expression");
+#endif
     JsString *n = arg_string(ctx, ARG(0));
     if (!n)
         return oom(ctx, r);
@@ -411,6 +419,10 @@ static bool sm_endsWith(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
+#ifdef LAMASSU_HAS_REGEX
+    if (js_regexp_isregexp(ctx, ARG(0)))
+        return native_throw(ctx, r, "TypeError: First argument to String.prototype.endsWith must not be a regular expression");
+#endif
     JsString *n = arg_string(ctx, ARG(0));
     if (!n)
         return oom(ctx, r);
@@ -858,8 +870,11 @@ static bool sm_replace_impl(JsContext *ctx, JsValue tv, const JsValue *args, int
     if (!js_str_this_check(ctx, tv, r))
         return false;
 #ifdef LAMASSU_HAS_REGEX
-    if (js_regexp_is(ARG(0)))
-        return js_re_str_replace(ctx, tv, args, argc, r, all);
+    /* a regexp, or anything that inherits from RegExp.prototype: its @@replace does the work */
+    if (all && !js_re_global_check(ctx, ARG(0), false, r))
+        return false;
+    if (js_regexp_like(ctx, ARG(0)))
+        return js_re_str_replace(ctx, tv, args, argc, r);
 #endif
     JsVm *vm = ctx->vm;
     JsString *s;
@@ -961,7 +976,7 @@ static bool sm_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
     if (!js_str_this_check(ctx, tv, r))
         return false;
 #ifdef LAMASSU_HAS_REGEX
-    if (js_regexp_is(ARG(0)))
+    if (js_regexp_like(ctx, ARG(0)))
         return js_re_str_split(ctx, tv, args, argc, r);
 #endif
     /* this, then the limit, then the separator, as the spec orders the conversions; the
@@ -7904,6 +7919,18 @@ bool js_builtins_init(JsContext *ctx) {
         !def_fn(ctx, ctx->globals, "decodeURIComponent", g_decodeURIComponent) ||
         !def_fn(ctx, ctx->globals, "escape", g_escape) || !def_fn(ctx, ctx->globals, "unescape", g_unescape))
         return false;
+    /* the constructors with a [Symbol.species] in V8 (js_species) */
+    static const char *const species[JS_SPECIES__COUNT] = {"Array", "Map", "Set", "Promise", "RegExp"};
+    for (int i = 0; i < JS_SPECIES__COUNT; i++) {
+        JsString *k = js_ascii_cell(ctx->vm, species[i]);
+        k = k ? js_intern_cell(ctx->vm, k) : NULL;
+        if (!k)
+            return false;
+        bool found;
+        JsValue c = js_map_get(&ctx->globals->props, k, &found);
+        ctx->species_ctors[i] = found && js_is_function(c) && js_value_cell(c)->kind == JS_KIND_NATIVE
+                                    ? (JsNative *)js_value_cell(c) : NULL;
+    }
     hide_builtin_keys(ctx);
     return true;
 }

@@ -352,7 +352,7 @@ int js_iterobj_step(JsContext *ctx, JsIterObj *it, JsValue *out) {
     }
     case JS_ITER_REGEXP: {
 #ifdef LAMASSU_HAS_REGEX
-        int rc = js_re_iter_step(ctx, it->target, it->subject, &it->index, out);
+        int rc = js_re_iter_step(ctx, it, out);
         if (rc == 0)
             finish(vm, it);
         return rc;

@@ -9,8 +9,9 @@
  * rooted, so `args`/`this` survive; every cell created and held across a
  * further allocation (or a js_call into user code) is protected.
  *
- * Known deviation (documented): the string methods leave lastIndex at 0 (global) / untouched
- * (non-global) rather than emulating every intermediate spec mutation.
+ * The methods a script can redirect - through exec, flags, constructor, lastIndex - are written
+ * twice: as the spec's steps over properties, and as a fast path that gives the same result on
+ * a regexp none of those is redefined for ("the prototype chain", below).
  */
 #ifdef LAMASSU_HAS_REGEX
 
@@ -220,7 +221,8 @@ JsValue js_regexp_new(JsContext *ctx, const uint16_t *pat, uint32_t pat_len,
     re->obj.proto = ctx->regexp_proto ? js_value_from_cell(&ctx->regexp_proto->gc) : js_undefined();
     re->source = NULL;
     re->flags = NULL;
-    re->last_index = 0;
+    re->last_index = js_number(0);
+    re->last_index_ro = false;
     re->global = (mask & REGEX_FLAG_GLOBAL) != 0;
     re->vctx = NULL; /* built on first match, reused after — see js_regexp.h */
     memset(&re->prog, 0, sizeof re->prog); /* compile_into requires zero init */
@@ -278,6 +280,7 @@ void js_regexp_mark(JsVm *vm, JsObject *o) {
         js_gc_mark_cell(vm, &re->source->gc);
     if (re->flags)
         js_gc_mark_cell(vm, &re->flags->gc);
+    js_gc_mark_value(vm, re->last_index);
 }
 
 size_t js_regexp_release(JsVm *vm, JsObject *o) {
@@ -297,23 +300,25 @@ bool js_regexp_prop_get(JsContext *ctx, JsObject *o, JsValue key, JsValue *out,
     JsRegExp *re = (JsRegExp *)o;
     *handled = key_is(key, "lastIndex");
     if (*handled)
-        *out = js_number(re->last_index);
+        *out = re->last_index;
     return true;
 }
 
-bool js_regexp_prop_set(JsContext *ctx, JsObject *o, JsValue key, JsValue val,
-                        bool *handled, const char **errmsg) {
-    JsRegExp *re = (JsRegExp *)o;
-    if (key_is(key, "lastIndex")) {
-        /* converted as it is set (V8 keeps the value and converts it at the next match) */
-        *handled = true;
-        if (js_op_to_number(ctx, val, &re->last_index))
-            return true;
-        *errmsg = NULL; /* not a refused write: the conversion threw (pending) */
+/* Any value: a match converts it (ToLength), not the write */
+bool js_regexp_prop_set(JsObject *o, JsValue key, JsValue val) {
+    if (!key_is(key, "lastIndex"))
         return false;
-    }
-    *handled = false;
+    ((JsRegExp *)o)->last_index = val;
     return true;
+}
+
+void js_regexp_define_last_index(JsObject *o, JsValue val, bool readonly) {
+    JsRegExp *re = (JsRegExp *)o;
+    re->last_index = val;
+    if (readonly && !re->last_index_ro) {
+        re->last_index_ro = true;
+        o->obj_flags |= JS_OBJ_ATTRS; /* so that a write to it, or through an inheritor, looks */
+    }
 }
 
 static bool re_legacy_get(JsContext *ctx, int idx, JsValue *out);
@@ -436,6 +441,7 @@ static uint32_t advance_index(const JsString *s, uint32_t i, bool uni) {
 #define RE_RUN_MATCH 1
 #define RE_RUN_NOMATCH 0
 #define RE_RUN_BUDGET (-1)
+#define RE_RUN_READONLY (-2) /* exec_protocol: lastIndex cannot be written (a frozen regexp) */
 
 static const char *const re_budget_msg =
     "RangeError: regular expression step budget exhausted";
@@ -536,33 +542,57 @@ static int re_match(JsContext *ctx, JsRegExp *re, JsString *s, uint32_t start, b
     return rc;
 }
 
+/* Where a match from lastIndex I starts. A unicode pattern's input is code points, and an index
+ * into the middle of one is that code point's (RegExpBuiltinExec's inputIndex): /./uy with
+ * lastIndex 1 matches all of a pair at 0. */
+static uint32_t unicode_start(const JsString *s, uint32_t i, bool uni) {
+    if (uni && i > 0 && i < s->length && is_trail(s->units[i]) && is_lead(s->units[i - 1]))
+        return i - 1;
+    return i;
+}
+
+/* lastIndex when it is a number, which is all a fast path takes (re_pristine): anything else is
+ * converted by exec, where a script's code may run */
+static double li_number(const JsRegExp *re) {
+    return js_get_number(re->last_index);
+}
+
 /*
- * exec's lastIndex protocol (also used by test and non-global match):
- * lastIndex is consulted and updated only when the pattern is global or
- * sticky. Returns an RE_RUN_* result with caps filled on a match; a budget
- * result leaves lastIndex untouched (the caller throws).
+ * exec's lastIndex protocol (RegExpBuiltinExec; also test, and match and replace on a regexp
+ * that is not global), from LI, the number lastIndex is (li_number, or the caller's conversion
+ * of it): it is consulted and updated only when the pattern is global or sticky. Returns an RE_RUN_* result with caps filled on a match; a budget result leaves
+ * lastIndex untouched (the caller throws), and RE_RUN_READONLY is for the write to it a frozen
+ * regexp refuses, at the point exec would make it.
  */
-static int exec_protocol(JsContext *ctx, JsRegExp *re, JsString *s, int32_t *caps) {
+static int exec_protocol(JsContext *ctx, JsRegExp *re, JsString *s, double li, int32_t *caps) {
     bool track = re->global || re->prog.sticky;
+    bool readonly = track && js_regexp_last_index_readonly(&re->obj);
     uint32_t start = 0;
     if (track) {
-        double li = __builtin_trunc(re->last_index);
+        li = __builtin_trunc(li);
         if (li != li || li < 0)
             li = 0;
         if (li > (double)s->length) {
-            re->last_index = 0;
+            if (readonly)
+                return RE_RUN_READONLY;
+            re->last_index = js_number(0);
             return RE_RUN_NOMATCH;
         }
-        start = (uint32_t)li;
+        start = unicode_start(s, (uint32_t)li, re_is_unicode(re));
     }
     int rc = re_match(ctx, re, s, start, false, caps);
     if (rc != RE_RUN_MATCH) {
-        if (track && rc == RE_RUN_NOMATCH)
-            re->last_index = 0;
+        if (track && rc == RE_RUN_NOMATCH) {
+            if (readonly)
+                return RE_RUN_READONLY;
+            re->last_index = js_number(0);
+        }
         return rc;
     }
+    if (readonly)
+        return RE_RUN_READONLY;
     if (track)
-        re->last_index = caps[1];
+        re->last_index = js_number(caps[1]);
     return RE_RUN_MATCH;
 }
 
@@ -787,71 +817,263 @@ JsValue js_regexp_error(JsContext *ctx, const char *err, const uint16_t *pat, ui
     return e;
 }
 
+/* ---- the prototype chain, as the methods below consult it ----
+ *
+ * There are no symbols here, so RegExp.prototype's @@match, @@matchAll, @@replace, @@search and
+ * @@split are not properties a script could reach or replace: String.prototype's methods find
+ * them as V8 would, on an argument that is RegExp.prototype or inherits from it
+ * (js_regexp_like). What those methods read from the regexp they are given - exec, flags (and
+ * through it the flag getters), constructor, lastIndex - they read as properties, up the
+ * prototype chain, so a script's own are the ones used. Each has a fast path for a regexp
+ * nothing has redefined them for (re_pristine), which does the same without the lookups.
+ *
+ * A property read cannot run a script's code here (there are no script getters); a conversion
+ * and a call can. So a fast path is chosen after the conversions the method starts with, and
+ * runs no code of the script's while it holds a JsRegExp pointer's contents to be the same.
+ */
+
+static bool obj_type(JsValue v) {
+    return js_is_object(v) || js_is_function(v) || js_is_promise(v);
+}
+
+bool js_regexp_like(JsContext *ctx, JsValue v) {
+    const JsGcCell *rp = &ctx->regexp_proto->gc;
+    for (int depth = 0; depth < 10000 && obj_type(v); depth++) {
+        if (js_value_cell(v) == rp)
+            return true;
+        v = js_get_proto(ctx, v);
+    }
+    return false;
+}
+
+bool js_regexp_isregexp(JsContext *ctx, JsValue v) {
+    return js_regexp_is(v) || js_regexp_like(ctx, v);
+}
+
+#define RE_NEED_EXEC (1u << JS_INTACT_RE_EXEC)
+#define RE_NEED_FLAGS                                                                             \
+    ((1u << JS_INTACT_RE_FLAGS) | (1u << JS_INTACT_RE_HASINDICES) | (1u << JS_INTACT_RE_GLOBAL) | \
+     (1u << JS_INTACT_RE_IGNORECASE) | (1u << JS_INTACT_RE_MULTILINE) |                           \
+     (1u << JS_INTACT_RE_DOTALL) | (1u << JS_INTACT_RE_UNICODE) |                                 \
+     (1u << JS_INTACT_RE_UNICODESETS) | (1u << JS_INTACT_RE_STICKY))
+#define RE_NEED_CTOR (1u << JS_INTACT_RE_CONSTRUCTOR)
+#define RE_NEED_SOURCE (1u << JS_INTACT_RE_SOURCE)
+
+/* V is a regexp whose properties named in NEED (RE_NEED_*) are the builtin ones: its prototype
+ * is RegExp.prototype, which still has them as it was made, and it has none of its own by
+ * those names. And its lastIndex is a number, so that nothing a fast path does with it is a
+ * conversion. */
+static bool re_pristine(JsContext *ctx, JsValue v, unsigned need) {
+    if (!js_regexp_is(v))
+        return false;
+    const JsRegExp *re = (const JsRegExp *)js_value_object(v);
+    if (re->obj.proto.bits != js_value_from_cell(&ctx->regexp_proto->gc).bits ||
+        !js_is_number(re->last_index))
+        return false;
+    bool own = re->obj.props.count != 0;
+    for (unsigned id = 0; need; id++, need >>= 1) {
+        if (!(need & 1))
+            continue;
+        if (!js_intact(ctx, id))
+            return false;
+        if (own && js_map_position(&re->obj.props, ctx->intact[id].key) != JS_MAP_EMPTY)
+            return false;
+    }
+    return true;
+}
+
+/* O[name]. False thrown, *err the error. */
+static bool re_get(JsContext *ctx, JsValue o, const char *name, JsValue *out, JsValue *err) {
+    JsString *k = js_ascii_cell(ctx->vm, name);
+    if (k && js_get_property(ctx, o, js_value_from_cell(&k->gc), out))
+        return true;
+    *err = js_take_error(ctx);
+    return false;
+}
+
+/* O[i] */
+static bool re_get_index(JsContext *ctx, JsValue o, double i, JsValue *out, JsValue *err) {
+    if (js_get_property(ctx, o, js_number(i), out))
+        return true;
+    *err = js_take_error(ctx);
+    return false;
+}
+
+/* O[name] = v, a refused write thrown (a module is strict code) */
+static bool re_put(JsContext *ctx, JsValue o, const char *name, JsValue v, JsValue *err) {
+    JsString *k = js_ascii_cell(ctx->vm, name);
+    if (k && js_set_property(ctx, o, js_value_from_cell(&k->gc), v))
+        return true;
+    *err = js_take_error(ctx);
+    return false;
+}
+
+/* ToString(*slot), in place: SLOT is one the caller has rooted */
+static bool to_str(JsContext *ctx, JsValue *slot, JsValue *err) {
+    JsString *s = js_op_to_string(ctx, *slot);
+    if (!s)
+        return (*err = js_take_error(ctx)), false;
+    *slot = js_value_from_cell(&s->gc);
+    return true;
+}
+
+/* ToIntegerOrInfinity(O[name]), or ToLength of it (0 .. 2^53 - 1) */
+static bool re_get_integer(JsContext *ctx, JsValue o, const char *name, bool length, double *n,
+                           JsValue *err) {
+    JsValue v = js_undefined();
+    double d = 0;
+    js_gc_protect(ctx->vm, &v);
+    bool ok = re_get(ctx, o, name, &v, err);
+    if (ok && !js_op_to_number(ctx, v, &d)) {
+        *err = js_take_error(ctx);
+        ok = false;
+    }
+    js_gc_unprotect(ctx->vm, &v);
+    d = d != d ? 0 : __builtin_trunc(d);
+    if (length)
+        d = d <= 0 ? 0 : d > 9007199254740991.0 ? 9007199254740991.0 : d;
+    *n = d;
+    return ok;
+}
+
+static bool str_has(JsValue sv, uint16_t c) {
+    const JsString *s = js_value_string(sv);
+    for (uint32_t i = 0; i < s->length; i++) {
+        if (s->units[i] == c)
+            return true;
+    }
+    return false;
+}
+
+static bool same_value(JsValue x, JsValue y) {
+    if (js_is_number(x) && js_is_number(y)) {
+        double dx = js_get_number(x), dy = js_get_number(y);
+        return dx != dx ? dy != dy : (dx == dy && __builtin_signbit(dx) == __builtin_signbit(dy));
+    }
+    return js_strict_equals(x, y);
+}
+
+/* rx.lastIndex past an empty match: AdvanceStringIndex(S, ToLength(rx.lastIndex), unicode) */
+static bool bump_last_index(JsContext *ctx, JsValue rxv, const JsString *s, bool uni,
+                            JsValue *err) {
+    double li;
+    if (!re_get_integer(ctx, rxv, "lastIndex", true, &li, err))
+        return false;
+    double next = li + 1;
+    if (uni && li + 1 < (double)s->length && is_lead(s->units[(uint32_t)li]) &&
+        is_trail(s->units[(uint32_t)li + 1]))
+        next = li + 2;
+    return re_put(ctx, rxv, "lastIndex", js_number(next), err);
+}
+
+/* ---- RegExpExec ---- */
+
+/* What a negative RE_RUN_* throws */
+static bool re_run_throw(JsContext *ctx, int rc, JsValue *r) {
+    if (rc == RE_RUN_READONLY)
+        return re_throw(ctx, r, "TypeError: Cannot assign to read only property 'lastIndex' of "
+                                "object '[object RegExp]'");
+    return re_budget_throw(ctx, r);
+}
+
+/* RegExpBuiltinExec: exec's result for the regexp RV on the string SV (both rooted by the
+ * caller), null for no match */
+static bool builtin_exec(JsContext *ctx, JsValue rv, JsValue sv, JsValue *r) {
+    JsRegExp *re = (JsRegExp *)js_value_object(rv);
+    int32_t caps[CAPS_MAX];
+    double li;
+    if (js_is_number(re->last_index)) {
+        li = js_get_number(re->last_index);
+    } else {
+        /* ToLength(lastIndex), whatever the flags: the one place a script's code runs here, and
+         * the pattern is what it is after it (a valueOf may compile() the regexp) */
+        JsValue v = re->last_index;
+        js_gc_protect(ctx->vm, &v);
+        bool ok = js_op_to_number(ctx, v, &li);
+        js_gc_unprotect(ctx->vm, &v);
+        if (!ok)
+            return (*r = js_take_error(ctx)), false;
+    }
+    int rc = exec_protocol(ctx, re, js_value_string(sv), li, caps);
+    if (rc < 0)
+        return re_run_throw(ctx, rc, r);
+    if (rc == RE_RUN_NOMATCH) {
+        *r = js_null();
+        return true;
+    }
+    return build_exec_result(ctx, re, sv, caps, r) || re_oom(ctx, r);
+}
+
+/* RegExpExec(R, S): R's `exec` called when it has one that is a function (its result an object
+ * or null), else the builtin on a regexp. False thrown, *out the error. RV and SV are rooted by
+ * the caller. */
+static bool regexp_exec(JsContext *ctx, JsValue rv, JsValue sv, JsValue *out) {
+    JsValue exec;
+    if (!re_get(ctx, rv, "exec", &exec, out))
+        return false;
+    if (js_is_function(exec)) {
+        js_gc_protect(ctx->vm, &exec);
+        bool ok = js_call(ctx, exec, rv, &sv, 1, out);
+        js_gc_unprotect(ctx->vm, &exec);
+        if (ok && !obj_type(*out) && !js_is_null(*out))
+            return re_throw(ctx, out, "TypeError: RegExp exec method returned something other "
+                                      "than an Object or null");
+        return ok;
+    }
+    if (!js_regexp_is(rv)) {
+        *out = js_error_fmt(ctx, "TypeError: Method RegExp.prototype.exec called on incompatible receiver %v", rv);
+        return false;
+    }
+    return builtin_exec(ctx, rv, sv, out);
+}
+
 /* ---- RegExp methods ---- */
 
 static bool rexp_exec(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                       JsValue *r) {
     if (!js_regexp_is(tv))
         return (*r = js_error_receiver(ctx, "RegExp", tv)), false;
-    JsRegExp *re = (JsRegExp *)js_value_object(tv);
-    JsString *s = js_op_to_string(ctx, ARG(0));
+    JsString *s = js_native_string(ctx, ARG(0));
     if (!s)
         return re_oom(ctx, r);
-    JsValue sv = js_value_from_cell(&s->gc);
-    js_gc_protect(ctx->vm, &sv);
-    int32_t caps[CAPS_MAX];
-    bool ok = true;
-    int rc = exec_protocol(ctx, re, s, caps);
-    if (rc == RE_RUN_BUDGET) {
-        js_gc_unprotect(ctx->vm, &sv);
-        return re_budget_throw(ctx, r);
-    }
-    if (rc == RE_RUN_NOMATCH)
-        *r = js_null();
-    else
-        ok = build_exec_result(ctx, re, sv, caps, r);
-    js_gc_unprotect(ctx->vm, &sv);
-    return ok ? true : re_oom(ctx, r);
+    return builtin_exec(ctx, tv, js_value_from_cell(&s->gc), r);
 }
 
+/* test(S): RegExpExec(this, S) is not null, on any object */
 static bool rexp_test(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                       JsValue *r) {
-    if (!js_regexp_is(tv))
+    if (!obj_type(tv))
         return (*r = js_error_receiver(ctx, "RegExp", tv)), false;
-    JsRegExp *re = (JsRegExp *)js_value_object(tv);
-    JsString *s = js_op_to_string(ctx, ARG(0));
+    /* Rooted across the match like every other subject here: matching allocates through the
+     * VM, so it is a GC safe point, and a coerced subject (test(123)) is a fresh cell nothing
+     * else references. */
+    JsString *s = js_native_string(ctx, ARG(0));
     if (!s)
         return re_oom(ctx, r);
-    /* Rooted across the match like every other subject here: matching now
-     * allocates through the VM, so it is a GC safe point, and a coerced
-     * subject (test(123)) is a fresh cell nothing else references. */
-    JsValue sv = js_value_from_cell(&s->gc);
-    js_gc_protect(ctx->vm, &sv);
-    int32_t caps[CAPS_MAX];
-    int rc = exec_protocol(ctx, re, s, caps);
-    js_gc_unprotect(ctx->vm, &sv);
-    if (rc == RE_RUN_BUDGET)
-        return re_budget_throw(ctx, r);
-    *r = js_bool(rc == RE_RUN_MATCH);
+    if (re_pristine(ctx, tv, RE_NEED_EXEC)) {
+        int32_t caps[CAPS_MAX];
+        JsRegExp *re = (JsRegExp *)js_value_object(tv);
+        int rc = exec_protocol(ctx, re, s, li_number(re), caps);
+        if (rc < 0)
+            return re_run_throw(ctx, rc, r);
+        *r = js_bool(rc == RE_RUN_MATCH);
+        return true;
+    }
+    if (!regexp_exec(ctx, tv, js_value_from_cell(&s->gc), r))
+        return false;
+    *r = js_bool(!js_is_null(*r));
     return true;
 }
 
-/* RegExp.prototype.toString on any other object (22.2.6.17), as V8: "/" + ToString(source) +
- * "/" + ToString(flags), read from it */
+/* RegExp.prototype.toString (22.2.6.17): "/" + ToString(source) + "/" + ToString(flags), read
+ * from the receiver, whatever object it is */
 static bool regexp_generic_string(JsContext *ctx, JsValue tv, JsValue *r) {
     JsVm *vm = ctx->vm;
-    static const uint16_t ks[] = {'s', 'o', 'u', 'r', 'c', 'e'}, kf[] = {'f', 'l', 'a', 'g', 's'};
     JsValue parts[2] = {js_undefined(), js_undefined()};
     js_gc_protect(vm, &parts[0]);
     js_gc_protect(vm, &parts[1]);
-    bool ok = true;
-    for (int i = 0; i < 2 && ok; i++) {
-        JsValue key = i == 0 ? js_atom(vm, ks, 6) : js_atom(vm, kf, 5), v;
-        JsString *str = NULL;
-        ok = js_is_string(key) && js_get_property(ctx, tv, key, &v) && (str = js_op_to_string(ctx, v));
-        if (ok)
-            parts[i] = js_value_from_cell(&str->gc);
-    }
+    bool ok = re_get(ctx, tv, "source", &parts[0], r) && to_str(ctx, &parts[0], r) &&
+              re_get(ctx, tv, "flags", &parts[1], r) && to_str(ctx, &parts[1], r);
     JsString *out = NULL;
     if (ok) {
         const JsString *a = js_value_string(parts[0]), *b = js_value_string(parts[1]);
@@ -865,23 +1087,24 @@ static bool regexp_generic_string(JsContext *ctx, JsValue tv, JsValue *r) {
             out = js_string_cell_new(vm, buf, n);
             js_realloc_raw(vm, buf, n * sizeof(uint16_t), 0);
         }
+        if (!out)
+            ok = re_oom(ctx, r);
     }
     js_gc_unprotect(vm, &parts[1]);
     js_gc_unprotect(vm, &parts[0]);
-    if (!out)
-        return re_oom(ctx, r);
-    *r = js_value_from_cell(&out->gc);
-    return true;
+    if (ok)
+        *r = js_value_from_cell(&out->gc);
+    return ok;
 }
 
 static bool rexp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                           JsValue *r) {
     (void)args;
     (void)argc;
-    if (!js_regexp_is(tv) && (js_is_object(tv) || js_is_function(tv) || js_is_promise(tv)))
-        return regexp_generic_string(ctx, tv, r);
-    if (!js_regexp_is(tv))
+    if (!obj_type(tv))
         return (*r = js_error_receiver(ctx, "RegExp", tv)), false;
+    if (!re_pristine(ctx, tv, RE_NEED_SOURCE | RE_NEED_FLAGS))
+        return regexp_generic_string(ctx, tv, r);
     JsString *s = js_regexp_repr(ctx, js_value_object(tv));
     if (!s)
         return re_oom(ctx, r);
@@ -889,56 +1112,17 @@ static bool rexp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int a
     return true;
 }
 
-/* ---- RegExp global (plain callable; the engine has no `new`) ---- */
+/* ---- RegExp global ---- */
 
-static bool g_RegExp(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
-                     JsValue *r) {
-    (void)tv;
-    JsVm *vm = ctx->vm;
-    JsValue pv = ARG(0), fv = ARG(1);
-    const uint16_t *pu = NULL, *fu = NULL;
-    uint32_t pn = 0, fn = 0;
-    JsValue pstr = js_undefined(), fstr = js_undefined();
-    js_gc_protect(vm, &pstr);
-    js_gc_protect(vm, &fstr);
-    bool ok = true;
-
-    if (js_regexp_is(pv)) {
-        JsRegExp *src = (JsRegExp *)js_value_object(pv);
-        pu = src->source->units;
-        pn = src->source->length;
-        if (js_is_undefined(fv)) {
-            fu = src->flags->units;
-            fn = src->flags->length;
-        }
-    } else if (!js_is_undefined(pv)) {
-        JsString *ps = js_op_to_string(ctx, pv);
-        if (!ps) {
-            ok = false;
-        } else {
-            pstr = js_value_from_cell(&ps->gc);
-            pu = ps->units;
-            pn = ps->length;
-        }
-    }
-    if (ok && !js_is_undefined(fv)) {
-        JsString *fs = js_op_to_string(ctx, fv);
-        if (!fs) {
-            ok = false;
-        } else {
-            fstr = js_value_from_cell(&fs->gc);
-            fu = fs->units;
-            fn = fs->length;
-        }
-    }
+/* The regexp js_regexp_new makes of the strings (or undefined, the empty one) PV and FV, which
+ * the caller has rooted; a failure thrown as V8 words it */
+static bool regexp_new_of(JsContext *ctx, JsValue pv, JsValue fv, JsValue *r) {
+    const JsString *ps = js_is_undefined(pv) ? NULL : js_value_string(pv);
+    const JsString *fs = js_is_undefined(fv) ? NULL : js_value_string(fv);
+    const uint16_t *pu = ps ? ps->units : NULL, *fu = fs ? fs->units : NULL;
+    uint32_t pn = ps ? ps->length : 0, fn = fs ? fs->length : 0;
     const char *err = NULL;
-    JsValue rev = js_undefined();
-    if (ok)
-        rev = js_regexp_new(ctx, pu, pn, fu, fn, &err);
-    js_gc_unprotect(vm, &fstr);
-    js_gc_unprotect(vm, &pstr);
-    if (!ok)
-        return re_oom(ctx, r);
+    JsValue rev = js_regexp_new(ctx, pu, pn, fu, fn, &err);
     if (!js_is_object(rev)) {
         *r = js_regexp_error(ctx, err ? err : "out of memory", pu, pn, fu, fn);
         return false;
@@ -947,188 +1131,421 @@ static bool g_RegExp(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     return true;
 }
 
+/* A new regexp for PATTERN and FLAGS, as the constructor makes one (22.2.4.1 from step 4): a
+ * regexp gives its own source, and its flags where FLAGS is undefined; with LIKE, an object
+ * that inherits from RegExp.prototype gives its `source` and `flags` properties; anything else
+ * is the pattern, converted. False thrown, *r the error. */
+static bool regexp_create(JsContext *ctx, JsValue pv, JsValue fv, bool like, JsValue *r) {
+    JsVm *vm = ctx->vm;
+    JsValue p = pv, f = fv;
+    js_gc_protect(vm, &p);
+    js_gc_protect(vm, &f);
+    bool ok = true;
+    if (js_regexp_is(pv)) {
+        const JsRegExp *src = (const JsRegExp *)js_value_object(pv);
+        p = js_value_from_cell(&src->source->gc);
+        if (js_is_undefined(fv))
+            f = js_value_from_cell(&src->flags->gc);
+    } else if (like && js_regexp_like(ctx, pv)) {
+        ok = re_get(ctx, pv, "source", &p, r) &&
+             (!js_is_undefined(fv) || re_get(ctx, pv, "flags", &f, r));
+    }
+    ok = ok && (js_is_undefined(p) || to_str(ctx, &p, r)) &&
+         (js_is_undefined(f) || to_str(ctx, &f, r)) && regexp_new_of(ctx, p, f, r);
+    js_gc_unprotect(vm, &f);
+    js_gc_unprotect(vm, &p);
+    return ok;
+}
+
+/* RegExp(pattern, flags): called without `new` and without flags on something that is a regexp
+ * (IsRegExp) whose `constructor` is RegExp, it gives that back; else a new one */
+static bool g_RegExp(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
+                     JsValue *r) {
+    (void)tv;
+    JsValue pv = ARG(0), fv = ARG(1);
+    if (!js_native_is_new(ctx) && js_is_undefined(fv) && js_regexp_isregexp(ctx, pv)) {
+        JsValue c;
+        if (!re_get(ctx, pv, "constructor", &c, r))
+            return false;
+        if (js_is_function(c) && js_value_cell(c) == &ctx->regexp_ctor->gc) {
+            *r = pv;
+            return true;
+        }
+    }
+    return regexp_create(ctx, pv, fv, true, r);
+}
+
 /* ---- String methods ---- */
 
-/*
- * The regexp for match/matchAll/search: the argument itself, or a fresh one
- * compiled from ToString(argument) (undefined -> empty pattern) with
- * `extra_flags`. *rev must be a protected slot owned by the caller — it
- * keeps a freshly compiled regexp alive. False = thrown, *r set.
- */
-static bool coerce_regexp(JsContext *ctx, JsValue pv, const char *extra_flags,
-                          JsValue *rev, JsRegExp **out, JsValue *r) {
+/* RegExpCreate(P, flags) for match, matchAll and search given something that does not inherit
+ * from RegExp.prototype: undefined is the empty pattern, anything else its ToString (a regexp
+ * with another prototype too). *out is kept for the running native. False thrown. */
+static bool regexp_of_pattern(JsContext *ctx, JsValue pv, const char *flags, JsValue *out,
+                              JsValue *r) {
     JsVm *vm = ctx->vm;
-    if (js_regexp_is(pv)) {
-        *out = (JsRegExp *)js_value_object(pv);
+    JsValue p = pv, f = js_undefined();
+    js_gc_protect(vm, &p);
+    js_gc_protect(vm, &f);
+    bool ok = js_is_undefined(p) || to_str(ctx, &p, r);
+    if (ok && flags[0]) {
+        JsString *fs = js_ascii_cell(vm, flags);
+        if (fs)
+            f = js_value_from_cell(&fs->gc);
+        else
+            ok = re_oom(ctx, r);
+    }
+    ok = ok && regexp_new_of(ctx, p, f, r);
+    if (ok) {
+        *out = *r;
+        if (!js_native_keep(ctx, *out))
+            ok = re_oom(ctx, r);
+    }
+    js_gc_unprotect(vm, &f);
+    js_gc_unprotect(vm, &p);
+    return ok;
+}
+
+/* RegExp.prototype[@@match] on RXV (22.2.6.8), for the string SV. Both are rooted by the
+ * caller, here and in the methods after it. */
+static bool re_do_match(JsContext *ctx, JsValue rxv, JsValue sv, JsValue *r) {
+    JsVm *vm = ctx->vm;
+    JsString *s = js_value_string(sv);
+    if (re_pristine(ctx, rxv, RE_NEED_EXEC | RE_NEED_FLAGS)) {
+        JsRegExp *re = (JsRegExp *)js_value_object(rxv);
+        if (!re->global)
+            return builtin_exec(ctx, rxv, sv, r);
+        if (js_regexp_last_index_readonly(&re->obj))
+            return re_run_throw(ctx, RE_RUN_READONLY, r);
+        re->last_index = js_number(0); /* where the last, failed search leaves it too */
+        JsObject *arr = js_array_new_cell(ctx, 0);
+        if (!arr)
+            return re_oom(ctx, r);
+        JsValue arrv = js_value_from_cell(&arr->gc);
+        js_gc_protect(vm, &arrv);
+        int32_t caps[CAPS_MAX];
+        bool ok = true, uni = re_is_unicode(re), oom = false;
+        uint32_t pos = 0;
+        int rc = RE_RUN_NOMATCH;
+        while (ok && pos <= s->length &&
+               (rc = re_match(ctx, re, s, pos, false, caps)) == RE_RUN_MATCH) {
+            JsValue el = substr_or_undef(vm, s, caps[0], caps[1], &oom);
+            ok = !oom && js_array_append(vm, js_value_object(arrv), el);
+            pos = caps[1] == caps[0] ? advance_index(s, (uint32_t)caps[1], uni)
+                                     : (uint32_t)caps[1];
+        }
+        js_gc_unprotect(vm, &arrv);
+        if (rc == RE_RUN_BUDGET)
+            return re_budget_throw(ctx, r);
+        if (!ok)
+            return re_oom(ctx, r);
+        *r = js_value_object(arrv)->elem_count ? arrv : js_null();
         return true;
     }
-    const uint16_t *pu = NULL;
-    uint32_t pn = 0;
-    JsValue pstr = js_undefined();
-    js_gc_protect(vm, &pstr);
-    if (!js_is_undefined(pv)) {
-        JsString *ps = js_op_to_string(ctx, pv);
-        if (!ps) {
-            js_gc_unprotect(vm, &pstr);
-            return re_oom(ctx, r);
+
+    JsValue fl = js_undefined(), res = js_undefined(), ms = js_undefined(), arrv = js_undefined();
+    js_gc_protect(vm, &fl);
+    js_gc_protect(vm, &res);
+    js_gc_protect(vm, &ms);
+    js_gc_protect(vm, &arrv);
+    bool ok = re_get(ctx, rxv, "flags", &fl, r) && to_str(ctx, &fl, r);
+    if (ok && !str_has(fl, 'g')) {
+        ok = regexp_exec(ctx, rxv, sv, r);
+    } else if (ok) {
+        bool uni = str_has(fl, 'u') || str_has(fl, 'v');
+        ok = re_put(ctx, rxv, "lastIndex", js_number(0), r);
+        if (ok) {
+            JsObject *arr = js_array_new_cell(ctx, 0);
+            if (arr)
+                arrv = js_value_from_cell(&arr->gc);
+            else
+                ok = re_oom(ctx, r);
         }
-        pstr = js_value_from_cell(&ps->gc);
-        pu = ps->units;
-        pn = ps->length;
+        while (ok) {
+            if (!js_native_charge(ctx)) {
+                *r = js_take_error(ctx);
+                ok = false;
+            } else if (!regexp_exec(ctx, rxv, sv, &res)) {
+                *r = res;
+                ok = false;
+            } else if (js_is_null(res)) {
+                break;
+            } else {
+                ok = re_get_index(ctx, res, 0, &ms, r) && to_str(ctx, &ms, r);
+                if (ok && !js_array_append(vm, js_value_object(arrv), ms))
+                    ok = re_oom(ctx, r);
+                if (ok && js_value_string(ms)->length == 0)
+                    ok = bump_last_index(ctx, rxv, s, uni, r);
+            }
+        }
+        if (ok)
+            *r = js_value_object(arrv)->elem_count ? arrv : js_null();
     }
-    uint16_t fbuf[4];
-    uint32_t fn = 0;
-    while (extra_flags[fn]) {
-        fbuf[fn] = (uint16_t)extra_flags[fn];
-        fn++;
-    }
-    const char *err = NULL;
-    *rev = js_regexp_new(ctx, pu, pn, fbuf, fn, &err);
-    if (!js_is_object(*rev)) {
-        *r = js_regexp_error(ctx, err ? err : "out of memory", pu, pn, fbuf, fn);
-        js_gc_unprotect(vm, &pstr);
-        return false;
-    }
-    js_gc_unprotect(vm, &pstr);
-    *out = (JsRegExp *)js_value_object(*rev);
-    return true;
+    js_gc_unprotect(vm, &arrv);
+    js_gc_unprotect(vm, &ms);
+    js_gc_unprotect(vm, &res);
+    js_gc_unprotect(vm, &fl);
+    return ok;
 }
 
 bool js_re_str_match(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                      JsValue *r) {
     if (!js_str_this_check(ctx, tv, r))
         return false;
-    JsVm *vm = ctx->vm;
-    JsString *s = js_op_to_string(ctx, tv);
+    JsValue rxv = ARG(0);
+    bool like = js_regexp_like(ctx, rxv);
+    JsString *s = js_native_string(ctx, tv);
     if (!s)
         return re_oom(ctx, r);
-    JsValue sv = js_value_from_cell(&s->gc);
-    js_gc_protect(vm, &sv);
-    JsValue rev = js_undefined();
-    js_gc_protect(vm, &rev);
-    JsRegExp *re;
-    if (!coerce_regexp(ctx, ARG(0), "", &rev, &re, r)) {
-        js_gc_unprotect(vm, &rev);
-        js_gc_unprotect(vm, &sv);
+    if (!like && !regexp_of_pattern(ctx, rxv, "", &rxv, r))
         return false;
-    }
-    bool ok = true, budget = false;
-    int32_t caps[CAPS_MAX];
-    if (!re->global) {
-        int rc = exec_protocol(ctx, re, s, caps);
-        if (rc == RE_RUN_BUDGET)
-            budget = true;
-        else if (rc == RE_RUN_NOMATCH)
-            *r = js_null();
-        else
-            ok = build_exec_result(ctx, re, sv, caps, r);
-    } else {
-        JsObject *arr = js_array_new_cell(ctx, 0);
-        JsValue arrv = arr ? js_value_from_cell(&arr->gc) : js_undefined();
-        ok = arr != NULL;
-        if (ok) {
-            js_gc_protect(vm, &arrv);
-            bool uni = re_is_unicode(re), oom = false;
-            uint32_t pos = 0;
-            int rc = RE_RUN_NOMATCH;
-            while (ok && pos <= s->length &&
-                   (rc = re_match(ctx, re, s, pos, false, caps)) == RE_RUN_MATCH) {
-                JsValue el = substr_or_undef(vm, s, caps[0], caps[1], &oom);
-                ok = !oom && js_array_append(vm, js_value_object(arrv), el);
-                pos = caps[1] == caps[0] ? advance_index(s, (uint32_t)caps[1], uni)
-                                         : (uint32_t)caps[1];
-            }
-            budget = rc == RE_RUN_BUDGET;
-            re->last_index = 0;
-            if (ok && !budget)
-                *r = js_value_object(arrv)->elem_count ? arrv : js_null();
-            js_gc_unprotect(vm, &arrv);
-        }
-    }
-    js_gc_unprotect(vm, &rev);
-    js_gc_unprotect(vm, &sv);
-    if (budget)
-        return re_budget_throw(ctx, r);
-    return ok ? true : re_oom(ctx, r);
+    return re_do_match(ctx, rxv, js_value_from_cell(&s->gc), r);
 }
 
-/* matchAll: a RegExp String Iterator (js_iter.h) that runs one search per step, from the
- * regexp's lastIndex (ToLength) as V8's clone of it starts; the regexp's own lastIndex is left
- * alone. Its matches are exec's results. */
+/* A RegExp String Iterator (js_iter.h, JS_ITER_REGEXP), in one of two shapes. FAST: the regexp
+ * matchAll was given stands for the copy of it the method makes, while nothing can tell them
+ * apart - `target` is that regexp, `inner` its source as it was, `op` its flags (a bit for each
+ * of "dgimsuvy"), `index` the copy's lastIndex. A step that finds RegExp.prototype.exec
+ * replaced, or the regexp recompiled, makes the copy and goes on as GENERIC: `target` is the
+ * matcher, whatever object it is, stepped by RegExpExec and its lastIndex property, and `op`
+ * has bit 0 for global and bit 1 for unicode. DONE: a matcher that is not global has given its
+ * one match. */
+enum { RE_ITER_FAST, RE_ITER_GENERIC, RE_ITER_DONE };
+static const char re_flag_letters[] = "dgimsuvy";
+enum { RE_BIT_G = 1u << 1, RE_BIT_U = 1u << 5, RE_BIT_V = 1u << 6, RE_BIT_Y = 1u << 7 };
+
+/* RegExp.prototype[@@matchAll] on RXV (22.2.6.9) */
+static bool re_do_match_all(JsContext *ctx, JsValue rxv, JsValue sv, JsValue *r) {
+    JsVm *vm = ctx->vm;
+    JsString *s = js_value_string(sv);
+    if (re_pristine(ctx, rxv, RE_NEED_EXEC | RE_NEED_FLAGS | RE_NEED_CTOR)) {
+        JsRegExp *re = (JsRegExp *)js_value_object(rxv);
+        double li = li_number(re);
+        uint32_t start = li != li || li <= 0 ? 0
+                         : li > (double)s->length ? s->length + 1 : (uint32_t)li;
+        *r = js_iterobj_new(ctx, JS_ITER_REGEXP, rxv, sv, start);
+        if (js_is_undefined(*r))
+            return re_oom(ctx, r);
+        JsIterObj *it = (JsIterObj *)js_value_object(*r);
+        it->inner = js_value_from_cell(&re->source->gc);
+        it->op = 0;
+        for (int i = 0; i < 8; i++) {
+            if (str_has(js_value_from_cell(&re->flags->gc), (uint16_t)re_flag_letters[i]))
+                it->op |= (uint8_t)(1u << i);
+        }
+        it->state = RE_ITER_FAST;
+        return true;
+    }
+
+    JsValue ctor = js_undefined(), fl = js_undefined(), m = js_undefined();
+    js_gc_protect(vm, &ctor);
+    js_gc_protect(vm, &fl);
+    js_gc_protect(vm, &m);
+    int sp = js_species(ctx, rxv, ctx->regexp_ctor, &ctor);
+    bool ok = sp >= 0;
+    if (!ok)
+        *r = ctor;
+    ok = ok && re_get(ctx, rxv, "flags", &fl, r) && to_str(ctx, &fl, r);
+    if (ok) {
+        JsValue cargs[2] = {rxv, fl};
+        ok = sp ? js_construct(ctx, ctor, cargs, 2, &m) : regexp_create(ctx, rxv, fl, true, &m);
+        if (!ok)
+            *r = m;
+    }
+    double li = 0;
+    ok = ok && re_get_integer(ctx, rxv, "lastIndex", true, &li, r) &&
+         re_put(ctx, m, "lastIndex", js_number(li), r);
+    if (ok) {
+        *r = js_iterobj_new(ctx, JS_ITER_REGEXP, m, sv, 0);
+        if (js_is_undefined(*r)) {
+            ok = re_oom(ctx, r);
+        } else {
+            JsIterObj *it = (JsIterObj *)js_value_object(*r);
+            it->op = (uint8_t)((str_has(fl, 'g') ? 1 : 0) |
+                               (str_has(fl, 'u') || str_has(fl, 'v') ? 2 : 0));
+            it->state = RE_ITER_GENERIC;
+        }
+    }
+    js_gc_unprotect(vm, &m);
+    js_gc_unprotect(vm, &fl);
+    js_gc_unprotect(vm, &ctor);
+    return ok;
+}
+
+/* matchAll's and replaceAll's check of an argument that is a regexp (IsRegExp): its `flags`
+ * must have "g" */
+bool js_re_global_check(JsContext *ctx, JsValue v, bool match_all, JsValue *r) {
+    if (!js_regexp_isregexp(ctx, v))
+        return true;
+    bool global;
+    if (re_pristine(ctx, v, RE_NEED_FLAGS)) {
+        global = ((const JsRegExp *)js_value_object(v))->global;
+    } else {
+        JsValue f = js_undefined();
+        js_gc_protect(ctx->vm, &f);
+        bool ok = re_get(ctx, v, "flags", &f, r);
+        if (ok && (js_is_undefined(f) || js_is_null(f)))
+            ok = re_throw(ctx, r, match_all ? "TypeError: The .flags property of the argument to "
+                                              "String.prototype.matchAll cannot be null or undefined"
+                                            : "TypeError: String.prototype.replaceAll called on null "
+                                              "or undefined");
+        ok = ok && to_str(ctx, &f, r);
+        global = ok && str_has(f, 'g');
+        js_gc_unprotect(ctx->vm, &f);
+        if (!ok)
+            return false;
+    }
+    if (!global)
+        return re_throw(ctx, r, match_all ? "TypeError: String.prototype.matchAll called with a "
+                                            "non-global RegExp argument"
+                                          : "TypeError: String.prototype.replaceAll called with a "
+                                            "non-global RegExp argument");
+    return true;
+}
+
 bool js_re_str_matchAll(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                         JsValue *r) {
     if (!js_str_this_check(ctx, tv, r))
         return false;
-    JsVm *vm = ctx->vm;
-    if (js_regexp_is(ARG(0)) && !((JsRegExp *)js_value_object(args[0]))->global)
-        return re_throw(ctx, r, "TypeError: String.prototype.matchAll called with a non-global RegExp argument");
-    JsString *s = js_op_to_string(ctx, tv);
+    JsValue rxv = ARG(0);
+    if (!js_re_global_check(ctx, rxv, true, r))
+        return false;
+    bool like = js_regexp_like(ctx, rxv);
+    JsString *s = js_native_string(ctx, tv);
     if (!s)
         return re_oom(ctx, r);
-    JsValue sv = js_value_from_cell(&s->gc);
-    js_gc_protect(vm, &sv);
-    JsValue rev = js_undefined();
-    js_gc_protect(vm, &rev);
-    JsRegExp *re;
-    bool ok = coerce_regexp(ctx, ARG(0), "g", &rev, &re, r);
-    if (ok) {
-        double li = js_regexp_is(ARG(0)) ? re->last_index : 0;
-        uint32_t start = li != li || li <= 0 ? 0
-                         : li > (double)s->length ? s->length + 1 : (uint32_t)li;
-        *r = js_iterobj_new(ctx, JS_ITER_REGEXP, js_value_from_cell(&re->obj.gc), sv, start);
-        if (js_is_undefined(*r))
-            ok = re_oom(ctx, r);
-    }
-    js_gc_unprotect(vm, &rev);
-    js_gc_unprotect(vm, &sv);
-    return ok;
+    if (!like && !regexp_of_pattern(ctx, rxv, "g", &rxv, r))
+        return false;
+    return re_do_match_all(ctx, rxv, js_value_from_cell(&s->gc), r);
 }
 
-int js_re_iter_step(JsContext *ctx, JsValue rev, JsValue sv, uint32_t *pos, JsValue *out) {
-    JsRegExp *re = (JsRegExp *)js_value_object(rev);
-    JsString *s = js_value_string(sv);
-    if (*pos > s->length)
+int js_re_iter_step(JsContext *ctx, JsIterObj *it, JsValue *out) {
+    JsVm *vm = ctx->vm;
+    if (it->state == RE_ITER_DONE)
         return 0;
-    int32_t caps[CAPS_MAX];
-    int rc = re_match(ctx, re, s, *pos, false, caps);
-    if (rc == RE_RUN_BUDGET)
-        return re_budget_throw(ctx, out), -1;
-    if (rc == RE_RUN_NOMATCH)
-        return 0;
-    uint32_t next = caps[1] == caps[0] ? advance_index(s, (uint32_t)caps[1], re_is_unicode(re))
-                                       : (uint32_t)caps[1];
-    if (!build_exec_result(ctx, re, sv, caps, out))
-        return re_oom(ctx, out), -1;
-    *pos = next;
-    return 1;
+    if (it->state == RE_ITER_FAST) {
+        JsRegExp *re = (JsRegExp *)js_value_object(it->target);
+        JsString *s = js_value_string(it->subject);
+        if (js_intact(ctx, JS_INTACT_RE_EXEC) &&
+            js_value_from_cell(&re->source->gc).bits == it->inner.bits) {
+            bool global = (it->op & RE_BIT_G) != 0;
+            uint32_t start = global || (it->op & RE_BIT_Y) ? it->index : 0;
+            if (start > s->length)
+                return 0;
+            start = unicode_start(s, start, (it->op & (RE_BIT_U | RE_BIT_V)) != 0);
+            int32_t caps[CAPS_MAX];
+            int rc = re_match(ctx, re, s, start, false, caps);
+            if (rc == RE_RUN_BUDGET)
+                return re_budget_throw(ctx, out), -1;
+            if (rc == RE_RUN_NOMATCH)
+                return 0;
+            if (!build_exec_result(ctx, re, it->subject, caps, out))
+                return re_oom(ctx, out), -1;
+            if (!global)
+                it->state = RE_ITER_DONE;
+            else
+                it->index = caps[1] != caps[0] ? (uint32_t)caps[1]
+                            : advance_index(s, (uint32_t)caps[1], (it->op & (RE_BIT_U | RE_BIT_V)) != 0);
+            return 1;
+        }
+        /* the copy, as it would be by now */
+        uint16_t fbuf[8];
+        uint32_t fn = 0;
+        for (int i = 0; i < 8; i++) {
+            if (it->op & (1u << i))
+                fbuf[fn++] = (uint16_t)re_flag_letters[i];
+        }
+        const JsString *src = js_value_string(it->inner);
+        const char *err = NULL;
+        JsValue copy = js_regexp_new(ctx, src->units, src->length, fbuf, fn, &err);
+        if (!js_is_object(copy)) {
+            *out = js_regexp_error(ctx, err ? err : "out of memory", src->units, src->length, fbuf, fn);
+            return -1;
+        }
+        ((JsRegExp *)js_value_object(copy))->last_index = js_number(it->index);
+        uint8_t op = (uint8_t)((it->op & RE_BIT_G ? 1 : 0) | (it->op & (RE_BIT_U | RE_BIT_V) ? 2 : 0));
+        it->target = copy;
+        it->inner = js_undefined();
+        it->op = op;
+        it->state = RE_ITER_GENERIC;
+    }
+
+    /* a script's exec may step this iterator to its end, which lets go of what it holds */
+    JsValue rxv = it->target, sv = it->subject, m = js_undefined(), ms = js_undefined();
+    js_gc_protect(vm, &rxv);
+    js_gc_protect(vm, &sv);
+    js_gc_protect(vm, &m);
+    js_gc_protect(vm, &ms);
+    int ret = 1;
+    if (!regexp_exec(ctx, rxv, sv, &m)) {
+        *out = m;
+        ret = -1;
+    } else if (js_is_null(m)) {
+        ret = 0;
+    } else if (!(it->op & 1)) {
+        it->state = RE_ITER_DONE;
+    } else if (!re_get_index(ctx, m, 0, &ms, out) || !to_str(ctx, &ms, out) ||
+               (js_value_string(ms)->length == 0 &&
+                !bump_last_index(ctx, rxv, js_value_string(sv), (it->op & 2) != 0, out))) {
+        ret = -1;
+    }
+    if (ret == 1)
+        *out = m;
+    js_gc_unprotect(vm, &ms);
+    js_gc_unprotect(vm, &m);
+    js_gc_unprotect(vm, &sv);
+    js_gc_unprotect(vm, &rxv);
+    return ret;
+}
+
+/* RegExp.prototype[@@search] on RXV (22.2.6.12) */
+static bool re_do_search(JsContext *ctx, JsValue rxv, JsValue sv, JsValue *r) {
+    JsVm *vm = ctx->vm;
+    if (re_pristine(ctx, rxv, RE_NEED_EXEC)) {
+        /* lastIndex is 0 for the search and what it was after it; a regexp whose lastIndex
+         * cannot be written fails where one of those writes would */
+        JsRegExp *re = (JsRegExp *)js_value_object(rxv);
+        bool zero = li_number(re) == 0 && !__builtin_signbit(li_number(re));
+        if (js_regexp_last_index_readonly(&re->obj) && (re->global || re->prog.sticky || !zero))
+            return re_run_throw(ctx, RE_RUN_READONLY, r);
+        int32_t caps[CAPS_MAX];
+        int rc = re_match(ctx, re, js_value_string(sv), 0, false, caps);
+        if (rc < 0)
+            return re_run_throw(ctx, rc, r);
+        *r = js_number(rc == RE_RUN_MATCH ? (double)caps[0] : -1.0);
+        return true;
+    }
+    JsValue prev = js_undefined(), res = js_undefined(), cur;
+    js_gc_protect(vm, &prev);
+    js_gc_protect(vm, &res);
+    bool ok = re_get(ctx, rxv, "lastIndex", &prev, r) &&
+              (same_value(prev, js_number(0)) || re_put(ctx, rxv, "lastIndex", js_number(0), r));
+    if (ok && !regexp_exec(ctx, rxv, sv, &res)) {
+        *r = res;
+        ok = false;
+    }
+    ok = ok && re_get(ctx, rxv, "lastIndex", &cur, r) &&
+         (same_value(cur, prev) || re_put(ctx, rxv, "lastIndex", prev, r));
+    if (ok && js_is_null(res))
+        *r = js_number(-1);
+    else if (ok)
+        ok = re_get(ctx, res, "index", r, r);
+    js_gc_unprotect(vm, &res);
+    js_gc_unprotect(vm, &prev);
+    return ok;
 }
 
 bool js_re_str_search(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                       JsValue *r) {
     if (!js_str_this_check(ctx, tv, r))
         return false;
-    JsVm *vm = ctx->vm;
-    JsString *s = js_op_to_string(ctx, tv);
+    JsValue rxv = ARG(0);
+    bool like = js_regexp_like(ctx, rxv);
+    JsString *s = js_native_string(ctx, tv);
     if (!s)
         return re_oom(ctx, r);
-    JsValue sv = js_value_from_cell(&s->gc);
-    js_gc_protect(vm, &sv);
-    JsValue rev = js_undefined();
-    js_gc_protect(vm, &rev);
-    JsRegExp *re;
-    if (!coerce_regexp(ctx, ARG(0), "", &rev, &re, r)) {
-        js_gc_unprotect(vm, &rev);
-        js_gc_unprotect(vm, &sv);
+    if (!like && !regexp_of_pattern(ctx, rxv, "", &rxv, r))
         return false;
-    }
-    int32_t caps[CAPS_MAX];
-    int rc = re_match(ctx, re, s, 0, false, caps);
-    js_gc_unprotect(vm, &rev);
-    js_gc_unprotect(vm, &sv);
-    if (rc == RE_RUN_BUDGET)
-        return re_budget_throw(ctx, r);
-    *r = js_number(rc == RE_RUN_MATCH ? (double)caps[0] : -1.0);
-    return true;
+    return re_do_search(ctx, rxv, js_value_from_cell(&s->gc), r);
 }
 
 /* ---- replace ---- */
@@ -1272,16 +1689,68 @@ static void expand_replacement(UBuf *sb, JsRegExp *re, const JsString *s,
     }
 }
 
+/* The names of RE's groups, for a replacer that runs after RE may have changed: an array with
+ * group g's name (an atom) at g and undefined for a group without one; *out is undefined when
+ * no group has a name. False out of memory. */
+static bool group_names(JsContext *ctx, const JsRegExp *re, JsValue *out) {
+    JsVm *vm = ctx->vm;
+    *out = js_undefined();
+    if (!has_named_groups(re))
+        return true;
+    JsObject *arr = js_array_new_cell(ctx, (uint32_t)re->prog.group_count + 1);
+    if (!arr)
+        return false;
+    JsValue arrv = js_value_from_cell(&arr->gc);
+    js_gc_protect(vm, &arrv);
+    bool ok = true;
+    for (int g = 0; ok && g <= re->prog.group_count; g++) {
+        JsValue name = js_undefined();
+        if (g && re->prog.group_names[g][0]) {
+            uint16_t nbuf[64];
+            name = js_atom(vm, nbuf, name_units(re->prog.group_names[g], nbuf, 64));
+            ok = js_is_string(name);
+        }
+        ok = ok && js_array_append(vm, js_value_object(arrv), name);
+    }
+    js_gc_unprotect(vm, &arrv);
+    *out = arrv;
+    return ok;
+}
+
+/* The `groups` object of a match, from group_names' array */
+static bool groups_from_names(JsContext *ctx, JsValue names, const JsString *s,
+                              const int32_t *caps, JsValue *out) {
+    JsVm *vm = ctx->vm;
+    JsValue obj = js_object_new(ctx);
+    if (!js_is_object(obj))
+        return false;
+    js_value_object(obj)->proto = js_undefined(); /* no prototype, as named_groups_obj's */
+    js_gc_protect(vm, &obj);
+    JsValue vv = js_undefined();
+    js_gc_protect(vm, &vv);
+    bool ok = true, oom = false;
+    for (uint32_t g = 1; ok && g < js_value_object(names)->elem_count; g++) {
+        JsValue name = js_value_object(names)->elems[g];
+        if (js_is_undefined(name))
+            continue;
+        vv = substr_or_undef(vm, s, caps[g * 2], caps[g * 2 + 1], &oom);
+        ok = !oom && js_map_set(vm, &js_value_object(obj)->props, js_value_string(name), vv);
+    }
+    js_gc_unprotect(vm, &vv);
+    js_gc_unprotect(vm, &obj);
+    *out = obj;
+    return ok;
+}
+
 /*
- * Rooted argument vector for a function replacer:
- * (match, g1..gn, index, input[, groups]). Returned as an array object whose
- * elems back js_call's args; the caller protects the returned value.
+ * Rooted argument vector for a function replacer: (match, g1..gn, index, input[, groups]), for
+ * a match of a regexp with NG groups named by NAMES (group_names). Returned as an array object
+ * whose elems back js_call's args; undefined out of memory. The caller protects it.
  */
-static JsValue replacer_args(JsContext *ctx, JsRegExp *re, JsValue sv,
+static JsValue replacer_args(JsContext *ctx, int ng, JsValue names, JsValue sv,
                              const int32_t *caps) {
     JsVm *vm = ctx->vm;
     JsString *s = js_value_string(sv);
-    int ng = re->prog.group_count;
     JsObject *arr = js_array_new_cell(ctx, (uint32_t)ng + 3);
     if (!arr)
         return js_undefined();
@@ -1294,130 +1763,394 @@ static JsValue replacer_args(JsContext *ctx, JsRegExp *re, JsValue sv,
     }
     ok = ok && js_array_append(vm, js_value_object(arrv), js_number(caps[0]));
     ok = ok && js_array_append(vm, js_value_object(arrv), sv);
-    if (ok && has_named_groups(re)) {
+    if (ok && !js_is_undefined(names)) {
         JsValue groups;
-        ok = named_groups_obj(ctx, re, s, caps, false, &groups) &&
+        ok = groups_from_names(ctx, names, s, caps, &groups) &&
              js_array_append(vm, js_value_object(arrv), groups);
     }
     js_gc_unprotect(vm, &arrv);
     return ok ? arrv : js_undefined();
 }
 
-bool js_re_str_replace(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
-                       JsValue *r, bool all) {
-    JsVm *vm = ctx->vm;
-    JsRegExp *re = (JsRegExp *)js_value_object(args[0]); /* caller-checked */
-    if (all && !re->global)
-        return re_throw(ctx, r, "TypeError: String.prototype.replaceAll called with a non-global RegExp argument");
-    JsString *s = js_op_to_string(ctx, tv);
-    if (!s)
-        return re_oom(ctx, r);
-    JsValue sv = js_value_from_cell(&s->gc);
-    js_gc_protect(vm, &sv);
-
-    JsValue repfn = ARG(1);
-    bool is_fn = js_is_function(repfn);
-    JsString *reps = NULL;
-    JsValue repsv = js_undefined();
-    js_gc_protect(vm, &repsv);
-    if (!is_fn) {
-        reps = js_op_to_string(ctx, repfn);
-        if (!reps) {
-            js_gc_unprotect(vm, &repsv);
-            js_gc_unprotect(vm, &sv);
-            return re_oom(ctx, r);
+/* replace with a string, on a regexp nothing is redefined for: no code of the script's runs */
+static bool replace_fast_str(JsContext *ctx, JsValue rxv, JsValue sv, JsValue repv, JsValue *r) {
+    JsRegExp *re = (JsRegExp *)js_value_object(rxv);
+    JsString *s = js_value_string(sv);
+    const JsString *rep = js_value_string(repv);
+    UBuf sb;
+    ub_init(&sb, ctx->vm);
+    int32_t caps[CAPS_MAX];
+    uint32_t cursor = 0;
+    bool any = false;
+    int rc;
+    if (!re->global) {
+        rc = exec_protocol(ctx, re, s, li_number(re), caps);
+        if (rc == RE_RUN_MATCH) {
+            ub_units(&sb, s->units, (uint32_t)caps[0]);
+            expand_replacement(&sb, re, s, caps, rep);
+            cursor = (uint32_t)caps[1];
+            any = true;
         }
-        repsv = js_value_from_cell(&reps->gc);
+    } else {
+        if (js_regexp_last_index_readonly(&re->obj))
+            return re_run_throw(ctx, RE_RUN_READONLY, r);
+        re->last_index = js_number(0); /* where the last, failed search leaves it too */
+        bool uni = re_is_unicode(re);
+        uint32_t pos = 0;
+        rc = RE_RUN_NOMATCH;
+        while (pos <= s->length && (rc = re_match(ctx, re, s, pos, false, caps)) == RE_RUN_MATCH) {
+            uint32_t m0 = (uint32_t)caps[0], m1 = (uint32_t)caps[1];
+            ub_units(&sb, s->units + cursor, m0 - cursor);
+            expand_replacement(&sb, re, s, caps, rep);
+            cursor = m1;
+            any = true;
+            pos = m1 == m0 ? advance_index(s, m1, uni) : m1;
+        }
+    }
+    if (rc < 0 || !any) {
+        ub_free(&sb);
+        if (rc < 0)
+            return re_run_throw(ctx, rc, r);
+        *r = sv;
+        return true;
+    }
+    ub_units(&sb, s->units + cursor, s->length - cursor);
+    *r = ub_finish(&sb);
+    return !js_is_undefined(*r) || re_oom(ctx, r);
+}
+
+/* replace with a function, on a regexp nothing is redefined for. The matches are all found
+ * before the function is first called, as the spec has it, and the regexp is not looked at
+ * again: the function may recompile it, or move its lastIndex. */
+static bool replace_fast_fn(JsContext *ctx, JsValue rxv, JsValue sv, JsValue fn, JsValue *r) {
+    JsVm *vm = ctx->vm;
+    JsRegExp *re = (JsRegExp *)js_value_object(rxv);
+    JsString *s = js_value_string(sv);
+    int ng = re->prog.group_count;
+    size_t stride = 2 * ((size_t)ng + 1);
+    int32_t one[CAPS_MAX];
+    int32_t *list = one; /* COUNT matches' captures; the VM's when CAP is not 0 */
+    size_t count = 0, cap = 0;
+    if (!re->global) {
+        int rc = exec_protocol(ctx, re, s, li_number(re), one);
+        if (rc < 0)
+            return re_run_throw(ctx, rc, r);
+        count = rc == RE_RUN_MATCH;
+    } else {
+        if (js_regexp_last_index_readonly(&re->obj))
+            return re_run_throw(ctx, RE_RUN_READONLY, r);
+        re->last_index = js_number(0);
+        bool uni = re_is_unicode(re), oom = false;
+        uint32_t pos = 0;
+        int32_t caps[CAPS_MAX];
+        int rc = RE_RUN_NOMATCH;
+        while (pos <= s->length && (rc = re_match(ctx, re, s, pos, false, caps)) == RE_RUN_MATCH) {
+            if (count == cap) {
+                size_t ncap = cap ? cap * 2 : 8;
+                int32_t *nl = js_realloc_raw(vm, cap ? list : NULL, cap * stride * sizeof(int32_t),
+                                             ncap * stride * sizeof(int32_t));
+                if (!nl) {
+                    oom = true;
+                    break;
+                }
+                list = nl;
+                cap = ncap;
+            }
+            memcpy(list + count * stride, caps, stride * sizeof(int32_t));
+            count++;
+            pos = caps[1] == caps[0] ? advance_index(s, (uint32_t)caps[1], uni) : (uint32_t)caps[1];
+        }
+        if (oom || rc == RE_RUN_BUDGET) {
+            if (cap)
+                js_realloc_raw(vm, list, cap * stride * sizeof(int32_t), 0);
+            return oom ? re_oom(ctx, r) : re_budget_throw(ctx, r);
+        }
+    }
+    if (count == 0) {
+        *r = sv;
+        return true;
     }
 
+    JsValue names = js_undefined(), argv = js_undefined(), res = js_undefined();
+    js_gc_protect(vm, &names);
+    js_gc_protect(vm, &argv);
+    js_gc_protect(vm, &res);
     UBuf sb;
     ub_init(&sb, vm);
-    bool many = re->global;
-    bool uni = re_is_unicode(re);
-    int32_t caps[CAPS_MAX];
-    uint32_t pos = 0, cursor = 0;
-    bool ok = true, thrown = false, budget = false;
-    int rc = RE_RUN_NOMATCH;
-
-    while (pos <= s->length && (rc = re_match(ctx, re, s, pos, false, caps)) == RE_RUN_MATCH) {
-        uint32_t m0 = (uint32_t)caps[0], m1 = (uint32_t)caps[1];
-        ub_units(&sb, s->units + cursor, m0 - cursor);
-        if (is_fn) {
-            JsValue argv = replacer_args(ctx, re, sv, caps);
-            if (!js_is_object(argv)) {
-                ok = false;
-                break;
-            }
-            js_gc_protect(vm, &argv);
-            JsObject *aobj = js_value_object(argv);
-            JsValue res;
-            if (!js_call(ctx, repfn, js_undefined(), aobj->elems,
-                         (int)aobj->elem_count, &res)) {
-                *r = res; /* propagate the thrown value */
-                js_gc_unprotect(vm, &argv);
-                ok = false;
-                thrown = true;
-                break;
-            }
-            js_gc_unprotect(vm, &argv);
-            js_gc_protect(vm, &res);
-            JsString *rs = js_op_to_string(ctx, res);
-            js_gc_unprotect(vm, &res);
-            if (!rs) {
-                ok = false;
-                break;
-            }
-            ub_units(&sb, rs->units, rs->length);
-        } else {
-            expand_replacement(&sb, re, s, caps, reps);
-        }
-        cursor = m1;
-        if (!many)
+    bool ok = group_names(ctx, re, &names) || re_oom(ctx, r);
+    uint32_t cursor = 0;
+    for (size_t i = 0; ok && i < count; i++) {
+        const int32_t *c = list + i * stride;
+        argv = replacer_args(ctx, ng, names, sv, c);
+        if (!js_is_object(argv)) {
+            ok = re_oom(ctx, r);
             break;
-        pos = m1 == m0 ? advance_index(s, m1, uni) : m1;
+        }
+        JsObject *aobj = js_value_object(argv);
+        if (!js_call(ctx, fn, js_undefined(), aobj->elems, (int)aobj->elem_count, &res)) {
+            *r = res; /* what it threw */
+            ok = false;
+            break;
+        }
+        if (!to_str(ctx, &res, r)) {
+            ok = false;
+            break;
+        }
+        ub_units(&sb, s->units + cursor, (uint32_t)c[0] - cursor);
+        ub_units(&sb, js_value_string(res)->units, js_value_string(res)->length);
+        cursor = (uint32_t)c[1];
     }
-    budget = rc == RE_RUN_BUDGET;
-
-    if (ok && !budget) {
+    if (cap)
+        js_realloc_raw(vm, list, cap * stride * sizeof(int32_t), 0);
+    if (ok) {
         ub_units(&sb, s->units + cursor, s->length - cursor);
-        if (re->global)
-            re->last_index = 0;
         *r = ub_finish(&sb);
-        ok = !js_is_undefined(*r);
+        ok = !js_is_undefined(*r) || re_oom(ctx, r);
     } else {
         ub_free(&sb);
     }
-    js_gc_unprotect(vm, &repsv);
-    js_gc_unprotect(vm, &sv);
-    if (thrown)
-        return false;
-    if (budget)
-        return re_budget_throw(ctx, r);
-    return ok ? true : re_oom(ctx, r);
+    js_gc_unprotect(vm, &res);
+    js_gc_unprotect(vm, &argv);
+    js_gc_unprotect(vm, &names);
+    return ok;
+}
+
+/* GetSubstitution (22.1.3.19.1) for a match that is any object's: MATCHED at POSITION in S,
+ * CAPSV an array of the matched text and then its captures (strings, or undefined), GROUPS the
+ * result's `groups` (undefined for none). A named reference reads a property of GROUPS and
+ * converts it, which may run the script's code. False thrown. All are rooted by the caller. */
+static bool substitute(JsContext *ctx, UBuf *sb, JsValue repv, JsValue sv, uint32_t position,
+                       JsValue capsv, JsValue groups, JsValue *err) {
+    JsVm *vm = ctx->vm;
+    const JsString *rep = js_value_string(repv), *s = js_value_string(sv);
+    const JsObject *capso = js_value_object(capsv);
+    const JsString *matched = js_value_string(capso->elems[0]);
+    uint32_t m = capso->elem_count - 1;
+    uint32_t tail = position + matched->length; /* no more than twice a string's length */
+    uint32_t i = 0;
+    while (i < rep->length) {
+        uint16_t c = rep->units[i];
+        if (c != '$' || i + 1 >= rep->length) {
+            ub_unit(sb, c);
+            i++;
+            continue;
+        }
+        uint16_t n = rep->units[i + 1];
+        if (n == '$') {
+            ub_unit(sb, '$');
+            i += 2;
+        } else if (n == '&') {
+            ub_units(sb, matched->units, matched->length);
+            i += 2;
+        } else if (n == '`') {
+            ub_units(sb, s->units, position);
+            i += 2;
+        } else if (n == '\'') {
+            if (tail < s->length)
+                ub_units(sb, s->units + tail, s->length - tail);
+            i += 2;
+        } else if (n >= '0' && n <= '9') {
+            uint32_t g = (uint32_t)(n - '0');
+            uint32_t adv = 2;
+            if (i + 2 < rep->length && rep->units[i + 2] >= '0' && rep->units[i + 2] <= '9') {
+                uint32_t g2 = g * 10 + (uint32_t)(rep->units[i + 2] - '0');
+                if (g2 >= 1 && g2 <= m) {
+                    g = g2;
+                    adv = 3;
+                }
+            }
+            if (g >= 1 && g <= m) {
+                JsValue cv = capso->elems[g];
+                if (!js_is_undefined(cv))
+                    ub_units(sb, js_value_string(cv)->units, js_value_string(cv)->length);
+                i += adv;
+            } else {
+                ub_unit(sb, '$');
+                i++;
+            }
+        } else if (n == '<' && !js_is_undefined(groups)) {
+            uint32_t close = i + 2;
+            while (close < rep->length && rep->units[close] != '>')
+                close++;
+            if (close >= rep->length) {
+                ub_unit(sb, '$');
+                i++;
+                continue;
+            }
+            JsString *name = js_string_cell_new(vm, rep->units + i + 2, close - (i + 2));
+            if (!name)
+                return re_oom(ctx, err);
+            JsValue v = js_value_from_cell(&name->gc), got;
+            js_gc_protect(vm, &v);
+            bool ok = js_get_property(ctx, groups, v, &got) || ((*err = js_take_error(ctx)), false);
+            v = ok ? got : js_undefined();
+            ok = ok && (js_is_undefined(v) || to_str(ctx, &v, err));
+            if (ok && !js_is_undefined(v))
+                ub_units(sb, js_value_string(v)->units, js_value_string(v)->length);
+            js_gc_unprotect(vm, &v);
+            if (!ok)
+                return false;
+            i = close + 1;
+        } else {
+            ub_unit(sb, '$');
+            i++;
+        }
+    }
+    return true;
+}
+
+/* RegExp.prototype[@@replace] (22.2.6.11) as the spec writes it, on any object: its `flags`,
+ * `exec` and `lastIndex` are the ones a script gave it, and a match is whatever object exec
+ * returned */
+static bool replace_generic(JsContext *ctx, JsValue rxv, JsValue sv, JsValue repv, bool is_fn,
+                            JsValue *r) {
+    JsVm *vm = ctx->vm;
+    JsString *s = js_value_string(sv);
+    enum { FL, LIST, RES, STR, ARGS, GROUPS, REPL, NSLOT };
+    JsValue v[NSLOT];
+    for (int i = 0; i < NSLOT; i++) {
+        v[i] = js_undefined();
+        js_gc_protect(vm, &v[i]);
+    }
+    UBuf sb;
+    ub_init(&sb, vm);
+    bool ok = re_get(ctx, rxv, "flags", &v[FL], r) && to_str(ctx, &v[FL], r);
+    bool global = ok && str_has(v[FL], 'g');
+    bool uni = ok && (str_has(v[FL], 'u') || str_has(v[FL], 'v'));
+    if (global)
+        ok = re_put(ctx, rxv, "lastIndex", js_number(0), r);
+    if (ok) {
+        JsObject *arr = js_array_new_cell(ctx, 0);
+        if (arr)
+            v[LIST] = js_value_from_cell(&arr->gc);
+        else
+            ok = re_oom(ctx, r);
+    }
+    while (ok) {
+        if (!js_native_charge(ctx)) {
+            *r = js_take_error(ctx);
+            ok = false;
+        } else if (!regexp_exec(ctx, rxv, sv, &v[RES])) {
+            *r = v[RES];
+            v[RES] = js_undefined();
+            ok = false;
+        } else if (js_is_null(v[RES])) {
+            break;
+        } else if (!js_array_append(vm, js_value_object(v[LIST]), v[RES])) {
+            ok = re_oom(ctx, r);
+        } else if (!global) {
+            break;
+        } else {
+            ok = re_get_index(ctx, v[RES], 0, &v[STR], r) && to_str(ctx, &v[STR], r);
+            if (ok && js_value_string(v[STR])->length == 0)
+                ok = bump_last_index(ctx, rxv, s, uni, r);
+        }
+    }
+
+    double next = 0;
+    for (uint32_t i = 0; ok && i < js_value_object(v[LIST])->elem_count; i++) {
+        v[RES] = js_value_object(v[LIST])->elems[i];
+        double ncap = 0, position = 0;
+        ok = re_get_integer(ctx, v[RES], "length", true, &ncap, r) &&
+             re_get_index(ctx, v[RES], 0, &v[STR], r) && to_str(ctx, &v[STR], r) &&
+             re_get_integer(ctx, v[RES], "index", false, &position, r);
+        if (!ok)
+            break;
+        ncap = ncap > 0 ? ncap - 1 : 0;
+        position = position < 0 ? 0 : position > (double)s->length ? (double)s->length : position;
+        uint32_t mlen = js_value_string(v[STR])->length;
+        JsObject *arr = js_array_new_cell(ctx, 0);
+        if (!arr || ((v[ARGS] = js_value_from_cell(&arr->gc)), !js_array_append(vm, arr, v[STR]))) {
+            ok = re_oom(ctx, r);
+            break;
+        }
+        for (double n = 1; ok && n <= ncap; n++) {
+            if (!js_native_charge(ctx)) {
+                *r = js_take_error(ctx);
+                ok = false;
+                break;
+            }
+            ok = re_get_index(ctx, v[RES], n, &v[REPL], r) &&
+                 (js_is_undefined(v[REPL]) || to_str(ctx, &v[REPL], r));
+            if (ok && !js_array_append(vm, js_value_object(v[ARGS]), v[REPL]))
+                ok = re_oom(ctx, r);
+        }
+        ok = ok && re_get(ctx, v[RES], "groups", &v[GROUPS], r);
+        if (!ok)
+            break;
+        uint32_t mark = sb.len;
+        bool keep = position >= next;
+        if (keep)
+            ub_units(&sb, s->units + (uint32_t)next, (uint32_t)position - (uint32_t)next);
+        if (is_fn) {
+            JsObject *aobj = js_value_object(v[ARGS]);
+            if (!js_array_append(vm, aobj, js_number(position)) || !js_array_append(vm, aobj, sv) ||
+                (!js_is_undefined(v[GROUPS]) && !js_array_append(vm, aobj, v[GROUPS]))) {
+                ok = re_oom(ctx, r);
+                break;
+            }
+            if (!js_call(ctx, repv, js_undefined(), aobj->elems, (int)aobj->elem_count, &v[REPL])) {
+                *r = v[REPL];
+                v[REPL] = js_undefined();
+                ok = false;
+                break;
+            }
+            ok = to_str(ctx, &v[REPL], r);
+            if (ok)
+                ub_units(&sb, js_value_string(v[REPL])->units, js_value_string(v[REPL])->length);
+        } else if (js_is_null(v[GROUPS])) {
+            ok = re_throw(ctx, r, "TypeError: Cannot convert undefined or null to object");
+        } else {
+            ok = substitute(ctx, &sb, repv, sv, (uint32_t)position, v[ARGS], v[GROUPS], r);
+        }
+        if (!keep)
+            sb.len = mark; /* a match before the last one's end is not in the result */
+        else
+            next = position + mlen;
+    }
+    if (ok) {
+        if (next < (double)s->length)
+            ub_units(&sb, s->units + (uint32_t)next, s->length - (uint32_t)next);
+        *r = ub_finish(&sb);
+        ok = !js_is_undefined(*r) || re_oom(ctx, r);
+    } else {
+        ub_free(&sb);
+    }
+    for (int i = NSLOT - 1; i >= 0; i--)
+        js_gc_unprotect(vm, &v[i]);
+    return ok;
+}
+
+bool js_re_str_replace(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
+                       JsValue *r) {
+    JsValue rxv = args[0]; /* caller-checked: js_regexp_like */
+    JsString *s = js_native_string(ctx, tv);
+    if (!s)
+        return re_oom(ctx, r);
+    JsValue sv = js_value_from_cell(&s->gc), repv = ARG(1);
+    bool is_fn = js_is_function(repv);
+    if (!is_fn) {
+        JsString *rep = js_native_string(ctx, repv);
+        if (!rep)
+            return re_oom(ctx, r);
+        repv = js_value_from_cell(&rep->gc);
+    }
+    if (!re_pristine(ctx, rxv, RE_NEED_EXEC | RE_NEED_FLAGS))
+        return replace_generic(ctx, rxv, sv, repv, is_fn, r);
+    return is_fn ? replace_fast_fn(ctx, rxv, sv, repv, r) : replace_fast_str(ctx, rxv, sv, repv, r);
 }
 
 /* ---- split ---- */
 
-bool js_re_str_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
-                     JsValue *r) {
+/* split on a regexp nothing is redefined for: the splitter the spec makes of it (a copy with
+ * "y") is this regexp matched at each position, and no code of the script's runs */
+static bool split_fast(JsContext *ctx, JsValue rxv, JsValue sv, uint32_t lim, JsValue *r) {
     JsVm *vm = ctx->vm;
-    JsRegExp *re = (JsRegExp *)js_value_object(args[0]); /* caller-checked */
-    JsString *s = js_op_to_string(ctx, tv);
-    if (!s)
-        return re_oom(ctx, r);
-    JsValue sv = js_value_from_cell(&s->gc);
-    js_gc_protect(vm, &sv);
-    uint32_t lim; /* after the string, as RegExp.prototype[@@split] converts them */
-    if (!js_split_limit(ctx, ARG(1), &lim)) {
-        js_gc_unprotect(vm, &sv);
-        return re_oom(ctx, r);
-    }
-
+    JsRegExp *re = (JsRegExp *)js_value_object(rxv);
+    JsString *s = js_value_string(sv);
     JsObject *arr = js_array_new_cell(ctx, 0);
-    if (!arr) {
-        js_gc_unprotect(vm, &sv);
+    if (!arr)
         return re_oom(ctx, r);
-    }
     JsValue arrv = js_value_from_cell(&arr->gc);
     js_gc_protect(vm, &arrv);
 
@@ -1470,13 +2203,155 @@ bool js_re_str_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     }
 
     js_gc_unprotect(vm, &arrv);
-    js_gc_unprotect(vm, &sv);
     if (budget)
         return re_budget_throw(ctx, r);
     if (!ok)
         return re_oom(ctx, r);
     *r = arrv;
     return true;
+}
+
+/* S[a, b) appended to the array ARRV. *full: the array has LIM elements now. */
+static bool split_push(JsContext *ctx, JsValue arrv, const JsString *s, double a, double b,
+                       uint32_t lim, bool *full, JsValue *err) {
+    bool oom = false;
+    JsValue piece = substr_or_undef(ctx->vm, s, (int32_t)a, (int32_t)b, &oom);
+    if (oom || !js_array_append(ctx->vm, js_value_object(arrv), piece))
+        return re_oom(ctx, err);
+    *full = js_value_object(arrv)->elem_count >= lim;
+    return true;
+}
+
+/* RegExp.prototype[@@split] (22.2.6.14) as the spec writes it: the splitter is made by the
+ * regexp's species constructor from the regexp and its `flags` with "y", and matched through
+ * its own exec and lastIndex */
+static bool split_generic(JsContext *ctx, JsValue rxv, JsValue sv, JsValue limit, JsValue *r) {
+    JsVm *vm = ctx->vm;
+    JsString *s = js_value_string(sv);
+    enum { CTOR, FL, SPL, ARR, Z, EL, NSLOT };
+    JsValue v[NSLOT];
+    for (int i = 0; i < NSLOT; i++) {
+        v[i] = js_undefined();
+        js_gc_protect(vm, &v[i]);
+    }
+    int sp = js_species(ctx, rxv, ctx->regexp_ctor, &v[CTOR]);
+    bool ok = sp >= 0;
+    if (!ok)
+        *r = v[CTOR];
+    ok = ok && re_get(ctx, rxv, "flags", &v[FL], r) && to_str(ctx, &v[FL], r);
+    bool uni = ok && (str_has(v[FL], 'u') || str_has(v[FL], 'v'));
+    if (ok && !str_has(v[FL], 'y')) {
+        UBuf fb;
+        ub_init(&fb, vm);
+        ub_units(&fb, js_value_string(v[FL])->units, js_value_string(v[FL])->length);
+        ub_unit(&fb, 'y');
+        v[FL] = ub_finish(&fb);
+        if (js_is_undefined(v[FL]))
+            ok = re_oom(ctx, r);
+    }
+    if (ok) {
+        JsValue cargs[2] = {rxv, v[FL]};
+        ok = sp ? js_construct(ctx, v[CTOR], cargs, 2, &v[SPL])
+                : regexp_create(ctx, rxv, v[FL], true, &v[SPL]);
+        if (!ok) {
+            *r = v[SPL];
+            v[SPL] = js_undefined();
+        }
+    }
+    if (ok) {
+        JsObject *arr = js_array_new_cell(ctx, 0);
+        if (arr)
+            v[ARR] = js_value_from_cell(&arr->gc);
+        else
+            ok = re_oom(ctx, r);
+    }
+    uint32_t lim = 0;
+    if (ok && !js_split_limit(ctx, limit, &lim)) {
+        *r = js_take_error(ctx);
+        ok = false;
+    }
+    double size = s->length, p = 0, q = 0;
+    bool full = lim == 0;
+    if (ok && !full && s->length == 0) {
+        if (!regexp_exec(ctx, v[SPL], sv, &v[Z])) {
+            *r = v[Z];
+            v[Z] = js_undefined();
+            ok = false;
+        } else if (js_is_null(v[Z]) && !js_array_append(vm, js_value_object(v[ARR]), sv)) {
+            ok = re_oom(ctx, r);
+        }
+        full = true; /* and no tail */
+    }
+    while (ok && !full && q < size) {
+        double e = 0, ncap = 0;
+        if (!js_native_charge(ctx)) {
+            *r = js_take_error(ctx);
+            ok = false;
+            break;
+        }
+        if (!re_put(ctx, v[SPL], "lastIndex", js_number(q), r)) {
+            ok = false;
+            break;
+        }
+        if (!regexp_exec(ctx, v[SPL], sv, &v[Z])) {
+            *r = v[Z];
+            v[Z] = js_undefined();
+            ok = false;
+            break;
+        }
+        if (!js_is_null(v[Z]) && !re_get_integer(ctx, v[SPL], "lastIndex", true, &e, r)) {
+            ok = false;
+            break;
+        }
+        e = e > size ? size : e;
+        if (js_is_null(v[Z]) || e == p) {
+            q = advance_index(s, (uint32_t)q, uni);
+            continue;
+        }
+        ok = split_push(ctx, v[ARR], s, p, q, lim, &full, r);
+        if (!ok || full)
+            break;
+        p = e;
+        ok = re_get_integer(ctx, v[Z], "length", true, &ncap, r);
+        ncap = ncap > 0 ? ncap - 1 : 0;
+        for (double i = 1; ok && !full && i <= ncap; i++) {
+            if (!js_native_charge(ctx)) {
+                *r = js_take_error(ctx);
+                ok = false;
+            } else if (re_get_index(ctx, v[Z], i, &v[EL], r)) {
+                if (!js_array_append(vm, js_value_object(v[ARR]), v[EL]))
+                    ok = re_oom(ctx, r);
+                full = js_value_object(v[ARR])->elem_count >= lim;
+            } else {
+                ok = false;
+            }
+        }
+        q = p;
+    }
+    if (ok && !full)
+        ok = split_push(ctx, v[ARR], s, p, size, lim, &full, r);
+    if (ok)
+        *r = v[ARR];
+    for (int i = NSLOT - 1; i >= 0; i--)
+        js_gc_unprotect(vm, &v[i]);
+    return ok;
+}
+
+bool js_re_str_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
+                     JsValue *r) {
+    JsValue rxv = args[0], limit = ARG(1); /* caller-checked: js_regexp_like */
+    JsString *s = js_native_string(ctx, tv);
+    if (!s)
+        return re_oom(ctx, r);
+    JsValue sv = js_value_from_cell(&s->gc);
+    /* the spec makes the splitter and then converts the limit: an object's conversion is the
+     * script's code, which may change the regexp the fast path would still be reading */
+    if (obj_type(limit) || !re_pristine(ctx, rxv, RE_NEED_EXEC | RE_NEED_FLAGS | RE_NEED_CTOR))
+        return split_generic(ctx, rxv, sv, limit, r);
+    uint32_t lim;
+    if (!js_split_limit(ctx, limit, &lim))
+        return re_oom(ctx, r);
+    return split_fast(ctx, rxv, sv, lim, r);
 }
 
 /* ---- registration ---- */
@@ -1623,9 +2498,9 @@ static bool rexp_compile(JsContext *ctx, JsValue tv, const JsValue *args, int ar
     JsValue pv = ARG(0), fv = ARG(1);
     if (js_regexp_is(pv) && !js_is_undefined(fv))
         return re_throw(ctx, r, "TypeError: Cannot supply flags when constructing one RegExp from another");
-    JsValue rev, cargs[2] = {pv, fv};
+    JsValue rev;
     js_gc_protect(ctx->vm, &tv);
-    bool ok = g_RegExp(ctx, js_undefined(), cargs, js_regexp_is(pv) ? 1 : 2, &rev);
+    bool ok = regexp_create(ctx, pv, fv, false, &rev);
     if (ok) {
         /* swap the compiled pattern in: the new cell, holding the old one, goes to the collector */
         JsRegExp *re = (JsRegExp *)js_value_object(tv), *nre = (JsRegExp *)js_value_object(rev);
@@ -1687,7 +2562,21 @@ bool js_regexp_builtins_init(JsContext *ctx) {
         if (!js_object_set_accessor(ctx, statics, legacy_names[i], JS_ACC_RE_LEGACY_GET + i,
                                     JS_ACC_RE_LEGACY_SET + i))
             return false;
-    return def_method(ctx, statics, "escape", re_escape);
+    if (!def_method(ctx, statics, "escape", re_escape))
+        return false;
+    /* what the fast paths take to be as it was made (re_pristine) */
+    static const char *const watched[] = {
+        [JS_INTACT_RE_EXEC] = "exec",           [JS_INTACT_RE_FLAGS] = "flags",
+        [JS_INTACT_RE_HASINDICES] = "hasIndices", [JS_INTACT_RE_GLOBAL] = "global",
+        [JS_INTACT_RE_IGNORECASE] = "ignoreCase", [JS_INTACT_RE_MULTILINE] = "multiline",
+        [JS_INTACT_RE_DOTALL] = "dotAll",       [JS_INTACT_RE_UNICODE] = "unicode",
+        [JS_INTACT_RE_UNICODESETS] = "unicodeSets", [JS_INTACT_RE_STICKY] = "sticky",
+        [JS_INTACT_RE_CONSTRUCTOR] = "constructor", [JS_INTACT_RE_SOURCE] = "source",
+    };
+    for (unsigned id = 0; id < sizeof watched / sizeof watched[0]; id++)
+        if (watched[id] && !js_intact_watch(ctx, id, ctx->regexp_proto, watched[id]))
+            return false;
+    return true;
 }
 
 #else /* !LAMASSU_HAS_REGEX: keep the translation unit non-empty */

@@ -5,7 +5,8 @@
  *
  * A regexp is a JS_KIND_OBJECT cell with obj_kind == JS_OBJ_REGEXP whose
  * cell embeds the compiled Program. lastIndex is its one own property, kept
- * in the cell (js_regexp_prop_get/_set), not in the props map; source, flags
+ * in the cell (js_regexp_prop_get/_set), not in the props map: whatever value
+ * a script wrote, which a match converts (ToLength); source, flags
  * and the flag booleans are RegExp.prototype's accessors (js_regexp_accessor),
  * found by the ordinary prototype walk, as the spec has them.
  * Scripts may still add their own expando properties via the normal map.
@@ -50,7 +51,8 @@ typedef struct JsRegExp {
     JsObject obj;     /* obj_kind == JS_OBJ_REGEXP; props hold expandos only */
     JsString *source; /* pattern text as written ("(?:)" for empty) */
     JsString *flags;  /* normalized flags, spec order "dgimsuvy" */
-    double last_index;
+    JsValue last_index;    /* any value; a number unless a script wrote something else */
+    bool last_index_ro;    /* Object.defineProperty made it read-only (obj_flags then has JS_OBJ_ATTRS) */
     bool global;      /* /g lives here; the engine VM never needs it */
     /*
      * The engine's match-time scratch, kept between calls instead of built
@@ -108,12 +110,17 @@ void   js_regexp_mark(JsVm *vm, JsObject *o);
 size_t js_regexp_release(JsVm *vm, JsObject *o);
 
 /* lastIndex, the own property a regexp keeps in its cell (js_interp.c get_property and
- * set_property). *handled says whether the key was it. Set: false with *errmsg NULL when the
- * conversion threw (pending). */
+ * set_property). Get: *handled says whether the key was it. Set: true when the key was it, and
+ * VAL is written (the caller has asked js_regexp_last_index_readonly). */
 bool js_regexp_prop_get(JsContext *ctx, JsObject *o, JsValue key, JsValue *out,
                         bool *handled);
-bool js_regexp_prop_set(JsContext *ctx, JsObject *o, JsValue key, JsValue val,
-                        bool *handled, const char **errmsg);
+bool js_regexp_prop_set(JsObject *o, JsValue key, JsValue val);
+/* Object.defineProperty's write of it: the value, and read-only from then on when READONLY (it
+ * is never enumerable or configurable, and cannot be made writable again) */
+void js_regexp_define_last_index(JsObject *o, JsValue val, bool readonly);
+static inline bool js_regexp_last_index_readonly(const JsObject *o) {
+    return ((const JsRegExp *)o)->last_index_ro || (o->obj_flags & JS_OBJ_FROZEN) != 0;
+}
 
 /* "/source/flags" for ToString; NULL on OOM. */
 JsString *js_regexp_repr(JsContext *ctx, JsObject *o);
@@ -123,9 +130,20 @@ JsString *js_regexp_repr(JsContext *ctx, JsObject *o);
  * Called from js_builtins_init. */
 bool js_regexp_builtins_init(JsContext *ctx);
 
-/* Regex-aware String methods (registered/delegated from js_builtins.c).
- * match/matchAll/search coerce a non-regexp argument through ToString into
- * a pattern per spec; replace/split are called only for regexp arguments. */
+/* V is RegExp.prototype or inherits from it: what String.prototype's match, matchAll, replace,
+ * search and split hand the work to (in V8 through the prototype's Symbol.match and the others;
+ * there are no symbols here, so these are the methods and a script cannot replace them, only
+ * what they read: exec, flags, constructor, lastIndex). */
+bool js_regexp_like(JsContext *ctx, JsValue v);
+/* IsRegExp(V) (7.2.8): that, or a regexp whatever its prototype */
+bool js_regexp_isregexp(JsContext *ctx, JsValue v);
+/* matchAll's and replaceAll's check of an argument that is a regexp (IsRegExp): its `flags`
+ * must have "g". False thrown. */
+bool js_re_global_check(JsContext *ctx, JsValue v, bool match_all, JsValue *r);
+
+/* The String methods' regexp side (registered/delegated from js_builtins.c). match, matchAll
+ * and search make a regexp of an argument that is not js_regexp_like; replace and split are
+ * called only for one that is. */
 bool js_re_str_match(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                      JsValue *r);
 bool js_re_str_matchAll(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
@@ -133,13 +151,13 @@ bool js_re_str_matchAll(JsContext *ctx, JsValue tv, const JsValue *args, int arg
 bool js_re_str_search(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                       JsValue *r);
 bool js_re_str_replace(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
-                       JsValue *r, bool all);
-/* One step of a RegExp String Iterator (js_iter.h): the match at or after *POS as exec's
- * result in *OUT, and *POS past it; 1 matched, 0 none left, -1 thrown (*OUT the error). REV and
- * SV must be rooted. */
-int js_re_iter_step(JsContext *ctx, JsValue rev, JsValue sv, uint32_t *pos, JsValue *out);
+                       JsValue *r);
 bool js_re_str_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                      JsValue *r);
+/* One step of the RegExp String Iterator IT (js_iter.h), which the caller has rooted: 1 with
+ * exec's result in *OUT, 0 none left, -1 thrown (*OUT the error). */
+struct JsIterObj;
+int js_re_iter_step(JsContext *ctx, struct JsIterObj *it, JsValue *out);
 
 #endif /* LAMASSU_HAS_REGEX */
 

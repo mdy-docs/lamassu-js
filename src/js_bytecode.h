@@ -466,6 +466,9 @@ void js_native_builtin_ctor(JsValue ctor, JsObject *proto);
 /* Whether `new` may call V (V8's IsConstructor): a script function other than an arrow, a method
  * or an async function, a builtin or host constructor, or a function from bind() of one */
 bool js_is_constructor(JsValue v);
+/* Construct(F, args): `new F(...args)`. F and ARGS rooted by the caller. False thrown, *result
+ * the error. */
+bool js_construct(JsContext *ctx, JsValue fn, const JsValue *args, int argc, JsValue *result);
 /* Whether FN has `prototype` as its own property: a constructor, other than one from bind() */
 bool js_function_has_own_prototype(JsValue fn);
 /* js_object_set_ascii, the property not enumerable (JS_ATTR_HIDDEN), as V8 makes a built-in one */
