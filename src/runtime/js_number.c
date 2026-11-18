@@ -65,6 +65,64 @@ int32_t js_to_int32(double d) {
     return (int32_t)js_to_uint32(d);
 }
 
+/* The remainder of X / Y with the sign of X, exactly, as the `%` operator and C's fmod define it:
+ * the significands are divided in integers (no libm, no rounding), 11 bits at a time. */
+double js_fmod(double x, double y) {
+    /* two int32s (the usual case, as in V8): the integer remainder, -0 for a negative x it divides */
+    if (x >= -2147483648.0 && x <= 2147483647.0 && y >= -2147483648.0 && y <= 2147483647.0) {
+        int32_t ix = (int32_t)x, iy = (int32_t)y;
+        if ((double)ix == x && (double)iy == y && iy != 0) {
+            int32_t r = iy == -1 ? 0 : ix % iy; /* INT32_MIN % -1 overflows in C */
+            return r ? (double)r : 0.0 * x;
+        }
+    }
+    uint64_t ux, uy;
+    __builtin_memcpy(&ux, &x, 8);
+    __builtin_memcpy(&uy, &y, 8);
+    int ex = (int)(ux >> 52 & 0x7ff), ey = (int)(uy >> 52 & 0x7ff);
+    uint64_t sign = ux & (1ull << 63);
+    if ((uy << 1) == 0 || y != y || ex == 0x7ff) /* y zero or NaN, x infinite or NaN */
+        return __builtin_nan("");
+    if ((ux << 1) <= (uy << 1)) /* |x| <= |y| (y infinite included): x, or 0 when equal */
+        return (ux << 1) == (uy << 1) ? 0.0 * x : x;
+    /* the significands as integers with the implicit bit, subnormals normalized */
+    uint64_t i;
+    if (!ex) {
+        for (i = ux << 12; !(i >> 63); ex--, i <<= 1)
+            ;
+        ux <<= -ex + 1;
+    } else {
+        ux = (ux & (~0ull >> 12)) | (1ull << 52);
+    }
+    if (!ey) {
+        for (i = uy << 12; !(i >> 63); ey--, i <<= 1)
+            ;
+        uy <<= -ey + 1;
+    } else {
+        uy = (uy & (~0ull >> 12)) | (1ull << 52);
+    }
+    /* (ux * 2^(ex - ey)) mod uy: both are below 2^53, so a remainder shifted by 11 bits fits */
+    ux %= uy;
+    for (int d = ex - ey; d > 0 && ux;) {
+        int k = d < 11 ? d : 11;
+        ux = (ux << k) % uy;
+        d -= k;
+    }
+    if (!ux)
+        return 0.0 * x;
+    ex = ey;
+    for (; !(ux >> 52); ux <<= 1, ex--)
+        ;
+    if (ex > 0)
+        ux = (ux - (1ull << 52)) | ((uint64_t)ex << 52);
+    else
+        ux >>= -ex + 1; /* a subnormal result */
+    ux |= sign;
+    double r;
+    __builtin_memcpy(&r, &ux, 8);
+    return r;
+}
+
 uint32_t js_to_uint32(double d) {
     if (d != d)
         return 0;

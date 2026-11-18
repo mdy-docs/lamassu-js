@@ -16,10 +16,8 @@
  * rooted via ctx->fiber), never on the C stack — so any opcode may allocate
  * and trigger collection safely, and later phases get suspension for free.
  *
- * Semantics notes (documented approximations, revisited with builtins):
- * - % is a - trunc(a/b)*b (may differ in the last ulp for extreme ratios).
- * - ** supports integer exponents and ±0.5 exactly; other fractional
- *   exponents yield NaN (TODO transcendental pow).
+ * Semantics notes:
+ * - % is the exact remainder (js_fmod), ** is Math.pow (js_pow_op).
  * - delete on array elements writes undefined instead of making a hole.
  */
 
@@ -404,40 +402,13 @@ __attribute__((noinline)) static int js_compare_values(JsContext *ctx, JsValue a
     return da == db ? 0 : 1;
 }
 
-static double js_fmod_approx(double a, double b) {
-    if (a != a || b != b || b == 0.0 || a - a != 0.0 /* a inf */)
+/* X ** Y and Math.pow(X, Y), one function as in V8 (`2 ** -1074 === Math.pow(2, -1074)`). C's pow
+ * answers 1 for `1 ** NaN` and `(-1) ** Infinity`; Number::exponentiate (and V8) answer NaN for an
+ * exponent that is NaN, and for a base of 1 or -1 with an infinite one. */
+double js_pow_op(double base, double e) {
+    if (e != e || ((base == 1.0 || base == -1.0) && e - e != 0.0))
         return __builtin_nan("");
-    if (b - b != 0.0) /* b inf, a finite */
-        return a;
-    if (a == 0.0)
-        return a;
-    double q = __builtin_trunc(a / b);
-    return a - q * b;
-}
-
-static double js_pow_op(double base, double e) {
-    if (e == 0.0)
-        return 1.0;
-    if (e != e)
-        return __builtin_nan("");
-    if (e == 0.5)
-        return __builtin_sqrt(base);
-    if (e == -0.5)
-        return 1.0 / __builtin_sqrt(base);
-    if (e == __builtin_trunc(e) && e >= -9007199254740992.0 &&
-        e <= 9007199254740992.0) {
-        bool neg = e < 0;
-        uint64_t n = (uint64_t)(neg ? -e : e);
-        double result = 1.0, acc = base;
-        while (n) {
-            if (n & 1)
-                result *= acc;
-            acc *= acc;
-            n >>= 1;
-        }
-        return neg ? 1.0 / result : result;
-    }
-    return __builtin_nan(""); /* TODO transcendental pow */
+    return js_k_pow(base, e);
 }
 
 /* ---- property access ---- */
@@ -3283,7 +3254,7 @@ run:; /* (re)load the top frame */
                 case JS_OP_SUB: r = a - b; break;
                 case JS_OP_MUL: r = a * b; break;
                 case JS_OP_DIV: r = a / b; break;
-                case JS_OP_MOD: r = js_fmod_approx(a, b); break;
+                case JS_OP_MOD: r = js_fmod(a, b); break;
                 default: r = js_pow_op(a, b); break;
                 }
                 fb->sp--;

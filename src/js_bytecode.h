@@ -523,6 +523,10 @@ double  js_units_to_number(const uint16_t *units, size_t len);
 bool js_str_this_check(JsContext *ctx, JsValue this_val, JsValue *result);
 int32_t js_to_int32(double d);
 uint32_t js_to_uint32(double d);
+/* X % Y for numbers, exactly (js_number.c) */
+double js_fmod(double x, double y);
+/* X ** Y for numbers, as the `**` operator computes it (js_interp.c) */
+double js_pow_op(double base, double e);
 JsString *js_number_to_string(JsVm *vm, double d);
 /* D finite and > 0. The shortest digits that read back as D (Number::toString's), and every digit
  * of D's exact value (at most 767 significant), as ASCII into DIGITS without trailing zeros: the

@@ -397,6 +397,14 @@ Constants: `PI`, `E`, `LN2`, `LN10`, `LOG2E`, `LOG10E`, `SQRT2`,
 `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `pow`, `min`, `max`, `hypot`,
 `fround`, `f16round`, `clz32`, `imul`, `random`.
 
+`Math.pow` and the `**` operator are one function, as in V8 (`2 ** -1074 === Math.pow(2,
+-1074)`): Arm's pow, the one glibc and musl ship (worst case 0.54 ulp, correctly rounded in
+nearly every case), with ECMAScript's own answers where C's differ (`1 ** NaN` and
+`(-1) ** Infinity` are `NaN`). V8 takes the platform's pow, so Node on Linux gives these same
+bits; on macOS or Windows the last digit can differ in rare cases (`10 ** 23` is
+`1.0000000000000001e+23` here and with glibc, `1e+23` with Apple's libm). The `%` operator is the
+exact remainder (`1e17 % 3` is `1`, `5.5 % 0.1` is `0.0999999999999997`).
+
 ## `JSON`
 
 `parse`, `stringify`, `rawJSON`, `isRawJSON`, as V8 has them.

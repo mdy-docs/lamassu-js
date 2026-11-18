@@ -84,7 +84,7 @@ static uint16_t to_uint16(double d) {
     d = to_int(d);
     if (d == __builtin_inf() || d == -__builtin_inf())
         return 0;
-    double m = __builtin_fmod(d, 65536.0);
+    double m = js_fmod(d, 65536.0);
     if (m < 0)
         m += 65536.0;
     return (uint16_t)m; /* m is now in [0, 65536) — safe */
@@ -4337,7 +4337,7 @@ static bool math_pow(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
     double x, y;
     TO_NUM(x, ARG(0));
     TO_NUM(y, ARG(1));
-    *r = js_number(js_k_pow(x, y));
+    *r = js_number(js_pow_op(x, y));
     return true;
 }
 
