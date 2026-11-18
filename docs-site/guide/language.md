@@ -45,7 +45,11 @@ supported. `debugger;` is a statement that does nothing (there is no debugger to
   its enclosing function's); outside a function it is V8's `SyntaxError: new.target expression
   is not allowed here`.
 - Duplicate parameter names are a `SyntaxError`, and so is a `let` or `const` of the body
-  that takes a parameter's name.
+  that takes a parameter's name. A name declared twice in one scope is a `SyntaxError` where
+  the second is read, as in V8; a function declared at the top level of a function's body is a
+  `var` there, so it may take a parameter's name or repeat another function's, the later one
+  being what the name holds from the start. In a block or at a module's top level a function is
+  lexical and may not be declared twice.
 
 ## Objects, arrays, and constructors
 

@@ -254,11 +254,9 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   - `for (a.async of xs)` is accepted, as the specification has it. V8 refuses it (`The left-hand
     side of a for-of loop may not be 'async'`), meaning to refuse only `for (async of xs)`,
     which lamassu refuses too.
-  - Redeclarations (`Identifier 'x' has already been declared`), duplicate parameter names and
-    invalid regular expression literals are found after the source has parsed. Alone in a
-    source they are reported as V8 reports them; in a source with another syntax error as well,
-    that other error is the one reported, even when it comes later (`let x; let x; 1 +` is
-    `Unexpected end of input` here, the redeclaration in V8).
+  - A catch block that redeclares more than one name its parameter's pattern binds (`catch ([a,
+    b]) { let b; let a; }`) reports the first of them in the source. V8 reports the one its hash
+    table gives first, which changes from one run of node to the next.
   - `([f(a.b = 1)]) => 1` is `Invalid destructuring assignment target`; V8 says `Illegal
     property in declaration context`.
 - **Out-of-memory errors may still be bare strings**: when the engine
@@ -332,6 +330,16 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   first such word of an export list is what is reported whatever else is wrong after it, and it
   comes before `Export 'x' is not defined in module`. The one difference is the string names
   lamassu leaves out (see Syntax, above).
+- **A module's declarations and exports are checked as V8 checks them**, by the parser, so an
+  error about them comes in the same order relative to other syntax errors as in V8. An import
+  binding clashes with any other declaration of its name (`import { a } from 'm'; let a;`; V8
+  points a default or namespace import's clash at `import`). Once the module is read, a name
+  exported twice is `Duplicate export of 'x'` (counting `export default`, `export * as x` and
+  re-exports), and only then is an export of an undeclared name `Export 'x' is not defined in
+  module`; of several, the one V8 picks, by its order of local names. Two `export default`
+  declarations are V8's `Identifier '.default' has already been declared`, its name for the
+  hidden binding of a default export. `export { x } from ""` is a re-export from the module
+  `""`.
 - **A module specifier may not contain U+0000** (`SyntaxError`, or a rejected `import()`): a
   module request carries its import attributes after one.
 - **A graph may be 3000 modules deep along its imports.** No walk over a module graph is on

@@ -1010,11 +1010,9 @@ static bool declare_local(JsCompiler *cx, const uint16_t *name, uint32_t len,
         /* unnamed slots (destructuring parameters) never clash */
         if (!units_equal(fs->locals[i].name, fs->locals[i].len, name, len))
             continue;
-        if (cx->binding_params) /* V8 points at the second of the two */
-            return cerr(cx, pos > fs->locals[i].pos ? pos : fs->locals[i].pos,
-                        "Duplicate parameter name not allowed in this context");
-        return cerr(cx, pos, js_compile_error_fmt(cx->vm, "Identifier '%U' has already been declared",
-                                                  name, len));
+        /* the parser reports every clash (as V8 does, where it reads the second name), so one
+         * here is the compiler's own mistake */
+        return cerr(cx, pos, js_compile_error_fmt(cx->vm, "internal: '%U' declared twice", name, len));
     }
     if (fs->slot_count >= JS_MAX_LOCALS)
         return cerr(cx, pos, "too many local variables");
@@ -1206,6 +1204,13 @@ static bool prescan_declarations(JsCompiler *cx, JsAstNode *const *stmts,
             if (cx->module && cx->cur->is_module) {
                 JsModBinding *b = resolve_module_binding(cx, s->units, s->len);
                 if (b && b->kind == JS_MB_EXPORT)
+                    continue;
+            }
+            /* at the top of a function's body a function is a var: a second one of that name
+             * is the same binding, which the later one sets (hoist_functions, in source order) */
+            if (!cx->cur->is_module && cx->cur->scope_depth == 1) {
+                int idx = resolve_local_in(cx->cur, s->units, s->len);
+                if (idx >= (int)scope_floor)
                     continue;
             }
             uint16_t slot;
@@ -2727,19 +2732,8 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
         return emit_op(cx, JS_OP_DYNAMIC_IMPORT, 0);
     case JS_AST_REGEX: {
 #ifdef LAMASSU_HAS_REGEX
-        /* early SyntaxError: validate the pattern now; the opcode recompiles
-         * it at evaluation (a literal yields a fresh object each time) */
-        const char *em = js_regexp_validate(cx->vm, n->units, n->len,
-                                            n->units2, n->len2);
-        if (em) {
-            /* V8: "Invalid regular expression flags", or the pattern and the reason */
-            if (strcmp(em, JS_REGEXP_FLAGS_ERROR) == 0)
-                return cerr(cx, n->pos, "Invalid regular expression flags");
-            if (strncmp(em, "SyntaxError: ", 13) == 0)
-                return cerr(cx, n->pos, js_compile_error_fmt(cx->vm, "Invalid regular expression: /%U/%U: %s",
-                                                             n->units, n->len, n->units2, n->len2, em + 13));
-            return cerr(cx, n->pos, em);
-        }
+        /* the parser has checked the pattern (an early error); the opcode compiles it at
+         * evaluation (a literal yields a fresh object each time) */
         uint16_t csrc, cflags;
         if (!atom_const(cx, n->units, n->len, n->pos, &csrc) ||
             !atom_const(cx, n->units2, n->len2, n->pos, &cflags))
@@ -4008,8 +4002,8 @@ static bool list_export(JsCompiler *cx, ModAnalysis *an, const JsAstNode *module
             return mbind_add_export(cx, cap, name, len, exp, exp_len, false, false);
         }
     }
-    return cerr(cx, sp->pos, js_compile_error_fmt(cx->vm, "Export '%U' is not defined in module",
-                                                  name, len));
+    /* the parser reports an export of an undeclared name (exports_check) */
+    return cerr(cx, sp->pos, js_compile_error_fmt(cx->vm, "internal: export '%U' not bound", name, len));
 }
 
 /* Gives the exports object every name the module itself exports before anything runs: linking
@@ -4154,7 +4148,7 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
                     if (!mbind_add_export(cx, &an.cap, d->units, d->len, NULL, 0, false, false))
                         return false;
                 }
-            } else if (n->len) { /* export { x as y } from 'm' (re-export) */
+            } else if (n->flags & JS_F_REEXPORT) { /* export { x as y } from 'm' (re-export) */
                 JsString *spec = module_request(cx, n);
                 if (!spec || !mod_add_dep(cx, mod, spec))
                     return cerr(cx, n->pos, "out of memory");
@@ -4182,7 +4176,7 @@ static bool analyze_module(JsCompiler *cx, const JsAstNode *module, JsModule *mo
     }
     for (uint32_t i = 0; i < module->count; i++) {
         const JsAstNode *n = module->items[i];
-        if (n->kind != JS_AST_EXPORT_NAMED || n->a || n->len)
+        if (n->kind != JS_AST_EXPORT_NAMED || n->a || (n->flags & JS_F_REEXPORT))
             continue;
         for (uint32_t s = 0; s < n->count; s++)
             if (!list_export(cx, &an, module, mod, n->items[s]))

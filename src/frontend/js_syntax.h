@@ -169,6 +169,7 @@ typedef enum JsAstKind {
 #define JS_F_TRUE        0x01 /* BOOL_LIT */
 #define JS_F_HAS_TLA     0x01 /* MODULE: uses top-level await */
 #define JS_F_DEFAULT_DECL 0x01 /* EXPORT_DEFAULT: `export default function ...` (not an expression) */
+#define JS_F_REEXPORT     0x02 /* EXPORT_NAMED: `export { ... } from 'm'` (the specifier may be "") */
 #define JS_F_SPEC_DEFAULT 0x01 /* IMPORT_SPEC */
 #define JS_F_SPEC_NS      0x02 /* IMPORT_SPEC */
 #define JS_F_COVER_SPREAD 0x01 /* COVER */
@@ -195,10 +196,12 @@ struct JsAstNode {
     const uint16_t *units2; uint32_t len2; /* second name (regex flags, spec local, export alias) */
     JsAstNode *a, *b, *c, *d;
     JsAstNode **items; uint32_t count;
-    uint32_t src_start, src_end; /* FUNC_*: the source text Function.prototype.toString gives */
+    /* FUNC_*: the source text Function.prototype.toString gives; EXPORT_ALL with `as`: where
+     * the name after it is (src_start) */
+    uint32_t src_start, src_end;
     /* Where V8 places the operation, for errors and stack frames: MEMBER the property (its name,
      * or `[`); CALL the callee's name when it is a name or a member's name, else the `(`;
-     * EXPORT_ALL the `*`. */
+     * EXPORT_ALL the `*`; EXPORT_DEFAULT the `default`. */
     uint32_t pos2;
 };
 

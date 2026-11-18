@@ -1,5 +1,7 @@
+#include <stdio.h>
 #include <string.h>
 #include "js_syntax.h"
+#include "js_regexp.h"
 
 /*
  * Recursive-descent / Pratt parser for the lamassu subset: always strict,
@@ -57,7 +59,52 @@ typedef struct JsParser {
     uint32_t prev_end; /* end of the token before the current one: where a function's text ends */
     uint32_t prev_pos; /* and where that token starts: V8 points some errors at the last token read */
     bool no_in;        /* in a `for (` head: `in` is no operator here */
+    /* Declarations, checked as V8 checks them while it reads (Scope::Declare), so a name
+     * declared twice is an error where the second one is read and before anything after it:
+     * the scopes the parser is in, innermost last, and the names declared in them, each
+     * scope's from its base on. */
+    struct JsPDecl *decls;
+    uint32_t decl_count, decl_cap;
+    struct JsPScope *scopes;
+    uint32_t scope_count, scope_cap;
+    int8_t bind_kind;  /* what a binding name read now declares (JS_BIND_*), NONE in expressions */
+    bool body_block;   /* the block about to be read is a function's body: the function's scope */
+    bool catch_block;  /* the block about to be read is a catch clause's: checked at its end */
+    bool default_fn;   /* parse_func_common reads `export default function`: it declares */
+    /* The module's exports, for V8's checks once the module is read (Validate) */
+    struct JsPExport *exports;
+    uint32_t export_count, export_cap, ns_exports;
 } JsParser;
+
+/* What a declaration is, for which others it clashes with: a let, const, import, catch parameter
+ * or function in a block or the module (lexical); a function at the top level of a function's
+ * body, which V8 declares as a `var` (two of them, or one and a parameter, do not clash); a
+ * parameter (two of them are the parameter list's own error, once the list is read). */
+enum { JS_BIND_NONE = -1, JS_BIND_LEX = 0, JS_BIND_FN_VAR, JS_BIND_PARAM };
+enum { JS_SCOPE_BLOCK, JS_SCOPE_FUNC, JS_SCOPE_CATCH, JS_SCOPE_MODULE };
+
+typedef struct JsPDecl {
+    const uint16_t *name;
+    uint32_t len;
+    uint32_t pos; /* where V8 points an error about it */
+    int8_t kind;
+} JsPDecl;
+
+typedef struct JsPScope {
+    uint32_t base; /* its first declaration */
+    uint8_t kind;
+} JsPScope;
+
+/* One export, as V8's module descriptor has it: a local one (`export { a as b }`, a declaration,
+ * `export default`, and `export * as b`, which V8 makes an import of a hidden name exported), or
+ * a re-export of another module's (SPECIAL) */
+typedef struct JsPExport {
+    const uint16_t *local, *name;
+    uint32_t local_len, name_len;
+    uint32_t pos;
+    bool special;
+    bool defined; /* its local name is declared here by what made it */
+} JsPExport;
 
 /* What a label names, for `continue`: nothing a `continue` can see (V8: "Undefined label"), a
  * statement that is not a loop ("does not denote an iteration statement"), or a loop. `break`
@@ -257,6 +304,221 @@ static JsAstNode *perr_earlier(JsParser *p, uint32_t pos, uint32_t end, const ch
     return NULL;
 }
 
+/* ---- declarations ---- */
+
+static bool same_name(const uint16_t *a, uint32_t alen, const uint16_t *b, uint32_t blen) {
+    return alen == blen && memcmp(a, b, (size_t)alen * sizeof *a) == 0;
+}
+
+static bool grow_array(JsParser *p, void **items, uint32_t count, uint32_t *cap, size_t size) {
+    if (count < *cap)
+        return true;
+    uint32_t ncap = *cap ? *cap * 2 : 16;
+    void *n = js_arena_alloc(p->arena, (size_t)ncap * size);
+    if (!n) {
+        perr(p, TOK(p).pos, "out of memory");
+        return false;
+    }
+    if (count)
+        memcpy(n, *items, (size_t)count * size);
+    *items = n;
+    *cap = ncap;
+    return true;
+}
+
+static bool scope_push(JsParser *p, uint8_t kind) {
+    if (!grow_array(p, (void **)&p->scopes, p->scope_count, &p->scope_cap, sizeof *p->scopes))
+        return false;
+    p->scopes[p->scope_count++] = (JsPScope){p->decl_count, kind};
+    return true;
+}
+
+static void scope_pop(JsParser *p) {
+    if (p->scope_count)
+        p->decl_count = p->scopes[--p->scope_count].base;
+}
+
+static bool fail_redeclared(JsParser *p, const uint16_t *name, uint32_t len, uint32_t pos) {
+    perr(p, pos, js_compile_error_fmt(p->arena->vm, "Identifier '%U' has already been declared", name, len));
+    return false;
+}
+
+/* Declares NAME in the innermost scope, as KIND; POS is where an error about it points */
+static bool declare(JsParser *p, const uint16_t *name, uint32_t len, uint32_t pos, int8_t kind) {
+    const JsPScope *s = &p->scopes[p->scope_count - 1];
+    for (uint32_t i = s->base; i < p->decl_count; i++) {
+        const JsPDecl *d = &p->decls[i];
+        if (!same_name(d->name, d->len, name, len))
+            continue;
+        if (kind == JS_BIND_PARAM && d->kind == JS_BIND_PARAM)
+            continue; /* the parameter list's own error (params_check) */
+        if (kind == JS_BIND_FN_VAR && d->kind != JS_BIND_LEX)
+            continue; /* a var over a var or a parameter */
+        return fail_redeclared(p, name, len, pos);
+    }
+    if (!grow_array(p, (void **)&p->decls, p->decl_count, &p->decl_cap, sizeof *p->decls))
+        return false;
+    p->decls[p->decl_count++] = (JsPDecl){name, len, pos, kind};
+    return true;
+}
+
+/* What a function declaration is where it is read: a var at the top of a function's body */
+static int8_t function_kind(const JsParser *p) {
+    return p->scopes[p->scope_count - 1].kind == JS_SCOPE_FUNC ? JS_BIND_FN_VAR : JS_BIND_LEX;
+}
+
+/* Every name a parameter or declaration pattern binds, in source order */
+static bool declare_pattern(JsParser *p, const JsAstNode *pat, int8_t kind) {
+    switch ((JsAstKind)pat->kind) {
+    case JS_AST_IDENT:
+        return declare(p, pat->units, pat->len, pat->pos, kind);
+    case JS_AST_DEFAULT:
+    case JS_AST_REST:
+        return declare_pattern(p, pat->a, kind);
+    case JS_AST_ARRAY_PATTERN:
+        for (uint32_t i = 0; i < pat->count; i++)
+            if (pat->items[i]->kind != JS_AST_HOLE && !declare_pattern(p, pat->items[i], kind))
+                return false;
+        return true;
+    case JS_AST_OBJECT_PATTERN:
+        for (uint32_t i = 0; i < pat->count; i++) {
+            const JsAstNode *prop = pat->items[i];
+            if (!declare_pattern(p, prop->kind == JS_AST_REST ? prop->a : prop->b, kind))
+                return false;
+        }
+        return true;
+    default:
+        return true;
+    }
+}
+
+/* Once a parameter list is read (and before the body): the first parameter that repeats an
+ * earlier one's name, where it is (V8's ValidateFormalParameters, strict as lamassu is) */
+static bool params_check(JsParser *p) {
+    const JsPScope *s = &p->scopes[p->scope_count - 1];
+    for (uint32_t i = s->base + 1; i < p->decl_count; i++)
+        for (uint32_t j = s->base; j < i; j++)
+            if (same_name(p->decls[i].name, p->decls[i].len, p->decls[j].name, p->decls[j].len)) {
+                perr(p, p->decls[i].pos, "Duplicate parameter name not allowed in this context");
+                return false;
+            }
+    return true;
+}
+
+/* At the end of a catch clause's block: a declaration of the block's own that takes the name of
+ * the parameter, or of one the parameter's pattern binds (`catch (e) { let e; }`). V8 checks
+ * this only once the block is read; with more than one such name it reports the one its hash
+ * table gives first, lamassu the first in the source. */
+static bool catch_check(JsParser *p) {
+    const JsPScope *block = &p->scopes[p->scope_count - 1], *clause = block - 1;
+    for (uint32_t i = block->base; i < p->decl_count; i++)
+        for (uint32_t j = clause->base; j < block->base; j++)
+            if (same_name(p->decls[i].name, p->decls[i].len, p->decls[j].name, p->decls[j].len))
+                return fail_redeclared(p, p->decls[i].name, p->decls[i].len, p->decls[i].pos);
+    return true;
+}
+
+static bool export_add(JsParser *p, const uint16_t *local, uint32_t local_len, const uint16_t *name,
+                       uint32_t name_len, uint32_t pos, bool special, bool defined) {
+    if (!grow_array(p, (void **)&p->exports, p->export_count, &p->export_cap, sizeof *p->exports))
+        return false;
+    p->exports[p->export_count++] = (JsPExport){local, name, local_len, name_len, pos, special, defined};
+    return true;
+}
+
+/* The order of V8's AstRawString::Compare: code units, a prefix before the longer name */
+static int name_cmp(const uint16_t *a, uint32_t alen, const uint16_t *b, uint32_t blen) {
+    uint32_t n = alen < blen ? alen : blen;
+    for (uint32_t i = 0; i < n; i++)
+        if (a[i] != b[i])
+            return a[i] < b[i] ? -1 : 1;
+    return alen == blen ? 0 : alen < blen ? -1 : 1;
+}
+
+/* Sorts V[0..N) stably by KEY, which gives each item's name (merge sort; TMP holds N) */
+static void sort_by_name(JsPExport **v, JsPExport **tmp, uint32_t n, bool by_local) {
+    for (uint32_t w = 1; w < n; w *= 2) {
+        for (uint32_t lo = 0; lo < n; lo += 2 * w) {
+            uint32_t mid = lo + w < n ? lo + w : n, hi = lo + 2 * w < n ? lo + 2 * w : n;
+            uint32_t i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) {
+                const JsPExport *a = v[i], *b = v[j];
+                int c = by_local ? name_cmp(b->local, b->local_len, a->local, a->local_len)
+                                 : name_cmp(b->name, b->name_len, a->name, a->name_len);
+                tmp[k++] = c < 0 ? v[j++] : v[i++];
+            }
+            while (i < mid)
+                tmp[k++] = v[i++];
+            while (j < hi)
+                tmp[k++] = v[j++];
+        }
+        memcpy(v, tmp, (size_t)n * sizeof *v);
+    }
+}
+
+/*
+ * Once the module is read, V8's SourceTextModuleDescriptor::Validate: first a name exported twice,
+ * then a local export of a name the module does not declare. V8 keeps the local exports in a map
+ * ordered by local name and the re-exports after them in source order; of the exports whose name
+ * an earlier one in that order already took, it reports the one latest in the source (counting
+ * the first taker of the first such name), and of the undeclared ones the first in that order.
+ */
+static bool exports_check(JsParser *p) {
+    uint32_t n = p->export_count, regular = 0;
+    if (!n)
+        return true;
+    JsPExport **order = js_arena_alloc(p->arena, (size_t)n * sizeof *order);
+    JsPExport **by_name = js_arena_alloc(p->arena, (size_t)n * sizeof *by_name);
+    JsPExport **tmp = js_arena_alloc(p->arena, (size_t)n * sizeof *tmp);
+    JsPExport **first = js_arena_alloc(p->arena, (size_t)n * sizeof *first);
+    if (!order || !by_name || !tmp || !first) {
+        perr(p, 0, "out of memory");
+        return false;
+    }
+    for (uint32_t i = 0; i < n; i++)
+        if (!p->exports[i].special)
+            order[regular++] = &p->exports[i];
+    sort_by_name(order, tmp, regular, true);
+    for (uint32_t i = 0, k = regular; i < n; i++)
+        if (p->exports[i].special)
+            order[k++] = &p->exports[i];
+    /* the first export in that order to take each export's name */
+    memcpy(by_name, order, (size_t)n * sizeof *by_name);
+    sort_by_name(by_name, tmp, n, false);
+    for (uint32_t i = 0; i < n; i++) {
+        bool same = i && same_name(by_name[i]->name, by_name[i]->name_len, by_name[i - 1]->name,
+                                   by_name[i - 1]->name_len);
+        first[by_name[i] - p->exports] = same ? first[by_name[i - 1] - p->exports] : by_name[i];
+    }
+    const JsPExport *dup = NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        JsPExport *e = order[i], *taker = first[e - p->exports];
+        if (taker == e)
+            continue;
+        if (!dup)
+            dup = taker;
+        if (e->pos > dup->pos)
+            dup = e;
+    }
+    if (dup) {
+        perr(p, dup->pos, js_compile_error_fmt(p->arena->vm, "Duplicate export of '%U'", dup->name, dup->name_len));
+        return false;
+    }
+    for (uint32_t i = 0; i < regular; i++) {
+        const JsPExport *e = order[i];
+        if (e->defined)
+            continue;
+        bool found = false;
+        for (uint32_t d = 0; d < p->decl_count && !found; d++)
+            found = same_name(p->decls[d].name, p->decls[d].len, e->local, e->local_len);
+        if (!found) {
+            perr(p, e->pos, js_compile_error_fmt(p->arena->vm, "Export '%U' is not defined in module", e->local, e->local_len));
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool advance(JsParser *p) {
     if (p->err_msg)
         return false;
@@ -419,6 +681,8 @@ static JsAstNode *check_binding_name(JsParser *p, JsAstNode *ident) {
     if (units_is(ident->units, ident->len, "eval") ||
         units_is(ident->units, ident->len, "arguments"))
         return perr(p, ident->pos, "cannot bind 'eval' or 'arguments' in strict mode");
+    if (p->bind_kind != JS_BIND_NONE && !declare(p, ident->units, ident->len, ident->pos, p->bind_kind))
+        return NULL;
     return ident;
 }
 
@@ -860,6 +1124,7 @@ static JsAstNode *parse_pattern_element(JsParser *p) {
     } else if (k == JS_T_LBRACE || k == JS_T_LBRACK) {
         JsLexer lx = p->lx;
         uint32_t prev_end = p->prev_end, prev_pos = p->prev_pos, cover_count = p->cover_count;
+        uint32_t decl_count = p->decl_count;
         JsAstNode *target = parse_binding_target(p);
         if (!target)
             return NULL;
@@ -869,11 +1134,15 @@ static JsAstNode *parse_pattern_element(JsParser *p) {
         p->prev_end = prev_end;
         p->prev_pos = prev_pos;
         p->cover_count = cover_count;
+        p->decl_count = decl_count;
     }
     bool was = p->decl_element;
+    int8_t bind = p->bind_kind;
     p->decl_element = true;
+    p->bind_kind = JS_BIND_NONE;
     JsAstNode *e = parse_assign(p);
     p->decl_element = was;
+    p->bind_kind = bind;
     if (!e)
         return NULL;
     p->pattern_depth++; /* an element: never the whole target */
@@ -1370,12 +1639,19 @@ static void ctx_leave_function(JsParser *p, JsSavedCtx s) {
 
 static JsAstNode *parse_params_inner(JsParser *p, JsNodeVec *out);
 
+/* A function's parameter list, read into the function's scope (opened here: the caller reads
+ * the body into it and closes it), and checked once it is read */
 static JsAstNode *parse_params(JsParser *p, JsNodeVec *out) {
     bool no_in = p->no_in;
+    int8_t bind = p->bind_kind;
     p->no_in = false;
+    if (!scope_push(p, JS_SCOPE_FUNC))
+        return NULL;
+    p->bind_kind = JS_BIND_PARAM;
     JsAstNode *r = parse_params_inner(p, out);
     p->no_in = no_in;
-    return r;
+    p->bind_kind = bind;
+    return r && params_check(p) ? r : NULL;
 }
 
 static JsAstNode *parse_params_inner(JsParser *p, JsNodeVec *out) {
@@ -1420,12 +1696,26 @@ static JsAstNode *parse_func_common(JsParser *p, uint8_t flags, bool need_name,
     uint32_t star_pos = TOK(p).pos;
     if (generator && !advance(p))
         return NULL;
+    /* A declaration declares its name where it is read, before the parameters and the body;
+     * V8 points a clash at `function` (or `async`). `export default function` without a name
+     * declares the hidden binding of the default export there. */
+    bool declares = kind == JS_AST_FUNC_DECL || p->default_fn;
+    bool default_fn = p->default_fn;
+    int8_t bind = p->bind_kind;
+    p->default_fn = false;
+    p->bind_kind = JS_BIND_NONE;
     if (TOK(p).kind == JS_T_IDENT) {
         JsAstNode *name = check_binding_name(p, parse_ident(p, "expected name"));
         if (!name)
             return NULL;
         fn->units = name->units;
         fn->len = name->len;
+        if (declares && !declare(p, name->units, name->len, src_start, function_kind(p)))
+            return NULL;
+    } else if (default_fn) {
+        static const uint16_t dot_default[] = {'.', 'd', 'e', 'f', 'a', 'u', 'l', 't'};
+        if (!declare(p, dot_default, sizeof dot_default / sizeof dot_default[0], src_start, JS_BIND_LEX))
+            return NULL;
     } else if (need_name) {
         /* V8 has words of its own only for the name left out, and points them at `function` */
         if (TOK(p).kind == JS_T_LPAREN)
@@ -1444,9 +1734,12 @@ static JsAstNode *parse_func_common(JsParser *p, uint8_t flags, bool need_name,
         return NULL;
     vec_store(fn, &params);
     JsSavedCtx s = ctx_enter_function(p, (flags & JS_F_ASYNC) != 0, false);
+    p->body_block = true;
     fn->a = parse_block(p);
     ctx_leave_function(p, s);
+    scope_pop(p);
     p->super_ok = super_ok;
+    p->bind_kind = bind;
     fn->src_start = src_start;
     fn->src_end = p->prev_end;
     return fn->a && octal_check(p, src_start) ? fn : NULL;
@@ -1497,16 +1790,28 @@ static JsAstNode *build_arrow(JsParser *p, JsAstNode *params_src, bool is_async,
         }
     }
     vec_store(fn, &params);
+    if (!scope_push(p, JS_SCOPE_FUNC))
+        return NULL;
+    for (uint32_t i = 0; i < params.count; i++)
+        if (!declare_pattern(p, params.items[i], JS_BIND_PARAM))
+            return NULL;
+    if (!params_check(p))
+        return NULL;
 
     JsSavedCtx s = ctx_enter_function(p, is_async, true);
+    int8_t bind = p->bind_kind;
+    p->bind_kind = JS_BIND_NONE;
     if (TOK(p).kind == JS_T_LBRACE) {
+        p->body_block = true;
         fn->a = parse_block(p);
     } else {
         fn->flags |= JS_F_EXPR_BODY;
         p->no_in = s.no_in; /* an expression body is still inside the `for (` head it is in */
         fn->a = parse_assign_scoped(p);
     }
+    p->bind_kind = bind;
     ctx_leave_function(p, s);
+    scope_pop(p);
     fn->src_start = src_start;
     fn->src_end = p->prev_end;
     return fn->a && octal_check(p, src_start) ? fn : NULL;
@@ -1710,8 +2015,10 @@ static JsAstNode *parse_object_literal_inner(JsParser *p) {
                 vec_store(fn, &params);
                 JsSavedCtx s = ctx_enter_function(p, (fn->flags & JS_F_ASYNC) != 0, false);
                 p->super_ok = true;
+                p->body_block = true;
                 fn->a = parse_block(p);
                 ctx_leave_function(p, s);
+                scope_pop(p);
                 p->super_ok = super_ok;
                 if (!fn->a || !octal_check(p, params_pos))
                     return NULL;
@@ -1884,6 +2191,21 @@ static JsAstNode *parse_primary(JsParser *p) {
         n->len = t->u.regex.pattern_len;
         n->units2 = t->u.regex.flags;
         n->len2 = t->u.regex.flags_len;
+#ifdef LAMASSU_HAS_REGEX
+        {
+            /* an early error, where V8's scanner reports it: "Invalid regular expression
+             * flags", or the pattern and the reason */
+            const char *em = js_regexp_validate(p->arena->vm, n->units, n->len, n->units2, n->len2);
+            if (em) {
+                if (strcmp(em, JS_REGEXP_FLAGS_ERROR) == 0)
+                    return perr(p, n->pos, "Invalid regular expression flags");
+                if (strncmp(em, "SyntaxError: ", 13) == 0)
+                    em = js_compile_error_fmt(p->arena->vm, "Invalid regular expression: /%U/%U: %s", n->units,
+                                              n->len, n->units2, n->len2, em + 13);
+                return perr(p, n->pos, em);
+            }
+        }
+#endif
         return advance(p) ? n : NULL;
     case JS_T_NULL:
         n = new_node(p, JS_AST_NULL_LIT, t->pos);
@@ -2545,7 +2867,10 @@ out:
  * cover initializer still open when it ends is an error (V8's ValidateExpression). */
 static JsAstNode *parse_assign_scoped(JsParser *p) {
     uint32_t mark = p->cover_count;
+    int8_t bind = p->bind_kind; /* a default or a key inside a pattern declares nothing */
+    p->bind_kind = JS_BIND_NONE;
     JsAstNode *e = parse_assign(p);
+    p->bind_kind = bind;
     return e && cover_closed(p, mark) ? e : NULL;
 }
 
@@ -2630,9 +2955,17 @@ static void labels_mark(JsParser *p, uint32_t n, uint32_t own, uint8_t kind) {
 
 static JsAstNode *parse_block(JsParser *p) {
     uint32_t pos = TOK(p).pos;
+    /* a function's body is read into the function's scope, any other block into its own */
+    bool body = p->body_block, catch_body = p->catch_block;
+    p->body_block = false;
+    p->catch_block = false;
     if (!enter(p))
         return NULL;
     JsAstNode *result = NULL;
+    if (!body && !scope_push(p, JS_SCOPE_BLOCK)) {
+        leave(p);
+        return NULL;
+    }
     if (!expect(p, JS_T_LBRACE, "expected '{'"))
         goto out;
     {
@@ -2644,12 +2977,16 @@ static JsAstNode *parse_block(JsParser *p) {
         }
         if (!expect(p, JS_T_RBRACE, "expected '}'"))
             goto out;
+        if (catch_body && !catch_check(p))
+            goto out;
         result = new_node(p, JS_AST_BLOCK, pos);
         if (!result)
             goto out;
         vec_store(result, &stmts);
     }
 out:
+    if (!body)
+        scope_pop(p);
     leave(p);
     return result;
 }
@@ -2661,7 +2998,10 @@ static JsAstNode *parse_var_decl(JsParser *p, bool is_const) {
     JsNodeVec decls = {0};
     for (;;) {
         uint32_t bind_pos = TOK(p).pos;
+        int8_t bind = p->bind_kind;
+        p->bind_kind = JS_BIND_LEX;
         JsAstNode *target = parse_binding_target(p);
+        p->bind_kind = bind;
         if (!target)
             return NULL;
         JsAstNode *init = NULL;
@@ -2768,7 +3108,7 @@ static JsAstNode *parse_for_of(JsParser *p, uint32_t pos, uint8_t flags, JsAstNo
     return n->c ? n : NULL;
 }
 
-static JsAstNode *parse_for(JsParser *p) {
+static JsAstNode *parse_for_inner(JsParser *p) {
     uint32_t pos = TOK(p).pos;
     if (!advance(p) || !expect(p, JS_T_LPAREN, "expected '(' after 'for'"))
         return NULL;
@@ -2787,7 +3127,10 @@ static JsAstNode *parse_for(JsParser *p) {
         bool any_init = false;
         for (;;) {
             uint32_t bind_pos = TOK(p).pos;
+            int8_t bind = p->bind_kind;
+            p->bind_kind = JS_BIND_LEX;
             JsAstNode *target = parse_binding_target(p);
+            p->bind_kind = bind;
             if (!target)
                 return NULL;
             uint32_t last_pos = p->prev_pos; /* the binding's last token */
@@ -2898,7 +3241,27 @@ static JsAstNode *parse_for(JsParser *p) {
     return n->d ? n : NULL;
 }
 
+/* A `for` statement: its head's declarations are a scope around the body */
+static JsAstNode *parse_for(JsParser *p) {
+    if (!scope_push(p, JS_SCOPE_BLOCK))
+        return NULL;
+    JsAstNode *n = parse_for_inner(p);
+    scope_pop(p);
+    return n;
+}
+
+static JsAstNode *parse_switch_inner(JsParser *p);
+
+/* A `switch` statement: its cases are one scope */
 static JsAstNode *parse_switch(JsParser *p) {
+    if (!scope_push(p, JS_SCOPE_BLOCK))
+        return NULL;
+    JsAstNode *n = parse_switch_inner(p);
+    scope_pop(p);
+    return n;
+}
+
+static JsAstNode *parse_switch_inner(JsParser *p) {
     uint32_t pos = TOK(p).pos;
     if (!advance(p) || !expect(p, JS_T_LPAREN, "expected '(' after 'switch'"))
         return NULL;
@@ -2969,12 +3332,22 @@ static JsAstNode *parse_try(JsParser *p) {
     if (TOK(p).kind == JS_T_CATCH) {
         if (!advance(p))
             return NULL;
-        if (accept(p, JS_T_LPAREN)) {
+        bool param = accept(p, JS_T_LPAREN);
+        if (param) {
+            /* the parameter is a scope around the block, which is checked against it */
+            int8_t bind = p->bind_kind;
+            if (!scope_push(p, JS_SCOPE_CATCH))
+                return NULL;
+            p->bind_kind = JS_BIND_LEX;
             n->b = parse_binding_target(p);
+            p->bind_kind = bind;
             if (!n->b || !expect(p, JS_T_RPAREN, "expected ')'"))
                 return NULL;
         }
+        p->catch_block = param;
         n->c = parse_block(p);
+        if (param)
+            scope_pop(p);
         if (!n->c)
             return NULL;
     }
@@ -3416,7 +3789,7 @@ static JsAstNode *parse_import_named(JsParser *p, JsNodeVec *specs) {
         }
         if (!binds)
             return perr(p, local->pos, "Unexpected reserved word");
-        if (!check_binding_name(p, local))
+        if (!check_binding_name(p, local) || !declare(p, local->units, local->len, local->pos, JS_BIND_LEX))
             return NULL;
         spec->units2 = local->units;
         spec->len2 = local->len;
@@ -3443,7 +3816,7 @@ static JsAstNode *parse_import(JsParser *p) {
     }
     if (TOK(p).kind == JS_T_IDENT) { /* default binding */
         JsAstNode *local = check_binding_name(p, parse_ident(p, "expected binding"));
-        if (!local)
+        if (!local || !declare(p, local->units, local->len, pos, JS_BIND_LEX))
             return NULL;
         JsAstNode *spec = new_node(p, JS_AST_IMPORT_SPEC, local->pos);
         if (!spec)
@@ -3465,7 +3838,7 @@ static JsAstNode *parse_import(JsParser *p) {
         if (!advance(p) || !expect_contextual(p, "as"))
             return NULL;
         JsAstNode *local = check_binding_name(p, parse_ident(p, "expected namespace name"));
-        if (!local)
+        if (!local || !declare(p, local->units, local->len, pos, JS_BIND_LEX))
             return NULL;
         JsAstNode *spec = new_node(p, JS_AST_IMPORT_SPEC, local->pos);
         if (!spec)
@@ -3531,22 +3904,106 @@ static bool parse_export_specs(JsParser *p, JsNodeVec *specs, bool *has_reserved
     return advance(p); /* } */
 }
 
+/* The exports of a declaration's pattern, each where the declaration begins */
+static bool export_pattern(JsParser *p, const JsAstNode *pat, uint32_t pos) {
+    switch ((JsAstKind)pat->kind) {
+    case JS_AST_IDENT:
+        return export_add(p, pat->units, pat->len, pat->units, pat->len, pos, false, true);
+    case JS_AST_DEFAULT:
+    case JS_AST_REST:
+        return export_pattern(p, pat->a, pos);
+    case JS_AST_ARRAY_PATTERN:
+        for (uint32_t i = 0; i < pat->count; i++)
+            if (pat->items[i]->kind != JS_AST_HOLE && !export_pattern(p, pat->items[i], pos))
+                return false;
+        return true;
+    case JS_AST_OBJECT_PATTERN:
+        for (uint32_t i = 0; i < pat->count; i++) {
+            const JsAstNode *prop = pat->items[i];
+            if (!export_pattern(p, prop->kind == JS_AST_REST ? prop->a : prop->b, pos))
+                return false;
+        }
+        return true;
+    default:
+        return true;
+    }
+}
+
+static const uint16_t DOT_DEFAULT[] = {'.', 'd', 'e', 'f', 'a', 'u', 'l', 't'};
+static const uint16_t DEFAULT_NAME[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
+
+static JsAstNode *parse_export_inner(JsParser *p);
+
+/* An export declaration, and what it exports, for exports_check */
 static JsAstNode *parse_export(JsParser *p) {
+    uint32_t decl_pos = peek(p).pos; /* where V8 places a declaration's exports */
+    JsAstNode *n = parse_export_inner(p);
+    if (!n)
+        return NULL;
+    bool ok = true;
+    switch ((JsAstKind)n->kind) {
+    case JS_AST_EXPORT_DEFAULT: {
+        const JsAstNode *f = (n->flags & JS_F_DEFAULT_DECL) ? n->a : NULL;
+        ok = f && f->len ? export_add(p, f->units, f->len, DEFAULT_NAME, 7, n->pos2, false, true)
+                         : export_add(p, DOT_DEFAULT, 8, DEFAULT_NAME, 7, n->pos2, false, true);
+        break;
+    }
+    case JS_AST_EXPORT_ALL:
+        if (n->len2) {
+            /* `export * as x from 'm'` is V8's `import * as .ns-exportN from 'm'; export
+             * { .ns-exportN as x }`, at `x` */
+            char buf[32];
+            int k = snprintf(buf, sizeof buf, ".ns-export%u", p->ns_exports++);
+            uint16_t *local = js_arena_alloc(p->arena, (size_t)k * sizeof *local);
+            if (!local) {
+                perr(p, n->pos, "out of memory");
+                return NULL;
+            }
+            for (int i = 0; i < k; i++)
+                local[i] = (uint8_t)buf[i];
+            ok = export_add(p, local, (uint32_t)k, n->units2, n->len2, n->src_start, false, true);
+        }
+        break;
+    case JS_AST_EXPORT_NAMED:
+        if (n->a && n->a->kind == JS_AST_LET_DECL) {
+            for (uint32_t i = 0; ok && i < n->a->count; i++)
+                ok = export_pattern(p, n->a->items[i]->a, decl_pos);
+        } else if (n->a) {
+            ok = export_add(p, n->a->units, n->a->len, n->a->units, n->a->len, decl_pos, false, true);
+        } else {
+            bool from = (n->flags & JS_F_REEXPORT) != 0;
+            for (uint32_t i = 0; ok && i < n->count; i++) {
+                const JsAstNode *sp = n->items[i];
+                ok = from ? export_add(p, NULL, 0, sp->units2, sp->len2, sp->pos, true, true)
+                          : export_add(p, sp->units, sp->len, sp->units2, sp->len2, sp->pos, false, false);
+            }
+        }
+        break;
+    default:
+        break;
+    }
+    return ok ? n : NULL;
+}
+
+static JsAstNode *parse_export_inner(JsParser *p) {
     uint32_t pos = TOK(p).pos;
     if (!advance(p))
         return NULL;
 
     if (TOK(p).kind == JS_T_DEFAULT) {
+        uint32_t default_pos = TOK(p).pos;
         if (!advance(p))
             return NULL;
         JsAstNode *n = new_node(p, JS_AST_EXPORT_DEFAULT, pos);
         if (!n)
             return NULL;
+        n->pos2 = default_pos; /* where V8 places the export */
         if (TOK(p).kind == JS_T_FUNCTION) {
             uint32_t start = TOK(p).pos;
             if (!advance(p))
                 return NULL;
             n->flags |= JS_F_DEFAULT_DECL;
+            p->default_fn = true;
             n->a = parse_func_common(p, 0, false, pos, JS_AST_FUNC_EXPR, start);
             return n->a ? n : NULL;
         }
@@ -3556,10 +4013,14 @@ static JsAstNode *parse_export(JsParser *p) {
             if (!advance(p) || !advance(p))
                 return NULL;
             n->flags |= JS_F_DEFAULT_DECL;
+            p->default_fn = true;
             n->a = parse_func_common(p, JS_F_ASYNC, false, pos, JS_AST_FUNC_EXPR, start);
             return n->a ? n : NULL;
         }
         n->a = parse_assign_scoped(p);
+        /* the value's hidden binding, declared at `default` once the value is read */
+        if (n->a && !declare(p, DOT_DEFAULT, 8, default_pos, JS_BIND_LEX))
+            return NULL;
         if (!n->a || !expect_semicolon(p))
             return NULL;
         return n;
@@ -3581,6 +4042,7 @@ static JsAstNode *parse_export(JsParser *p) {
                 return NULL;
             n->units2 = alias->units;
             n->len2 = alias->len;
+            n->src_start = alias->pos; /* where V8 places the export */
         }
         if (!expect_contextual(p, "from"))
             return NULL;
@@ -3600,6 +4062,7 @@ static JsAstNode *parse_export(JsParser *p) {
         if (closed && tok_is_name(&TOK(p), "from")) {
             if (!advance(p))
                 return NULL;
+            n->flags |= JS_F_REEXPORT;
             vec_store(n, &specs);
             return parse_module_source(p, n); /* re-export */
         }
@@ -3671,7 +4134,8 @@ bool js_parse_module(JsArena *arena, const uint16_t *src, size_t len, bool allow
     out->err_msg = NULL;
     out->err_pos = 0;
 
-    if (!advance(&p))
+    p.bind_kind = JS_BIND_NONE;
+    if (!scope_push(&p, JS_SCOPE_MODULE) || !advance(&p))
         goto fail;
     JsAstNode *mod = new_node(&p, JS_AST_MODULE, 0);
     if (!mod)
@@ -3693,7 +4157,7 @@ bool js_parse_module(JsArena *arena, const uint16_t *src, size_t len, bool allow
         if (!check_cover_drained(&p))
             goto fail;
     }
-    if (!octal_check(&p, 0))
+    if (!exports_check(&p) || !octal_check(&p, 0))
         goto fail;
     vec_store(mod, &stmts);
     if (p.module_tla)

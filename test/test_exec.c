@@ -1561,6 +1561,21 @@ static void test_cover_grammar(void) {
     expect_result("let k = 0; try { throw 1; } catch (e) { { let e = 2; k = e; } } k;", "2");
 }
 
+/* At the top of a function's body (an arrow's, a method's) a function declaration is a var, as
+ * V8 has it: a second of the same name is the same binding, and the later one is what it holds
+ * from the start; one may take a parameter's name. In a block, a switch or the module it is
+ * lexical, and the parser refuses the second (test_early_errors). */
+static void test_function_vars(void) {
+    expect_result("function f() { function x() { return 1; } function x() { return 2; } return x(); } f();", "2");
+    expect_result("function f() { let r = x(); function x() { return 1; } function x() { return 2; } return r; } f();", "2");
+    expect_result("function g(x) { function x() { return 'fn'; } return typeof x; } g(5);", "function");
+    expect_result("const h = () => { function q() { return 'a'; } function q() { return 'b'; } return q(); }; h();", "b");
+    expect_result("const o = { m() { function z() { return 3; } function z() { return 4; } return z(); } }; o.m();", "4");
+    expect_result("function f() { function x() { return 1; } { function x() { return 5; } } return x(); } f();", "1");
+    expect_error("function x() {} function x() {}", RUN_COMPILE_ERR, "Identifier 'x' has already been declared");
+    expect_error("{ function x() {} function x() {} }", RUN_COMPILE_ERR, "Identifier 'x' has already been declared");
+}
+
 int main(void) {
     test_heap_limit_is_a_hard_cap();
     test_regex_memory_is_capped();
@@ -1573,6 +1588,7 @@ int main(void) {
     test_coercions_equality();
     test_bitwise();
     test_scoping();
+    test_function_vars();
     test_control_flow();
     test_objects_arrays();
     test_destructuring();

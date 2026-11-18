@@ -733,8 +733,8 @@ static void test_modules(void) {
                "(module (import \"m\" (default d) (n a b) (n default dd)))");
     check_dump("export const x = 1;",
                "(module (export (const (d x 1))))");
-    check_dump("export {x as y, z};",
-               "(module (export (n x y) (n z z)))");
+    check_dump("let x, z; export {x as y, z};",
+               "(module (let (d x) (d z)) (export (n x y) (n z z)))");
     check_dump("export {a} from \"m\";",
                "(module (export-from \"m\" (n a a)))");
     check_dump("export * from \"m\"; export * as ns from \"m\";",
