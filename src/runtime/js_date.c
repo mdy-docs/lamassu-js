@@ -724,15 +724,30 @@ static bool date_toISOString(JsContext *ctx, JsValue tv, const JsValue *args, in
     return true;
 }
 
+/* Date.prototype.toJSON (21.4.4.37) takes any receiver: ToPrimitive with the number hint, null
+ * when that is a number that is not finite, and otherwise whatever the receiver's toISOString
+ * (looked up as a property and called with no arguments) returns. */
 static bool date_toJSON(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    JsDateObject *d;
-    if (!this_date(ctx, tv, &d, r))
-        return false;
-    if (d->time != d->time) {
+    (void)args;
+    (void)argc;
+    if (js_is_undefined(tv) || js_is_null(tv))
+        return nthrow(ctx, r, "TypeError: Cannot convert undefined or null to object");
+    JsValue prim;
+    if (!js_to_primitive(ctx, tv, JS_HINT_NUMBER, &prim))
+        return (*r = js_take_error(ctx)), false;
+    if (js_is_number(prim) && !is_finite_num(js_get_number(prim))) {
         *r = js_null();
         return true;
     }
-    return date_toISOString(ctx, tv, args, argc, r);
+    static const uint16_t ki[] = {'t', 'o', 'I', 'S', 'O', 'S', 't', 'r', 'i', 'n', 'g'};
+    JsValue key = js_atom(ctx->vm, ki, 11), fn = js_undefined();
+    if (!js_is_string(key))
+        return nthrow(ctx, r, "out of memory");
+    if (!js_get_property(ctx, tv, key, &fn))
+        return (*r = js_take_error(ctx)), false;
+    if (!js_is_function(fn))
+        return nthrow(ctx, r, "TypeError: toISOString is not a function");
+    return js_call(ctx, fn, tv, NULL, 0, r);
 }
 
 /* ---- registration ---- */

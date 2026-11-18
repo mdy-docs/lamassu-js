@@ -431,7 +431,10 @@ string, whatever it is given.
   return the same thing), `getYear`/`setYear` (V8's legacy two-digit years),
   `getTimezoneOffset` (`0`, or `NaN` for an invalid date), `toISOString`,
   `toJSON`, `toString`, `toDateString`, `toTimeString`, `toUTCString` /
-  `toGMTString`.
+  `toGMTString`. `toJSON` takes any receiver, as the specification has it: `null` when the
+  receiver converts to a number that is not finite, and otherwise whatever the `toISOString` it
+  finds on the receiver returns, so a replaced `Date.prototype.toISOString` or `valueOf` is what
+  `JSON.stringify` of a date goes through.
 
 ## `Error`
 
