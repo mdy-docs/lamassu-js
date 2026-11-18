@@ -127,6 +127,32 @@ static bool this_weak(JsContext *ctx, JsValue tv, uint8_t kind, const char *cls,
     return true;
 }
 
+bool js_weak_side_set(JsContext *ctx, JsObject **table, JsValue key, JsValue value) {
+    if (!*table) {
+        JsValue tv;
+        js_gc_protect(ctx->vm, &key);
+        js_gc_protect(ctx->vm, &value);
+        bool ok = weak_alloc(ctx, JS_OBJ_WEAKMAP, NULL, true, &tv);
+        js_gc_unprotect(ctx->vm, &value);
+        js_gc_unprotect(ctx->vm, &key);
+        if (!ok)
+            return false;
+        *table = js_value_object(tv);
+    }
+    return weak_put(ctx->vm, (JsWeakObj *)*table, key, value);
+}
+
+bool js_weak_side_get(const JsObject *table, JsValue key, JsValue *out) {
+    if (!table || !weak_ok(key))
+        return false;
+    const JsWeakObj *w = (const JsWeakObj *)table;
+    int64_t i = weak_find(w, key);
+    if (i < 0)
+        return false;
+    *out = w->values[(uint32_t)i];
+    return true;
+}
+
 /* ---- the collector's side ---- */
 
 void js_weak_mark(JsVm *vm, JsObject *o) {

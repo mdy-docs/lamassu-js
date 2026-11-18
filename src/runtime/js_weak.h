@@ -50,5 +50,11 @@ bool   js_weak_builtins_init(JsContext *ctx);
 /* JsContext.weak_kept: marked strongly as a root; emptied when the job queue is */
 void   js_weak_mark_kept(JsVm *vm, JsObject *kept);
 void   js_weak_clear_kept(JsContext *ctx);
+/* A weak map of the runtime's own, which no script can reach: *TABLE (a GC root its owner
+ * marks as a cell; NULL until the first entry) gets KEY -> VALUE, the value living as long as
+ * the key does, as a WeakMap's. KEY is an object, function or promise. False on OOM. */
+bool   js_weak_side_set(JsContext *ctx, JsObject **table, JsValue key, JsValue value);
+/* False when TABLE (which may be NULL) has nothing for KEY */
+bool   js_weak_side_get(const JsObject *table, JsValue key, JsValue *out);
 
 #endif /* JS_WEAK_H */

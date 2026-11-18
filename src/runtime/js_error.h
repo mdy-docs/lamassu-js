@@ -74,9 +74,9 @@ bool js_message_names(JsContext *ctx, JsValue v);
  * called on incompatible receiver 5". The method's name is the running native's. */
 JsValue js_error_receiver(JsContext *ctx, const char *cls, JsValue receiver);
 
-/* "name: message" (either half omitted when empty). `depth` guards against
- * an error whose message/name refers back to itself. NULL on OOM. */
-JsString *js_error_repr(JsContext *ctx, JsObject *o); /* NULL: failed, error pending */
+/* Error.prototype.toString's "name: message" (either half left out when empty) of O, which is
+ * an object, a function or a promise. NULL: failed, the error pending (js_take_error). */
+JsString *js_error_repr(JsContext *ctx, JsValue o);
 
 /* Installs Error/TypeError/RangeError/ReferenceError/SyntaxError and their
  * prototypes. Must run after ctx->object_proto exists. */

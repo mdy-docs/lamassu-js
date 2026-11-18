@@ -94,9 +94,7 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   `TypeError: Cannot redefine property` that says so: an **array element** cannot be made
   read-only, non-enumerable or non-configurable (elements are a flat vector with no attribute
   storage; a frozen or sealed array's elements are), nor can an **array's `length`** be made
-  read-only (outside `freeze`). The **`stack`** that
-  `Error.captureStackTrace(o)` gives an object that is not an error is a data property here
-  where V8 has an accessor (an error's own `stack` is V8's accessor).
+  read-only (outside `freeze`).
 - **`Object.getOwnPropertyNames` of a builtin gives V8's names, not V8's order.** What V8 makes
   non-enumerable (a builtin prototype's methods, a function's `prototype.constructor`, an
   error's `message`) is non-enumerable here too: left out of `Object.keys`, JSON, spread and
@@ -208,8 +206,14 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
 - **Nothing raises `EvalError`**: there is no `eval`. The constructor is
   there, as in V8.
 - **`stack` is V8's**, with these differences: no `Error.prepareStackTrace` hook;
-  `Error.captureStackTrace` on an object that is not an error makes an ordinary (enumerable)
-  `stack` property; an anonymous function's inferred name comes only from a member assignment
+  the first line is made as Node makes it, not as V8's own formatter does (the one a browser
+  runs): it has the `message` the error has when `stack` is first read, where V8's own keeps
+  the message the error was constructed with (`e.message = 'b'` before the first read shows
+  `b` here and in Node, the original in Chrome), and a `name` or `message` whose conversion
+  throws makes reading `stack` throw that, as in Node, where V8's own writes
+  `<error: RangeError: x>` in its place (and so does Node for a `stack` read from inside that
+  conversion, which here throws too);
+  an anonymous function's inferred name comes only from a member assignment
   (`x.y = function () {}` is `x.y`, `F.prototype.m = ...` is `F.m`), where V8 also infers from
   other places (`const a = [function () {}]` is `a` there); a host's natives have no frame.
 - **Subclassing is not possible** (no classes); set `name` on an instance

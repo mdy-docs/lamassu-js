@@ -171,10 +171,13 @@ typedef struct JsObject {
 /* A host object (js_host_object_new): an ordinary object in every way guest code can see, whose
  * cell also carries a host pointer. The class's finalizer runs when the collector frees the cell
  * or the VM is freed; external_bytes counts toward collection pacing (JsVm.external_bytes). */
-/* An error (obj_kind JS_OBJ_ERROR): an ordinary object plus its `stack`, V8's own property,
- * kept out of the property map so that it is not enumerable. The frames are taken when the
- * error is made (js_error_capture) and turned into text the first time `stack` is read, as V8
- * does: the first line uses the name and message the error has by then. */
+/* An error (obj_kind JS_OBJ_ERROR): an ordinary object plus what its `stack` accessor reads and
+ * writes (js_error_stack_accessor). The frames are taken when the error is made
+ * (js_error_capture) and turned into text the first time `stack` is read, as V8 does; the
+ * first line uses the name and message the error has by then, as Node's formatter does (V8's
+ * own keeps the message the error was made with). The same struct, reached by no script, is
+ * the record of a stack Error.captureStackTrace gave another object
+ * (JsContext.stack_records). */
 typedef struct JsErrorFrame {
     JsValue fn;       /* the closure or native running in the frame */
     JsValue receiver; /* `this` it was called with: names a method's type, as V8 does */
@@ -185,6 +188,16 @@ typedef struct JsErrorFrame {
 #define JS_EF_ASYNC 2u     /* an async function waiting on the one above it */
 
 enum { JS_STACK_PENDING, JS_STACK_FRAMES, JS_STACK_VALUE };
+
+/* Frames a stack's text is being made from (JsContext.frame_roots, on the C stack of
+ * js_error_stack_accessor): the name and message that head the text are converted by the
+ * script's own toString, which may capture the stack again or assign `stack`; these stay what
+ * the text is made from, as in V8, and their values GC roots until it is. */
+typedef struct JsFrameRoot {
+    const JsErrorFrame *frames;
+    uint32_t count;
+    struct JsFrameRoot *next;
+} JsFrameRoot;
 
 /* The engine's accessor functions: what V8 has as getters and setters, by number. A property that
  * is an accessor holds a marker naming two of them (js_accessor, js_bytecode.h); js_accessor_call
@@ -879,6 +892,12 @@ struct JsContext {
     JsObject *math_obj, *json_obj; /* Math and JSON, whose toString tags are theirs; GC roots */
     JsObject *weakmap_proto, *weakset_proto, *weakref_proto, *finreg_proto; /* GC roots */
     JsObject *weak_kept; /* WeakRef targets kept alive to the end of the job (an array); GC root */
+    /* What Error.captureStackTrace gave an object that is not an error: a weak map of the
+     * runtime's own (js_weak_side_set) from the object to a record, a JsErrorObject no script
+     * sees, holding the frames and then the text (V8 keeps them under a private symbol). NULL
+     * until the first one; GC root. */
+    JsObject *stack_records;
+    JsFrameRoot *frame_roots; /* GC roots */
     /* RegExp's legacy statics (RegExp.$1, lastMatch, input, ...): the last successful match's
      * subject and groups 0-9 ([start, end], -1 for none), its last group, and RegExp.input
      * (which a script may set): what the constructor's accessors read. GC roots: re_subject,

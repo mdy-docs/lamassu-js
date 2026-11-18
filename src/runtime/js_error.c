@@ -5,6 +5,7 @@
 #include "js_error.h"
 #include "js_bytecode.h"
 #include "js_iter.h"
+#include "js_weak.h"
 
 #define ARG(i) ((i) < argc ? args[i] : js_undefined())
 
@@ -63,24 +64,30 @@ static bool chain_find_from(JsContext *ctx, JsValue start, const char *k, JsValu
     return ok;
 }
 
-static bool chain_find(JsContext *ctx, JsObject *o, const char *k, JsValue *out, bool *found) {
-    return chain_find_from(ctx, js_value_from_cell(&o->gc), k, out, found);
+/* Whether V is an object as the language counts one: an object, a function or a promise */
+static bool is_object_type(JsValue v) {
+    return js_is_object(v) || js_has_cell_props(v);
 }
 
-/* [[Get]] by ASCII key: an accessor's getter runs with O as its receiver. False: failed, with
- * what the getter threw pending (nothing pending: out of memory). */
-static bool chain_get(JsContext *ctx, JsObject *o, const char *k, JsValue *out, bool *found) {
-    if (!chain_find(ctx, o, k, out, found))
+/* [[Get]] by ASCII key from START (an object, a function or a promise): an accessor's getter
+ * runs with START as its receiver. False: failed, with what the getter threw pending (nothing
+ * pending: out of memory). */
+static bool chain_get_from(JsContext *ctx, JsValue start, const char *k, JsValue *out, bool *found) {
+    if (!chain_find_from(ctx, start, k, out, found))
         return false;
     if (*found && js_is_accessor(*out)) {
         JsValue v;
-        if (!js_accessor_read(ctx, *out, js_value_from_cell(&o->gc), &v)) {
+        if (!js_accessor_read(ctx, *out, start, &v)) {
             js_set_error(ctx, v);
             return false;
         }
         *out = v;
     }
     return true;
+}
+
+static bool chain_get(JsContext *ctx, JsObject *o, const char *k, JsValue *out, bool *found) {
+    return chain_get_from(ctx, js_value_from_cell(&o->gc), k, out, found);
 }
 
 /* V8's GetDataProperty, for what must not run code (a message being written, a stack trace):
@@ -489,17 +496,17 @@ JsValue js_error_from_ascii(JsContext *ctx, const char *msg) {
     return s ? js_error_from_cell(ctx, s) : js_oom_value(ctx->vm);
 }
 
-/* Error.prototype.toString's "name: message" (20.5.3.4): each read from O and converted with
- * ToString, which can run their own toString (and nest, through an error as a name, up to the
- * re-entry limit, as V8's stack overflow). NULL: failed, the error pending (js_take_error). */
-JsString *js_error_repr(JsContext *ctx, JsObject *o) {
+/* Error.prototype.toString's "name: message" (20.5.3.4): each read from OV (an object, a
+ * function or a promise) and converted with ToString, which can run their own toString (and
+ * nest, through an error as a name, up to the re-entry limit, as V8's stack overflow). NULL:
+ * failed, the error pending (js_take_error). */
+JsString *js_error_repr(JsContext *ctx, JsValue ov) {
     JsVm *vm = ctx->vm;
-    JsValue ov = js_value_from_cell(&o->gc);
     js_gc_protect(vm, &ov);
     JsString *out = NULL;
     JsValue nv, mv, nsv = js_undefined();
     bool found;
-    if (!chain_get(ctx, o, "name", &nv, &found))
+    if (!chain_get_from(ctx, ov, "name", &nv, &found))
         goto done;
     JsString *name = js_is_undefined(nv) ? js_ascii_cell(vm, "Error")
                                          : js_op_to_string(ctx, nv);
@@ -507,7 +514,7 @@ JsString *js_error_repr(JsContext *ctx, JsObject *o) {
         goto done;
     nsv = js_value_from_cell(&name->gc);
     js_gc_protect(vm, &nsv);
-    if (!chain_get(ctx, o, "message", &mv, &found)) {
+    if (!chain_get_from(ctx, ov, "message", &mv, &found)) {
         js_gc_unprotect(vm, &nsv);
         goto done;
     }
@@ -894,9 +901,13 @@ static void frame_text(JsContext *ctx, FmtBuf *b, const JsErrorFrame *fr) {
     fb_ascii(b, ")", 1);
 }
 
-/* "Name: message" and a line per frame, as V8's default Error.prepareStackTrace gives it. O and
- * its frames are rooted by the caller. NULL on OOM. */
-static JsString *stack_text(JsContext *ctx, JsObject *o, const JsErrorFrame *frames, uint32_t n) {
+/* O's "Name: message" (Error.prototype.toString's, whatever kind of object O is) and a line
+ * per frame, as Node's formatter gives it and, but for two things, V8's own: V8's heads the
+ * text with the message an error was made with where this has the one it has now, and writes
+ * "<error: ...>" where converting the name or message throws, which here, as in Node, is what
+ * reading `stack` throws. O and the frames' values are rooted by the caller. NULL: failed, the
+ * error pending (js_take_error). */
+static JsString *stack_text(JsContext *ctx, JsValue o, const JsErrorFrame *frames, uint32_t n) {
     JsString *head = js_error_repr(ctx, o);
     if (!head)
         return NULL;
@@ -909,47 +920,111 @@ static JsString *stack_text(JsContext *ctx, JsObject *o, const JsErrorFrame *fra
         frame_text(ctx, &b, &frames[i]);
     }
     js_gc_unprotect(ctx->vm, &hv);
-    JsString *s = b.oom ? NULL : js_string_cell_new(ctx->vm, b.u, b.n);
+    JsString *s2 = b.oom ? NULL : js_string_cell_new(ctx->vm, b.u, b.n);
     free(b.u);
-    return s;
+    return s2;
 }
 
-/* An error's `stack`: an own accessor property, not enumerable, as V8 has it (the entry
- * error_object_new makes), whose getter and setter these are (js_accessor_call). What they read
- * and write is the error's own: the frames it captured, or what a script assigned. As V8's, they
- * answer for the first error on the receiver's prototype chain (so for what inherits from an
- * error, and still for an error whose `stack` property was deleted or redefined) and give
- * undefined for anything else, a primitive included. False with the error in *OUT. */
-bool js_error_stack_accessor(JsContext *ctx, bool set, JsValue recv, JsValue arg, JsValue *out) {
-    *out = js_undefined();
-    JsValue h = recv;
-    for (int depth = 0;; depth++) {
-        if (js_is_object(h) && js_value_object(h)->obj_kind == JS_OBJ_ERROR)
-            break;
-        if (depth >= 1000 || !(js_is_object(h) || js_is_function(h) || js_is_promise(h)))
-            return true;
+/* What holds the stack RECV reads and writes: the first object on its prototype chain that is
+ * an error or was given one by Error.captureStackTrace (V8 looks for the private symbol both
+ * carry), in *HOLDER, and the JsErrorObject keeping the frames and the text: the error itself,
+ * or the other object's record. NULL when there is none. V8 calls its accessors as it calls
+ * any function of the embedder's, the receiver made an object first: a primitive's chain is
+ * its prototype's, and undefined and null stand for the global object. */
+static JsErrorObject *stack_holder(JsContext *ctx, JsValue recv, JsValue *holder) {
+    JsValue h = is_object_type(recv)                         ? recv
+                : js_is_undefined(recv) || js_is_null(recv) ? js_value_from_cell(&ctx->globals->gc)
+                                                             : js_get_proto(ctx, recv);
+    for (int depth = 0; depth < 1000 && is_object_type(h); depth++) {
+        JsValue rec = h;
+        if ((js_is_object(h) && js_value_object(h)->obj_kind == JS_OBJ_ERROR) ||
+            js_weak_side_get(ctx->stack_records, h, &rec)) {
+            *holder = h;
+            return (JsErrorObject *)js_value_object(rec);
+        }
         h = js_get_proto(ctx, h);
     }
-    JsObject *o = js_value_object(h);
-    JsErrorObject *e = (JsErrorObject *)o;
+    return NULL;
+}
+
+/* `stack`: an own accessor property, not enumerable, as V8 has it, of an error (the entry
+ * error_object_new makes) and of what Error.captureStackTrace was given; its getter and setter
+ * are these (js_accessor_call), the same two functions everywhere. What they read and write is
+ * the holder's (stack_holder): the frames it captured, or what a script assigned. So they
+ * answer for what inherits from a holder, and still for one whose `stack` property was deleted
+ * or redefined, and give undefined where there is no holder.
+ *
+ * The text is made the first time it is read, as V8 makes it: the first line uses the name and
+ * message the holder has by then, over the frames it has by then (a copy, rooted in
+ * JsContext.frame_roots: converting the name can run a toString that captures again or assigns
+ * `stack`, and as in V8 the text then made replaces either). False with the error in *OUT. */
+bool js_error_stack_accessor(JsContext *ctx, bool set, JsValue recv, JsValue arg, JsValue *out) {
+    *out = js_undefined();
+    JsVm *vm = ctx->vm;
+    JsValue h = js_undefined();
+    JsErrorObject *e = stack_holder(ctx, recv, &h);
+    if (!e)
+        return true;
     if (set) {
         drop_frames(ctx, e);
         e->stack = arg;
         e->stack_state = JS_STACK_VALUE;
         return true;
     }
-    if (e->stack_state != JS_STACK_VALUE) {
-        js_gc_protect(ctx->vm, &h);
-        JsString *s = stack_text(ctx, o, e->frames, e->stack_state == JS_STACK_FRAMES ? e->frame_count : 0);
-        js_gc_unprotect(ctx->vm, &h);
-        if (!s)
-            return nthrow(ctx, out, "out of memory");
-        drop_frames(ctx, e);
-        e->stack = js_value_from_cell(&s->gc);
-        e->stack_state = JS_STACK_VALUE;
+    if (e->stack_state == JS_STACK_VALUE) {
+        *out = e->stack;
+        return true;
     }
-    *out = e->stack;
+    uint32_t n = e->stack_state == JS_STACK_FRAMES ? e->frame_count : 0;
+    JsErrorFrame *frames = NULL;
+    if (n) {
+        frames = js_realloc_raw(vm, NULL, 0, (size_t)n * sizeof *frames);
+        if (!frames)
+            return nthrow(ctx, out, "out of memory");
+        memcpy(frames, e->frames, (size_t)n * sizeof *frames);
+    }
+    JsFrameRoot root = {frames, n, ctx->frame_roots};
+    ctx->frame_roots = &root;
+    JsValue rec = js_value_from_cell(&e->obj.gc);
+    js_gc_protect(vm, &h);
+    js_gc_protect(vm, &rec);
+    JsString *s = stack_text(ctx, h, frames, n);
+    js_gc_unprotect(vm, &rec);
+    js_gc_unprotect(vm, &h);
+    ctx->frame_roots = root.next;
+    js_realloc_raw(vm, frames, (size_t)n * sizeof *frames, 0);
+    if (!s)
+        return (*out = js_take_error(ctx)), false;
+    *out = js_value_from_cell(&s->gc);
+    drop_frames(ctx, e);
+    e->stack = *out;
+    e->stack_state = JS_STACK_VALUE;
     return true;
+}
+
+/* A JsErrorObject cell with no stack yet and no properties, its prototype PROTO (NULL: none).
+ * Undefined on OOM. */
+static JsValue error_cell_new(JsContext *ctx, JsObject *proto) {
+    JsGcCell *c = js_gc_new_cell(ctx->vm, JS_KIND_OBJECT, sizeof(JsErrorObject));
+    if (!c)
+        return js_undefined();
+    JsErrorObject *eo = (JsErrorObject *)c;
+    JsObject *e = &eo->obj;
+    e->obj_kind = JS_OBJ_ERROR;
+    e->obj_flags = 0; /* js_object_set_accessor marks it as holding an accessor */
+    js_map_init(&e->props);
+    e->elems = NULL;
+    e->elem_count = e->elem_cap = 0;
+    e->error_cause = JS_CAUSE_GUEST;
+    e->proto = proto ? js_value_from_cell(&proto->gc) : js_undefined();
+    eo->stack = js_undefined();
+    eo->frames = NULL;
+    eo->frame_count = 0;
+    eo->stack_state = JS_STACK_PENDING;
+    eo->has_origin = false;
+    eo->origin_pos = 0;
+    eo->origin_spec = NULL;
+    return js_value_from_cell(c);
 }
 
 /* A new error object. SKIP as for js_error_capture; the frames are taken now when a native is
@@ -959,28 +1034,10 @@ static JsValue error_object_new(JsContext *ctx, JsErrorKind kind, JsString *mess
     JsValue mv = message ? js_value_from_cell(&message->gc) : js_undefined();
     js_gc_protect(vm, &mv);
     js_gc_protect(vm, &skip);
-    JsGcCell *c = js_gc_new_cell(vm, JS_KIND_OBJECT, sizeof(JsErrorObject));
-    JsValue ev = js_undefined();
-    bool ok = c != NULL;
+    JsValue ev = error_cell_new(ctx, ctx->error_protos[kind]);
+    bool ok = !js_is_undefined(ev);
     if (ok) {
-        JsErrorObject *eo = (JsErrorObject *)c;
-        JsObject *e = &eo->obj;
-        e->obj_kind = JS_OBJ_ERROR;
-        e->obj_flags = 0; /* js_object_set_accessor marks it as holding an accessor */
-        js_map_init(&e->props);
-        e->elems = NULL;
-        e->elem_count = e->elem_cap = 0;
-        e->error_cause = JS_CAUSE_GUEST;
-        JsObject *proto = ctx->error_protos[kind];
-        e->proto = proto ? js_value_from_cell(&proto->gc) : js_undefined();
-        eo->stack = js_undefined();
-        eo->frames = NULL;
-        eo->frame_count = 0;
-        eo->stack_state = JS_STACK_PENDING;
-        eo->has_origin = false;
-        eo->origin_pos = 0;
-        eo->origin_spec = NULL;
-        ev = js_value_from_cell(c);
+        JsObject *e = js_value_object(ev);
         js_gc_protect(vm, &ev);
         /* `stack` first, then `message`: the order V8 lists them in */
         ok = js_object_set_accessor(ctx, e, "stack", JS_ACC_STACK_GET, JS_ACC_STACK_SET);
@@ -1109,55 +1166,54 @@ static const JsNativeFn kind_ctors[JS_ERROR_KIND_COUNT] = {
 static bool errp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)args;
     (void)argc;
-    if (!js_is_object(tv))
+    if (!is_object_type(tv))
         return (*r = js_error_receiver(ctx, "Error", tv)), false;
-    JsString *s = js_error_repr(ctx, js_value_object(tv));
+    JsString *s = js_error_repr(ctx, tv);
     if (!s)
         return (*r = js_take_error(ctx)), false;
     *r = js_value_from_cell(&s->gc);
     return true;
 }
 
-/* Error.captureStackTrace(object, fn?): gives OBJECT a `stack` of the frames running now, below
- * FN's call when it is given, as V8 does. On an error it is the error's own `stack` accessor,
- * defined again (so one a script deleted or redefined is back; V8 refuses an error that is not
- * extensible even when it has one, and so does this); on any other object an ordinary data
- * property holding the text, where V8 defines the same accessor over storage of its own. */
+/* Error.captureStackTrace(object, fn?): gives OBJECT, anything that is an object, a `stack` of
+ * the frames running now, below FN's call when it is given, as V8 does: the `stack` accessor
+ * every error has, defined on it (again, for an error: one a script deleted or redefined is
+ * back), over frames the object now holds: an error in itself, anything else in a record the
+ * context keeps for it (JsContext.stack_records), for as long as the object lives. V8 refuses
+ * an object that is not extensible even when it has a `stack`, and so does this; an own
+ * `stack` that cannot be redefined is the definition's error. */
 static bool err_captureStackTrace(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
+    JsVm *vm = ctx->vm;
     JsValue target = ARG(0);
-    if (!js_is_object(target))
+    if (!is_object_type(target))
         return nthrow(ctx, r, "TypeError: invalid_argument"); /* V8's text, as it stands */
     JsValue skip = js_is_function(ARG(1)) ? ARG(1)
                    : ctx->running_native ? js_value_from_cell(&ctx->running_native->gc) : js_undefined();
-    JsObject *o = js_value_object(target);
     *r = js_undefined();
-    if (o->obj_flags & JS_OBJ_NO_ADD)
+    if (!js_is_extensible(ctx, target))
         return (*r = js_error_fmt(ctx, "TypeError: Cannot define property stack, object is not extensible")), false;
-    if (o->obj_kind == JS_OBJ_ERROR) {
-        JsString *k = key(ctx, "stack"); /* the target and SKIP are the caller's arguments: rooted */
-        if (!k)
-            return nthrow(ctx, r, "out of memory");
-        JsPropDesc d = {JS_DESC_GET | JS_DESC_SET | JS_DESC_ENUMERABLE | JS_DESC_CONFIGURABLE, false, false, true,
-                        js_accessor(JS_ACC_STACK_GET, JS_ACC_STACK_SET)};
-        if (!js_define_own_property(ctx, target, js_value_from_cell(&k->gc), &d))
-            return (*r = js_take_error(ctx)), false;
-        if (!js_error_capture(ctx, o, skip))
-            return nthrow(ctx, r, "out of memory");
-        return true;
-    }
-    uint32_t limit;
-    if (!stack_trace_limit(ctx, &limit))
-        return true;
-    uint32_t cap = limit < 1024 ? limit : 1024;
-    JsErrorFrame *buf = cap ? js_realloc_raw(ctx->vm, NULL, 0, (size_t)cap * sizeof *buf) : NULL;
-    if (cap && !buf)
+    JsString *k = key(ctx, "stack"); /* the target and SKIP are the caller's arguments: rooted */
+    if (!k)
         return nthrow(ctx, r, "out of memory");
-    uint32_t n = cap ? js_capture_frames(ctx, buf, cap, skip) : 0;
-    /* the frames' values stay on the stacks they came from while the text is built */
-    JsString *s = stack_text(ctx, o, buf, n);
-    js_realloc_raw(ctx->vm, buf, (size_t)cap * sizeof *buf, 0);
-    if (!s || !js_object_set_ascii(ctx, o, "stack", js_value_from_cell(&s->gc)))
+    JsPropDesc d = {JS_DESC_GET | JS_DESC_SET | JS_DESC_ENUMERABLE | JS_DESC_CONFIGURABLE, false, false, true,
+                    js_accessor(JS_ACC_STACK_GET, JS_ACC_STACK_SET)};
+    if (!js_define_own_property(ctx, target, js_value_from_cell(&k->gc), &d))
+        return (*r = js_take_error(ctx)), false;
+    JsValue rec = target;
+    if (!(js_is_object(target) && js_value_object(target)->obj_kind == JS_OBJ_ERROR) &&
+        !js_weak_side_get(ctx->stack_records, target, &rec)) {
+        rec = error_cell_new(ctx, NULL);
+        if (js_is_undefined(rec))
+            return nthrow(ctx, r, "out of memory");
+        js_gc_protect(vm, &rec);
+        bool ok = js_weak_side_set(ctx, &ctx->stack_records, target, rec);
+        js_gc_unprotect(vm, &rec);
+        if (!ok)
+            return nthrow(ctx, r, "out of memory");
+    }
+    /* the record is its object's from here: alive while the target, an argument, is */
+    if (!js_error_capture(ctx, js_value_object(rec), skip))
         return nthrow(ctx, r, "out of memory");
     return true;
 }

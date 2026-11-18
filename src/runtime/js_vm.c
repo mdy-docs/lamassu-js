@@ -297,6 +297,8 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->math_obj = ctx->json_obj = NULL;
     ctx->weakmap_proto = ctx->weakset_proto = ctx->weakref_proto = ctx->finreg_proto = NULL;
     ctx->weak_kept = NULL;
+    ctx->stack_records = NULL;
+    ctx->frame_roots = NULL;
     ctx->bigint_methods = NULL;
     ctx->regexp_ctor = NULL;
     ctx->re_subject = NULL;

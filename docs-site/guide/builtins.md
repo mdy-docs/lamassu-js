@@ -455,10 +455,14 @@ Each subclass constructor's `[[Prototype]]` is `Error`, so `TypeError.captureSta
   assigned to an error that had none, is ordinary).
 - **`Error.prototype`**: `name` (`"Error"`; each subclass prototype
   overrides it), `message` (`""`), `toString` → `"name: message"`, dropping
-  either half when it is empty.
+  either half when it is empty. `toString` works on any object, a function or a promise
+  included, reading `name` and `message` as properties (`Error.prototype.toString.call(f)` is
+  `f`'s name); a primitive is V8's `TypeError`.
 - **`stack`**, as V8 gives it: `"TypeError: x\n    at f (main.js:3:9)\n    at main.js:7:1"`.
   The frames are taken when the error is made and the text is built the first time `stack` is
-  read, so the first line shows the name and message the error has by then. A frame reads
+  read, so the first line shows the name and message the error has by then, as in Node (a
+  `name` or `message` whose conversion throws makes the read throw that; [V8's own formatter
+  differs](./deviations.md#errors)). A frame reads
   `at name (module:line:column)`, or just the location for an anonymous function or a module
   body, with V8's details: `Object.m` / `F.m` for a method (the receiver's type; an inferred
   `x.y` for `x.y = function () {}`), ` [as k]` when it was called under another key, `new C`,
@@ -466,13 +470,29 @@ Each subclass constructor's `[[Prototype]]` is `Error`, so `TypeError.captureSta
   `at Array.map (<anonymous>)` (no frames for `call`, `apply` or a bound function, nor for a
   host's natives). The column is where V8 puts it: a call at its callee's name (or its `(`), a
   property read at the property, `new` and `await` at the keyword. A function compiled outside
-  the module pipeline is in `<anonymous>`. `stack` is an own property that is not enumerated
-  (`Object.keys`, `JSON.stringify` and spread do not see it); it can be assigned, even on a
-  frozen error, and deleted.
+  the module pipeline is in `<anonymous>`. `stack` is an own accessor property that is not
+  enumerated (`Object.keys`, `JSON.stringify` and spread do not see it); it can be assigned,
+  even on a frozen error, and deleted. Its getter and setter are the same two functions on
+  every error and on every object `Error.captureStackTrace` was given, and they work through
+  the prototype chain as V8's do: they read and write the stack of the first such object on
+  the receiver's chain, so an object that inherits from an error reads that error's `stack`
+  and assigning it changes the error's; one whose `stack` property was deleted still answers
+  to the getter; and where the chain has none the getter gives `undefined` and the setter does
+  nothing. A primitive's chain is its prototype's, and `undefined` and `null` stand for the
+  global object.
 - **`Error.stackTraceLimit`** (10): the frames kept. Anything but a number gives a `stack` that
   reads `undefined`.
 - **`Error.captureStackTrace(object, fn?)`** gives `object` a `stack` of the frames running now,
-  leaving out `fn`'s call and those above it.
+  leaving out `fn`'s call and those above it. `object` is anything that is an object: an
+  error, a plain object, an array, a function, a promise. It gets the `stack` accessor errors
+  have (not enumerable, configurable, replacing a `stack` it had), over frames kept with the
+  object for as long as it lives; the text is built the first time it is read, headed by what
+  `Error.prototype.toString` gives for the object then (`Error` for a plain one, a function's
+  name). A primitive is V8's `TypeError: invalid_argument`, an object that is not extensible
+  `TypeError: Cannot define property stack, object is not extensible`, and an own `stack` that
+  is not configurable `TypeError: Cannot redefine property: stack`. When
+  `Error.stackTraceLimit` is not a number the accessor is defined all the same and reads
+  `undefined`.
 - String conversion (`String(e)`, `'' + e`, template literals) uses the
   same `"name: message"` form, so an error renders identically whether it
   came from `throw new TypeError('x')` or from the engine.
