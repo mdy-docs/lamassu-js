@@ -1211,8 +1211,9 @@ static bool combinator(JsContext *ctx, JsValue tv, const JsValue *args, int argc
         if (open <= 0) {
             cur.src = js_undefined();
             cur.i = JS_ITER_DONE_INDEX;
-            if (open < 0) {
-                oom = true;
+            if (open < 0) { /* what opening it threw (out of memory, when nothing) */
+                err = js_take_error(ctx);
+                failed = true;
             } else {
                 err = js_iter_not_iterable(ctx, ARG(0));
                 failed = true;

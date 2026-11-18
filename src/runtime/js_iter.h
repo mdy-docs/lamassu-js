@@ -143,11 +143,14 @@ typedef struct JsIterCursor {
  * next threw, so there is nothing to close. */
 #define JS_ITER_DONE_INDEX 4294967294u
 
-/* Whether V is iterable: a string, an array, a Map, a Set, an iterator object, or an object
- * that inherits from Iterator.prototype. */
+/* Whether V is iterable: a string, or an object with Array.prototype, String.prototype,
+ * Map.prototype, Set.prototype or Iterator.prototype on its chain (the objects with a
+ * [Symbol.iterator], which no script can name). */
 bool js_iter_is_iterable(JsContext *ctx, JsValue v);
 
-/* 1 opened, 0 V is not iterable (nothing thrown; the caller words the error), -1 OOM. */
+/* 1 opened, 0 V is not iterable (nothing thrown; the caller words the error), -1 thrown: what
+ * V's iterator method threw is pending (js_take_error; out of memory when nothing is). Opening
+ * runs script only for an object that inherits from String.prototype (its toString). */
 int js_iter_open(JsContext *ctx, JsValue v, JsIterCursor *c);
 /* As js_iterobj_step; a cursor that ends (0) or throws (-1) is left done. */
 int js_iter_next(JsContext *ctx, JsIterCursor *c, JsValue *out);

@@ -1,8 +1,8 @@
 #include <stdio.h>
 /*
  * Standard library. Array instance methods live on a real, script-visible
- * Array.prototype (ctx->array_proto is a construction-time cache of it, not
- * a lookup shortcut — see lamassu_internal.h). String/Number don't have a
+ * Array.prototype, itself an array as V8's is (ctx->array_proto is a
+ * construction-time cache of it, not a lookup shortcut — see lamassu_internal.h). String/Number don't have a
  * [[Prototype]] slot to hang a real chain off (they're primitives, not
  * JS_KIND_OBJECT), so their methods still live on a hidden per-context
  * table (ctx->string_methods / number_methods) that property lookup falls
@@ -4666,6 +4666,31 @@ static bool json_is_raw(JsValue v) {
     return js_is_object(v) && (js_value_object(v)->obj_flags & JS_OBJ_RAW_JSON);
 }
 
+/* The primitive JSON.stringify puts for a Number, String or Boolean object: ToNumber, ToString
+ * (each runs the object's own valueOf and toString) or the boolean held. The only such objects
+ * here are Number.prototype, String.prototype and Boolean.prototype (0, "" and false in V8);
+ * any other *v is left as it is. STRINGS has a Number converted with ToString too, as a
+ * replacer array's elements are. False thrown: the error is pending. */
+static bool json_unwrap(JsContext *ctx, JsValue *v, bool strings) {
+    if (!js_is_object(*v))
+        return true;
+    const JsObject *o = js_value_object(*v);
+    if (o == ctx->string_methods || (strings && o == ctx->number_methods)) {
+        JsString *str = js_native_string(ctx, *v);
+        if (!str)
+            return false;
+        *v = js_value_from_cell(&str->gc);
+    } else if (o == ctx->number_methods) {
+        double d;
+        if (!js_op_to_number(ctx, *v, &d))
+            return false;
+        *v = js_number(d);
+    } else if (o == ctx->boolean_methods && !strings) {
+        *v = js_bool(false);
+    }
+    return true;
+}
+
 /* SerializeJSONProperty: VALUE is holder[key], already read. toJSON, then the replacer, then
  * the value's own form. *emitted is false for undefined, a function, or what becomes one. */
 static bool json_prop(JsonS *s, JsValue holder, JsValue key, JsValue value, bool *emitted) {
@@ -4704,6 +4729,7 @@ static bool json_prop(JsonS *s, JsValue holder, JsValue key, JsValue value, bool
                 v = res;
         }
     }
+    ok = ok && json_unwrap(ctx, &v, false);
     if (ok) {
         if (js_is_null(v)) {
             sb_ascii(&s->sb, "null");
@@ -4743,7 +4769,8 @@ static bool json_prop(JsonS *s, JsValue holder, JsValue key, JsValue value, bool
     return ok && !s->sb.oom;
 }
 
-/* A replacer array's property list: its strings and numbers as keys, in order, once each */
+/* A replacer array's property list: its strings and numbers as keys, in order, once each (a
+ * String or Number object, which the two prototypes are, by its ToString) */
 static bool json_property_list(JsContext *ctx, JsObject *ra, JsValue *out) {
     JsObject *list = js_array_new_cell(ctx, 0);
     if (!list)
@@ -4751,6 +4778,8 @@ static bool json_property_list(JsContext *ctx, JsObject *ra, JsValue *out) {
     *out = js_value_from_cell(&list->gc); /* the caller roots *out */
     for (uint32_t i = 0; i < ra->elem_count; i++) {
         JsValue e = ra->elems[i];
+        if (!json_unwrap(ctx, &e, true)) /* (runs script: RA may have changed; I is checked) */
+            return false;
         JsString *k = js_is_string(e) ? js_value_string(e)
                       : js_is_number(e) ? js_number_to_string(ctx->vm, js_get_number(e)) : NULL;
         if (!k) {
@@ -4772,23 +4801,10 @@ static bool json_property_list(JsContext *ctx, JsObject *ra, JsValue *out) {
 static bool json_stringify(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     (void)tv;
     uint16_t gap[10];
-    uint32_t gap_len = 0;
-    JsValue space = ARG(2);
-    if (js_is_number(space)) {
-        /* space count is clamped to [0,10]; route through to_integer_clamped so
-         * an Infinity/NaN/huge argument can't UB on the cast to int */
-        int n = (int)to_integer_clamped(js_get_number(space), 0, 10);
-        for (int i = 0; i < n; i++)
-            gap[gap_len++] = ' ';
-    } else if (js_is_string(space)) {
-        JsString *sp = js_value_string(space);
-        for (uint32_t i = 0; i < sp->length && i < 10; i++)
-            gap[gap_len++] = sp->units[i];
-    }
     JsonS s = {ctx, {0}, js_undefined(), js_undefined(), js_undefined(), js_undefined(),
-               js_undefined(), gap, gap_len, 0};
+               js_undefined(), gap, 0, 0};
     sb_init(&s.sb, ctx->vm);
-    JsValue rep = ARG(1), wrapper = js_undefined();
+    JsValue rep = ARG(1), space = ARG(2), wrapper = js_undefined();
     if (js_is_function(rep))
         s.replacer = rep; /* an argument: rooted */
     JsValue empty = js_undefined();
@@ -4799,8 +4815,22 @@ static bool json_stringify(JsContext *ctx, JsValue tv, const JsValue *args, int 
     js_gc_protect(ctx->vm, &wrapper);
     js_gc_protect(ctx->vm, &empty);
     bool ok = true;
+    /* the property list first, then the space: a String or Number object among them is
+     * converted, which runs script, and that is in this order */
     if (js_is_object(rep) && js_value_object(rep)->obj_kind == JS_OBJ_ARRAY)
         ok = json_property_list(ctx, js_value_object(rep), &s.plist);
+    ok = ok && json_unwrap(ctx, &space, false); /* (a string it made is kept for the native) */
+    if (ok && js_is_number(space)) {
+        /* space count is clamped to [0,10]; route through to_integer_clamped so
+         * an Infinity/NaN/huge argument can't UB on the cast to int */
+        int n = (int)to_integer_clamped(js_get_number(space), 0, 10);
+        for (int i = 0; i < n; i++)
+            gap[s.gap_len++] = ' ';
+    } else if (ok && js_is_string(space)) {
+        JsString *sp = js_value_string(space);
+        for (uint32_t i = 0; i < sp->length && i < 10; i++)
+            gap[s.gap_len++] = sp->units[i];
+    }
     JsObject *st = ok ? js_array_new_cell(ctx, 0) : NULL;
     ok = st != NULL;
     if (ok)
@@ -6165,8 +6195,11 @@ static bool objp_propertyIsEnumerable(JsContext *ctx, JsValue tv, const JsValue 
         return oom(ctx, r);
     if (found) {
         JsValue kv = js_value_from_cell(&ks->gc);
-        if (js_is_string(tv) || (js_is_object(tv) && js_value_object(tv)->obj_kind == JS_OBJ_ARRAY)) {
+        bool array = js_is_object(tv) && js_value_object(tv)->obj_kind == JS_OBJ_ARRAY;
+        if (js_is_string(tv) || (array && str_is_ascii(kv, "length"))) {
             found = !str_is_ascii(kv, "length");
+        } else if (array && is_index_below(ks, js_value_object(tv)->elem_count)) {
+            found = true; /* an element; an array's other properties have their attributes, below */
         } else if (js_is_function(tv) && (str_is_ascii(kv, "name") || str_is_ascii(kv, "length") ||
                                           str_is_ascii(kv, "prototype"))) {
             found = false;
@@ -6413,7 +6446,7 @@ JsObject *js_iterable_to_array(JsContext *ctx, JsValue v, JsValue *err) {
     JsIterCursor cur;
     int open = js_iter_open(ctx, v, &cur);
     if (open <= 0) {
-        *err = open < 0 ? js_oom_value(vm) : js_iter_not_iterable(ctx, v);
+        *err = open < 0 ? js_take_error(ctx) : js_iter_not_iterable(ctx, v);
         return NULL;
     }
     js_gc_protect(vm, &cur.src);
@@ -7890,16 +7923,15 @@ bool js_builtins_init(JsContext *ctx) {
     if (!js_is_object(sm))
         return false;
     ctx->string_methods = js_value_object(sm);
-    /* Array.prototype: a real object, exposed below as Array's own
-     * "prototype" property; ctx->array_proto is just a fast-path cache so
-     * js_array_new_cell doesn't need a property lookup on every array it
-     * creates — property access on array instances never consults it
-     * directly, it goes through the normal [[Prototype]] walk. Chains to
-     * Object.prototype automatically (js_object_new, above). */
-    JsValue am = js_object_new(ctx);
-    if (!js_is_object(am))
+    /* Array.prototype: an array itself, as V8's is (`length` 0, Array.isArray, `[]` in JSON),
+     * whose [[Prototype]] is Object.prototype; exposed below as Array's own "prototype"
+     * property. ctx->array_proto is just a fast-path cache so js_array_new_cell doesn't need a
+     * property lookup on every array it creates — property access on array instances never
+     * consults it directly, it goes through the normal [[Prototype]] walk. */
+    ctx->array_proto = js_array_new_cell(ctx, 0);
+    if (!ctx->array_proto)
         return false;
-    ctx->array_proto = js_value_object(am);
+    ctx->array_proto->proto = js_value_from_cell(&ctx->object_proto->gc);
     JsValue num = js_object_new(ctx);
     if (!js_is_object(num))
         return false;
@@ -7998,6 +8030,9 @@ bool js_builtins_init(JsContext *ctx) {
         if (!found || !js_object_set_ascii(ctx, ctx->string_methods, i ? "trimRight" : "trimLeft", fn))
             return false;
     }
+    /* String.prototype is a String of "" in V8: its `length` is 0, fixed (and hidden, below) */
+    if (!def_num(ctx, ctx->string_methods, "length", 0))
+        return false;
     /* call and apply have no frame of their own in a stack trace, as in V8 */
     for (const char *const *m = (const char *const[]){"call", "apply", NULL}; *m; m++) {
         JsString *k = js_ascii_cell(ctx->vm, *m);

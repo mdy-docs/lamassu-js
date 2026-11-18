@@ -88,19 +88,62 @@ static bool inherits_iterator(JsContext *ctx, JsValue v) {
     return false;
 }
 
-/* V is Array.prototype or inherits from it without being an array: what V8 iterates with
- * Array.prototype.values, which it finds as V's [Symbol.iterator] */
-static bool inherits_array(JsContext *ctx, JsValue v) {
-    if (!ctx->array_proto || !is_obj(v))
-        return false;
-    const JsGcCell *ap = &ctx->array_proto->gc;
+/* An object's [Symbol.iterator]. No script can name that property, so it is where the engine
+ * put it and nowhere else: on Array.prototype (Array.prototype.values), String.prototype,
+ * Map.prototype (Map.prototype.entries), Set.prototype (Set.prototype.values) and
+ * Iterator.prototype (which returns its receiver). What V has is the first of those on its
+ * chain, V itself included, whatever kind of object V is: an array whose prototype was taken
+ * away has none, and a plain object that inherits from Map.prototype has Map's. */
+typedef enum { DI_NONE, DI_ARRAY, DI_STRING, DI_MAP, DI_SET, DI_SELF } DefaultIter;
+
+static DefaultIter default_iter(JsContext *ctx, JsValue v) {
     JsValue p = v;
     for (int depth = 0; depth < 10000 && is_obj(p); depth++) {
-        if (js_value_cell(p) == ap)
-            return true;
+        if (js_is_object(p)) {
+            const JsObject *o = js_value_object(p);
+            if (o == ctx->array_proto)
+                return DI_ARRAY;
+            if (o == ctx->iterator_proto)
+                return DI_SELF;
+            if (o == ctx->map_proto)
+                return DI_MAP;
+            if (o == ctx->set_proto)
+                return DI_SET;
+            if (o == ctx->string_methods)
+                return DI_STRING;
+        }
         p = js_get_proto(ctx, p);
     }
-    return false;
+    return DI_NONE;
+}
+
+/* Calls it on V (rooted; not DI_NONE, DI_SELF): *it the iterator object it makes, as the method
+ * called on V would: Map's and Set's refuse a receiver that is not one, and String's iterates
+ * ToString(V), which runs V's toString. False thrown, the error pending (none: out of memory). */
+static bool default_iter_call(JsContext *ctx, DefaultIter k, JsValue v, JsValue *it) {
+    JsValue target = v;
+    JsIterKind kind = JS_ITER_ARRAY_VALUES;
+    if (k == DI_MAP || k == DI_SET) {
+        bool map = k == DI_MAP;
+        if (!(map ? js_mapobj_is(v) : js_setobj_is(v))) {
+            js_set_error(ctx, js_error_fmt(ctx, "TypeError: Method %s called on incompatible receiver %v",
+                                           map ? "Map.prototype.entries" : "Set.prototype.values", v));
+            return false;
+        }
+        kind = map ? JS_ITER_MAP_ENTRIES : JS_ITER_SET_VALUES;
+    } else if (k == DI_STRING) {
+        if (!js_is_string(v)) {
+            JsString *str = js_op_to_string(ctx, v);
+            if (!str)
+                return false;
+            target = js_value_from_cell(&str->gc);
+        }
+        kind = JS_ITER_STRING;
+    }
+    js_gc_protect(ctx->vm, &target);
+    *it = js_iterobj_new(ctx, kind, target, js_undefined(), 0);
+    js_gc_unprotect(ctx->vm, &target);
+    return !js_is_undefined(*it);
 }
 
 /* O[name] for a property name in ASCII. False thrown, *out the error. */
@@ -511,37 +554,36 @@ static bool get_direct(JsContext *ctx, JsValue o, JsValue *src) {
 /* ---- cursors ---- */
 
 bool js_iter_is_iterable(JsContext *ctx, JsValue v) {
-    return js_is_string(v) || js_iterobj_is(v) || js_mapobj_is(v) || js_setobj_is(v) ||
-           inherits_iterator(ctx, v) || inherits_array(ctx, v);
+    return js_is_string(v) || default_iter(ctx, v) != DI_NONE;
 }
 
 int js_iter_open(JsContext *ctx, JsValue v, JsIterCursor *c) {
     c->i = 0;
     c->src = v;
     JsValue it = v;
-    if (js_is_string(v) || (is_array(v) && inherits_array(ctx, v))) {
-        /* (an array whose prototype was taken away is not iterable, as in V8.) The iterator V8
-         * makes here is stepped by the `next` it reads from it once. While that is still the
-         * Array Iterator's (the String Iterator's) own, stepping the cursor over V is what calling
-         * it would do, and no iterator object is made; a `next` a script put there is called. */
-        bool str = js_is_string(v);
-        if (js_intact(ctx, str ? JS_INTACT_STRING_ITER_NEXT : JS_INTACT_ARRAY_ITER_NEXT))
+    DefaultIter k = js_is_string(v) ? DI_STRING : default_iter(ctx, v);
+    if (k == DI_NONE)
+        return 0;
+    if (k == DI_STRING && !js_is_string(v)) {
+        /* String.prototype, or what inherits from it: iterated as the string ToString gives */
+        JsString *str = js_op_to_string(ctx, v);
+        if (!str)
+            return -1;
+        v = c->src = js_value_from_cell(&str->gc);
+    }
+    if (js_is_string(v) || (k == DI_ARRAY && is_array(v))) {
+        /* The iterator V8 makes here is stepped by the `next` it reads from it once. While that
+         * is still the Array Iterator's (the String Iterator's) own, stepping the cursor over V
+         * is what calling it would do, and no iterator object is made; a `next` a script put
+         * there is called. */
+        if (js_intact(ctx, js_is_string(v) ? JS_INTACT_STRING_ITER_NEXT : JS_INTACT_ARRAY_ITER_NEXT))
             return 1;
-        it = js_iterobj_new(ctx, str ? JS_ITER_STRING : JS_ITER_ARRAY_VALUES, v, js_undefined(), 0);
-        if (js_is_undefined(it))
-            return -1;
-    } else if (js_mapobj_is(v) || js_setobj_is(v)) {
-        /* a Map's default iterator is its entries, a Set's its values */
-        it = js_iterobj_new(ctx, js_mapobj_is(v) ? JS_ITER_MAP_ENTRIES : JS_ITER_SET_VALUES, v,
-                            js_undefined(), 0);
-        if (js_is_undefined(it))
-            return -1;
-    } else if (!js_iterobj_is(v) && !inherits_iterator(ctx, v)) {
-        if (!inherits_array(ctx, v))
-            return 0;
-        /* an array's inheritor: the array iterator over its `length` and indices */
-        it = js_iterobj_new(ctx, JS_ITER_ARRAY_VALUES, v, js_undefined(), 0);
-        if (js_is_undefined(it))
+    }
+    if (k != DI_SELF) {
+        js_gc_protect(ctx->vm, &v);
+        bool made = default_iter_call(ctx, k, v, &it);
+        js_gc_unprotect(ctx->vm, &v);
+        if (!made)
             return -1;
     }
     /* an iterator, or what inherits Iterator.prototype: [Symbol.iterator]() is the object itself,
@@ -550,6 +592,7 @@ int js_iter_open(JsContext *ctx, JsValue v, JsIterCursor *c) {
     bool ok = get_direct(ctx, it, &c->src);
     js_gc_unprotect(ctx->vm, &it);
     if (!ok) {
+        js_set_error(ctx, c->src);
         c->src = v;
         return -1;
     }
@@ -725,7 +768,7 @@ bool js_collection_fill(JsContext *ctx, JsValue coll, JsValue iterable, bool pai
     int open = js_iter_open(ctx, iterable, &cur);
     if (open <= 0) {
         js_gc_unprotect(vm, &adder);
-        *r = open < 0 ? js_oom_value(vm) : js_iter_not_iterable(ctx, iterable);
+        *r = open < 0 ? js_take_error(ctx) : js_iter_not_iterable(ctx, iterable);
         return false;
     }
     js_gc_protect(vm, &cur.src);
@@ -813,7 +856,7 @@ static bool open_flattenable(JsContext *ctx, JsValue v, bool strings, const char
         return (*err = js_error_fmt(ctx, "TypeError: %s called on non-object", what)), false;
     int rc = js_iter_open(ctx, v, c);
     if (rc < 0)
-        return (*err = js_oom_value(ctx->vm)), false;
+        return (*err = js_take_error(ctx)), false;
     if (rc > 0)
         return true;
     c->i = 0;
@@ -1208,14 +1251,10 @@ static bool it_from(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     if (!is_obj(o))
         return (*r = js_error_from_ascii(ctx, "TypeError: Iterator.from called on non-object")), false;
     JsValue iter = o;
-    if (inherits_array(ctx, o)) { /* an array, or what has Array.prototype.values as its iterator */
-        iter = js_iterobj_new(ctx, JS_ITER_ARRAY_VALUES, o, js_undefined(), 0);
-    } else if (js_mapobj_is(o) || js_setobj_is(o)) {
-        iter = js_iterobj_new(ctx, js_mapobj_is(o) ? JS_ITER_MAP_ENTRIES : JS_ITER_SET_VALUES, o,
-                              js_undefined(), 0);
-    }
-    if (js_is_undefined(iter))
-        return (*r = js_oom_value(vm)), false;
+    DefaultIter di = default_iter(ctx, o);
+    /* its [Symbol.iterator] called (Iterator.prototype's gives O back); with none, O itself */
+    if (di != DI_NONE && di != DI_SELF && !default_iter_call(ctx, di, o, &iter))
+        return (*r = js_take_error(ctx)), false;
     js_gc_protect(vm, &iter);
     JsValue next;
     bool ok = get_named(ctx, iter, "next", &next);
@@ -1401,7 +1440,7 @@ bool js_group_by(JsContext *ctx, JsValue items, JsValue cb, bool property_keys, 
     JsIterCursor cur;
     int open = js_iter_open(ctx, items, &cur);
     if (open <= 0) {
-        *r = open < 0 ? js_oom_value(vm) : js_iter_not_iterable(ctx, items);
+        *r = open < 0 ? js_take_error(ctx) : js_iter_not_iterable(ctx, items);
         return false;
     }
     JsValue v = js_undefined(), key = js_undefined();

@@ -162,6 +162,10 @@ as in V8: callable with anything, returning `undefined`, not a constructor, with
 `Array(...)` / `new Array(...)`: one numeric argument creates an empty
 array of that length; anything else behaves like `Array.of`.
 
+`Array.prototype` is itself an array, as in V8: empty, with its own `length`
+(`Array.isArray(Array.prototype)`, `JSON.stringify(Array.prototype)` is `[]`), and its prototype
+is `Object.prototype`.
+
 - **Statics**: `isArray`, `of`, `from` (any iterable, else an array-like's `[0, length)`; with
   `mapFn(value, index)` and its `thisArg`), `fromAsync` (the same, as a promise: each value
   awaited, and each `mapFn` result; a rejection or a throwing `mapFn` closes the iterator).
@@ -273,7 +277,7 @@ boxed `String` object — this engine has no boxed-primitive type at all).
   and `Object.getPrototypeOf(5)` lead to; likewise `String.prototype`). Their receiver must be a
   number (`Number.prototype.toString requires that 'this' be a Number`), as `String.prototype`'s
   `toString`/`valueOf` need a string; the prototypes themselves stand for `0` and `""`, as V8's
-  wrapper objects do. These tables, and functions' and promises', go on to `Object.prototype`
+  wrapper objects do (`String.prototype.length` is `0`, read-only). These tables, and functions' and promises', go on to `Object.prototype`
   (`(1).hasOwnProperty`, `f.valueOf`), and answer for any key the primitive does not have
   itself, an index included: `(5)[0]` and `'ab'[7]` are `undefined` unless
   `Number.prototype[0]` or `String.prototype[7]` has been set.
@@ -405,7 +409,11 @@ Constants: `PI`, `E`, `LN2`, `LN10`, `LOG2E`, `LOG10E`, `SQRT2`,
   and keys are those the object had when it was reached. A lone surrogate is written as `\udXXX`.
   A cycle throws V8's `TypeError`, naming the path: `Converting circular structure to JSON
   --> starting at object with constructor 'Object' | property 'a' -> ... --- property 'c' closes
-  the circle`.
+  the circle`. `Number.prototype`, `String.prototype` and `Boolean.prototype`, which are a
+  `Number`, a `String` and a `Boolean` object in V8, are written as V8 writes those: as the
+  number their `valueOf` gives, the string their `toString` gives, and `false`
+  (`JSON.stringify([Number.prototype, String.prototype])` is `[0,""]`); the same holds for one
+  of them in a replacer array or as `space`.
 - `JSON.parse(text, reviver)` calls the reviver for each member, innermost first, with the holder
   as `this` and `(key, value, context)`; what it returns replaces the member, and `undefined`
   deletes it. `context.source` is a primitive's source text (`"1.50"`, `"\"x\""`) while the
@@ -554,6 +562,15 @@ that inherits from `Iterator.prototype`**, which is how a script makes its own i
 An object that inherits from `Array.prototype` without being an array (`Object.create([1, 2])`)
 is iterated as V8 iterates it, by `Array.prototype.values` over its `length` and indices; an
 array as a prototype passes on its elements and `length` like any other property.
+
+Which of these a value is goes by its prototype chain, as V8's lookup of `[Symbol.iterator]`
+does: the nearest of `Array.prototype`, `String.prototype`, `Map.prototype`, `Set.prototype` and
+`Iterator.prototype` on the chain (the value itself included) gives the method, and it is called
+on the value. So an object that inherits from `String.prototype` iterates the code points of
+its `toString()`, one that inherits from `Map.prototype` or `Set.prototype` without being a
+`Map` or a `Set` throws V8's `TypeError: Method Map.prototype.entries called on incompatible
+receiver #<Map>`, a `Map` given `Array.prototype` as its prototype iterates as an array-like,
+and a `Map`, an array or an iterator whose chain reaches none of the five is not iterable.
 
 ```js
 const countdown = Object.create(Iterator.prototype);

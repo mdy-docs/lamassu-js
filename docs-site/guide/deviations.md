@@ -59,9 +59,7 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   inherits from `Math`, `JSON`, `Promise.prototype`, `AsyncFunction.prototype`, `Map.prototype`,
   `Set.prototype` or the weak collections' prototypes reports that tag, as V8's own
   `Symbol.toStringTag` makes it; there is no
-  symbol to set another (there are no symbols). `Array.prototype` is a plain object here, not an
-  array (`Array.isArray(Array.prototype)` is `false`), but it reports V8's tag,
-  `[object Array]`.
+  symbol to set another (there are no symbols).
 - **The builtins' accessors are V8's; a script cannot write one of its own.** Where V8 has an
   accessor property lamassu has one, on the same object, found by the walk up the prototype
   chain: `Object.prototype.__proto__`, `size` on `Map.prototype` and `Set.prototype`, `source`,
@@ -101,8 +99,7 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   `Object.assign`, and listed by `Object.getOwnPropertyNames`. The names of a builtin are V8's
   but for what is left out (see the list at the top), in the order lamassu defines them rather
   than V8's (`Math` starts `abs, floor, ceil` here and `abs, acos, acosh` in V8).
-  `Array.prototype` has no `length`, being a plain object, nor has `String.prototype` (it is
-  not a string: there are no wrapper objects), and `arguments` (an array here) has no `callee`.
+  `arguments` (an array here) has no `callee`.
 
 ## Functions
 
@@ -186,14 +183,16 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
 
 ## Iteration
 
-- **There is no `Symbol.iterator`**, so an object of a script's iterates only if it inherits from
-  `Iterator.prototype` (whose `[Symbol.iterator]` returns the object itself in V8) or from
-  `Array.prototype` (whose `[Symbol.iterator]` is `values`: `[...Object.create([1, 2])]` is
-  `[1, 2]`, read through `length` and the indices, as in V8): an iterable
-  that is not its own iterator (one whose `[Symbol.iterator]()` makes a fresh iterator each time)
-  cannot otherwise be written. `Iterator.from({ next() { ... } })` makes any object with `next`
-  iterable. An array stops being iterable when its prototype chain no longer reaches
-  `Array.prototype` (`Object.setPrototypeOf([1], null)`), as in V8. See
+- **There is no `Symbol.iterator`**, so a script cannot give an object an iterator method of its
+  own: an object iterates by the `[Symbol.iterator]` V8 would find on its prototype chain, which
+  is the one of the nearest of `Iterator.prototype` (returns the object itself),
+  `Array.prototype` (`values`: `[...Object.create([1, 2])]` is `[1, 2]`, read through `length`
+  and the indices), `String.prototype`, `Map.prototype` and `Set.prototype`, called on the
+  object as V8 calls it. An iterable that is not its own iterator (one whose
+  `[Symbol.iterator]()` makes a fresh iterator each time) cannot otherwise be written.
+  `Iterator.from({ next() { ... } })` makes any object with `next` iterable. A value stops
+  being iterable when its prototype chain no longer reaches one of those five
+  (`Object.setPrototypeOf([1], null)`, a `Map` whose prototype was replaced), as in V8. See
   [Built-ins → Iteration](/guide/builtins#iteration).
 - **A spread whose iterator has a `next` that is not a function says so**
   (`TypeError: undefined is not a function`, as `for...of` and destructuring say in both engines).

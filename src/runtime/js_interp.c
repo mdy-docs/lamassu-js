@@ -2401,7 +2401,7 @@ JS_COLD static bool iter_open_slow(JsContext *ctx, JsFiber *fb, const JsFunction
         return true;
     }
     if (rc < 0)
-        fiber_throw(ctx, fb, "out of memory");
+        fiber_throw_value(fb, js_take_error(ctx)); /* what opening it threw, or out of memory */
     else
         fiber_throw_operand(ctx, fb, fn, ip, *slot, " is not iterable");
     return false;
@@ -2535,7 +2535,7 @@ JS_COLD static bool spread_slow(JsContext *ctx, JsFiber *fb, const JsFunctionCel
     int rc = js_iter_open(ctx, src, &c);
     if (rc <= 0) {
         if (rc < 0)
-            fiber_throw(ctx, fb, "out of memory");
+            fiber_throw_value(fb, js_take_error(ctx)); /* what opening it threw, or out of memory */
         else if (!call)
             fiber_throw_operand(ctx, fb, fn, ip, src, " is not iterable");
         else if (js_is_undefined(src)) /* V8's spread call words these two its own way */

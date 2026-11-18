@@ -821,7 +821,7 @@ struct JsContext {
                              * Created first in js_builtins_init, before
                              * anything below — see js_object_new's bootstrap
                              * comment in js_object.c. */
-    JsObject *array_proto;
+    JsObject *array_proto; /* an array (JS_OBJ_ARRAY, length 0) whose proto is object_proto */
     JsObject *regexp_proto; /* NULL unless built with LAMASSU_HAS_REGEX */
     JsObject *date_proto;
     JsObject *map_proto;
