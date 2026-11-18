@@ -130,9 +130,19 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   has `RegExp.prototype` in its prototype chain, which is where V8 finds those methods; a script
   cannot replace them, or give them to an object that does not inherit from `RegExp.prototype`.
   Everything they read from the regexp is a script's to redefine, as in V8: `exec`, `flags` (and
-  through it `global`, `unicode` and the other flags), `constructor` (there is no
-  `Symbol.species`: the constructor itself is the one `split` and `matchAll` copy the regexp
-  with) and `lastIndex`. See [`RegExp`](/guide/builtins#regexp).
+  through it `global`, `unicode` and the other flags), `constructor` (whose species `split` and
+  `matchAll` copy the regexp with, see the next point) and `lastIndex`. See
+  [`RegExp`](/guide/builtins#regexp).
+- **There is no `Symbol.species`**, so a script cannot give a constructor one. What V8's
+  builtins have is here: `Array`, `Map`, `Set`, `Promise` and `RegExp` have the getter that
+  answers `this`, so a constructor has a species, itself, when it is one of those or inherits
+  from one (`Object.setPrototypeOf(C, Array)`, which is what `class C extends Array` does), and
+  any other function or object has none. Where V8 reads `constructor[Symbol.species]` the answer
+  is therefore the same as V8's for everything a script here can build: the array methods that
+  make an array (`map`, `filter`, `slice`, `splice`, `concat`, `flat`, `flatMap`) and the regexp
+  ones call `new constructor(...)` for a constructor with a species, make the default for one
+  without, and refuse a `constructor` that is not an object
+  (`TypeError: object.constructor[Symbol.species] is not a constructor`).
 - **`Object.prototype.valueOf.call(5)`** gives `5`, not a `Number` object (no wrapper objects).
 
 ## Arrays
@@ -155,6 +165,11 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
 - **A primitive receiver stays a primitive.** `Array.prototype.fill.call('abc', 1, 3)` returns
   an object in V8 (`Object('abc')`) and `'abc'` here, and a callback's third argument is the
   string, not its wrapper (no wrapper objects). What is read and what is refused are the same.
+- **`Array.of.call(Object, 1)` throws.** `Array.from` and `Array.of` build on `new this(...)`
+  when `this` is a constructor, as in V8, and `new Object(1)` is the number 1 here, not a
+  wrapper object, so the element cannot be defined on it:
+  `TypeError: Cannot create property '0' on number '1'`. The same goes for `Number`, `String`,
+  `Boolean` and `BigInt` as `this`. V8 answers a wrapper object with the elements on it.
 
 ## Numbers
 

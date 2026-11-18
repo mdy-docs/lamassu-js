@@ -4511,6 +4511,20 @@ done:
     return ok;
 }
 
+static const char SPECIES_NOT_CTOR[] = "TypeError: object.constructor[Symbol.species] is not a constructor";
+
+/* C[Symbol.species] is C: C is, or inherits from, one of the constructors V8 gives the getter
+ * (which answers `this`). Anything else has none. */
+static bool has_species(JsContext *ctx, JsValue c) {
+    for (JsValue p = c; is_object_type(p); p = js_get_proto(ctx, p)) {
+        for (int i = 0; i < JS_SPECIES__COUNT; i++) {
+            if (ctx->species_ctors[i] && js_is_function(p) && js_value_cell(p) == &ctx->species_ctors[i]->gc)
+                return true;
+        }
+    }
+    return false;
+}
+
 /*
  * SpeciesConstructor(O, DFLT) (7.3.22) for a builtin constructor DFLT, without Symbol: the
  * [Symbol.species] V8 would read from O.constructor is the getter Array, Map, Set, Promise and
@@ -4532,16 +4546,33 @@ int js_species(JsContext *ctx, JsValue o, const JsNative *dflt, JsValue *out) {
         return (*out = js_error_from_ascii(ctx, "TypeError: The .constructor property is not an object")), -1;
     if (js_value_cell(c) == &dflt->gc)
         return 0;
-    bool has = false;
-    for (JsValue p = c; !has && is_object_type(p); p = js_get_proto(ctx, p)) {
-        for (int i = 0; i < JS_SPECIES__COUNT; i++)
-            has = has || (ctx->species_ctors[i] && js_is_function(p) &&
-                          js_value_cell(p) == &ctx->species_ctors[i]->gc);
-    }
-    if (!has)
+    if (!has_species(ctx, c))
         return 0;
     if (!js_is_constructor(c))
-        return (*out = js_error_from_ascii(ctx, "TypeError: object.constructor[Symbol.species] is not a constructor")), -1;
+        return (*out = js_error_from_ascii(ctx, SPECIES_NOT_CTOR)), -1;
+    *out = c;
+    return 1;
+}
+
+/* ArraySpeciesCreate's choice for the array O (23.1.3.x, steps 3-7), with the same three answers:
+ * 0 a plain array. Unlike SpeciesConstructor, a `constructor` that is not an object is not
+ * refused for that, but for being no constructor (null and 5 alike). */
+int js_array_species(JsContext *ctx, JsValue o, JsValue *out) {
+    JsString *k = js_ascii_cell(ctx->vm, "constructor");
+    JsValue c;
+    if (!k)
+        return (*out = js_oom_value(ctx->vm)), -1;
+    if (!js_get_property(ctx, o, js_value_from_cell(&k->gc), &c))
+        return (*out = js_take_error(ctx)), -1;
+    if (js_is_undefined(c))
+        return 0;
+    if (is_object_type(c)) {
+        const JsNative *array = ctx->species_ctors[JS_SPECIES_ARRAY];
+        if ((array && js_value_cell(c) == &array->gc) || !has_species(ctx, c))
+            return 0; /* Array itself, or its [Symbol.species] is undefined */
+    }
+    if (!js_is_constructor(c))
+        return (*out = js_error_from_ascii(ctx, SPECIES_NOT_CTOR)), -1;
     *out = c;
     return 1;
 }

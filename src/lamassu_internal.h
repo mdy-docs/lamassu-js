@@ -219,6 +219,7 @@ enum {
     JS_INTACT_RE_DOTALL, JS_INTACT_RE_UNICODE, JS_INTACT_RE_UNICODESETS, JS_INTACT_RE_STICKY,
     JS_INTACT_RE_CONSTRUCTOR,
     JS_INTACT_RE_SOURCE,
+    JS_INTACT_ARRAY_CONSTRUCTOR, /* Array.prototype.constructor */
     JS_INTACT__COUNT
 };
 
@@ -1055,6 +1056,7 @@ uint32_t js_map_position(const JsMap *m, const JsString *key);
 /* SpeciesConstructor(O, DFLT) for a builtin DFLT: 0 construct the default, 1 *out is the
  * constructor to use (unrooted), -1 thrown with *out the error. O rooted by the caller. */
 int js_species(JsContext *ctx, JsValue o, const struct JsNative *dflt, JsValue *out);
+int js_array_species(JsContext *ctx, JsValue o, JsValue *out); /* ArraySpeciesCreate's */
 
 /* Watches HOLDER's own property NAME (which it has) as intact-id ID. False on OOM. */
 bool js_intact_watch(JsContext *ctx, unsigned id, JsObject *holder, const char *name);

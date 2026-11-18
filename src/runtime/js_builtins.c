@@ -1139,9 +1139,24 @@ static bool gen_flat(Gen *g, const JsValue *args, int argc);
 static bool gen_splice(Gen *g, const JsValue *args, int argc);
 static bool gen_copyWithin(Gen *g, const JsValue *args, int argc);
 static bool gen_copy(Gen *g, const JsValue *args, int argc);
+static bool gen_concat(Gen *g, const JsValue *args, int argc);
 
 static inline bool is_array(JsValue v) {
     return js_is_object(v) && js_value_object(v)->obj_kind == JS_OBJ_ARRAY;
+}
+
+/* TV is an array whose `constructor` is the Array the engine gave Array.prototype, found there:
+ * what ArraySpeciesCreate makes for it is a plain array, and reading that has no effect a script
+ * could see. Any other array (an own `constructor`, another prototype, Array.prototype's
+ * replaced) takes the generic steps, which ask (gen_out_new). */
+static inline bool array_plain_species(JsContext *ctx, JsValue tv) {
+    if (!is_array(tv))
+        return false;
+    const JsObject *a = js_value_object(tv);
+    return js_is_object(a->proto) && js_value_object(a->proto) == ctx->array_proto &&
+           js_intact(ctx, JS_INTACT_ARRAY_CONSTRUCTOR) &&
+           (a->props.used == 0 ||
+            js_map_position(&a->props, ctx->intact[JS_INTACT_ARRAY_CONSTRUCTOR].key) == JS_MAP_EMPTY);
 }
 
 /* A receiver that is not an array: BODY's steps on it, and that is the method's result. NAME is
@@ -1151,6 +1166,13 @@ static inline bool is_array(JsValue v) {
 #define GENERIC(name, body, kind)                                                                  \
     do {                                                                                           \
         if (JS_UNLIKELY(!is_array(tv)))                                                            \
+            return gen_run(ctx, tv, args, argc, r, name, body, kind);                              \
+    } while (0)
+/* The same for a method whose result ArraySpeciesCreate makes: an array takes the direct path
+ * only when that is a plain array */
+#define GENERIC_SPECIES(name, body, kind)                                                          \
+    do {                                                                                           \
+        if (JS_UNLIKELY(!array_plain_species(ctx, tv)))                                            \
             return gen_run(ctx, tv, args, argc, r, name, body, kind);                              \
     } while (0)
 
@@ -1364,7 +1386,7 @@ static bool am_includes(JsContext *ctx, JsValue tv, const JsValue *args, int arg
 }
 
 static bool am_slice(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    GENERIC(NULL, gen_slice, 0);
+    GENERIC_SPECIES(NULL, gen_slice, 0);
     JsObject *a = js_value_object(tv);
     /* the length first, then start and end, as V8; an element a valueOf removed reads undefined */
     uint32_t len = a->elem_count;
@@ -1509,6 +1531,8 @@ static bool am_fill(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
 static bool am_concat(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     if (js_is_undefined(tv) || js_is_null(tv))
         return native_throw(ctx, r, "TypeError: Array.prototype.concat called on null or undefined");
+    if (is_array(tv) && !array_plain_species(ctx, tv))
+        return gen_run(ctx, tv, args, argc, r, NULL, gen_concat, 0);
     JsObject *a = is_array(tv) ? js_value_object(tv) : NULL;
     JsObject *out = js_array_new_cell(ctx, a ? a->elem_count : 1);
     if (!out)
@@ -1549,6 +1573,8 @@ enum { IT_FINDLAST = IT_FINDINDEX + 1, IT_FINDLASTINDEX };
 
 static bool array_iterate(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
                           JsValue *r, IterKind kind) {
+    if (kind == IT_MAP || kind == IT_FILTER)
+        GENERIC_SPECIES(iter_names[kind], gen_iterate, kind);
     GENERIC(iter_names[kind], gen_iterate, kind);
     JsObject *a = js_value_object(tv);
     if (!js_is_function(ARG(0)))
@@ -2376,7 +2402,7 @@ static bool flat_into(JsContext *ctx, JsObject *out, JsObject *src, double depth
 }
 
 static bool am_flat(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    GENERIC(NULL, gen_flat, 0);
+    GENERIC_SPECIES(NULL, gen_flat, 0);
     JsObject *a = js_value_object(tv);
     double depth = 1;
     if (argc > 0 && !js_is_undefined(ARG(0))) {
@@ -2480,7 +2506,7 @@ static bool am_reduceRight(JsContext *ctx, JsValue tv, const JsValue *args, int 
 /* Array.prototype.flatMap (23.1.3.14): map, then flatten what the mapper returns one level (an
  * array's elements; anything else as itself) */
 static bool am_flatMap(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    GENERIC(NULL, gen_flat, 1);
+    GENERIC_SPECIES(NULL, gen_flat, 1);
     JsObject *a = js_value_object(tv);
     if (!js_is_function(ARG(0)))
         return native_throw_fmt(ctx, r, "TypeError: %t is not a function", ARG(0));
@@ -2573,7 +2599,7 @@ static bool arr_delete(JsContext *ctx, JsObject *a, uint32_t i, JsValue *r) {
 
 /* Array.prototype.splice (23.1.3.31), step by step as the spec moves and deletes. */
 static bool am_splice(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    GENERIC(NULL, gen_splice, 0);
+    GENERIC_SPECIES(NULL, gen_splice, 0);
     JsObject *a = js_value_object(tv);
     uint32_t len = a->elem_count, start = 0, del = 0;
     if (argc > 0 && !relative_index(ctx, ARG(0), len, &start, r))
@@ -2743,6 +2769,7 @@ struct Gen {
     JsValue lenkey;         /* "length" */
     JsValue v, w, acc, out; /* rooted: two elements, an accumulator, the result array */
     int kind;               /* which of a family of methods */
+    bool made;              /* OUT is what a species constructor made (gen_out_species): any object */
 };
 
 #define GEN_MAX_LEN 9007199254740991.0 /* 2**53 - 1, the longest array-like */
@@ -2863,20 +2890,80 @@ static bool gen_out_new(Gen *g) {
     return true;
 }
 
-/* out[n] = v, n at or past its end; the indices skipped are undefined (holes, in V8) */
+/* ArraySpeciesCreate(O, len) (23.1.3.x): the result is a plain array unless O is an array whose
+ * `constructor` says otherwise, when it is whatever `new constructor(len)` gives, and the
+ * elements are defined on it as properties (gen_out_put) */
+static bool gen_out_species(Gen *g, double len) {
+    JsValue ctor = js_undefined();
+    int sp = is_array(g->o) ? js_array_species(g->ctx, g->o, &ctor) : 0;
+    if (sp < 0)
+        return (*g->r = ctor), false;
+    if (sp == 0)
+        return gen_out_new(g);
+    JsVm *vm = g->ctx->vm;
+    JsValue arg = js_number(len);
+    js_gc_protect(vm, &ctor);
+    bool ok = js_construct(g->ctx, ctor, &arg, 1, &g->out);
+    js_gc_unprotect(vm, &ctor);
+    if (!ok) {
+        *g->r = g->out;
+        g->out = js_undefined();
+        return false;
+    }
+    g->made = true;
+    return true;
+}
+
+/* CreateDataPropertyOrThrow(a, key, v): A and V rooted by the caller. False thrown (pending).
+ * A is what a constructor made, which here can be a primitive (`new Object(1)` is 1: there are
+ * no wrapper objects), and that takes no property: the assignment's TypeError. */
+static bool create_data_property(JsContext *ctx, JsValue a, JsValue key, JsValue v) {
+    JsVm *vm = ctx->vm;
+    if (gen_primitive(a))
+        return js_set_property(ctx, a, key, v);
+    if (js_is_number(key)) {
+        JsString *ks = js_op_to_string(ctx, key);
+        if (!ks)
+            return false;
+        key = js_value_from_cell(&ks->gc);
+    }
+    JsPropDesc d = {JS_DESC_VALUE | JS_DESC_WRITABLE | JS_DESC_ENUMERABLE | JS_DESC_CONFIGURABLE, true, true, true, v};
+    js_gc_protect(vm, &key);
+    bool ok = js_define_own_property(ctx, a, key, &d);
+    js_gc_unprotect(vm, &key);
+    return ok;
+}
+
+/* out[n] = v, n at or past its end; the indices skipped are undefined (holes, in V8). On what a
+ * species constructor made, CreateDataPropertyOrThrow(out, n, v). */
 static bool gen_out_put(Gen *g, double n, JsValue v) {
-    JsObject *out = js_value_object(g->out);
-    if (n >= GEN_MAX_ARRAY || n - out->elem_count > JS_MAX_ARRAY_GAP)
-        return native_throw(g->ctx, g->r, GEN_BAD_LENGTH);
+    bool ok;
     js_gc_protect(g->ctx->vm, &v);
-    bool ok = js_array_set_index(g->ctx->vm, out, (uint32_t)n, v);
+    if (g->made) {
+        ok = create_data_property(g->ctx, g->out, js_number(n), v);
+    } else {
+        JsObject *out = js_value_object(g->out);
+        if (n >= GEN_MAX_ARRAY || n - out->elem_count > JS_MAX_ARRAY_GAP) {
+            js_gc_unprotect(g->ctx->vm, &v);
+            return native_throw(g->ctx, g->r, GEN_BAD_LENGTH);
+        }
+        ok = js_array_set_index(g->ctx->vm, out, (uint32_t)n, v);
+    }
     js_gc_unprotect(g->ctx->vm, &v);
     return ok || gen_fail(g);
 }
 
-/* out.length = n, n at least its length */
+/* The array's indices up to n exist (they are holes in V8): n at least its length. Nothing, on
+ * what a species constructor made. */
+static bool gen_out_fill(Gen *g, double n) {
+    return g->made || n <= js_value_object(g->out)->elem_count || gen_out_put(g, n - 1, js_undefined());
+}
+
+/* Set(out, "length", n, true), which a plain array's filling to n is */
 static bool gen_out_len(Gen *g, double n) {
-    return n <= js_value_object(g->out)->elem_count || gen_out_put(g, n - 1, js_undefined());
+    if (!g->made)
+        return gen_out_fill(g, n);
+    return js_set_property(g->ctx, g->out, g->lenkey, js_number(n)) || gen_fail(g);
 }
 
 /* callback(v, i, O) with THISARG; the result into *RES. False: it threw. RES is not the slot
@@ -2903,6 +2990,7 @@ static bool gen_run(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     g.r = r;
     g.o = tv;
     g.kind = kind;
+    g.made = false;
     g.v = g.w = g.acc = g.out = js_undefined();
     g.lenkey = js_atom(ctx->vm, klen, 6);
     if (!js_is_string(g.lenkey))
@@ -3088,7 +3176,7 @@ static bool gen_slice(Gen *g, const JsValue *args, int argc) {
         return false;
     if (fin - k > GEN_MAX_ARRAY)
         return native_throw(g->ctx, g->r, GEN_BAD_LENGTH);
-    if (!gen_out_new(g))
+    if (!gen_out_species(g, fin > k ? fin - k : 0))
         return false;
     double n = 0;
     for (; k < fin; k++, n++) {
@@ -3217,7 +3305,7 @@ static bool gen_iterate(Gen *g, const JsValue *args, int argc) {
     JsValue cb = args[0], thisArg = ARG(1); /* rooted as the native's arguments */
     if (kind == IT_MAP && len > GEN_MAX_ARRAY)
         return native_throw(g->ctx, g->r, GEN_BAD_LENGTH);
-    if ((kind == IT_MAP || kind == IT_FILTER) && !gen_out_new(g))
+    if ((kind == IT_MAP || kind == IT_FILTER) && !gen_out_species(g, kind == IT_MAP ? len : 0))
         return false;
     JsValue result = js_undefined();
     switch (kind) {
@@ -3249,7 +3337,7 @@ static bool gen_iterate(Gen *g, const JsValue *args, int argc) {
             return true;
         }
     }
-    if (kind == IT_MAP && !gen_out_len(g, len))
+    if (kind == IT_MAP && !gen_out_fill(g, len))
         return false;
     *g->r = kind == IT_MAP || kind == IT_FILTER ? g->out : result;
     return true;
@@ -3348,6 +3436,106 @@ static bool gen_sort(Gen *g, const JsValue *args, int argc) {
     return true;
 }
 
+/* FlattenIntoArray onto what a species constructor made: flat_into, with each element defined on
+ * it at *N on (gen_out_put). A define runs no script, but that result may be one of the arrays
+ * being flattened (the constructor chose it), so a level's length is the one it had when it was
+ * entered, as the spec has it, an index it has lost is skipped, and the levels are kept alive by
+ * g->acc and not by SRC alone (which g->v roots). */
+typedef struct {
+    JsObject *arr;
+    uint32_t idx, len;
+} FlatMadeLevel;
+
+static bool gen_flat_made(Gen *g, JsObject *src, double depth, double *n) {
+    JsVm *vm = g->ctx->vm;
+    FlatMadeLevel fixed[16], *st = fixed;
+    uint32_t sp = 0, cap = 16;
+    bool ok = true;
+    JsObject *keep = js_array_new_cell(g->ctx, 0);
+    if (!keep)
+        return gen_fail(g);
+    g->acc = js_value_from_cell(&keep->gc);
+    st[0].arr = src;
+    st[0].idx = 0;
+    st[0].len = src->elem_count;
+    for (;;) {
+        JsObject *cur = st[sp].arr;
+        if (st[sp].idx >= st[sp].len) {
+            if (sp-- == 0)
+                break;
+            continue;
+        }
+        uint32_t i = st[sp].idx++;
+        if (i >= cur->elem_count)
+            continue;
+        JsValue el = cur->elems[i];
+        if (!(depth - sp > 0 && is_array(el))) {
+            if (!gen_out_put(g, (*n)++, el)) {
+                ok = false;
+                break;
+            }
+            continue;
+        }
+        if (sp + 1 == FLAT_MAX_NEST) {
+            ok = native_throw(g->ctx, g->r, "RangeError: Maximum call stack size exceeded");
+            break;
+        }
+        if (sp + 1 == cap) {
+            FlatMadeLevel *grown = js_realloc_raw(vm, st == fixed ? NULL : st, st == fixed ? 0 : cap * sizeof *st,
+                                                  (size_t)cap * 2 * sizeof *st);
+            if (!grown) {
+                ok = gen_fail(g);
+                break;
+            }
+            if (st == fixed)
+                memcpy(grown, fixed, sizeof fixed);
+            st = grown;
+            cap *= 2;
+        }
+        st[++sp].arr = js_value_object(el); /* before the append, which may collect */
+        st[sp].idx = 0;
+        st[sp].len = st[sp].arr->elem_count;
+        js_gc_protect(vm, &el);
+        bool kept = js_array_append(vm, js_value_object(g->acc), el);
+        js_gc_unprotect(vm, &el);
+        if (!kept) {
+            ok = gen_fail(g);
+            break;
+        }
+    }
+    if (st != fixed)
+        js_realloc_raw(vm, st, cap * sizeof *st, 0);
+    g->acc = js_undefined();
+    return ok;
+}
+
+/* 23.1.3.2 concat, of an array whose result ArraySpeciesCreate has to be asked for (am_concat
+ * does every other receiver): the receiver and each argument, an array's elements and anything
+ * else as itself, defined on the result, whose length is then set */
+static bool gen_concat(Gen *g, const JsValue *args, int argc) {
+    if (!gen_out_species(g, 0))
+        return false;
+    double n = 0;
+    for (int i = -1; i < argc; i++) {
+        JsValue e = i < 0 ? g->o : args[i];
+        if (!is_array(e)) {
+            if (!gen_out_put(g, n++, e))
+                return false;
+            continue;
+        }
+        JsObject *a = js_value_object(e);
+        uint32_t len = a->elem_count;
+        for (uint32_t k = 0; k < len; k++)
+            if (!gen_step(g) || (k < a->elem_count && !gen_out_put(g, n + k, a->elems[k])))
+                return false;
+        n += len;
+    }
+    if (!gen_out_len(g, n))
+        return false;
+    *g->r = g->out;
+    return true;
+}
+
 /* 23.1.3.13 flat (kind 0), 14 flatMap (kind 1): the receiver's own level here, the arrays in it
  * by flat_into */
 static bool gen_flat(Gen *g, const JsValue *args, int argc) {
@@ -3361,8 +3549,9 @@ static bool gen_flat(Gen *g, const JsValue *args, int argc) {
     } else if (argc > 0 && !js_is_undefined(args[0]) && !gen_int(g, args[0], &depth)) {
         return false;
     }
-    if (!gen_out_new(g))
+    if (!gen_out_species(g, 0))
         return false;
+    double n = 0; /* the next index of what a species constructor made */
     for (double k = 0; k < len; k++) {
         bool has;
         if (!gen_step(g) || !gen_has(g, k, &has))
@@ -3375,6 +3564,15 @@ static bool gen_flat(Gen *g, const JsValue *args, int argc) {
             if (!gen_call(g, args[0], ARG(1), g->v, k, &g->w))
                 return false;
             g->v = g->w;
+        }
+        if (g->made) {
+            if (!(depth > 0 && is_array(g->v))) {
+                if (!gen_out_put(g, n++, g->v))
+                    return false;
+            } else if (!gen_flat_made(g, js_value_object(g->v), mapped ? 0 : depth - 1, &n)) {
+                return false;
+            }
+            continue;
         }
         JsObject *out = js_value_object(g->out);
         if (depth > 0 && is_array(g->v)) {
@@ -3404,7 +3602,7 @@ static bool gen_splice(Gen *g, const JsValue *args, int argc) {
         return native_throw(g->ctx, g->r, "TypeError: Invalid array length");
     if (del > GEN_MAX_ARRAY)
         return native_throw(g->ctx, g->r, GEN_BAD_LENGTH);
-    if (!gen_out_new(g))
+    if (!gen_out_species(g, del))
         return false;
     for (double k = 0; k < del; k++) {
         bool has;
@@ -6748,8 +6946,45 @@ static bool arr_isArray(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     return true;
 }
 
+/* Array.from's and Array.of's result when `this` is a constructor other than Array:
+ * `new this()`, or `new this(len)` with ARG, on which the elements are then defined
+ * (create_data_property) and `length` set (from_set_length). 0: a plain array is the result, as
+ * for any `this` that is no constructor; 1: *OUT is what it made; -1: thrown, *OUT the error. */
+static int from_construct(JsContext *ctx, JsValue tv, const JsValue *arg, JsValue *out) {
+    const JsNative *array = ctx->species_ctors[JS_SPECIES_ARRAY];
+    if ((js_is_function(tv) && array && js_value_cell(tv) == &array->gc) || !js_is_constructor(tv))
+        return 0;
+    return js_construct(ctx, tv, arg, arg ? 1 : 0, out) ? 1 : -1;
+}
+
+/* Set(a, "length", n, true): A rooted by the caller. False thrown (*r the error). */
+static bool from_set_length(JsContext *ctx, JsValue a, double n, JsValue *r) {
+    JsString *lk = js_ascii_cell(ctx->vm, "length");
+    if (!lk)
+        return oom(ctx, r);
+    JsValue key = js_value_from_cell(&lk->gc);
+    js_gc_protect(ctx->vm, &key);
+    bool ok = js_set_property(ctx, a, key, js_number(n));
+    js_gc_unprotect(ctx->vm, &key);
+    return ok || oom(ctx, r);
+}
+
 static bool arr_of(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    (void)tv;
+    JsValue made = js_undefined(), count = js_number(argc);
+    int sp = from_construct(ctx, tv, &count, &made);
+    if (sp < 0)
+        return (*r = made), false;
+    if (sp > 0) {
+        js_gc_protect(ctx->vm, &made);
+        bool ok = true;
+        for (int i = 0; ok && i < argc; i++)
+            ok = create_data_property(ctx, made, js_number(i), args[i]) || oom(ctx, r);
+        ok = ok && from_set_length(ctx, made, argc, r);
+        js_gc_unprotect(ctx->vm, &made);
+        if (ok)
+            *r = made;
+        return ok;
+    }
     JsObject *out = js_array_new_cell(ctx, (uint32_t)argc);
     if (!out)
         return oom(ctx, r);
@@ -6781,7 +7016,6 @@ static bool am_entries(JsContext *ctx, JsValue tv, const JsValue *args, int argc
 /* Array.from(items, mapFn, thisArg): an iterable's values in order, else an array-like's
  * [0, length) (ToLength of its length), each through mapFn(value, index) when it is given. */
 static bool arr_from(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
-    (void)tv;
     JsVm *vm = ctx->vm;
     JsValue src = ARG(0), mapfn = ARG(1), thisArg = ARG(2);
     bool has_map = !js_is_undefined(mapfn);
@@ -6794,17 +7028,25 @@ static bool arr_from(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
     if (open == 0 && (js_is_undefined(src) || js_is_null(src)))
         return (*r = js_iter_not_iterable(ctx, src)), false;
     js_gc_protect(vm, &cur.src); /* a Map's or a record's new iterator is held nowhere else */
-    JsObject *out = js_array_new_cell(ctx, 0);
-    if (!out) {
-        js_gc_unprotect(vm, &cur.src);
-        return oom(ctx, r);
-    }
-    JsValue outv = js_value_from_cell(&out->gc), item = js_undefined();
+    JsValue outv = js_undefined(), item = js_undefined();
     js_gc_protect(vm, &outv);
     js_gc_protect(vm, &item);
     bool ok = true, thrown = false;
+    /* what a constructor `this` made (from_construct): of an iterable `new this()`, before the
+     * first value is asked for; of an array-like `new this(len)`, below */
+    int made = open ? from_construct(ctx, tv, NULL, &outv) : 0;
+    if (made < 0) {
+        *r = outv;
+        outv = js_undefined();
+        ok = false;
+        thrown = true;
+        js_gc_protect(vm, r);
+        JsValue ignored;
+        (void)js_iter_close(ctx, &cur, true, false, &ignored);
+        js_gc_unprotect(vm, r);
+    }
     double len = 0;
-    if (open == 0) {
+    if (ok && open == 0) {
         /* an array-like: ToLength(items.length) */
         JsValue lv;
         JsString *lk = js_ascii_cell(vm, "length");
@@ -6815,13 +7057,31 @@ static bool arr_from(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
             thrown = true;
         }
         len = len != len || len <= 0 ? 0 : len > 9007199254740991.0 ? 9007199254740991.0 : (double)(uint64_t)len;
-        if (ok && len > 4294967295.0) {
+        if (ok) {
+            JsValue lenv = js_number(len);
+            made = from_construct(ctx, tv, &lenv, &outv);
+            if (made < 0) {
+                *r = outv;
+                outv = js_undefined();
+                ok = false;
+                thrown = true;
+            }
+        }
+        if (ok && !made && len > 4294967295.0) {
             *r = js_error_from_ascii(ctx, "RangeError: Invalid array length");
             ok = false;
             thrown = true;
         }
     }
-    for (uint32_t k = 0; ok; k++) {
+    if (ok && !made) {
+        JsObject *out = js_array_new_cell(ctx, 0);
+        if (out)
+            outv = js_value_from_cell(&out->gc);
+        else
+            ok = false;
+    }
+    double k = 0;
+    for (; ok; k++) {
         if (open) {
             int rc = js_iter_next(ctx, &cur, &item);
             if (rc == 0)
@@ -6833,7 +7093,7 @@ static bool arr_from(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
                 break;
             }
         } else {
-            if ((double)k >= len)
+            if (k >= len)
                 break;
             if (!js_get_property(ctx, src, js_number(k), &item)) {
                 *r = js_take_error(ctx);
@@ -6857,7 +7117,25 @@ static bool arr_from(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
                 break;
             }
         }
-        ok = js_array_append(vm, js_value_object(outv), item);
+        if (!made) {
+            ok = js_array_append(vm, js_value_object(outv), item);
+            continue;
+        }
+        if (!js_native_charge(ctx) || !create_data_property(ctx, outv, js_number(k), item)) {
+            (void)oom(ctx, r);
+            ok = false;
+            thrown = true;
+            if (open) { /* as the mapper's does */
+                js_gc_protect(vm, r);
+                JsValue ignored;
+                (void)js_iter_close(ctx, &cur, true, false, &ignored);
+                js_gc_unprotect(vm, r);
+            }
+        }
+    }
+    if (ok && made && !from_set_length(ctx, outv, k, r)) {
+        ok = false;
+        thrown = true;
     }
     js_gc_unprotect(vm, &item);
     js_gc_unprotect(vm, &outv);
@@ -7931,6 +8209,8 @@ bool js_builtins_init(JsContext *ctx) {
         ctx->species_ctors[i] = found && js_is_function(c) && js_value_cell(c)->kind == JS_KIND_NATIVE
                                     ? (JsNative *)js_value_cell(c) : NULL;
     }
+    if (!js_intact_watch(ctx, JS_INTACT_ARRAY_CONSTRUCTOR, ctx->array_proto, "constructor"))
+        return false;
     hide_builtin_keys(ctx);
     return true;
 }

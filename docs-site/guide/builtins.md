@@ -200,6 +200,28 @@ array of that length; anything else behaves like `Array.of`.
   spreads only arrays, as there is no `Symbol.isConcatSpreadable`: any other receiver or
   argument is one element. See [Deviations](/guide/deviations#arrays) for the two places the
   result differs: the copy has no holes, and a primitive receiver stays a primitive.
+- **The result of `map`, `filter`, `slice`, `splice`, `concat`, `flat` and `flatMap` is the
+  receiver's `constructor`'s to make**, as in V8 (`ArraySpeciesCreate`), when the receiver is an
+  array. The property is read as any other, on the array and then up its prototype chain, so
+  `arr.constructor = C`, a prototype of the script's between the array and `Array.prototype`,
+  and `Array.prototype.constructor = C` all count. `undefined`, `Array`, and any function or
+  object that does not inherit from a builtin constructor give an ordinary array, without
+  being called; a constructor that inherits from `Array` (`Object.setPrototypeOf(C, Array)`)
+  is called as `new C(length)`, before the first callback, with the length V8 passes (`map`
+  the receiver's, `slice` and `splice` the count of elements, the others 0), and whatever it
+  answers has the elements defined on it as properties; `slice`, `splice` and `concat` then set
+  its `length`, the others do not. A result that refuses them throws V8's errors
+  (`Cannot define property 0, object is not extensible`, `Cannot redefine property: 0`,
+  `Cannot assign to read only property 'length' of object '#<Object>'`), and a `constructor`
+  that is `null` or a primitive is
+  `TypeError: object.constructor[Symbol.species] is not a constructor`. A receiver that is not
+  an array always gives an array, and `toSorted`, `toSpliced`, `toReversed` and `with` never
+  ask. [Deviations](/guide/deviations#conversions) has what stands in for `Symbol.species`.
+- **`Array.from` and `Array.of` build on `this`** when it is a constructor other than `Array`
+  (`Array.from.call(C, items)`, or the function assigned to a constructor of the script's):
+  `new C()` for an iterable and `new C(length)` for an array-like and for `of`, then each
+  element defined as a property and `length` set, as in V8; a failure closes the iterator. Any
+  other `this` (`const from = Array.from`, an arrow function, an object) gives an array.
 - `flat` and `flatMap` go as deep as they are asked, whatever the nesting; an array that holds
   itself, flattened without a limit, is `RangeError: Maximum call stack size exceeded` as in V8
   (here after 2000 levels). `join` (and `toString`) of more than 2<sup>26</sup> code units, the
