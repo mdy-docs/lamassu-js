@@ -333,6 +333,13 @@ typedef struct Lit {
     uint16_t buf[JS_CALLEE_MAX]; /* STRING: a concatenation's units */
 } Lit;
 
+/* *DST = *SRC, a concatenation's units moved into DST's own buffer: a Lit may point into itself */
+static void lit_assign(Lit *dst, const Lit *src) {
+    *dst = *src;
+    if (src->su == src->buf)
+        dst->su = dst->buf;
+}
+
 static bool lit_truthy(const Lit *l) {
     switch (l->kind) {
     case LIT_NUMBER: return l->num == l->num && l->num != 0.0;
@@ -577,7 +584,7 @@ static void render_nary(CalleeBuf *b, const JsAstNode *n, uint8_t op, int depth,
         cb_ascii(b, op_text(op));
         cb_ascii(b, " ");
         if (fold_lit(n->b, &r, 0) && r.kind == LIT_STRING && op == JS_T_PLUS)
-            *last = r; /* may be joined by what follows */
+            lit_assign(last, &r); /* may be joined by what follows */
         else
             render_expr(b, n->b, depth + 1, false);
         return;
@@ -585,7 +592,7 @@ static void render_nary(CalleeBuf *b, const JsAstNode *n, uint8_t op, int depth,
     /* the first operand */
     *first = false;
     if (fold_lit(n, &l, 0) && l.kind == LIT_STRING && op == JS_T_PLUS)
-        *last = l;
+        lit_assign(last, &l);
     else
         render_expr(b, n, depth + 1, false);
 }

@@ -1723,6 +1723,9 @@ static void test_number_ops(void) {
 /* Optional chains that parentheses end or calls continue, and the text an error gives an
  * expression (V8's call printer, with the parser's folding); expectations are Node's output */
 static void test_chains_and_call_printer(void) {
+    /* a folded concatenation copied while printing (it once pointed into a dead frame) */
+    eq_s("let x = 1; const out = []; try { (\"a\" + \"b\" + x)(); } catch (e) { out.push(e.message); } try { (x + (\"c\" + \"d\") + \"e\")(); } catch (e) { out.push(e.message); } out.join(' | ');",
+         "(\"ab\" + x) is not a function | (x + \"cde\") is not a function");
     /* parentheses end an optional chain, and a call inside a chain is skipped with it */
     eq_s("const o = {}; const out = []; for (const g of [() => (o.a?.b)(), () => (o?.a)(), () => (o.a?.b).c, () => (o.a?.b)[0], () => (o.a?.b.c)(), () => o.a?.b(), () => o.a?.b.c(), () => (o.a?.())(), () => (o.a?.b)`t`, () => new (o.a?.b)(), () => (o.a?.b)?.()]) { try { out.push(String(g())); } catch (e) { out.push(e.message); } } [out.join(' | ')].join(' ');",
          "(intermediate value) is not a function | (intermediate value) is not a function | Cannot read properties of undefined (reading 'c') | Cannot read properties of undefined (reading '0') | (intermediate value) is not a function | undefined | undefined | (intermediate value) is not a function | (intermediate value) is not a function | (intermediate value) is not a constructor | undefined");
