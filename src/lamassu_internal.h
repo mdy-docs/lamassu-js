@@ -898,6 +898,11 @@ struct JsContext {
      * until the first one; GC root. */
     JsObject *stack_records;
     JsFrameRoot *frame_roots; /* GC roots */
+    /* Error.prepareStackTrace's CallSites: their prototype (made when first needed) and a weak
+     * map of the runtime's own from each CallSite to its record (js_error.c). GC roots. */
+    JsObject *callsite_proto;
+    JsObject *callsite_records;
+    bool formatting_stack; /* Error.prepareStackTrace is running: a `stack` read formats without it */
     /* RegExp's legacy statics (RegExp.$1, lastMatch, input, ...): the last successful match's
      * subject and groups 0-9 ([start, end], -1 for none), its last group, and RegExp.input
      * (which a script may set): what the constructor's accessors read. GC roots: re_subject,

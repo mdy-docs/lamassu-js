@@ -498,6 +498,24 @@ Each subclass constructor's `[[Prototype]]` is `Error`, so `TypeError.captureSta
   global object.
 - **`Error.stackTraceLimit`** (10): the frames kept. Anything but a number gives a `stack` that
   reads `undefined`.
+- **`Error.prepareStackTrace(error, callSites)`**, when a script makes it a function, makes the
+  value of `stack` in place of the text, as in V8 and Node: it is called the first time `stack`
+  is read (not when the error is made), with `Error` as `this` (the global `Error`'s, else the
+  one the engine made), the error (or what `Error.captureStackTrace` was given) and an array of
+  `CallSite` objects, one per frame; what it returns is `stack`, whatever it is, and what it
+  throws is what the read throws (the next read tries again). A `stack` read from inside it is
+  formatted as if it were not there. A `CallSite` answers `getFunctionName()`,
+  `getMethodName()`, `getTypeName()`, `getFileName()` and `getScriptNameOrSourceURL()` (the
+  module's specifier, `undefined` for none), `getLineNumber()`, `getColumnNumber()`,
+  `getPosition()` (the offset in the source), `getEnclosingLineNumber()` and
+  `getEnclosingColumnNumber()` (where the function starts), `isToplevel()`, `isConstructor()`,
+  `isAsync()`, `getScriptHash()` (the SHA-256 of the source's UTF-8, in hex), and `toString()`
+  (the frame's line in `stack`), as V8's do. Every frame is strict, so `getThis()` and
+  `getFunction()` are `undefined`, as V8 has them for a strict frame; `isNative()`, `isEval()`
+  and `isPromiseAll()` are `false`, `getPromiseIndex()` is `null` and `getEvalOrigin()`
+  `undefined`. The methods are on a prototype whose `constructor` is `CallSite` (not a global,
+  and `Error: Not supported` when called), read-only and not configurable as in V8; called on
+  anything else they are `TypeError: CallSite method getFileName expects CallSite as receiver`.
 - **`Error.captureStackTrace(object, fn?)`** gives `object` a `stack` of the frames running now,
   leaving out `fn`'s call and those above it. `object` is anything that is an object: an
   error, a plain object, an array, a function, a promise. It gets the `stack` accessor errors

@@ -299,6 +299,9 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->weak_kept = NULL;
     ctx->stack_records = NULL;
     ctx->frame_roots = NULL;
+    ctx->callsite_proto = NULL;
+    ctx->callsite_records = NULL;
+    ctx->formatting_stack = false;
     ctx->bigint_methods = NULL;
     ctx->regexp_ctor = NULL;
     ctx->re_subject = NULL;

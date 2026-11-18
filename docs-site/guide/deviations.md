@@ -25,7 +25,6 @@ so everything left is left out by design:
   builtins **are** there, on the prototypes and constructors where V8 has them
   (`Object.prototype.__proto__`, `Map.prototype.size`, `RegExp.prototype.source`, ...).
 - `Function.prototype.constructor`: see Functions, below.
-- `Error.prepareStackTrace`: see Errors, below.
 - `queueMicrotask` and `structuredClone` are the host's (HTML, Node), not V8's; an embedder adds
   them as natives if it wants them.
 - `Reflect`, `Proxy`, `Symbol`, typed arrays, `ArrayBuffer`, `SharedArrayBuffer`,
@@ -199,8 +198,7 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
 
 - **Nothing raises `EvalError`**: there is no `eval`. The constructor is
   there, as in V8.
-- **`stack` is V8's**, with these differences: no `Error.prepareStackTrace` hook;
-  the first line is made as Node makes it, not as V8's own formatter does (the one a browser
+- **`stack` is V8's**, with these differences: the first line is made as Node makes it, not as V8's own formatter does (the one a browser
   runs): it has the `message` the error has when `stack` is first read, where V8's own keeps
   the message the error was constructed with (`e.message = 'b'` before the first read shows
   `b` here and in Node, the original in Chrome), and a `name` or `message` whose conversion

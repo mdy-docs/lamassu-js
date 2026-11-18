@@ -925,6 +925,369 @@ static JsString *stack_text(JsContext *ctx, JsValue o, const JsErrorFrame *frame
     return s2;
 }
 
+/* ---- Error.prepareStackTrace ---- */
+
+/* What a CallSite answers, taken from its frame when it is made: values only (strings, numbers,
+ * booleans, null), never the frame's function or receiver, which V8 does not give a strict-mode
+ * frame's CallSite either (getThis() and getFunction() are undefined), and every frame here is
+ * strict. The record is an array kept in JsContext.callsite_records, which no script reaches. */
+enum {
+    CS_FUNCTION_NAME, CS_METHOD_NAME, CS_TYPE_NAME, CS_FILE_NAME, CS_LINE, CS_COLUMN,
+    CS_ENCLOSING_LINE, CS_ENCLOSING_COLUMN, CS_POSITION, CS_TOPLEVEL, CS_CONSTRUCTOR, CS_ASYNC,
+    CS_TEXT, CS_SOURCE, CS_COUNT
+};
+
+static JsValue str_or_null(const JsString *s) {
+    return s && s->length ? js_value_from_cell((JsGcCell *)&s->gc) : js_null();
+}
+
+/* The function of FR as a closure compiled from source, or NULL (a native) */
+static const JsFunctionCell *frame_code(const JsErrorFrame *fr) {
+    JsGcCell *c = js_value_cell(fr->fn);
+    return c->kind == JS_KIND_CLOSURE ? ((const JsClosure *)c)->fn : NULL;
+}
+
+/* FR's record (CS_*), or undefined on OOM. FR's values are rooted by the caller. */
+static JsValue callsite_record(JsContext *ctx, const JsErrorFrame *fr) {
+    JsVm *vm = ctx->vm;
+    JsObject *rec = js_array_new_cell(ctx, 0);
+    if (!rec)
+        return js_undefined();
+    JsValue rv = js_value_from_cell(&rec->gc);
+    js_gc_protect(vm, &rv);
+    bool top_level = js_is_undefined(fr->receiver) || js_is_null(fr->receiver);
+    bool construct = (fr->flags & JS_EF_CONSTRUCT) != 0, called = !top_level && !construct;
+    const JsFunctionCell *f = frame_code(fr);
+    bool ok = js_array_append(vm, rec, str_or_null(frame_function_name(fr->fn)));
+    /* a method's name and the receiver's type, for a frame called on an object (V8: null for a
+     * plain call and for `new`) */
+    ok = ok && js_array_append(vm, rec, called ? str_or_null(method_name(ctx, fr->receiver, fr->fn)) : js_null());
+    JsString *tmp = NULL;
+    const JsString *type = called ? type_name(ctx, fr->receiver, &tmp) : NULL;
+    JsValue tv = tmp ? js_value_from_cell(&tmp->gc) : js_undefined();
+    js_gc_protect(vm, &tv);
+    ok = ok && js_array_append(vm, rec, str_or_null(type));
+    js_gc_unprotect(vm, &tv);
+    bool named = f && f->module && f->module->specifier && f->module->specifier->length;
+    ok = ok && js_array_append(vm, rec, named ? js_value_from_cell(&f->module->specifier->gc) : js_undefined());
+    uint32_t line = 0, col = 0, eline = 0, ecol = 0;
+    if (f && f->source) {
+        js_source_line_col(f->source->units, f->source->length, fr->pos, &line, &col);
+        js_source_line_col(f->source->units, f->source->length, f->src_end ? f->src_start : 0, &eline, &ecol);
+    }
+    ok = ok && js_array_append(vm, rec, line ? js_number(line) : js_null());
+    ok = ok && js_array_append(vm, rec, col ? js_number(col) : js_null());
+    ok = ok && js_array_append(vm, rec, eline ? js_number(eline) : js_null());
+    ok = ok && js_array_append(vm, rec, ecol ? js_number(ecol) : js_null());
+    ok = ok && js_array_append(vm, rec, js_number(fr->pos));
+    ok = ok && js_array_append(vm, rec, js_bool(top_level && !construct));
+    ok = ok && js_array_append(vm, rec, js_bool(construct));
+    ok = ok && js_array_append(vm, rec, js_bool((fr->flags & JS_EF_ASYNC) != 0));
+    if (ok) {
+        FmtBuf b = {0};
+        frame_text(ctx, &b, fr);
+        JsString *t = b.oom ? NULL : js_string_cell_new(vm, b.u, b.n);
+        free(b.u);
+        JsValue t_v = t ? js_value_from_cell(&t->gc) : js_undefined();
+        js_gc_protect(vm, &t_v);
+        ok = t && js_array_append(vm, rec, t_v);
+        js_gc_unprotect(vm, &t_v);
+    }
+    ok = ok && js_array_append(vm, rec, f && f->source ? js_value_from_cell(&f->source->gc) : js_undefined());
+    js_gc_unprotect(vm, &rv);
+    return ok ? rv : js_undefined();
+}
+
+/* SHA-256 (FIPS 180-4) of LEN bytes */
+static void sha256(const uint8_t *data, size_t len, uint8_t out[32]) {
+    static const uint32_t K[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+    uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+#define ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+    uint64_t bits = (uint64_t)len * 8;
+    size_t total = ((len + 9 + 63) / 64) * 64;
+    for (size_t off = 0; off < total; off += 64) {
+        uint8_t blk[64];
+        for (int i = 0; i < 64; i++) {
+            size_t p = off + (size_t)i;
+            blk[i] = p < len ? data[p] : p == len ? 0x80 : 0;
+        }
+        if (off + 64 == total)
+            for (int i = 0; i < 8; i++)
+                blk[56 + i] = (uint8_t)(bits >> (56 - 8 * i));
+        uint32_t w[64];
+        for (int i = 0; i < 16; i++)
+            w[i] = (uint32_t)blk[4 * i] << 24 | (uint32_t)blk[4 * i + 1] << 16 |
+                   (uint32_t)blk[4 * i + 2] << 8 | blk[4 * i + 3];
+        for (int i = 16; i < 64; i++) {
+            uint32_t s0 = ROR(w[i - 15], 7) ^ ROR(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            uint32_t s1 = ROR(w[i - 2], 17) ^ ROR(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+        for (int i = 0; i < 64; i++) {
+            uint32_t t1 = hh + (ROR(e, 6) ^ ROR(e, 11) ^ ROR(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i];
+            uint32_t t2 = (ROR(a, 2) ^ ROR(a, 13) ^ ROR(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    }
+#undef ROR
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 4; j++)
+            out[4 * i + j] = (uint8_t)(h[i] >> (24 - 8 * j));
+}
+
+/* getScriptHash(): the SHA-256 of the source's UTF-8 (a lone surrogate as U+FFFD), in hex, as V8
+ * gives it; "" when there is no source */
+static bool script_hash(JsContext *ctx, JsValue src, JsValue *r) {
+    if (!js_is_string(src)) {
+        JsString *e = js_string_cell_new(ctx->vm, NULL, 0);
+        *r = e ? js_value_from_cell(&e->gc) : js_undefined();
+        return e ? true : nthrow(ctx, r, "out of memory");
+    }
+    const JsString *s = js_value_string(src);
+    size_t cap = (size_t)s->length * 3 + 1, n = 0;
+    uint8_t *u8 = js_realloc_raw(ctx->vm, NULL, 0, cap);
+    if (!u8)
+        return nthrow(ctx, r, "out of memory");
+    for (uint32_t i = 0; i < s->length; i++) {
+        uint32_t c = s->units[i];
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s->length && s->units[i + 1] >= 0xDC00 && s->units[i + 1] <= 0xDFFF) {
+            c = 0x10000 + ((c - 0xD800) << 10) + (s->units[++i] - 0xDC00);
+        } else if (c >= 0xD800 && c <= 0xDFFF) {
+            c = 0xFFFD;
+        }
+        if (c < 0x80) {
+            u8[n++] = (uint8_t)c;
+        } else if (c < 0x800) {
+            u8[n++] = (uint8_t)(0xC0 | c >> 6);
+            u8[n++] = (uint8_t)(0x80 | (c & 0x3F));
+        } else if (c < 0x10000) {
+            u8[n++] = (uint8_t)(0xE0 | c >> 12);
+            u8[n++] = (uint8_t)(0x80 | (c >> 6 & 0x3F));
+            u8[n++] = (uint8_t)(0x80 | (c & 0x3F));
+        } else {
+            u8[n++] = (uint8_t)(0xF0 | c >> 18);
+            u8[n++] = (uint8_t)(0x80 | (c >> 12 & 0x3F));
+            u8[n++] = (uint8_t)(0x80 | (c >> 6 & 0x3F));
+            u8[n++] = (uint8_t)(0x80 | (c & 0x3F));
+        }
+    }
+    uint8_t d[32];
+    sha256(u8, n, d);
+    js_realloc_raw(ctx->vm, u8, cap, 0);
+    char hex[65];
+    for (int i = 0; i < 32; i++) {
+        hex[2 * i] = "0123456789abcdef"[d[i] >> 4];
+        hex[2 * i + 1] = "0123456789abcdef"[d[i] & 15];
+    }
+    hex[64] = 0;
+    JsString *hs = js_ascii_cell(ctx->vm, hex);
+    if (!hs)
+        return nthrow(ctx, r, "out of memory");
+    *r = js_value_from_cell(&hs->gc);
+    return true;
+}
+
+/* The record of the CallSite TV, or false with V8's TypeError naming METHOD */
+static bool callsite_of(JsContext *ctx, JsValue tv, const char *method, JsValue *rec, JsValue *r) {
+    if (is_object_type(tv) && js_weak_side_get(ctx->callsite_records, tv, rec) && js_is_object(*rec) &&
+        js_value_object(*rec)->obj_kind == JS_OBJ_ARRAY && js_value_object(*rec)->elem_count == CS_COUNT)
+        return true;
+    *r = js_error_fmt(ctx, "TypeError: CallSite method %s expects CallSite as receiver", method);
+    return false;
+}
+
+static bool cs_field(JsContext *ctx, JsValue tv, const char *method, int field, JsValue *r) {
+    JsValue rec;
+    if (!callsite_of(ctx, tv, method, &rec, r))
+        return false;
+    *r = js_value_object(rec)->elems[field];
+    return true;
+}
+
+static bool cs_const(JsContext *ctx, JsValue tv, const char *method, JsValue v, JsValue *r) {
+    JsValue rec;
+    if (!callsite_of(ctx, tv, method, &rec, r))
+        return false;
+    *r = v;
+    return true;
+}
+
+#define CS_FIELD(fn, method, field)                                                                \
+    static bool fn(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {        \
+        (void)args; (void)argc;                                                                    \
+        return cs_field(ctx, tv, method, field, r);                                                \
+    }
+#define CS_CONST(fn, method, value)                                                                \
+    static bool fn(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {        \
+        (void)args; (void)argc;                                                                    \
+        return cs_const(ctx, tv, method, value, r);                                                \
+    }
+CS_FIELD(cs_getColumnNumber, "getColumnNumber", CS_COLUMN)
+CS_FIELD(cs_getEnclosingColumnNumber, "getEnclosingColumnNumber", CS_ENCLOSING_COLUMN)
+CS_FIELD(cs_getEnclosingLineNumber, "getEnclosingLineNumber", CS_ENCLOSING_LINE)
+CS_CONST(cs_getEvalOrigin, "getEvalOrigin", js_undefined())
+CS_FIELD(cs_getFileName, "getFileName", CS_FILE_NAME)
+CS_CONST(cs_getFunction, "getFunction", js_undefined())
+CS_FIELD(cs_getFunctionName, "getFunctionName", CS_FUNCTION_NAME)
+CS_FIELD(cs_getLineNumber, "getLineNumber", CS_LINE)
+CS_FIELD(cs_getMethodName, "getMethodName", CS_METHOD_NAME)
+CS_FIELD(cs_getPosition, "getPosition", CS_POSITION)
+CS_CONST(cs_getPromiseIndex, "getPromiseIndex", js_null())
+CS_FIELD(cs_getScriptNameOrSourceURL, "getScriptNameOrSourceURL", CS_FILE_NAME)
+CS_CONST(cs_getThis, "getThis", js_undefined())
+CS_FIELD(cs_getTypeName, "getTypeName", CS_TYPE_NAME)
+CS_FIELD(cs_isAsync, "isAsync", CS_ASYNC)
+CS_FIELD(cs_isConstructor, "isConstructor", CS_CONSTRUCTOR)
+CS_CONST(cs_isEval, "isEval", js_bool(false))
+CS_CONST(cs_isNative, "isNative", js_bool(false))
+CS_CONST(cs_isPromiseAll, "isPromiseAll", js_bool(false))
+CS_FIELD(cs_isToplevel, "isToplevel", CS_TOPLEVEL)
+CS_FIELD(cs_toString, "toString", CS_TEXT)
+#undef CS_FIELD
+#undef CS_CONST
+
+static bool cs_getScriptHash(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)args; (void)argc;
+    JsValue rec;
+    if (!callsite_of(ctx, tv, "getScriptHash", &rec, r))
+        return false;
+    return script_hash(ctx, js_value_object(rec)->elems[CS_SOURCE], r);
+}
+
+/* CallSite, the constructor of CallSite.prototype (not a global): V8's refuses to make one */
+static bool cs_ctor(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
+    (void)tv; (void)args; (void)argc;
+    return nthrow(ctx, r, "Error: Not supported");
+}
+
+/* KEY on O, not enumerable, with ATTRS besides. V is rooted while the key is made. */
+static bool cs_define(JsContext *ctx, JsObject *o, const char *k, JsValue v, uint8_t attrs) {
+    js_gc_protect(ctx->vm, &v);
+    JsString *ks = js_ascii_cell(ctx->vm, k);
+    JsString *ik = ks ? js_intern_cell(ctx->vm, ks) : NULL;
+    bool ok = ik && js_map_set(ctx->vm, &o->props, ik, v);
+    js_gc_unprotect(ctx->vm, &v);
+    if (!ok)
+        return false;
+    js_map_add_attrs(&o->props, ik, (uint8_t)(JS_ATTR_HIDDEN | attrs));
+    if (attrs)
+        o->obj_flags |= JS_OBJ_ATTRS;
+    return true;
+}
+
+/* CallSite.prototype, made when first needed: its methods in V8's order, read-only and not
+ * configurable as V8 has them; `constructor` writable and configurable */
+static JsObject *callsite_proto(JsContext *ctx) {
+    if (ctx->callsite_proto)
+        return ctx->callsite_proto;
+    static const struct { const char *name; JsNativeFn fn; } methods[] = {
+        {"getColumnNumber", cs_getColumnNumber}, {"getEnclosingColumnNumber", cs_getEnclosingColumnNumber},
+        {"getEnclosingLineNumber", cs_getEnclosingLineNumber}, {"getEvalOrigin", cs_getEvalOrigin},
+        {"getFileName", cs_getFileName}, {"getFunction", cs_getFunction},
+        {"getFunctionName", cs_getFunctionName}, {"getLineNumber", cs_getLineNumber},
+        {"getMethodName", cs_getMethodName}, {"getPosition", cs_getPosition},
+        {"getPromiseIndex", cs_getPromiseIndex}, {"getScriptNameOrSourceURL", cs_getScriptNameOrSourceURL},
+        {"getScriptHash", cs_getScriptHash}, {"getThis", cs_getThis}, {"getTypeName", cs_getTypeName},
+        {"isAsync", cs_isAsync}, {"isConstructor", cs_isConstructor}, {"isEval", cs_isEval},
+        {"isNative", cs_isNative}, {"isPromiseAll", cs_isPromiseAll}, {"isToplevel", cs_isToplevel},
+        {"toString", cs_toString}};
+    JsValue pv = js_object_new(ctx);
+    if (!js_is_object(pv))
+        return NULL;
+    js_gc_protect(ctx->vm, &pv);
+    JsObject *proto = js_value_object(pv);
+    JsValue ctor = js_native_new(ctx, "CallSite", cs_ctor, NULL);
+    bool ok = js_is_function(ctor);
+    if (ok) {
+        js_native_builtin_ctor(ctor, proto);
+        ok = cs_define(ctx, proto, "constructor", ctor, 0);
+    }
+    for (size_t i = 0; ok && i < sizeof methods / sizeof methods[0]; i++) {
+        JsValue m = js_native_new(ctx, methods[i].name, methods[i].fn, NULL);
+        ok = js_is_function(m) && cs_define(ctx, proto, methods[i].name, m, JS_ATTR_READONLY | JS_ATTR_FIXED);
+    }
+    if (ok)
+        ctx->callsite_proto = proto;
+    js_gc_unprotect(ctx->vm, &pv);
+    return ok ? proto : NULL;
+}
+
+/* The function Error.prepareStackTrace names, and the `this` it is called with, as Node finds
+ * them: globalThis.Error's, else the Error this context made. False when neither is a function. */
+static bool find_prepare(JsContext *ctx, JsValue *fn, JsValue *self) {
+    for (int i = 0; i < 2; i++) {
+        JsValue err = js_value_from_cell(&ctx->error_ctor->gc), f = js_undefined();
+        bool found = false;
+        if (i == 0 && !(chain_get(ctx, ctx->globals, "Error", &err, &found) && found && is_object_type(err))) {
+            js_take_error(ctx); /* nothing there, or a read that failed: the next place */
+            continue;
+        }
+        found = false;
+        if (chain_get_from(ctx, err, "prepareStackTrace", &f, &found) && found && js_is_function(f)) {
+            *fn = f;
+            *self = err;
+            return true;
+        }
+        js_take_error(ctx);
+    }
+    return false;
+}
+
+/* `stack` through Error.prepareStackTrace: FN called as V8 calls it, with SELF as `this`, the
+ * holder H and an array of CallSites for the N FRAMES (rooted by the caller). 1 with what it
+ * returned in *OUT, -1 with what it threw (or out of memory) in *OUT. */
+static int prepared_stack(JsContext *ctx, JsValue fn, JsValue self, JsValue h,
+                          const JsErrorFrame *frames, uint32_t n, JsValue *out) {
+    JsVm *vm = ctx->vm;
+    JsValue args[2] = {h, js_undefined()};
+    js_gc_protect(vm, &fn);
+    js_gc_protect(vm, &self);
+    js_gc_protect(vm, &args[1]);
+    JsObject *proto = callsite_proto(ctx);
+    JsObject *arr = proto ? js_array_new_cell(ctx, 0) : NULL;
+    bool ok = arr != NULL;
+    if (arr)
+        args[1] = js_value_from_cell(&arr->gc);
+    for (uint32_t i = 0; ok && i < n; i++) {
+        JsValue cs = js_object_new(ctx);
+        ok = js_is_object(cs);
+        if (!ok)
+            break;
+        js_value_object(cs)->proto = js_value_from_cell(&proto->gc);
+        js_gc_protect(vm, &cs);
+        JsValue rec = callsite_record(ctx, &frames[i]);
+        js_gc_protect(vm, &rec);
+        ok = js_is_object(rec) && js_weak_side_set(ctx, &ctx->callsite_records, cs, rec) &&
+             js_array_append(vm, arr, cs);
+        js_gc_unprotect(vm, &rec);
+        js_gc_unprotect(vm, &cs);
+    }
+    int rc = -1;
+    if (!ok) {
+        *out = js_oom_value(vm);
+    } else {
+        bool saved = ctx->formatting_stack;
+        ctx->formatting_stack = true; /* a `stack` read inside formats as if there were no hook */
+        rc = js_call(ctx, fn, self, args, 2, out) ? 1 : -1;
+        ctx->formatting_stack = saved;
+    }
+    js_gc_unprotect(vm, &args[1]);
+    js_gc_unprotect(vm, &self);
+    js_gc_unprotect(vm, &fn);
+    return rc;
+}
+
 /* What holds the stack RECV reads and writes: the first object on its prototype chain that is
  * an error or was given one by Error.captureStackTrace (V8 looks for the private symbol both
  * carry), in *HOLDER, and the JsErrorObject keeping the frames and the text: the error itself,
@@ -988,14 +1351,26 @@ bool js_error_stack_accessor(JsContext *ctx, bool set, JsValue recv, JsValue arg
     JsValue rec = js_value_from_cell(&e->obj.gc);
     js_gc_protect(vm, &h);
     js_gc_protect(vm, &rec);
-    JsString *s = stack_text(ctx, h, frames, n);
+    /* Error.prepareStackTrace, when it is a function, makes the value instead, as in V8 and
+     * Node: what it returns is `stack`; what it throws is what this read throws, and the next
+     * read tries again. A read from inside it formats as if there were none. */
+    JsValue prep = js_undefined(), self = js_undefined();
+    JsString *s = NULL;
+    int prepared = 0;
+    if (!ctx->formatting_stack && find_prepare(ctx, &prep, &self))
+        prepared = prepared_stack(ctx, prep, self, h, frames, n, out);
+    else
+        s = stack_text(ctx, h, frames, n);
     js_gc_unprotect(vm, &rec);
     js_gc_unprotect(vm, &h);
     ctx->frame_roots = root.next;
     js_realloc_raw(vm, frames, (size_t)n * sizeof *frames, 0);
-    if (!s)
+    if (prepared < 0)
+        return false;
+    if (!prepared && !s)
         return (*out = js_take_error(ctx)), false;
-    *out = js_value_from_cell(&s->gc);
+    if (!prepared)
+        *out = js_value_from_cell(&s->gc);
     drop_frames(ctx, e);
     e->stack = *out;
     e->stack_state = JS_STACK_VALUE;

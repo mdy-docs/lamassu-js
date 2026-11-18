@@ -423,6 +423,10 @@ void js_gc_collect(JsVm *vm) {
             js_weak_mark_kept(vm, ctx->weak_kept);
         if (ctx->stack_records) /* its records live as long as their objects: js_weak_ephemerons */
             js_gc_mark_cell(vm, &ctx->stack_records->gc);
+        if (ctx->callsite_records) /* the same, for CallSites */
+            js_gc_mark_cell(vm, &ctx->callsite_records->gc);
+        if (ctx->callsite_proto)
+            js_gc_mark_cell(vm, &ctx->callsite_proto->gc);
         for (const JsFrameRoot *fr = ctx->frame_roots; fr; fr = fr->next)
             for (uint32_t i = 0; i < fr->count; i++) {
                 js_gc_mark_value(vm, fr->frames[i].fn);

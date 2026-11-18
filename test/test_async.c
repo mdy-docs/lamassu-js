@@ -209,6 +209,10 @@ static void err(const char *src, const char *substr) {
 
 static void test_then(void) {
     eq("let r = 0; Promise.resolve(41).then(v => { r = v + 1; }); r;", "0"); /* sync: not yet run */
+    /* Error.prepareStackTrace's CallSites for an error made after an await: the async callers, as
+     * in Node */
+    eq("async function af() { await null; return new Error('async'); } async function caller() { return await af(); } Error.prepareStackTrace = (er, cs) => cs.map(c => [c.getFunctionName(), c.isAsync(), c.isToplevel()].join('/')).join(' ; '); const e = await caller(); const s = e.stack; Error.prepareStackTrace = undefined; s;",
+       "af/false/true ; caller/true/true ; /true/true");
     /* completion via TLA to observe post-drain state */
     eq("let out; await Promise.resolve('hi').then(v => out = v); out;", "hi");
     eq("await Promise.resolve(10).then(v => v * 2);", "20");
