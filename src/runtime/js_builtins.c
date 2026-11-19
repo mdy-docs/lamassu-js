@@ -66,6 +66,13 @@ static double to_integer_clamped(double d, double lo, double hi) {
 }
 
 /* clamp a relative index (negative counts from end) into [0, len] */
+/* A string search's position (indexOf, includes): ToIntegerOrInfinity clamped to [0, LEN], a
+ * negative one 0 (not counted from the end, as an array's relative index is) */
+static uint32_t search_position(double d, uint32_t len) {
+    d = to_int(d);
+    return d <= 0 ? 0 : d >= len ? len : (uint32_t)d;
+}
+
 static uint32_t clamp_index(double d, uint32_t len) {
     d = to_int(d);
     if (d < 0)
@@ -239,51 +246,245 @@ static bool search_charge(JsContext *ctx, uint64_t *steps, bool flush) {
     return js_native_charge_n(ctx, n);
 }
 
+/* The search itself, linear in the haystack whatever the needle (V8's searches avoid the naive
+ * search's haystack times needle as well): a single unit is a scan (search_unit); a needle of up
+ * to four units
+ * the naive search, which costs at most four comparisons a position; anything longer the Two-Way
+ * algorithm (Crochemore and Perrin, 1991), as musl's memmem has it: the needle is split at its
+ * critical factorization, the right part compared left to right and the left part right to left,
+ * with a skip on the haystack unit under the needle's last unit. The skip table is indexed by a
+ * unit's low byte, so a unit shares its entry with every unit of the same low byte: the shift it
+ * gives is the smallest of theirs, which is never too far. The same code runs over the reversed
+ * haystack and needle for lastIndexOf. Every comparison is counted toward the fuel charge.
+ *
+ * SEARCH_BODY(name, H, N) makes `static long name(ctx, hay, hlen, ndl, nlen, from)`: the first
+ * position >= FROM, in the order H and N index, where the needle starts; -1 none; -2 the
+ * budget's or the interrupt's error pending. */
+#define SEARCH_BODY(name, H, N)                                                                   \
+    static long name(JsContext *ctx, const uint16_t *hay, uint32_t hlen, const uint16_t *ndl,     \
+                     uint32_t l, uint32_t from) {                                                 \
+        uint64_t steps = 0;                                                                       \
+        long found = -1;                                                                          \
+        if (l <= 4) {                                                                             \
+            for (uint32_t i = from; i + l <= hlen; i++) {                                         \
+                uint32_t k = 0;                                                                   \
+                while (k < l && H(i + k) == N(k))                                                 \
+                    k++;                                                                          \
+                steps += k + 1;                                                                   \
+                if (k == l) {                                                                     \
+                    found = (long)i;                                                              \
+                    break;                                                                        \
+                }                                                                                 \
+                if (!search_charge(ctx, &steps, false))                                           \
+                    return -2;                                                                    \
+            }                                                                                     \
+            return search_charge(ctx, &steps, true) ? found : -2;                                 \
+        }                                                                                         \
+        /* the skip table, on the low byte: the last place + 1 each value has in the needle */  \
+        uint32_t shift[256];                                                                      \
+        uint8_t present[32] = {0};                                                                \
+        for (uint32_t k = 0; k < l; k++) {                                                        \
+            uint8_t b = (uint8_t)N(k);                                                            \
+            present[b >> 3] |= (uint8_t)(1u << (b & 7));                                          \
+            shift[b] = k + 1;                                                                     \
+        }                                                                                         \
+        steps += l;                                                                               \
+        /* the maximal suffix, for each ordering of the units; the critical factorization is the  \
+         * later one (ms is one before the split: -1, here UINT32_MAX, for a split at 0) */       \
+        uint32_t ip = UINT32_MAX, jp = 0, k = 1, p = 1, ms, p0;                                   \
+        while (jp + k < l) {                                                                      \
+            uint16_t a = N(ip + k), b = N(jp + k);                                                \
+            if (a == b) {                                                                         \
+                if (k == p) {                                                                     \
+                    jp += p;                                                                      \
+                    k = 1;                                                                        \
+                } else {                                                                          \
+                    k++;                                                                          \
+                }                                                                                 \
+            } else if (a > b) {                                                                   \
+                jp += k;                                                                          \
+                k = 1;                                                                            \
+                p = jp - ip;                                                                      \
+            } else {                                                                              \
+                ip = jp++;                                                                        \
+                k = p = 1;                                                                        \
+            }                                                                                     \
+        }                                                                                         \
+        ms = ip;                                                                                  \
+        p0 = p;                                                                                   \
+        ip = UINT32_MAX, jp = 0, k = 1, p = 1;                                                    \
+        while (jp + k < l) {                                                                      \
+            uint16_t a = N(ip + k), b = N(jp + k);                                                \
+            if (a == b) {                                                                         \
+                if (k == p) {                                                                     \
+                    jp += p;                                                                      \
+                    k = 1;                                                                        \
+                } else {                                                                          \
+                    k++;                                                                          \
+                }                                                                                 \
+            } else if (a < b) {                                                                   \
+                jp += k;                                                                          \
+                k = 1;                                                                            \
+                p = jp - ip;                                                                      \
+            } else {                                                                              \
+                ip = jp++;                                                                        \
+                k = p = 1;                                                                        \
+            }                                                                                     \
+        }                                                                                         \
+        if (ip + 1 > ms + 1)                                                                      \
+            ms = ip;                                                                              \
+        else                                                                                      \
+            p = p0;                                                                               \
+        steps += 4 * (uint64_t)l;                                                                 \
+        /* a periodic needle remembers how much of itself already matched (mem) */               \
+        uint32_t mem0, mem = 0;                                                                   \
+        bool periodic = true;                                                                     \
+        for (uint32_t t = 0; t < ms + 1; t++)                                                     \
+            if (N(t) != N(t + p)) {                                                               \
+                periodic = false;                                                                 \
+                break;                                                                            \
+            }                                                                                     \
+        if (!periodic) {                                                                          \
+            mem0 = 0;                                                                             \
+            p = (ms > l - ms - 1 ? ms : l - ms - 1) + 1;                                          \
+        } else {                                                                                  \
+            mem0 = l - p;                                                                         \
+        }                                                                                         \
+        for (uint32_t h = from; h + l <= hlen;) {                                                 \
+            uint8_t b = (uint8_t)H(h + l - 1);                                                    \
+            steps++;                                                                              \
+            if (!search_charge(ctx, &steps, false))                                               \
+                return -2;                                                                        \
+            if (present[b >> 3] & (1u << (b & 7))) {                                              \
+                uint32_t sk = l - shift[b];                                                       \
+                if (sk) {                                                                         \
+                    if (sk < mem)                                                                 \
+                        sk = mem;                                                                 \
+                    h += sk;                                                                      \
+                    mem = 0;                                                                      \
+                    continue;                                                                     \
+                }                                                                                 \
+            } else {                                                                              \
+                h += l;                                                                           \
+                mem = 0;                                                                          \
+                continue;                                                                         \
+            }                                                                                     \
+            /* the right half */                                                                  \
+            uint32_t t = ms + 1 > mem ? ms + 1 : mem;                                             \
+            while (t < l && N(t) == H(h + t))                                                     \
+                t++;                                                                              \
+            steps += t;                                                                           \
+            if (t < l) {                                                                          \
+                h += t - ms;                                                                      \
+                mem = 0;                                                                          \
+                continue;                                                                         \
+            }                                                                                     \
+            /* the left half */                                                                   \
+            t = ms + 1;                                                                           \
+            while (t > mem && N(t - 1) == H(h + t - 1))                                           \
+                t--;                                                                              \
+            steps += ms + 1;                                                                      \
+            if (t <= mem) {                                                                       \
+                found = (long)h;                                                                  \
+                break;                                                                            \
+            }                                                                                     \
+            h += p;                                                                               \
+            mem = mem0;                                                                           \
+        }                                                                                         \
+        return search_charge(ctx, &steps, true) ? found : -2;                                     \
+    }
+
+/* The first index in [FROM, END) of unit C in HAY: four units a 64-bit word at a time (a word
+ * holds C where the word XOR four copies of C has a zero lane), the tail one by one */
+static long scan_unit(const uint16_t *hay, uint32_t from, uint32_t end, uint16_t c) {
+    const uint64_t ones = 0x0001000100010001ull, highs = 0x8000800080008000ull, cs = c * ones;
+    uint32_t i = from;
+    for (; i + 4 <= end; i += 4) {
+        uint64_t w;
+        memcpy(&w, hay + i, sizeof w);
+        uint64_t x = w ^ cs;
+        if ((x - ones) & ~x & highs)
+            break; /* a lane is C: found among these four */
+    }
+    for (; i < end; i++)
+        if (hay[i] == c)
+            return (long)i;
+    return -1;
+}
+
+/* A single-unit search, a block of 64K units at a time between fuel charges: forward from FROM,
+ * or (BACKWARD) the last index <= FROM */
+static long search_unit(JsContext *ctx, const uint16_t *hay, uint32_t hlen, uint16_t c,
+                        uint32_t from, bool backward) {
+    const uint32_t block = 1u << 16;
+    uint64_t steps = 0;
+    if (!backward) {
+        for (uint32_t i = from; i < hlen; i += block) {
+            uint32_t end = hlen - i > block ? i + block : hlen;
+            long f = scan_unit(hay, i, end, c);
+            steps += (f < 0 ? end : (uint32_t)f + 1) - i;
+            if (!search_charge(ctx, &steps, f >= 0))
+                return -2;
+            if (f >= 0)
+                return f;
+        }
+        return search_charge(ctx, &steps, true) ? -1 : -2;
+    }
+    for (long i = (long)from; i >= 0; i--) {
+        if (hay[i] == c) {
+            steps += (uint64_t)(from - (uint32_t)i + 1);
+            return search_charge(ctx, &steps, true) ? i : -2;
+        }
+        if (((from - (uint32_t)i) & (block - 1)) == block - 1) {
+            steps += block;
+            if (!search_charge(ctx, &steps, false))
+                return -2;
+        }
+    }
+    steps += ((uint64_t)from + 1) & (block - 1);
+    return search_charge(ctx, &steps, true) ? -1 : -2;
+}
+
+#define FWD_H(i) hay[(i)]
+#define FWD_N(i) ndl[(i)]
+#define REV_H(i) hay[hlen - 1 - (i)]
+#define REV_N(i) ndl[l - 1 - (i)]
+SEARCH_BODY(search_forward, FWD_H, FWD_N)
+SEARCH_BODY(search_backward, REV_H, REV_N)
+#undef FWD_H
+#undef FWD_N
+#undef REV_H
+#undef REV_N
+#undef SEARCH_BODY
+
 /* The first index >= FROM where NDL starts in HAY; -1 none, -2 the budget's or the interrupt's
  * error pending */
 static long units_find(JsContext *ctx, const uint16_t *hay, uint32_t hlen, const uint16_t *ndl,
                        uint32_t nlen, uint32_t from) {
     if (nlen == 0)
         return from <= hlen ? (long)from : (long)hlen;
-    if (nlen > hlen)
+    if (nlen > hlen || from > hlen - nlen)
         return -1;
-    uint64_t steps = 0;
-    long found = -1;
-    for (uint32_t i = from; i + nlen <= hlen; i++) {
-        uint32_t j = 0;
-        while (j < nlen && hay[i + j] == ndl[j])
-            j++;
-        steps += j + 1;
-        if (j == nlen) {
-            found = (long)i;
-            break;
-        }
-        if (!search_charge(ctx, &steps, false))
-            return -2;
-    }
-    return search_charge(ctx, &steps, true) ? found : -2;
+    if (nlen == 1)
+        return search_unit(ctx, hay, hlen, ndl[0], from, false);
+    return search_forward(ctx, hay, hlen, ndl, nlen, from);
 }
 
-/* The last index <= LIMIT where NDL starts in HAY; -1 none, -2 as units_find */
+/* The last index <= LIMIT where NDL starts in HAY; -1 none, -2 as units_find. It is the first
+ * match, from the end, of the reversed needle in the reversed haystack: a match at S is one at
+ * HLEN - NLEN - S there, so the search starts at HLEN - NLEN - LIMIT. */
 static long units_find_last(JsContext *ctx, const uint16_t *hay, uint32_t hlen, const uint16_t *ndl,
                             uint32_t nlen, uint32_t limit) {
     if (nlen > hlen)
         return -1;
-    uint64_t steps = 0;
-    long found = -1;
-    for (long i = (long)(limit < hlen - nlen ? limit : hlen - nlen); i >= 0; i--) {
-        uint32_t j = 0;
-        while (j < nlen && hay[i + j] == ndl[j])
-            j++;
-        steps += j + 1;
-        if (j == nlen) {
-            found = i;
-            break;
-        }
-        if (!search_charge(ctx, &steps, false))
-            return -2;
-    }
-    return search_charge(ctx, &steps, true) ? found : -2;
+    uint32_t last = hlen - nlen; /* the last place a match can start */
+    if (nlen == 0)
+        return limit < last ? (long)limit : (long)last;
+    if (nlen == 1)
+        return search_unit(ctx, hay, hlen, ndl[0], limit < last ? limit : last, true);
+    uint32_t start = limit < last ? last - limit : 0;
+    long r = search_backward(ctx, hay, hlen, ndl, nlen, start);
+    return r < 0 ? r : (long)(last - (uint32_t)r);
 }
 
 /* =====================================================================
@@ -398,7 +599,7 @@ static bool sm_indexOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     double fromd = 0;
     if (argc > 1)
         TO_NUM(fromd, ARG(1));
-    uint32_t from = clamp_index(fromd, s->length);
+    uint32_t from = search_position(fromd, s->length);
     long f = units_find(ctx, s->units, s->length, n->units, n->length, from);
     if (f == -2)
         return (*r = js_take_error(ctx)), false;
@@ -443,7 +644,10 @@ static bool sm_includes(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     JsString *n = arg_string(ctx, ARG(0));
     if (!n)
         return oom(ctx, r);
-    long f = units_find(ctx, s->units, s->length, n->units, n->length, 0);
+    double posd = 0;
+    if (argc > 1)
+        TO_NUM(posd, ARG(1));
+    long f = units_find(ctx, s->units, s->length, n->units, n->length, search_position(posd, s->length));
     if (f == -2)
         return (*r = js_take_error(ctx)), false;
     *r = js_bool(f >= 0);

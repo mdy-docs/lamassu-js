@@ -175,7 +175,7 @@ instruction is charged too, at about what the same time would buy in instruction
   `Set`.
 - **Work that grows faster than its input**, charged a batch at a time so the
   interrupt stops it as it goes: string search (`indexOf`, `includes`, `split`,
-  `replace`, up to haystack × needle), `sort`'s comparisons, regular expressions
+  `replace`: linear in the haystack, but a long one is many steps), `sort`'s comparisons, regular expressions
   (every step of the engine, and no match may take more steps than the budget has
   left), BigInt multiplication, division, `**`, parsing and printing (quadratic in the
   length, including a literal's digits at compile time) and `normalize`.

@@ -668,6 +668,56 @@ static void test_date(void) {
     eq("let a = new Date(12345); let b = new Date(a); b.getTime();", "12345");
 }
 
+/* String search: indexOf, lastIndexOf, includes, split and replaceAll against a naive search in
+ * script, over small alphabets (periodic needles, the Two-Way search's hard cases), needles of
+ * every length from 0 to 40, every start position and lastIndexOf limit, and units that share a
+ * low byte (the skip table's index); then the position argument, which is clamped to [0, length],
+ * a negative one 0 (it was counted from the end), and which includes ignored. Node's output. */
+static void test_string_search(void) {
+    eq(
+        "let seed = 4242;\n"
+        "const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed; };\n"
+        "const naiveFirst = (h, n, from) => { for (let i = Math.max(0, from); i + n.length <= h.length; i++) { let k = 0; while (k < n.length && h.charCodeAt(i + k) === n.charCodeAt(k)) k++; if (k === n.length) return i; } return n.length === 0 ? Math.min(Math.max(0, from), h.length) : -1; };\n"
+        "const naiveLast = (h, n, lim) => { for (let i = Math.min(lim, h.length - n.length); i >= 0; i--) { let k = 0; while (k < n.length && h.charCodeAt(i + k) === n.charCodeAt(k)) k++; if (k === n.length) return i; } return -1; };\n"
+        "const alphabets = ['ab', 'abc', 'aš', 'aab', 'abcdefghij', 'ĀȀa'];\n"
+        "let checks = 0, bad = 0; const fails = [];\n"
+        "for (let t = 0; t < 120; t++) {\n"
+        "  const al = alphabets[t % alphabets.length];\n"
+        "  const pick = () => al[rnd() % al.length];\n"
+        "  const hl = rnd() % 200, nl = rnd() % 41;\n"
+        "  let h = ''; for (let i = 0; i < hl; i++) h += pick();\n"
+        "  let n = '';\n"
+        "  if (rnd() % 3 === 0 && hl > 0) { const s = rnd() % hl; n = h.slice(s, s + nl); } else { for (let i = 0; i < nl; i++) n += pick(); }\n"
+        "  if (rnd() % 4 === 0) { const per = n.slice(0, 1 + rnd() % 3); n = per.repeat(1 + rnd() % 12).slice(0, Math.max(nl, 1)); h = per.repeat(1 + rnd() % 60) + h; }\n"
+        "  for (let from = -1; from <= h.length + 1; from += 1 + (rnd() % 7)) {\n"
+        "    checks++;\n"
+        "    const a = h.indexOf(n, from), b = naiveFirst(h, n, Math.min(Math.max(from, 0), h.length));\n"
+        "    if (a !== b) { bad++; if (fails.length < 5) fails.push(['indexOf', JSON.stringify(h), JSON.stringify(n), from, a, b].join(' ')); }\n"
+        "  }\n"
+        "  for (const lim of [-1, 0, 3, h.length >> 1, h.length - 1, h.length, h.length + 5, NaN]) {\n"
+        "    checks++;\n"
+        "    const L = lim !== lim ? Infinity : lim;\n"
+        "    const a = h.lastIndexOf(n, lim), b = naiveLast(h, n, L < 0 ? 0 : L >= h.length ? h.length : L);\n"
+        "    if (a !== b) { bad++; if (fails.length < 5) fails.push(['lastIndexOf', JSON.stringify(h), JSON.stringify(n), lim, a, b].join(' ')); }\n"
+        "  }\n"
+        "  checks++;\n"
+        "  if (h.includes(n) !== (naiveFirst(h, n, 0) >= 0)) { bad++; if (fails.length < 5) fails.push('includes ' + h + ' ' + n); }\n"
+        "  if (n.length) {\n"
+        "    checks++;\n"
+        "    const parts = []; let pos = 0, f;\n"
+        "    while ((f = naiveFirst(h, n, pos)) >= 0) { parts.push(h.slice(pos, f)); pos = f + n.length; }\n"
+        "    parts.push(h.slice(pos));\n"
+        "    if (h.split(n).join('|') !== parts.join('|')) { bad++; if (fails.length < 5) fails.push('split ' + h + ' ' + n); }\n"
+        "    checks++;\n"
+        "    if (h.replaceAll(n, '#') !== parts.join('#')) { bad++; if (fails.length < 5) fails.push('replaceAll ' + h + ' ' + n); }\n"
+        "  }\n"
+        "}\n"
+        "'checks ' + checks + ' mismatches ' + bad + (fails.length ? ' ' + fails.join(' || ') : '');",
+        "checks 6132 mismatches 0");
+    eq("JSON.stringify(['abc'.includes('a', 1), 'abc'.includes('c', -10), 'abc'.includes('c', 2), 'abc'.includes('c', 3), 'aaa'.indexOf('a', -1), 'aaa'.indexOf('aa', -1), 'abcabc'.indexOf('bc', -5), 'abc'.indexOf('c', 2.7), 'abc'.indexOf('', 10), 'abc'.indexOf('a', -Infinity), 'abc'.includes('', 99), 'aaa'.lastIndexOf('a', -5), 'abcabc'.lastIndexOf('bc', 3)])",
+       "[false,true,true,false,0,0,1,2,3,0,true,0,1]");
+}
+
 /* A native's call into script reuses a finished fiber (JsContext.fiber_pool): a closure made in a
  * callback, an upvalue a throw left open, nested callbacks, a deep recursion (its fiber too big to
  * keep), a stack trace and an async function suspended inside a callback must all be as if each
@@ -3148,6 +3198,7 @@ int main(void) {
     test_bigint();
     test_string_limit();
     test_fiber_reuse();
+    test_string_search();
     test_stress();
     test_integration();
     if (checks_failed) {

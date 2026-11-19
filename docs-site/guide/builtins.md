@@ -257,6 +257,9 @@ boxed `String` object — this engine has no boxed-primitive type at all).
   `link`, `small`, `strike`, `sub`, `sup`), and,
   when regex support is compiled in (the default): `match`, `matchAll` (a lazy
   `RegExp String Iterator`, one search per step, starting at the regexp's `lastIndex`), `search`.
+- **Searching** (`indexOf`, `lastIndexOf`, `includes`, `split`, `replace`/`replaceAll` with a
+  string) takes time linear in the string whatever the needle: the Two-Way algorithm (as musl's
+  `memmem`), and a single character four units at a time.
 - Called on `undefined` or `null` (`String.prototype.trim.call(null)`), each throws V8's
   `TypeError: String.prototype.trim called on null or undefined`.
 - **The longest string is 2<sup>26</sup> code units** (64M; V8's is 2<sup>29</sup>−24), and

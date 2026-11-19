@@ -119,7 +119,7 @@ counted with it, at about the time it takes (an instruction is about 2.5 ns): th
 debt in `lamassu_internal.h` (`js_work`, settled into the running fiber's fuel) takes every
 allocation, a new string's hashing, and the loops that compare, scan or move without
 allocating; `js_native_charge_n` charges, a batch at a time with the interrupt read between,
-the work a single call cannot bound by its data: string search (up to haystack × needle),
+the work a single call cannot bound by its data: string search (Two-Way, linear in the haystack, a 64M-unit one is still many steps),
 `sort`'s comparisons, regexp steps (the step budget is no more than the fuel left buys, and
 the engine polls the interrupt), BigInt multiplication, division, `**`, parsing and printing,
 and `normalize`. A literal's BigInt parse falls on the budget armed when the source compiles,
