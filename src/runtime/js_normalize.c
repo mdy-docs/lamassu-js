@@ -11,6 +11,8 @@
  */
 #include "lamassu_internal.h"
 #include "js_normalize_data.h"
+#include "js_bytecode.h"
+#include "js_error.h"
 
 enum { S_BASE = 0xAC00, L_BASE = 0x1100, V_BASE = 0x1161, T_BASE = 0x11A7,
        L_COUNT = 19, V_COUNT = 21, T_COUNT = 28, N_COUNT = V_COUNT * T_COUNT, S_COUNT = L_COUNT * N_COUNT };
@@ -112,8 +114,25 @@ static bool decompose(CpBuf *b, uint32_t cp, bool compat) {
     return true;
 }
 
-JsString *js_normalize(JsVm *vm, JsString *s, int form, bool *too_long) {
-    *too_long = false;
+/* What a code point costs, in instructions: decomposed, ordered and composed, about 22 ns where an
+ * instruction is about 2.5. Each place a mark moves in the ordering costs one more: that sort is
+ * quadratic in a run of marks. */
+#define NF_CP_COST 9
+/* charged a batch at a time: tens of microseconds of work between interrupt polls */
+#define NF_BATCH 8192
+
+/* WORK instructions' worth, charged once it reaches a batch (or at once when FLUSH) */
+static bool nf_charge(JsContext *ctx, uint64_t *work, bool flush) {
+    if (*work < NF_BATCH && !flush)
+        return true;
+    uint64_t n = *work;
+    *work = 0;
+    return !n || js_native_charge_n(ctx, n);
+}
+
+JsString *js_normalize(JsContext *ctx, JsString *s, int form) {
+    JsVm *vm = ctx->vm;
+    uint64_t work = 0;
     bool compose = form == JS_NF_NFC || form == JS_NF_NFKC;
     bool compat = form == JS_NF_NFKC || form == JS_NF_NFKD;
     /* quick check: nothing below U+00A0 changes in any form, nothing below U+0300 in NFC */
@@ -124,16 +143,20 @@ JsString *js_normalize(JsVm *vm, JsString *s, int form, bool *too_long) {
     if (i == s->length)
         return s;
     CpBuf b = {vm, NULL, 0, 0};
-    bool ok = true;
+    bool ok = true, too_long = false;
     for (i = 0; ok && i < s->length; i++) {
         uint32_t c = s->units[i];
         if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s->length && s->units[i + 1] >= 0xDC00 &&
             s->units[i + 1] <= 0xDFFF)
             c = 0x10000 + ((c - 0xD800) << 10) + (s->units[++i] - 0xDC00);
+        size_t before = b.len;
         ok = decompose(&b, c, compat);
+        work += (b.len - before) * NF_CP_COST;
         /* every code point is a unit at least, and without composition none goes away */
         if (ok && !compose && b.len > JS_MAX_STRING_UNITS)
-            ok = !(*too_long = true);
+            ok = !(too_long = true);
+        if (ok && !nf_charge(ctx, &work, false))
+            ok = false;
     }
     /* canonical ordering: a stable insertion sort of each run of marks by class */
     for (size_t k = 1; ok && k < b.len; k++) {
@@ -147,7 +170,12 @@ JsString *js_normalize(JsVm *vm, JsString *s, int form, bool *too_long) {
             j--;
         }
         b.cp[j] = c;
+        work += k - j;
+        if (!nf_charge(ctx, &work, false))
+            ok = false;
     }
+    if (ok && !nf_charge(ctx, &work, true))
+        ok = false;
     /* canonical composition (UAX #15's reference algorithm) */
     if (ok && compose && b.len) {
         size_t starter = 0, out = 1;
@@ -175,9 +203,9 @@ JsString *js_normalize(JsVm *vm, JsString *s, int form, bool *too_long) {
         size_t units = 0;
         for (size_t k = 0; k < b.len; k++)
             units += b.cp[k] > 0xFFFF ? 2 : 1;
-        *too_long = units > JS_MAX_STRING_UNITS;
-        uint16_t *u = units && !*too_long ? js_realloc_raw(vm, NULL, 0, units * sizeof *u) : NULL;
-        if (u || (!units && !*too_long)) {
+        too_long = units > JS_MAX_STRING_UNITS;
+        uint16_t *u = units && !too_long ? js_realloc_raw(vm, NULL, 0, units * sizeof *u) : NULL;
+        if (u || (!units && !too_long)) {
             size_t n = 0;
             for (size_t k = 0; k < b.len; k++) {
                 uint32_t c = b.cp[k];
@@ -196,5 +224,7 @@ JsString *js_normalize(JsVm *vm, JsString *s, int form, bool *too_long) {
         }
     }
     js_realloc_raw(vm, b.cp, b.cap * sizeof *b.cp, 0);
+    if (too_long)
+        js_set_error(ctx, js_error_from_ascii(ctx, JS_STRING_LENGTH_ERROR));
     return r;
 }

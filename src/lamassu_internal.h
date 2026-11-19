@@ -1129,8 +1129,9 @@ bool    js_map_put_attrs(JsMap *m, const JsString *key, uint8_t attrs);
 
 enum { JS_NF_NFC, JS_NF_NFD, JS_NF_NFKC, JS_NF_NFKD };
 /* S in normalization FORM (JS_NF_*): S itself when nothing changes, NULL on OOM */
-/* NULL on OOM, or with *too_long set when the result would pass JS_MAX_STRING_UNITS */
-JsString *js_normalize(JsVm *vm, JsString *s, int form, bool *too_long);
+/* S in normalization FORM, the work charged to the budget. NULL with the error pending (V8's
+ * RangeError past JS_MAX_STRING_UNITS, the budget's or the interrupt's), or with none: OOM. */
+JsString *js_normalize(JsContext *ctx, JsString *s, int form);
 
 /* ---- strings / atoms (js_string.c) ---- */
 

@@ -451,16 +451,20 @@ static unsigned ceil_log2(int r) {
     return k;
 }
 
-JsString *js_bigint_to_string(JsVm *vm, const JsBigInt *b, int radix, bool *too_long) {
+/* A limb of one division pass, in instructions: a 64-by-32-bit division and its loop, about 8 ns,
+ * where an instruction is about 2.5 */
+#define TO_STRING_LIMB_COST 3
+/* charged a batch at a time: about 50 us of work between interrupt polls */
+#define TO_STRING_BATCH 4096
+
+JsString *js_bigint_to_string(JsContext *ctx, const JsBigInt *b, int radix) {
     static const char digs[] = "0123456789abcdefghijklmnopqrstuvwxyz";
-    if (too_long)
-        *too_long = false;
+    JsVm *vm = ctx->vm;
     if (!b->len)
         return js_ascii_cell(vm, "0");
-    /* the digits at least, sign aside: refused before the conversion, which no fuel pays for */
+    /* the digits at least, sign aside: refused before the conversion */
     if ((bit_length(b) - 1) / ceil_log2(radix) + 1 > JS_MAX_STRING_UNITS) {
-        if (too_long)
-            *too_long = true;
+        js_set_error(ctx, js_error_from_ascii(ctx, JS_STRING_LENGTH_ERROR));
         return NULL;
     }
     uint32_t chunk_digits = 1;
@@ -479,8 +483,17 @@ JsString *js_bigint_to_string(JsVm *vm, const JsBigInt *b, int radix, bool *too_
     }
     memcpy(m, b->d, b->len * sizeof *m);
     uint32_t mn = b->len;
-    size_t pos = max_digits + chunk_digits + 1;
+    size_t pos = max_digits + chunk_digits + 1, total = pos;
+    uint64_t work = 0; /* limbs divided since the last charge */
+    bool ok = true;
     while (mn) {
+        /* quadratic in the length: each pass divides every limb left, so it is paid for */
+        work += mn;
+        if (work >= TO_STRING_BATCH) {
+            if (!(ok = js_native_charge_n(ctx, work * TO_STRING_LIMB_COST)))
+                break;
+            work = 0;
+        }
         uint32_t rem = mag_divmod_small(m, mn, (uint32_t)chunk_div);
         while (mn && !m[mn - 1])
             mn--;
@@ -491,17 +504,15 @@ JsString *js_bigint_to_string(JsVm *vm, const JsBigInt *b, int radix, bool *too_
                 break;
         }
     }
-    if (b->neg)
+    if (ok && work)
+        ok = js_native_charge_n(ctx, work * TO_STRING_LIMB_COST);
+    if (ok && b->neg)
         out[--pos] = '-';
-    size_t total = max_digits + chunk_digits + 1;
-    if (total - pos > JS_MAX_STRING_UNITS) {
-        js_realloc_raw(vm, out, total * sizeof *out, 0);
-        js_realloc_raw(vm, m, (size_t)b->len * sizeof *m, 0);
-        if (too_long)
-            *too_long = true;
-        return NULL;
+    if (ok && total - pos > JS_MAX_STRING_UNITS) {
+        js_set_error(ctx, js_error_from_ascii(ctx, JS_STRING_LENGTH_ERROR));
+        ok = false;
     }
-    JsString *s = js_string_cell_new(vm, out + pos, total - pos);
+    JsString *s = ok ? js_string_cell_new(vm, out + pos, total - pos) : NULL;
     js_realloc_raw(vm, out, total * sizeof *out, 0);
     js_realloc_raw(vm, m, (size_t)b->len * sizeof *m, 0);
     return s;
@@ -929,12 +940,9 @@ static bool bp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int arg
         *r = js_error_fmt(ctx, "RangeError: toString() radix argument must be between 2 and 36");
         return false;
     }
-    bool too_long;
-    JsString *s = js_bigint_to_string(ctx->vm, js_value_bigint(tv), (int)radix, &too_long);
-    if (!s && too_long)
-        return (*r = js_error_from_ascii(ctx, JS_STRING_LENGTH_ERROR)), false;
+    JsString *s = js_bigint_to_string(ctx, js_value_bigint(tv), (int)radix);
     if (!s)
-        return bthrow(ctx, r);
+        return bthrow(ctx, r); /* the length limit, the budget, else out of memory */
     *r = js_value_from_cell(&s->gc);
     return true;
 }

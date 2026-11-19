@@ -264,6 +264,7 @@ bool      js_define_own_property(JsContext *ctx, JsValue v, JsValue key, const J
 bool      js_has_property(JsContext *ctx, JsValue base, JsValue key, bool *out);
 bool      js_delete_property(JsContext *ctx, JsValue base, JsValue key);
 bool      js_native_charge(JsContext *ctx);
+bool      js_native_charge_n(JsContext *ctx, uint64_t n); /* N instructions' worth of a native's work */
 bool      js_is_extensible(JsContext *ctx, JsValue v);
 bool      js_function_has_own_special(JsValue fn, bool name);
 bool      js_prevent_extensions(JsContext *ctx, JsValue v);
@@ -278,7 +279,9 @@ JsString *js_native_string(JsContext *ctx, JsValue v);
 bool      js_native_is_new(const JsContext *ctx);
 void      js_set_error(JsContext *ctx, JsValue error);
 /* Of a primitive (never runs guest code); NULL on OOM. */
-JsString *js_primitive_to_string(JsVm *vm, JsValue v);
+/* ToString of a primitive. NULL with the error pending (a BigInt's: the string length limit, the
+ * budget its digits are charged to), or with none pending: out of memory. */
+JsString *js_primitive_to_string(JsContext *ctx, JsValue v);
 double    js_primitive_to_number(JsValue v);
 bool      js_strict_equals(JsValue a, JsValue b);
 JsString *js_ascii_cell(JsVm *vm, const char *s); /* <=128 chars */

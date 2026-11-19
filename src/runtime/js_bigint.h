@@ -33,9 +33,10 @@ JsBigInt *js_bigint_parse(JsContext *ctx, const uint16_t *u, uint32_t n, int rad
 JsBigInt *js_bigint_from_string(JsContext *ctx, const JsString *s, bool *bad);
 
 /* Conversion */
-/* NULL on OOM, or with *too_long set (too_long may be NULL) when the digits would pass
- * JS_MAX_STRING_UNITS: V8's RangeError "Invalid string length" */
-JsString *js_bigint_to_string(JsVm *vm, const JsBigInt *b, int radix, bool *too_long);
+/* B's digits in RADIX, the work charged to the budget (it is quadratic in B's length). NULL with
+ * the error pending: V8's RangeError "Invalid string length" past JS_MAX_STRING_UNITS, the
+ * budget's or the interrupt's error; NULL with none pending: out of memory. */
+JsString *js_bigint_to_string(JsContext *ctx, const JsBigInt *b, int radix);
 double    js_bigint_to_double(const JsBigInt *b);
 bool      js_bigint_is_zero(const JsBigInt *b);
 int       js_bigint_cmp(const JsBigInt *a, const JsBigInt *b);      /* -1, 0, 1 */

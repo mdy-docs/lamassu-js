@@ -689,10 +689,9 @@ static bool sm_normalize(JsContext *ctx, JsValue tv, const JsValue *args, int ar
         if (form < 0)
             return native_throw(ctx, r, "RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD.");
     }
-    bool too_long;
-    JsString *n = js_normalize(ctx->vm, s, form, &too_long);
+    JsString *n = js_normalize(ctx, s, form);
     if (!n)
-        return too_long ? native_throw(ctx, r, JS_STRING_LENGTH_ERROR) : oom(ctx, r);
+        return oom(ctx, r); /* the length limit, the budget, else out of memory */
     *r = js_value_from_cell(&n->gc);
     return true;
 }

@@ -172,7 +172,10 @@ memory-unsafe and all are bounded per operation — but the aggregate is not
 bounded in *time* by fuel alone. The one builtin loop with no memory behind its
 length is charged: an array method on a receiver that is not an array
 (`Array.prototype.indexOf.call({ length: 2 ** 53 - 1 }, x)`) spends a unit of
-fuel for each index and reads the interrupt there.
+fuel for each index and reads the interrupt there. So are the builtins whose work
+grows faster than their input: a BigInt's `toString` (quadratic in its length) and
+`normalize` (whose ordering of a run of marks is quadratic) spend about the fuel
+the time would buy in instructions, and read the interrupt as they go.
 :::
 
 Arm a timer and call

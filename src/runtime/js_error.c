@@ -426,7 +426,7 @@ JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
                 fb_ascii(b, "]", 1);
             }
         } else {
-            JsString *s = js_primitive_to_string(vm, v);
+            JsString *s = js_primitive_to_string(ctx, v);
             if (s)
                 fb_piece(b, s->units, s->length);
             else
@@ -462,8 +462,8 @@ JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
     if (out.too_long) { /* a message past the string length limit: V8's RangeError in its place */
         JsString *s = js_ascii_cell(vm, JS_STRING_LENGTH_ERROR);
         r = s ? js_error_from_cell(ctx, s) : js_oom_value(vm);
-    } else if (out.oom) {
-        r = js_oom_value(vm);
+    } else if (out.oom) { /* what converting a value threw (a BigInt's budget), else out of memory */
+        r = js_is_undefined(ctx->pending_error) ? js_oom_value(vm) : js_take_error(ctx);
     } else {
         JsString *s = js_string_cell_new(vm, out.u, (uint32_t)out.n);
         r = s ? js_error_from_cell(ctx, s) : js_oom_value(vm);

@@ -92,7 +92,8 @@ static bool fail_ascii(JsContext *ctx, const char *msg) {
     return false;
 }
 
-JsString *js_primitive_to_string(JsVm *vm, JsValue v) {
+JsString *js_primitive_to_string(JsContext *ctx, JsValue v) {
+    JsVm *vm = ctx->vm;
     if (js_is_string(v))
         return js_value_string(v);
     if (js_is_number(v))
@@ -104,18 +105,15 @@ JsString *js_primitive_to_string(JsVm *vm, JsValue v) {
     if (v.bits == JS_SPECIAL_FALSE)
         return js_ascii_cell(vm, "false");
     if (js_is_bigint(v))
-        return js_bigint_to_string(vm, js_value_bigint(v), 10, NULL);
+        return js_bigint_to_string(ctx, js_value_bigint(v), 10);
     return js_ascii_cell(vm, "undefined");
 }
 
-/* js_primitive_to_string with the failure pending: V8's RangeError for a BigInt whose digits
- * would pass the string length limit, else out of memory */
+/* js_primitive_to_string with the failure always pending: out of memory when it left none */
 static JsString *primitive_to_string(JsContext *ctx, JsValue v) {
-    bool too_long = false;
-    JsString *s = js_is_bigint(v) ? js_bigint_to_string(ctx->vm, js_value_bigint(v), 10, &too_long)
-                                  : js_primitive_to_string(ctx->vm, v);
-    if (!s)
-        too_long ? fail_ascii(ctx, JS_STRING_LENGTH_ERROR) : fail_oom(ctx);
+    JsString *s = js_primitive_to_string(ctx, v);
+    if (!s && js_is_undefined(ctx->pending_error))
+        fail_oom(ctx);
     return s;
 }
 
@@ -5418,15 +5416,23 @@ bool js_delete_property(JsContext *ctx, JsValue base, JsValue key) {
  * False with the error pending. Outside a fiber (the host calling a native) the turn's budget
  * pays. */
 bool js_native_charge(JsContext *ctx) {
+    return js_native_charge_n(ctx, 1);
+}
+
+/* N instructions' worth of a native's own work at once (a BigInt's digits, a normalization):
+ * what the work costs in time, at what an instruction costs, so a budget bounds a native's
+ * time as it bounds the script's. Natives charge as they go, a batch at a time, so the interrupt
+ * flag stops them too. False with the error pending. */
+bool js_native_charge_n(JsContext *ctx, uint64_t n) {
     if (ctx->vm->interrupt)
         return fail_ascii(ctx, JS_MSG_INTERRUPT);
     uint64_t *fuel = ctx->fiber ? &ctx->fiber->fuel : ctx->fuel ? &ctx->fuel_left : NULL;
     if (fuel) {
-        if (*fuel <= 1) { /* spent: 1 is where the dispatch loop leaves it too */
+        if (*fuel <= n) { /* spent: 1 is where the dispatch loop leaves it too */
             *fuel = 1;
             return fail_ascii(ctx, JS_MSG_BUDGET);
         }
-        --*fuel;
+        *fuel -= n;
     }
     return true;
 }

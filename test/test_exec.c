@@ -599,6 +599,15 @@ static void test_fuel(void) {
         "A.copyWithin.call(big, 1, 0)",  "A.unshift.call({ length: 2 ** 52 }, 1)",
         "A.shift.call(big)",             "A.splice.call(big, 0, 1)",   "A.sort.call(big)",
     };
+    /* and so is a native's own work where it grows faster than its input: a BigInt's digits
+     * (quadratic in its length: minutes for this one), a normalization (the ordering of a run of
+     * marks is quadratic) */
+    static const char *const works[] = {
+        "((1n << 3000000n) - 1n).toString()",
+        "('a' + '\\u0301'.repeat(200000) + '\\u0323'.repeat(200000)).normalize('NFD')",
+        "String((1n << 3000000n) - 1n)",
+        "`${(1n << 3000000n) - 1n}`",
+    };
     opts.fuel = 200000;
     for (size_t i = 0; i < sizeof loops / sizeof loops[0]; i++) {
         char src[256];
@@ -610,6 +619,22 @@ static void test_fuel(void) {
         CHECK(strstr(out, "budget") != NULL);
         free(out);
     }
+    opts.fuel = 2000000;
+    for (size_t i = 0; i < sizeof works / sizeof works[0]; i++) {
+        char src[256];
+        snprintf(src, sizeof src, "try { %s; } catch (e) {} 'never';", works[i]);
+        st = run_src_opts(src, &opts, &out);
+        CHECK(st == RUN_RUNTIME_ERR);
+        CHECK(strstr(out, "budget") != NULL);
+        free(out);
+    }
+    /* the same work within its budget completes: the charge is what the time costs, not a cap */
+    opts.fuel = 50000000;
+    st = run_src_opts("((1n << 20000n) - 1n).toString().length + ('a' + '\\u0301'.repeat(2000) + '\\u0323'.repeat(2000)).normalize('NFD').length;",
+                      &opts, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "10022") == 0);
+    free(out);
 }
 
 static void test_heap_limit(void) {
@@ -1152,6 +1177,16 @@ static void test_interrupt(void) {
     CHECK(strstr(out, "interrupted") != NULL);
     free(out);
 
+    /* a native's own long work polls the flag as it goes: the interrupt comes from inside it (the
+     * radix's and the form's conversion), so nothing but the native can notice it */
+    st = run_with_stop("((1n << 3000000n) - 1n).toString({ valueOf() { stopNow(); return 10; } }); 'never';",
+                       &out, false);
+    CHECK(strstr(out, "interrupted") != NULL);
+    free(out);
+    st = run_with_stop("('a' + '\\u0301'.repeat(200000) + '\\u0323'.repeat(200000)).normalize({ toString() { stopNow(); return 'NFD'; } }); 'never';",
+                       &out, false);
+    CHECK(strstr(out, "interrupted") != NULL);
+    free(out);
     /* a finally block cannot outrun it either */
     st = run_with_stop("stopNow(); try { while (true) {} } finally { while (true) {} } 'never';",
                        &out, false);
