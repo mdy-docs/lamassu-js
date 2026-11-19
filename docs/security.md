@@ -124,10 +124,12 @@ bounded in *time* by fuel alone. (The one builtin loop with no memory behind its
 length is charged: an array method on a receiver that is not an array,
 `Array.prototype.indexOf.call({ length: 2 ** 53 - 1 }, x)`, spends a unit of fuel
 for each index and reads the interrupt there. So are the builtins whose work grows faster
-than their input: a BigInt's `toString` (quadratic in its length) and `normalize` (whose
-ordering of a run of marks is quadratic) charge about what the time would buy in
-instructions, a batch at a time through `js_native_charge_n`, and read the interrupt
-between batches.) Arm a timer and call `js_vm_interrupt`, which
+than their input: BigInt multiplication, division, remainder, `**`, parsing (`BigInt(s)`,
+a comparison with a string, a literal at compile time) and printing, all quadratic in the
+length, and `normalize` (whose ordering of a run of marks is quadratic) charge about what the
+time would buy in instructions, a batch at a time through `js_native_charge_n`, and read the
+interrupt between batches. A literal's charge falls on the budget armed when the source
+compiles, and stopping it is a compile error: `SyntaxError: execution budget exhausted`.) Arm a timer and call `js_vm_interrupt`, which
 is safe from another thread or a signal handler and stops the run at the next
 dispatch. Keep an outer kill as well if the deadline is hard rather than
 best-effort: the interrupt is read between instructions, so a builtin already

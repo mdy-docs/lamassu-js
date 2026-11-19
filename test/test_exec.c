@@ -607,6 +607,14 @@ static void test_fuel(void) {
         "('a' + '\\u0301'.repeat(200000) + '\\u0323'.repeat(200000)).normalize('NFD')",
         "String((1n << 3000000n) - 1n)",
         "`${(1n << 3000000n) - 1n}`",
+        /* BigInt arithmetic: a multiplication, a division, a power, a parse (BigInt(), ==, <) */
+        "((1n << 3000000n) - 1n) * ((1n << 3000000n) - 3n)",
+        "(1n << 6000000n) / ((1n << 3000000n) - 1n)",
+        "(1n << 6000000n) % ((1n << 3000000n) - 1n)",
+        "((1n << 1000n) - 1n) ** 3000n",
+        "BigInt('9'.repeat(3000000))",
+        "1n == '9'.repeat(3000000)",
+        "1n < '9'.repeat(3000000)",
     };
     opts.fuel = 200000;
     for (size_t i = 0; i < sizeof loops / sizeof loops[0]; i++) {
@@ -634,6 +642,11 @@ static void test_fuel(void) {
                       &opts, &out);
     CHECK(st == RUN_OK);
     CHECK(strcmp(out, "10022") == 0);
+    free(out);
+    st = run_src_opts("const a = (1n << 64000n) - 1n; String([(a * a) / a === a, (a * a) % a, ((1n << 100n) - 1n) ** 300n === ((1n << 100n) - 1n) ** 299n * ((1n << 100n) - 1n), BigInt('9'.repeat(20000)) + 1n === 10n ** 20000n, 1n == '1', 2n > '1'])",
+                      &opts, &out);
+    CHECK(st == RUN_OK);
+    CHECK(strcmp(out, "true,0,true,true,true,true") == 0);
     free(out);
 }
 
@@ -1184,6 +1197,18 @@ static void test_interrupt(void) {
     CHECK(strstr(out, "interrupted") != NULL);
     free(out);
     st = run_with_stop("('a' + '\\u0301'.repeat(200000) + '\\u0323'.repeat(200000)).normalize({ toString() { stopNow(); return 'NFD'; } }); 'never';",
+                       &out, false);
+    CHECK(strstr(out, "interrupted") != NULL);
+    free(out);
+    st = run_with_stop("const a = (1n << 3000000n) - 1n; a * { valueOf() { stopNow(); return a; } }; 'never';",
+                       &out, false);
+    CHECK(strstr(out, "interrupted") != NULL);
+    free(out);
+    st = run_with_stop("(1n << 6000000n) / { valueOf() { stopNow(); return (1n << 3000000n) - 1n; } }; 'never';",
+                       &out, false);
+    CHECK(strstr(out, "interrupted") != NULL);
+    free(out);
+    st = run_with_stop("BigInt({ toString() { stopNow(); return '9'.repeat(3000000); } }); 'never';",
                        &out, false);
     CHECK(strstr(out, "interrupted") != NULL);
     free(out);

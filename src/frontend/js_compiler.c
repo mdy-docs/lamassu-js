@@ -2706,6 +2706,14 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
         bool bad = false;
         JsBigInt *b = text ? js_bigint_from_string(cx->ctx, text, &bad) : NULL;
         js_gc_unprotect(cx->vm, &tv);
+        if (!b && !bad && !js_is_undefined(cx->ctx->pending_error)) {
+            /* its digits are charged to the budget (quadratic in their number), which ran out or
+             * was interrupted */
+            JsErrorCause cause = js_error_cause(cx->ctx, js_take_error(cx->ctx));
+            return cerr(cx, n->pos, cause == JS_CAUSE_BUDGET      ? "execution budget exhausted"
+                                    : cause == JS_CAUSE_INTERRUPT ? "execution interrupted"
+                                                                  : "out of memory");
+        }
         if (!b)
             return cerr(cx, n->pos, bad ? "Invalid or unexpected token" : "out of memory");
         uint16_t c;

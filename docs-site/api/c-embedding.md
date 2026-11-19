@@ -492,8 +492,9 @@ and rehash a large string, and the regex step budget is per call, so a loop of
 cheap-looking `re.test(s)` calls multiplies it. All of those are individually
 bounded and none are memory-unsafe, but the aggregate is not bounded in *time*
 by fuel alone. (The builtins whose work grows faster than their input are charged
-for it: a BigInt's `toString` and `normalize` spend about the fuel the time would
-buy in instructions, and read the interrupt as they go.) To bound wall-clock, arm a timer and call
+for it: BigInt multiplication, division, `**`, parsing and printing, and `normalize`,
+spend about the fuel the time would buy in instructions, and read the interrupt as they
+go; a BigInt literal's digits are charged when the source compiles.) To bound wall-clock, arm a timer and call
 [`js_vm_interrupt`](#stopping-a-run-from-outside).
 :::
 

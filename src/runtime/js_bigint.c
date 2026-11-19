@@ -116,10 +116,54 @@ static void mag_sub(uint32_t *out, const uint32_t *a, uint32_t an, const uint32_
     }
 }
 
-/* OUT (an + bn limbs, zeroed) = A * B */
-static void mag_mul(uint32_t *out, const uint32_t *a, uint32_t an, const uint32_t *b, uint32_t bn) {
+/* ---- fuel ----
+ *
+ * Multiplication, division, parsing and printing are quadratic in the length, and a BigInt may
+ * have 2^25 limbs, so each pays for its work as it goes, at about what the time would buy in
+ * instructions (one is about 2.5 ns), and reads the interrupt between batches. The meter counts
+ * quarter-instructions, so each inner step can be charged its measured cost:
+ *   a multiplication's limb product  0.7 ns: 1 quarter
+ *   a parse's limb step              0.5 ns: 1 quarter
+ *   a division's limb step           0.9 ns: 2 quarters
+ *   a printing division's limb       8 ns:   12 quarters (a 64-by-32-bit hardware division)
+ * (measured: within 1.3 times of the interpreter's own rate of fuel per millisecond) */
+#define Q_MUL 1
+#define Q_DIV 2
+#define Q_PARSE 1
+#define Q_PRINT 12
+#define METER_BATCH (4u * 16384) /* about 40 us of work between charges */
+
+typedef struct {
+    JsContext *ctx;
+    uint64_t q; /* quarters not yet charged */
+} Meter;
+
+/* Q quarters' more work; false with the budget's or the interrupt's error pending */
+static bool meter(Meter *m, uint64_t q) {
+    m->q += q;
+    if (m->q < METER_BATCH)
+        return true;
+    uint64_t n = m->q / 4;
+    m->q %= 4;
+    return js_native_charge_n(m->ctx, n);
+}
+
+/* what is left, rounded up; less than 16 instructions' worth (the arithmetic of numbers of a few
+ * limbs, the common case) goes with the instruction that asked for it */
+static bool meter_end(Meter *m) {
+    uint64_t n = (m->q + 3) / 4;
+    m->q = 0;
+    return n < 16 || js_native_charge_n(m->ctx, n);
+}
+
+/* OUT (an + bn limbs, zeroed) = A * B. False with the budget's or the interrupt's error pending. */
+static bool mag_mul(JsContext *ctx, uint32_t *out, const uint32_t *a, uint32_t an, const uint32_t *b,
+                    uint32_t bn) {
+    Meter m = {ctx, 0};
     for (uint32_t i = 0; i < an; i++) {
         uint64_t carry = 0, ai = a[i];
+        if (!meter(&m, (uint64_t)bn * Q_MUL))
+            return false;
         if (!ai)
             continue;
         for (uint32_t j = 0; j < bn; j++) {
@@ -129,6 +173,7 @@ static void mag_mul(uint32_t *out, const uint32_t *a, uint32_t an, const uint32_
         }
         out[i + bn] = (uint32_t)carry;
     }
+    return meter_end(&m);
 }
 
 /* A (n limbs) = A / D in place; the remainder */
@@ -154,7 +199,8 @@ static int clz32(uint32_t x) {
 }
 
 /* Q (an - bn + 1 limbs, or NULL) and R (bn limbs, or NULL) of A / B, B nonzero with bn > 1
- * significant limbs: Knuth's algorithm D. False on OOM. */
+ * significant limbs: Knuth's algorithm D. False with the budget's or the interrupt's error
+ * pending, or none: out of memory. */
 static bool mag_divmod(JsContext *ctx, uint32_t *q, uint32_t *r, const uint32_t *a, uint32_t an,
                        const uint32_t *b, uint32_t bn) {
     int s = clz32(b[bn - 1]);
@@ -171,7 +217,11 @@ static bool mag_divmod(JsContext *ctx, uint32_t *q, uint32_t *r, const uint32_t 
     u[an] = s ? a[an - 1] >> (32 - s) : 0;
     for (uint32_t i = an; i-- > 0;)
         u[i] = (a[i] << s) | (s && i ? a[i - 1] >> (32 - s) : 0);
+    Meter m = {ctx, 0};
+    bool ok = true;
     for (uint32_t j = an - bn + 1; j-- > 0;) {
+        if (!(ok = meter(&m, (uint64_t)bn * Q_DIV)))
+            break;
         uint64_t num = ((uint64_t)u[j + bn] << 32) | u[j + bn - 1];
         uint64_t qhat = num / v[bn - 1], rhat = num % v[bn - 1];
         while (qhat >= ((uint64_t)1 << 32) ||
@@ -206,12 +256,13 @@ static bool mag_divmod(JsContext *ctx, uint32_t *q, uint32_t *r, const uint32_t 
         if (q)
             q[j] = (uint32_t)qhat;
     }
-    if (r) /* the remainder is in u[0 .. bn], still shifted left by s */
+    ok = ok && meter_end(&m);
+    if (ok && r) /* the remainder is in u[0 .. bn], still shifted left by s */
         for (uint32_t i = 0; i < bn; i++)
             r[i] = s ? (u[i] >> s) | (uint32_t)((uint64_t)u[i + 1] << (32 - s)) : u[i];
     scratch_free(ctx, u, (uint64_t)an + 1);
     scratch_free(ctx, v, bn);
-    return true;
+    return ok;
 }
 
 /* M[e/32 ..] = MANT << E (MANT < 2^53): three limbs */
@@ -377,7 +428,12 @@ JsBigInt *js_bigint_parse(JsContext *ctx, const uint16_t *u, uint32_t n, int rad
     if (!m)
         return NULL;
     uint32_t mn = 0;
+    Meter mt = {ctx, 0};
     for (uint32_t i = 0; i < n;) {
+        if (!meter(&mt, ((uint64_t)mn + 1) * Q_PARSE)) { /* each chunk multiplies every limb so far */
+            scratch_free(ctx, m, cap);
+            return NULL;
+        }
         uint32_t k = n - i < chunk_digits ? n - i : chunk_digits;
         uint64_t mul = 1, val = 0;
         for (uint32_t j = 0; j < k; j++, i++) {
@@ -393,7 +449,7 @@ JsBigInt *js_bigint_parse(JsContext *ctx, const uint16_t *u, uint32_t n, int rad
         if (carry)
             m[mn++] = (uint32_t)carry;
     }
-    JsBigInt *b = bi_make(ctx, m, mn, neg);
+    JsBigInt *b = meter_end(&mt) ? bi_make(ctx, m, mn, neg) : NULL;
     scratch_free(ctx, m, cap);
     return b;
 }
@@ -451,12 +507,6 @@ static unsigned ceil_log2(int r) {
     return k;
 }
 
-/* A limb of one division pass, in instructions: a 64-by-32-bit division and its loop, about 8 ns,
- * where an instruction is about 2.5 */
-#define TO_STRING_LIMB_COST 3
-/* charged a batch at a time: about 50 us of work between interrupt polls */
-#define TO_STRING_BATCH 4096
-
 JsString *js_bigint_to_string(JsContext *ctx, const JsBigInt *b, int radix) {
     static const char digs[] = "0123456789abcdefghijklmnopqrstuvwxyz";
     JsVm *vm = ctx->vm;
@@ -484,16 +534,12 @@ JsString *js_bigint_to_string(JsContext *ctx, const JsBigInt *b, int radix) {
     memcpy(m, b->d, b->len * sizeof *m);
     uint32_t mn = b->len;
     size_t pos = max_digits + chunk_digits + 1, total = pos;
-    uint64_t work = 0; /* limbs divided since the last charge */
+    Meter mt = {ctx, 0};
     bool ok = true;
     while (mn) {
-        /* quadratic in the length: each pass divides every limb left, so it is paid for */
-        work += mn;
-        if (work >= TO_STRING_BATCH) {
-            if (!(ok = js_native_charge_n(ctx, work * TO_STRING_LIMB_COST)))
-                break;
-            work = 0;
-        }
+        /* quadratic in the length: each pass divides every limb left */
+        if (!(ok = meter(&mt, (uint64_t)mn * Q_PRINT)))
+            break;
         uint32_t rem = mag_divmod_small(m, mn, (uint32_t)chunk_div);
         while (mn && !m[mn - 1])
             mn--;
@@ -504,8 +550,7 @@ JsString *js_bigint_to_string(JsContext *ctx, const JsBigInt *b, int radix) {
                 break;
         }
     }
-    if (ok && work)
-        ok = js_native_charge_n(ctx, work * TO_STRING_LIMB_COST);
+    ok = ok && meter_end(&mt);
     if (ok && b->neg)
         out[--pos] = '-';
     if (ok && total - pos > JS_MAX_STRING_UNITS) {
@@ -550,7 +595,8 @@ static JsBigInt *mul_signed(JsContext *ctx, const JsBigInt *a, const JsBigInt *b
     if (!r)
         return NULL;
     memset(r->d, 0, ((size_t)a->len + b->len) * sizeof(uint32_t));
-    mag_mul(r->d, a->d, a->len, b->d, b->len);
+    if (!mag_mul(ctx, r->d, a->d, a->len, b->d, b->len))
+        return NULL;
     r->len = a->len + b->len;
     r->neg = a->neg != b->neg;
     return bi_finish(r);
@@ -607,14 +653,16 @@ static JsBigInt *pow_signed(JsContext *ctx, const JsBigInt *a, const JsBigInt *b
     uint64_t cap = (bit_length(a) * e) / 32 + 2;
     uint32_t *res = scratch(ctx, cap), *base = scratch(ctx, cap), *tmp = scratch(ctx, cap * 2);
     JsBigInt *r = NULL;
-    if (res && base && tmp) {
+    bool ok = res && base && tmp;
+    if (ok) {
         uint32_t rn = 1, bn = a->len;
         res[0] = 1;
         memcpy(base, a->d, a->len * sizeof *base);
         for (;;) {
             if (e & 1) {
                 memset(tmp, 0, (size_t)(rn + bn) * sizeof *tmp);
-                mag_mul(tmp, res, rn, base, bn);
+                if (!(ok = mag_mul(ctx, tmp, res, rn, base, bn)))
+                    break;
                 rn = rn + bn;
                 while (rn > 1 && !tmp[rn - 1])
                     rn--;
@@ -624,13 +672,15 @@ static JsBigInt *pow_signed(JsContext *ctx, const JsBigInt *a, const JsBigInt *b
             if (!e)
                 break;
             memset(tmp, 0, (size_t)(2 * bn) * sizeof *tmp);
-            mag_mul(tmp, base, bn, base, bn);
+            if (!(ok = mag_mul(ctx, tmp, base, bn, base, bn)))
+                break;
             bn = 2 * bn;
             while (bn > 1 && !tmp[bn - 1])
                 bn--;
             memcpy(base, tmp, bn * sizeof *base);
         }
-        r = bi_make(ctx, res, rn, a->neg && (b->d[0] & 1));
+        if (ok)
+            r = bi_make(ctx, res, rn, a->neg && (b->d[0] & 1));
     }
     if (res)
         scratch_free(ctx, res, cap);

@@ -297,9 +297,12 @@ static int bigint_loose_eq(JsContext *ctx, JsValue a, JsValue b) {
         js_gc_protect(ctx->vm, &av);
         JsBigInt *n = js_bigint_from_string(ctx, js_value_string(b), &bad);
         js_gc_unprotect(ctx->vm, &av);
-        if (!n) {
-            js_set_error(ctx, js_undefined()); /* only OOM is possible here; it reads as unequal */
+        if (!n && bad) /* not a BigInt's text: unequal */
             return 0;
+        if (!n) { /* the budget or the interrupt (its digits are charged), else out of memory */
+            if (js_is_undefined(ctx->pending_error))
+                fail_oom(ctx);
+            return -1;
         }
         return js_bigint_equal(js_value_bigint(av), n);
     }
