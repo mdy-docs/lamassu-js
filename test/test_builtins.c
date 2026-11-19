@@ -718,6 +718,47 @@ static void test_string_search(void) {
        "[false,true,true,false,0,0,1,2,3,0,true,0,1]");
 }
 
+/* push and unshift add elements with [[Set]]: a read-only index up the prototype chain refuses
+ * them, as it refuses an assignment (they appended to the elements regardless); what makes an
+ * element directly (a literal, spread, concat, map, Array.from) ignores it. Node's output, as a
+ * module. */
+static void test_array_set_chain(void) {
+    eq_s(
+        "let out = '';\n"
+        "const t = (name, f) => { let v; try { v = JSON.stringify(f()); } catch (e) { v = e.constructor.name + ': ' + e.message; } out += name + ' => ' + v + '\\n'; };\n"
+        "const P = Object.create(Array.prototype);\n"
+        "Object.defineProperty(P, 0, { value: 'P', writable: false });\n"
+        "Object.defineProperty(P, 3, { value: 'Q', writable: false });\n"
+        "const mk = (...xs) => { const a = [...xs]; Object.setPrototypeOf(a, P); return a; };\n"
+        "t('assign', () => { const a = mk(); a[0] = 1; });\n"
+        "t('push', () => { const a = mk(); a.push(1); });\n"
+        "t('unshift', () => { const a = mk(); a.unshift(1); });\n"
+        "t('splice', () => { const a = mk(); a.splice(0, 0, 1); });\n"
+        "t('push partly', () => { const a = mk(5); try { a.push(1, 2, 3); } catch (e) { return [e.message, a.length, a[1], a[2], Object.hasOwn(a, 3)]; } });\n"
+        "t('unshift several', () => { const a = mk(9); try { a.unshift(1, 2); } catch (e) { return [e.message, a.length, a[0]]; } });\n"
+        "t('own elements unaffected', () => { const a = mk(5, 6); a[0] = 1; return [a[0], a.push(7), a.length]; });\n"
+        "t('frozen array', () => { const a = Object.freeze(mk()); a.push(1); });\n"
+        "t('Object.prototype index', () => { Object.defineProperty(Object.prototype, 3, { value: 'O', writable: false, configurable: true }); try { const a = [0, 1, 2]; a.push(3); } finally { delete Object.prototype[3]; } });\n"
+        "t('after delete', () => { const a = [0, 1, 2]; return [a.push(3), a[3]]; });\n"
+        "t('literal, spread, concat, map, from ignore it', () => { Object.defineProperty(Object.prototype, 1, { value: 'O', writable: false, configurable: true }); try { return [[0, 9][1], [...[0, 9]][1], [0].concat([9])[1], [0, 1].map((x) => x + 8)[1], Array.from([0, 9])[1]]; } finally { delete Object.prototype[1]; } });\n"
+        "Object.freeze(Object.prototype);\n"
+        "t('frozen Object.prototype', () => { const a = [1]; return [a.push(2, 3), a.unshift(0), a]; });\n"
+        "out;",
+        "assign => TypeError: Cannot assign to read only property '0' of object '[object Array]'\n"
+        "push => TypeError: Cannot assign to read only property '0' of object '[object Array]'\n"
+        "unshift => TypeError: Cannot assign to read only property '0' of object '[object Array]'\n"
+        "splice => TypeError: Cannot assign to read only property '0' of object '[object Array]'\n"
+        "push partly => [\"Cannot assign to read only property '3' of object '[object Array]'\",3,1,2,false]\n"
+        "unshift several => undefined\n"
+        "own elements unaffected => [1,3,3]\n"
+        "frozen array => TypeError: Cannot assign to read only property '0' of object '[object Array]'\n"
+        "Object.prototype index => TypeError: Cannot assign to read only property '3' of object '[object Array]'\n"
+        "after delete => [4,3]\n"
+        "literal, spread, concat, map, from ignore it => [9,9,9,9,9]\n"
+        "frozen Object.prototype => [3,4,[0,1,2,3]]\n"
+        "");
+}
+
 /* A native's call into script reuses a finished fiber (JsContext.fiber_pool): a closure made in a
  * callback, an upvalue a throw left open, nested callbacks, a deep recursion (its fiber too big to
  * keep), a stack trace and an async function suspended inside a callback must all be as if each
@@ -3199,6 +3240,7 @@ int main(void) {
     test_string_limit();
     test_fiber_reuse();
     test_string_search();
+    test_array_set_chain();
     test_stress();
     test_integration();
     if (checks_failed) {

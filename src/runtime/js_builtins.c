@@ -1502,8 +1502,20 @@ static bool array_mut_ok(JsContext *ctx, JsObject *a, JsValue *r, ArrayMut how) 
     return true;
 }
 
+/* push and unshift add elements with [[Set]], which a read-only index or an accessor up the
+ * prototype chain refuses or takes (Object.defineProperty(Object.prototype, 3, { value: 1,
+ * writable: false }) makes [0, 1, 2].push(3) a TypeError in V8): the direct path appends to the
+ * elements, so when the chain may hold such a property (js_chain_may_be_read_only: a look at the
+ * prototypes' flags, false for an ordinary array) the generic path writes each one. */
+#define ARRAY_SET_CHAIN(body)                                                                      \
+    do {                                                                                           \
+        if (JS_UNLIKELY(js_chain_may_be_read_only(js_value_object(tv))))                           \
+            return gen_run(ctx, tv, args, argc, r, NULL, body, 0);                                 \
+    } while (0)
+
 static bool am_push(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     GENERIC(NULL, gen_push, 0);
+    ARRAY_SET_CHAIN(gen_push);
     JsObject *a = js_value_object(tv);
     if (!array_mut_ok(ctx, a, r, MUT_ADD))
         return false;
@@ -1552,6 +1564,7 @@ static bool am_shift(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
 
 static bool am_unshift(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
     GENERIC(NULL, gen_unshift, 0);
+    ARRAY_SET_CHAIN(gen_unshift);
     JsObject *a = js_value_object(tv);
     if (!array_mut_ok(ctx, a, r, MUT_ADD))
         return false;

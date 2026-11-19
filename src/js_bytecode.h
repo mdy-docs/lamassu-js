@@ -264,6 +264,9 @@ bool      js_define_own_property(JsContext *ctx, JsValue v, JsValue key, const J
 bool      js_has_property(JsContext *ctx, JsValue base, JsValue key, bool *out);
 bool      js_delete_property(JsContext *ctx, JsValue base, JsValue key);
 bool      js_native_charge(JsContext *ctx);
+/* Whether a [[Set]] on O may meet a read-only property or an accessor up its prototype chain
+ * (a quick, conservative look at the prototypes' flags) */
+bool      js_chain_may_be_read_only(const JsObject *o);
 bool      js_native_charge_n(JsContext *ctx, uint64_t n); /* N instructions' worth of a native's work */
 uint64_t  js_fuel_remaining(JsContext *ctx); /* what the budget has left; UINT64_MAX with none */
 bool      js_is_extensible(JsContext *ctx, JsValue v);

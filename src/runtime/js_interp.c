@@ -1397,6 +1397,10 @@ static inline bool chain_may_be_read_only(const JsObject *o) {
     return false;
 }
 
+bool js_chain_may_be_read_only(const JsObject *o) {
+    return chain_may_be_read_only(o);
+}
+
 static bool chain_write(JsContext *ctx, JsValue base, JsValue key, JsValue val, const char **errmsg,
                         JsPropStatus *st);
 /* chain_write for the object O, out of line: set_property's path for an object then keeps O in
