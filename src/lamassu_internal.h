@@ -1037,12 +1037,16 @@ static inline JsPromise *js_value_promise(JsValue v) { return (JsPromise *)js_va
  * js_builtins.c (the Array constructor). */
 #define JS_MAX_ARRAY_GAP 4096u
 
-/* Longest string, in UTF-16 code units, any operation may produce. Bounds what
- * one call from an untrusted script can be made to allocate AND — just as
- * importantly — how long it can spend filling it, since natives run without
- * consuming fuel. Shared by concat (js_interp.c) and repeat/pad
- * (js_builtins.c) so the ceiling is one number, not several. */
+/* Longest string, in UTF-16 code units, any operation may produce (V8's is
+ * 2^29-24; this one is lower on purpose). Bounds what one call from an
+ * untrusted script can be made to allocate AND — just as importantly — how
+ * long it can spend filling it, since natives run without consuming fuel.
+ * js_string_cell_new and js_concat_cells refuse anything longer, so no string
+ * cell can exceed it; every operation whose result can grow past its inputs
+ * checks the length first and throws JS_STRING_LENGTH_ERROR, as V8 does at its
+ * own limit, instead of reporting out of memory. */
 #define JS_MAX_STRING_UNITS (64u * 1024 * 1024)
+#define JS_STRING_LENGTH_ERROR "RangeError: Invalid string length"
 
 /* js_object.c: array helpers used by the interpreter. new_cell takes the
  * context (not just the VM) so it can set the new array's [[Prototype]] to
@@ -1125,13 +1129,14 @@ bool    js_map_put_attrs(JsMap *m, const JsString *key, uint8_t attrs);
 
 enum { JS_NF_NFC, JS_NF_NFD, JS_NF_NFKC, JS_NF_NFKD };
 /* S in normalization FORM (JS_NF_*): S itself when nothing changes, NULL on OOM */
-JsString *js_normalize(JsVm *vm, JsString *s, int form);
+/* NULL on OOM, or with *too_long set when the result would pass JS_MAX_STRING_UNITS */
+JsString *js_normalize(JsVm *vm, JsString *s, int form, bool *too_long);
 
 /* ---- strings / atoms (js_string.c) ---- */
 
 uint32_t  js_units_hash(const uint16_t *units, size_t len, uint32_t seed);
 uint32_t  js_units_hash_from(uint32_t h, const uint16_t *units, size_t len);
-JsString *js_string_cell_new(JsVm *vm, const uint16_t *units, size_t len);
+JsString *js_string_cell_new(JsVm *vm, const uint16_t *units, size_t len); /* NULL: OOM, or len > JS_MAX_STRING_UNITS */
 JsString *js_atoms_find(JsVm *vm, const uint16_t *units, size_t len, uint32_t hash);
 JsString *js_intern_cell(JsVm *vm, JsString *s); /* canonical string, or NULL on OOM */
 void      js_atoms_remove(JsVm *vm, JsString *s);

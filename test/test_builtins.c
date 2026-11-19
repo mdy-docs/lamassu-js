@@ -2582,6 +2582,32 @@ static void test_array_generic(void) {
        "67108864 | RangeError: Invalid string length | RangeError: Invalid string length");
 }
 
+/* The longest string is 2^26 code units (JS_MAX_STRING_UNITS), and everything that makes one keeps
+ * to it with V8's RangeError, as V8 does at its own limit. */
+static void test_string_limit(void) {
+    /* + and templates, concat, repeat, pad, at the limit and one past it */
+    eq("const M = 1 << 26, big = 'x'.repeat(M), half = 'x'.repeat(M / 2); const t = (f) => { try { const v = f(); return typeof v === 'string' ? String(v.length) : String(v); } catch (e) { return e.constructor.name + ': ' + e.message; } }; [t(() => big), t(() => big + 'y'), t(() => `${big}y`), t(() => half + half), t(() => big.concat('y')), t(() => half.repeat(2)), t(() => half.repeat(3)), t(() => 'x'.padEnd(M)), t(() => 'x'.padStart(M + 1))].join(' | ');",
+       "67108864 | RangeError: Invalid string length | RangeError: Invalid string length | 67108864 | RangeError: Invalid string length | 67108864 | RangeError: Invalid string length | 67108864 | RangeError: Invalid string length");
+    /* what grows a string's text: case, the HTML methods, escape, encodeURI, String.raw, fromCharCode */
+    eq("const M = 1 << 26, big = 'x'.repeat(M), half = 'x'.repeat(M / 2); const t = (f) => { try { const v = f(); return typeof v === 'string' ? String(v.length) : String(v); } catch (e) { return e.constructor.name + ': ' + e.message; } }; [t(() => ('ß' + 'x'.repeat(M - 1)).toUpperCase()), t(() => big.anchor('\\\"')), t(() => half.anchor('\\\"').length > M / 2), t(() => escape('Ā'.repeat(M / 4))), t(() => encodeURI('Ā'.repeat(M / 4))), t(() => String.raw({ raw: [big, 'y'] })), t(() => String.raw({ raw: ['', ''] }, big))].join(' | ');",
+       "RangeError: Invalid string length | RangeError: Invalid string length | true | RangeError: Invalid string length | RangeError: Invalid string length | RangeError: Invalid string length | 67108864");
+    /* replace, by string and by regexp, with a string and with a function */
+    eq("const M = 1 << 26, big = 'x'.repeat(M), half = 'x'.repeat(M / 2); const t = (f) => { try { const v = f(); return typeof v === 'string' ? String(v.length) : String(v); } catch (e) { return e.constructor.name + ': ' + e.message; } }; [t(() => big.replace('x', 'yy')), t(() => big.replaceAll('x', 'x')), t(() => big.replace('x', () => 'yy')), t(() => big.replace(/x/, 'yy')), t(() => big.replace(/x/, () => 'yy')), t(() => { const re = /x/; re.exec = function (s) { return RegExp.prototype.exec.call(this, s); }; return big.replace(re, '$&$&'); })].join(' | ');",
+       "RangeError: Invalid string length | 67108864 | RangeError: Invalid string length | RangeError: Invalid string length | RangeError: Invalid string length | RangeError: Invalid string length");
+    /* JSON.stringify, with a key taken back that would have passed it */
+    eq("const M = 1 << 26, big = 'x'.repeat(M), half = 'x'.repeat(M / 2); const t = (f) => { try { const v = f(); return typeof v === 'string' ? String(v.length) : String(v); } catch (e) { return e.constructor.name + ': ' + e.message; } }; [t(() => JSON.stringify(big)), t(() => JSON.stringify([half, half])), t(() => JSON.stringify({ a: 'y'.repeat(M - 10), ['k'.repeat(20)]: undefined }))].join(' | ');",
+       "RangeError: Invalid string length | RangeError: Invalid string length | 67108862");
+    /* an error's text, a bound function's name, a BigInt's digits */
+    eq("const M = 1 << 26, big = 'x'.repeat(M), half = 'x'.repeat(M / 2); const t = (f) => { try { const v = f(); return typeof v === 'string' ? String(v.length) : String(v); } catch (e) { return e.constructor.name + ': ' + e.message; } }; [t(() => new Error(big).message), t(() => String(new Error(big))), t(() => new Error(big).stack), t(() => { function f() {} Object.defineProperty(f, 'name', { value: big }); return f.bind().name; }), t(() => (1n << 300000000n).toString(2)), t(() => String(1n << 300000000n))].join(' | ');",
+       "67108864 | RangeError: Invalid string length | RangeError: Invalid string length | RangeError: Invalid string length | RangeError: Invalid string length | RangeError: Invalid string length");
+    /* normalize: past it by decomposition; composition that brings it back under is fine */
+    eq("const M = 1 << 26, big = 'x'.repeat(M), half = 'x'.repeat(M / 2); const t = (f) => { try { const v = f(); return typeof v === 'string' ? String(v.length) : String(v); } catch (e) { return e.constructor.name + ': ' + e.message; } }; [t(() => 'Ǆ'.repeat(M / 2).normalize('NFKD')), t(() => 'é'.repeat(M / 2).normalize('NFC'))].join(' | ');",
+       "RangeError: Invalid string length | 33554432");
+    /* where V8 calls the script back past its limit and where it stops: join, concat and a string replaceAll stop; a regexp replace, JSON's toJSON and replacer, and String.raw go on to the end */
+    eq("const r = 'y'.repeat(1 << 17); let n = 0; const objs = () => Array.from({ length: 1000 }, () => ({ toString() { n++; return r; }, toJSON() { n++; return r; } })); const t = (f) => { n = 0; try { f(); return 'ok ' + n; } catch (e) { return e.constructor.name + ' ' + n; } }; const s = 'x'.repeat(1000); [t(() => objs().join('')), t(() => ''.concat(...objs())), t(() => s.replaceAll('x', () => { n++; return r; })), t(() => s.replace(/x/g, () => { n++; return r; })), t(() => JSON.stringify(objs())), t(() => JSON.stringify(new Array(1000).fill(0), (k, v) => k === '' ? v : (n++, r))), t(() => String.raw({ raw: objs() }))].join(' | ');",
+       "RangeError 513 | RangeError 513 | RangeError 513 | RangeError 1000 | RangeError 1000 | RangeError 1000 | RangeError 1000");
+}
+
 static void test_function_prototype(void) {
     eq("const t = (l, f) => { let s; try { s = JSON.stringify(f()); } catch (e) { s = e.constructor.name + ': ' + e.message; } return l + ' ' + s; }; const FP = Object.getPrototypeOf(() => 1); const AFP = Object.getPrototypeOf(async function () {}); [t('typeof', () => [typeof FP, FP(), FP(1, 2, 3), FP.length, FP.name, JSON.stringify(FP.name)]), t('proto', () => [Object.getPrototypeOf(FP) === Object.prototype, Object.getPrototypeOf(function () {}) === FP, Object.getPrototypeOf(Math.max) === FP, Object.getPrototypeOf(async () => 1) === FP]), t('tag', () => [Object.prototype.toString.call(FP), FP.toString(), String(FP)]), t('new', () => { const C = FP; return new C(); }), t('own prototype', () => [Object.hasOwn(FP, 'prototype'), FP.prototype, 'prototype' in FP]), t('keys', () => [Object.keys(FP), Object.getOwnPropertyNames(FP).filter((n) => !['arguments', 'caller', 'constructor'].includes(n))])].join(\"\\n\");",
        "typeof [\"function\",null,null,0,\"\",\"\\\"\\\"\"]\nproto [true,true,true,false]\ntag [\"[object Function]\",\"function () { [native code] }\",\"function () { [native code] }\"]\nnew TypeError: C is not a constructor\nown prototype [false,null,false]\nkeys [[],[\"length\",\"name\",\"apply\",\"bind\",\"call\",\"toString\"]]");
@@ -3088,6 +3114,7 @@ int main(void) {
     test_regexp_legacy();
     test_lexical();
     test_bigint();
+    test_string_limit();
     test_stress();
     test_integration();
     if (checks_failed) {

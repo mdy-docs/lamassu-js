@@ -96,34 +96,32 @@ typedef struct {
     JsVm *vm;
     uint16_t *u;
     uint32_t len, cap;
-    bool oom;
+    bool oom;      /* stopped: out of memory, or too_long */
+    bool too_long; /* stopped because the text would pass JS_MAX_STRING_UNITS */
 } StrBuf;
 
 static void sb_init(StrBuf *sb, JsVm *vm) {
     sb->vm = vm;
     sb->u = NULL;
     sb->len = sb->cap = 0;
-    sb->oom = false;
+    sb->oom = sb->too_long = false;
 }
 
 static bool sb_reserve(StrBuf *sb, uint32_t extra) {
     if (sb->oom)
         return false;
-    if (extra > UINT32_MAX - sb->len) { /* len + extra would wrap uint32 */
-        sb->oom = true;
+    if (extra > JS_MAX_STRING_UNITS - sb->len) { /* len stays <= the cap, so this cannot wrap */
+        sb->oom = sb->too_long = true;
         return false;
     }
     uint32_t need = sb->len + extra;
     if (need <= sb->cap)
         return true;
     uint32_t ncap = sb->cap ? sb->cap * 2 : 32;
-    while (ncap < need) {
-        if (ncap > UINT32_MAX / 2) { /* next doubling would overflow */
-            ncap = need;
-            break;
-        }
+    while (ncap < need)
         ncap *= 2;
-    }
+    if (ncap > JS_MAX_STRING_UNITS) /* need fits, so the cap is enough */
+        ncap = JS_MAX_STRING_UNITS;
     uint16_t *nu = js_realloc_raw(sb->vm, sb->u, (size_t)sb->cap * sizeof(uint16_t),
                                   (size_t)ncap * sizeof(uint16_t));
     if (!nu) {
@@ -158,7 +156,8 @@ static void sb_free(StrBuf *sb) {
     sb->cap = sb->len = 0;
 }
 
-/* Turns the buffer into a JS string value and frees it. undefined on OOM. */
+/* Turns the buffer into a JS string value and frees it. undefined when the buffer stopped
+ * (sb_fail says why: too_long survives the free). */
 static JsValue sb_finish(StrBuf *sb) {
     if (sb->oom) {
         sb_free(sb);
@@ -197,6 +196,12 @@ static bool oom(JsContext *ctx, JsValue *result) {
         return false;
     }
     return native_throw(ctx, result, "out of memory");
+}
+
+/* Why a StrBuf's text never became a string: the length limit (V8's RangeError), else what a
+ * conversion threw or out of memory. For a result sb_finish left undefined. */
+static bool sb_fail(JsContext *ctx, const StrBuf *sb, JsValue *result) {
+    return sb->too_long ? native_throw(ctx, result, JS_STRING_LENGTH_ERROR) : oom(ctx, result);
 }
 
 /* ToNumber of V into D, or the native returns what it threw. For natives whose result is r and
@@ -571,7 +576,7 @@ static bool str_case_convert(JsContext *ctx, JsValue tv, JsValue *r, bool to_upp
         i += width;
     }
     *r = sb_finish(&sb);
-    return !js_is_undefined(*r) || s->length == 0 ? true : oom(ctx, r);
+    return js_is_undefined(*r) ? sb_fail(ctx, &sb, r) : true;
 }
 
 static bool sm_toUpperCase(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
@@ -661,7 +666,7 @@ static bool sm_toWellFormed(JsContext *ctx, JsValue tv, const JsValue *args, int
     for (; i < s->length; i++)
         sb_unit(&sb, lone_surrogate(s, i) ? 0xFFFD : s->units[i]);
     *r = sb_finish(&sb);
-    return js_is_undefined(*r) ? oom(ctx, r) : true;
+    return js_is_undefined(*r) ? sb_fail(ctx, &sb, r) : true;
 }
 
 static bool str_is_ascii(JsValue key, const char *a);
@@ -684,9 +689,10 @@ static bool sm_normalize(JsContext *ctx, JsValue tv, const JsValue *args, int ar
         if (form < 0)
             return native_throw(ctx, r, "RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD.");
     }
-    JsString *n = js_normalize(ctx->vm, s, form);
+    bool too_long;
+    JsString *n = js_normalize(ctx->vm, s, form, &too_long);
     if (!n)
-        return oom(ctx, r);
+        return too_long ? native_throw(ctx, r, JS_STRING_LENGTH_ERROR) : oom(ctx, r);
     *r = js_value_from_cell(&n->gc);
     return true;
 }
@@ -729,7 +735,7 @@ static bool create_html(JsContext *ctx, JsValue tv, JsValue *r, const char *tag,
         sb_unit(&sb, (uint16_t)*c);
     sb_unit(&sb, '>');
     *r = sb_finish(&sb);
-    return js_is_undefined(*r) ? oom(ctx, r) : true;
+    return js_is_undefined(*r) ? sb_fail(ctx, &sb, r) : true;
 }
 
 #define HTML_METHOD(fn, tag, attr)                                                    \
@@ -766,16 +772,16 @@ static bool sm_repeat(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
      * e.g. 'x'.repeat(1e20) — any count this large already fails the size
      * check below anyway, so throw the same error a step earlier. */
     if (d > 4294967295.0)
-        return native_throw(ctx, r, "RangeError: Invalid string length");
+        return native_throw(ctx, r, JS_STRING_LENGTH_ERROR);
     uint32_t n = (uint32_t)d;
-    if ((uint64_t)n * s->length > JS_MAX_STRING_UNITS)
-        return native_throw(ctx, r, "RangeError: Invalid string length");
+    if ((uint64_t)n * s->length > JS_MAX_STRING_UNITS) /* before the loop: no fuel is charged in it */
+        return native_throw(ctx, r, JS_STRING_LENGTH_ERROR);
     StrBuf sb;
     sb_init(&sb, ctx->vm);
     for (uint32_t i = 0; i < n; i++)
         sb_units(&sb, s->units, s->length);
     *r = sb_finish(&sb);
-    return js_is_undefined(*r) && n * s->length != 0 ? oom(ctx, r) : true;
+    return js_is_undefined(*r) ? sb_fail(ctx, &sb, r) : true;
 }
 
 static bool sm_pad(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r, bool start) {
@@ -809,7 +815,7 @@ static bool sm_pad(JsContext *ctx, JsValue tv, const JsValue *args, int argc, Js
      * `"x".padStart(4294967295)` would still spin four billion times inside
      * this one native, where no fuel is charged. */
     if ((uint64_t)need + s->length > JS_MAX_STRING_UNITS)
-        return native_throw(ctx, r, "RangeError: Invalid string length");
+        return native_throw(ctx, r, JS_STRING_LENGTH_ERROR);
     StrBuf sb;
     sb_init(&sb, ctx->vm);
     if (!start)
@@ -819,7 +825,7 @@ static bool sm_pad(JsContext *ctx, JsValue tv, const JsValue *args, int argc, Js
     if (start)
         sb_units(&sb, s->units, s->length);
     *r = sb_finish(&sb);
-    return js_is_undefined(*r) ? oom(ctx, r) : true;
+    return js_is_undefined(*r) ? sb_fail(ctx, &sb, r) : true;
 }
 
 static bool sm_padStart(JsContext *ctx, JsValue tv, const JsValue *a, int c, JsValue *r) {
@@ -906,7 +912,7 @@ static bool sm_replace_impl(JsContext *ctx, JsValue tv, const JsValue *args, int
     StrBuf sb;
     sb_init(&sb, vm);
     uint32_t pos = 0, cursor = 0;
-    while (ok) {
+    while (ok && !sb.oom) { /* stops at the length limit, as V8's concatenation throws there */
         long f = units_find(s->units, s->length, pat->units, pat->length, pos);
         if (f < 0)
             break;
@@ -949,7 +955,7 @@ static bool sm_replace_impl(JsContext *ctx, JsValue tv, const JsValue *args, int
     js_gc_unprotect(vm, &sv);
     if (thrown)
         return false;
-    return ok ? true : oom(ctx, r);
+    return ok ? true : sb_fail(ctx, &sb, r);
 }
 
 static bool sm_replace(JsContext *ctx, JsValue tv, const JsValue *a, int c, JsValue *r) {
@@ -1034,7 +1040,7 @@ static bool sm_concat(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     StrBuf sb;
     sb_init(&sb, ctx->vm);
     sb_units(&sb, s->units, s->length);
-    for (int i = 0; i < argc; i++) {
+    for (int i = 0; i < argc && !sb.oom; i++) { /* V8 throws at the limit, before the next converts */
         JsString *a = js_op_to_string(ctx, args[i]); /* copied out before the next converts */
         if (!a) {
             sb_free(&sb);
@@ -1043,7 +1049,7 @@ static bool sm_concat(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
         sb_units(&sb, a->units, a->length);
     }
     *r = sb_finish(&sb);
-    return js_is_undefined(*r) && sb.len ? oom(ctx, r) : true;
+    return js_is_undefined(*r) ? sb_fail(ctx, &sb, r) : true;
 }
 
 /* thisNumberValue / thisStringValue / thisBooleanValue: the receiver must be that primitive (there
@@ -1453,7 +1459,7 @@ static bool am_join(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
         sep = arg_string(ctx, ARG(0));
         ok = sep != NULL;
     }
-    for (uint32_t i = 0; ok && i < len; i++) {
+    for (uint32_t i = 0; ok && !sb.oom && i < len; i++) {
         if (i) {
             if (sep)
                 sb_units(&sb, sep->units, sep->length);
@@ -1475,12 +1481,8 @@ static bool am_join(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
         sb_free(&sb);
         return oom(ctx, r);
     }
-    if (!sb.oom && sb.len > JS_MAX_STRING_UNITS) {
-        sb_free(&sb);
-        return native_throw(ctx, r, "RangeError: Invalid string length");
-    }
     *r = sb_finish(&sb);
-    return js_is_undefined(*r) && sb.oom ? oom(ctx, r) : true;
+    return js_is_undefined(*r) ? sb_fail(ctx, &sb, r) : true;
 }
 
 static bool am_reverse(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
@@ -3229,8 +3231,8 @@ static bool gen_join(Gen *g, const JsValue *args, int argc) {
                 }
                 sb_units(&sb, es->units, es->length);
             }
-            if (sb.oom || sb.len > JS_MAX_STRING_UNITS) {
-                ok = sb.oom ? gen_fail(g) : native_throw(ctx, g->r, "RangeError: Invalid string length");
+            if (sb.oom) {
+                ok = sb.too_long ? native_throw(ctx, g->r, JS_STRING_LENGTH_ERROR) : gen_fail(g);
                 break;
             }
         }
@@ -3893,6 +3895,8 @@ static bool fm_bind(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
         nm = prefix && js_is_string(nv) && js_value_string(nv)->length
                  ? js_concat_cells(vm, prefix, js_value_string(nv)) : prefix;
         read = nm != NULL;
+        if (!read && prefix && (uint64_t)prefix->length + js_value_string(nv)->length > JS_MAX_STRING_UNITS)
+            js_set_error(ctx, js_error_from_ascii(ctx, JS_STRING_LENGTH_ERROR));
     }
     if (read) {
         ((JsNative *)js_value_cell(fn))->name = nm;
@@ -4517,8 +4521,8 @@ static bool json_circular(JsonS *s, uint32_t start, JsValue closing_key) {
     json_key_phrase(ctx, &m, closing_key);
     sb_ascii(&m, " closes the circle");
     JsValue msg = sb_finish(&m);
-    if (!js_is_string(msg))
-        return false;
+    if (!js_is_string(msg)) /* the length limit (a key of nearly that length), else out of memory */
+        return m.too_long ? json_fail_pending(ctx, js_error_from_ascii(ctx, JS_STRING_LENGTH_ERROR)) : false;
     js_gc_protect(ctx->vm, &msg);
     JsValue err = js_error_from_cell(ctx, js_value_string(msg)); /* whole: js_error_fmt shortens a piece */
     js_gc_unprotect(ctx->vm, &msg);
@@ -4632,6 +4636,7 @@ static bool json_object(JsonS *s, JsValue ov, JsValue key) {
             break;
         }
         uint32_t mark = s->sb.len; /* rewind point if the value emits nothing */
+        bool stopped = s->sb.oom;
         if (!first)
             sb_unit(&s->sb, ',');
         json_newline_indent(&s->sb, s->gap, s->gap_len, s->depth);
@@ -4646,6 +4651,8 @@ static bool json_object(JsonS *s, JsValue ov, JsValue key) {
         }
         if (!em) {
             s->sb.len = mark;
+            if (!stopped && s->sb.too_long) /* the key it took back does not count against the limit */
+                s->sb.oom = s->sb.too_long = false;
             continue;
         }
         first = false;
@@ -4766,7 +4773,9 @@ static bool json_prop(JsonS *s, JsValue holder, JsValue key, JsValue value, bool
     }
     js_gc_unprotect(ctx->vm, &ks);
     js_gc_unprotect(ctx->vm, &v);
-    return ok && !s->sb.oom;
+    /* past the length limit the walk goes on, calling toJSON and the replacer for every value,
+     * and the RangeError comes at the end, as in V8 (the buffer only stops growing) */
+    return ok && (!s->sb.oom || s->sb.too_long);
 }
 
 /* A replacer array's property list: its strings and numbers as keys, in order, once each (a
@@ -4865,7 +4874,7 @@ static bool json_stringify(JsContext *ctx, JsValue tv, const JsValue *args, int 
     js_gc_unprotect(ctx->vm, &s.plist);
     if (!ok) {
         sb_free(&s.sb);
-        return oom(ctx, r); /* the pending error, else out of memory */
+        return sb_fail(ctx, &s.sb, r); /* the length limit, the pending error, else out of memory */
     }
     if (!em) {
         sb_free(&s.sb);
@@ -4873,7 +4882,7 @@ static bool json_stringify(JsContext *ctx, JsValue tv, const JsValue *args, int 
         return true;
     }
     *r = sb_finish(&s.sb);
-    return js_is_undefined(*r) ? oom(ctx, r) : true;
+    return js_is_undefined(*r) ? sb_fail(ctx, &s.sb, r) : true;
 }
 
 /* --- JSON.parse --- */
@@ -7317,13 +7326,9 @@ static int hex_val(uint16_t c) {
 }
 
 static bool uri_finish(JsContext *ctx, StrBuf *sb, JsValue *r) {
-    if (!sb->oom && sb->len > JS_MAX_STRING_UNITS) {
-        sb_free(sb);
-        return native_throw(ctx, r, "RangeError: Invalid string length");
-    }
     JsValue v = sb_finish(sb);
     if (js_is_undefined(v))
-        return oom(ctx, r);
+        return sb_fail(ctx, sb, r);
     *r = v;
     return true;
 }
@@ -7587,7 +7592,7 @@ static bool str_fromCharCode(JsContext *ctx, JsValue tv, const JsValue *args, in
         sb_unit(&sb, to_uint16(d));
     }
     *r = sb_finish(&sb);
-    return js_is_undefined(*r) && argc ? oom(ctx, r) : true;
+    return js_is_undefined(*r) ? sb_fail(ctx, &sb, r) : true;
 }
 
 /* String.raw(template, ...subs): template.raw's pieces (read through its length) with the
@@ -7612,7 +7617,7 @@ static bool str_raw(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
     StrBuf sb;
     sb_init(&sb, vm);
     len = to_int(len);
-    for (double i = 0; ok && i < len; i++) {
+    for (double i = 0; ok && i < len; i++) { /* V8 converts every piece, then throws at the limit */
         char ib[24];
         snprintf(ib, sizeof ib, "%.0f", i);
         JsString *ik = js_ascii_cell(vm, ib);
@@ -7639,7 +7644,7 @@ static bool str_raw(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
         return oom(ctx, r);
     }
     *r = sb_finish(&sb);
-    return js_is_undefined(*r) ? oom(ctx, r) : true;
+    return js_is_undefined(*r) ? sb_fail(ctx, &sb, r) : true;
 }
 
 /* escape / unescape (Annex B): %XX for a unit below 256 outside A-Z a-z 0-9 @*_+-./, %uXXXX above */
@@ -7668,7 +7673,7 @@ static bool g_escape(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
         }
     }
     *r = sb_finish(&sb);
-    return js_is_undefined(*r) ? oom(ctx, r) : true;
+    return js_is_undefined(*r) ? sb_fail(ctx, &sb, r) : true;
 }
 
 static int hexval(uint16_t c) {
@@ -7696,7 +7701,7 @@ static bool g_unescape(JsContext *ctx, JsValue tv, const JsValue *args, int argc
         sb_unit(&sb, c);
     }
     *r = sb_finish(&sb);
-    return js_is_undefined(*r) ? oom(ctx, r) : true;
+    return js_is_undefined(*r) ? sb_fail(ctx, &sb, r) : true;
 }
 
 static bool str_fromCodePoint(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
@@ -7726,7 +7731,7 @@ static bool str_fromCodePoint(JsContext *ctx, JsValue tv, const JsValue *args, i
         }
     }
     *r = sb_finish(&sb);
-    return js_is_undefined(*r) && argc ? oom(ctx, r) : true;
+    return js_is_undefined(*r) ? sb_fail(ctx, &sb, r) : true;
 }
 
 /* =====================================================================

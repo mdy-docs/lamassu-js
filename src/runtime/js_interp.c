@@ -104,8 +104,19 @@ JsString *js_primitive_to_string(JsVm *vm, JsValue v) {
     if (v.bits == JS_SPECIAL_FALSE)
         return js_ascii_cell(vm, "false");
     if (js_is_bigint(v))
-        return js_bigint_to_string(vm, js_value_bigint(v), 10);
+        return js_bigint_to_string(vm, js_value_bigint(v), 10, NULL);
     return js_ascii_cell(vm, "undefined");
+}
+
+/* js_primitive_to_string with the failure pending: V8's RangeError for a BigInt whose digits
+ * would pass the string length limit, else out of memory */
+static JsString *primitive_to_string(JsContext *ctx, JsValue v) {
+    bool too_long = false;
+    JsString *s = js_is_bigint(v) ? js_bigint_to_string(ctx->vm, js_value_bigint(v), 10, &too_long)
+                                  : js_primitive_to_string(ctx->vm, v);
+    if (!s)
+        too_long ? fail_ascii(ctx, JS_STRING_LENGTH_ERROR) : fail_oom(ctx);
+    return s;
 }
 
 double js_primitive_to_number(JsValue v) {
@@ -245,10 +256,7 @@ JsString *js_op_to_string(JsContext *ctx, JsValue v) {
     JsValue p;
     if (!js_to_primitive(ctx, v, JS_HINT_STRING, &p))
         return NULL;
-    JsString *s = js_primitive_to_string(ctx->vm, p);
-    if (!s)
-        fail_oom(ctx);
-    return s;
+    return primitive_to_string(ctx, p);
 }
 
 bool js_op_to_number(JsContext *ctx, JsValue v, double *out) {
@@ -1766,17 +1774,18 @@ __attribute__((noinline)) static bool add_slow(JsContext *ctx, JsFiber *fb, uint
     }
     JsValue a = fb->stack[ia], b = fb->stack[ib];
     if (js_is_string(a) || js_is_string(b)) {
-        JsString *sa = js_primitive_to_string(vm, a);
+        JsString *sa = primitive_to_string(ctx, a);
         if (!sa)
-            return fail_oom(ctx);
+            return false;
         fb->stack[ia] = js_value_from_cell(&sa->gc);
-        JsString *sb = js_primitive_to_string(vm, b);
+        JsString *sb = primitive_to_string(ctx, b);
         if (!sb)
-            return fail_oom(ctx);
+            return false;
         fb->stack[ib] = js_value_from_cell(&sb->gc);
         JsString *r = js_concat_cells(vm, sa, sb);
         if (!r)
-            return fail_ascii(ctx, "RangeError: Invalid string length");
+            return (uint64_t)sa->length + sb->length > JS_MAX_STRING_UNITS
+                       ? fail_ascii(ctx, JS_STRING_LENGTH_ERROR) : fail_oom(ctx);
         fb->sp--;
         fb->stack[fb->sp - 1] = js_value_from_cell(&r->gc);
         return true;
@@ -2251,6 +2260,10 @@ static void fiber_throw_units(JsContext *ctx, JsFiber *fb, const char *prefix,
     while (suffix[slen])
         slen++;
     size_t total = plen + len + slen;
+    if (total > JS_MAX_STRING_UNITS) { /* a message past the string length limit: V8's RangeError */
+        fiber_throw(ctx, fb, JS_STRING_LENGTH_ERROR);
+        return;
+    }
     uint16_t *buf = js_realloc_raw(vm, NULL, 0, total * sizeof(uint16_t));
     if (!buf) {
         fiber_throw(ctx, fb, prefix);

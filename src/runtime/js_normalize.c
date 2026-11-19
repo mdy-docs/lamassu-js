@@ -112,7 +112,8 @@ static bool decompose(CpBuf *b, uint32_t cp, bool compat) {
     return true;
 }
 
-JsString *js_normalize(JsVm *vm, JsString *s, int form) {
+JsString *js_normalize(JsVm *vm, JsString *s, int form, bool *too_long) {
+    *too_long = false;
     bool compose = form == JS_NF_NFC || form == JS_NF_NFKC;
     bool compat = form == JS_NF_NFKC || form == JS_NF_NFKD;
     /* quick check: nothing below U+00A0 changes in any form, nothing below U+0300 in NFC */
@@ -130,6 +131,9 @@ JsString *js_normalize(JsVm *vm, JsString *s, int form) {
             s->units[i + 1] <= 0xDFFF)
             c = 0x10000 + ((c - 0xD800) << 10) + (s->units[++i] - 0xDC00);
         ok = decompose(&b, c, compat);
+        /* every code point is a unit at least, and without composition none goes away */
+        if (ok && !compose && b.len > JS_MAX_STRING_UNITS)
+            ok = !(*too_long = true);
     }
     /* canonical ordering: a stable insertion sort of each run of marks by class */
     for (size_t k = 1; ok && k < b.len; k++) {
@@ -171,8 +175,9 @@ JsString *js_normalize(JsVm *vm, JsString *s, int form) {
         size_t units = 0;
         for (size_t k = 0; k < b.len; k++)
             units += b.cp[k] > 0xFFFF ? 2 : 1;
-        uint16_t *u = units ? js_realloc_raw(vm, NULL, 0, units * sizeof *u) : NULL;
-        if (u || !units) {
+        *too_long = units > JS_MAX_STRING_UNITS;
+        uint16_t *u = units && !*too_long ? js_realloc_raw(vm, NULL, 0, units * sizeof *u) : NULL;
+        if (u || (!units && !*too_long)) {
             size_t n = 0;
             for (size_t k = 0; k < b.len; k++) {
                 uint32_t c = b.cp[k];

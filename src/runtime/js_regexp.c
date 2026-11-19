@@ -1088,7 +1088,7 @@ static bool regexp_generic_string(JsContext *ctx, JsValue tv, JsValue *r) {
             js_realloc_raw(vm, buf, n * sizeof(uint16_t), 0);
         }
         if (!out)
-            ok = re_oom(ctx, r);
+            ok = n > JS_MAX_STRING_UNITS ? re_throw(ctx, r, JS_STRING_LENGTH_ERROR) : re_oom(ctx, r);
     }
     js_gc_unprotect(vm, &parts[1]);
     js_gc_unprotect(vm, &parts[0]);
@@ -1106,8 +1106,11 @@ static bool rexp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int a
     if (!re_pristine(ctx, tv, RE_NEED_SOURCE | RE_NEED_FLAGS))
         return regexp_generic_string(ctx, tv, r);
     JsString *s = js_regexp_repr(ctx, js_value_object(tv));
-    if (!s)
-        return re_oom(ctx, r);
+    if (!s) {
+        const JsRegExp *re = (const JsRegExp *)js_value_object(tv);
+        return (uint64_t)re->source->length + re->flags->length + 2 > JS_MAX_STRING_UNITS
+                   ? re_throw(ctx, r, JS_STRING_LENGTH_ERROR) : re_oom(ctx, r);
+    }
     *r = js_value_from_cell(&s->gc);
     return true;
 }
@@ -1555,34 +1558,32 @@ typedef struct {
     JsVm *vm;
     uint16_t *u;
     uint32_t len, cap;
-    bool oom;
+    bool oom;      /* stopped: out of memory, or too_long */
+    bool too_long; /* stopped because the text would pass JS_MAX_STRING_UNITS */
 } UBuf;
 
 static void ub_init(UBuf *b, JsVm *vm) {
     b->vm = vm;
     b->u = NULL;
     b->len = b->cap = 0;
-    b->oom = false;
+    b->oom = b->too_long = false;
 }
 
 static bool ub_reserve(UBuf *b, uint32_t extra) {
     if (b->oom)
         return false;
-    if (extra > UINT32_MAX - b->len) { /* len + extra would wrap uint32 */
-        b->oom = true;
+    if (extra > JS_MAX_STRING_UNITS - b->len) { /* len stays <= the cap, so this cannot wrap */
+        b->oom = b->too_long = true;
         return false;
     }
     uint32_t need = b->len + extra;
     if (need <= b->cap)
         return true;
     uint32_t ncap = b->cap ? b->cap * 2 : 32;
-    while (ncap < need) {
-        if (ncap > UINT32_MAX / 2) { /* next doubling would overflow */
-            ncap = need;
-            break;
-        }
+    while (ncap < need)
         ncap *= 2;
-    }
+    if (ncap > JS_MAX_STRING_UNITS) /* need fits, so the cap is enough */
+        ncap = JS_MAX_STRING_UNITS;
     uint16_t *nu = js_realloc_raw(b->vm, b->u, (size_t)b->cap * sizeof(uint16_t),
                                   (size_t)ncap * sizeof(uint16_t));
     if (!nu) {
@@ -1612,6 +1613,12 @@ static void ub_free(UBuf *b) {
     b->cap = b->len = 0;
 }
 
+/* Why a UBuf's text never became a string: the length limit (V8's RangeError), else re_oom */
+static bool ub_fail(JsContext *ctx, const UBuf *b, JsValue *r) {
+    return b->too_long ? re_throw(ctx, r, JS_STRING_LENGTH_ERROR) : re_oom(ctx, r);
+}
+
+/* undefined when the buffer stopped (ub_fail says why: too_long survives the free) */
 static JsValue ub_finish(UBuf *b) {
     if (b->oom) {
         ub_free(b);
@@ -1816,7 +1823,7 @@ static bool replace_fast_str(JsContext *ctx, JsValue rxv, JsValue sv, JsValue re
     }
     ub_units(&sb, s->units + cursor, s->length - cursor);
     *r = ub_finish(&sb);
-    return !js_is_undefined(*r) || re_oom(ctx, r);
+    return !js_is_undefined(*r) || ub_fail(ctx, &sb, r);
 }
 
 /* replace with a function, on a regexp nothing is redefined for. The matches are all found
@@ -1879,6 +1886,8 @@ static bool replace_fast_fn(JsContext *ctx, JsValue rxv, JsValue sv, JsValue fn,
     ub_init(&sb, vm);
     bool ok = group_names(ctx, re, &names) || re_oom(ctx, r);
     uint32_t cursor = 0;
+    /* past the length limit the replacer is still called for every match, and the RangeError
+     * comes at the end, as in V8 (the buffer only stops growing) */
     for (size_t i = 0; ok && i < count; i++) {
         const int32_t *c = list + i * stride;
         argv = replacer_args(ctx, ng, names, sv, c);
@@ -1905,7 +1914,7 @@ static bool replace_fast_fn(JsContext *ctx, JsValue rxv, JsValue sv, JsValue fn,
     if (ok) {
         ub_units(&sb, s->units + cursor, s->length - cursor);
         *r = ub_finish(&sb);
-        ok = !js_is_undefined(*r) || re_oom(ctx, r);
+        ok = !js_is_undefined(*r) || ub_fail(ctx, &sb, r);
     } else {
         ub_free(&sb);
     }
@@ -2079,6 +2088,7 @@ static bool replace_generic(JsContext *ctx, JsValue rxv, JsValue sv, JsValue rep
         if (!ok)
             break;
         uint32_t mark = sb.len;
+        bool stopped = sb.oom;
         bool keep = position >= next;
         if (keep)
             ub_units(&sb, s->units + (uint32_t)next, (uint32_t)position - (uint32_t)next);
@@ -2103,16 +2113,19 @@ static bool replace_generic(JsContext *ctx, JsValue rxv, JsValue sv, JsValue rep
         } else {
             ok = substitute(ctx, &sb, repv, sv, (uint32_t)position, v[ARGS], v[GROUPS], r);
         }
-        if (!keep)
+        if (!keep) {
             sb.len = mark; /* a match before the last one's end is not in the result */
-        else
+            if (!stopped && sb.too_long) /* nor does its text count against the limit */
+                sb.oom = sb.too_long = false;
+        } else
             next = position + mlen;
-    }
+    } /* past the length limit, as in V8, every match is still replaced and the RangeError comes
+       * at the end */
     if (ok) {
         if (next < (double)s->length)
             ub_units(&sb, s->units + (uint32_t)next, s->length - (uint32_t)next);
         *r = ub_finish(&sb);
-        ok = !js_is_undefined(*r) || re_oom(ctx, r);
+        ok = !js_is_undefined(*r) || ub_fail(ctx, &sb, r);
     } else {
         ub_free(&sb);
     }
@@ -2247,7 +2260,7 @@ static bool split_generic(JsContext *ctx, JsValue rxv, JsValue sv, JsValue limit
         ub_unit(&fb, 'y');
         v[FL] = ub_finish(&fb);
         if (js_is_undefined(v[FL]))
-            ok = re_oom(ctx, r);
+            ok = ub_fail(ctx, &fb, r);
     }
     if (ok) {
         JsValue cargs[2] = {rxv, v[FL]};

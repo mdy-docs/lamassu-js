@@ -229,7 +229,7 @@ is `Object.prototype`.
 - `flat` and `flatMap` go as deep as they are asked, whatever the nesting; an array that holds
   itself, flattened without a limit, is `RangeError: Maximum call stack size exceeded` as in V8
   (here after 2000 levels). `join` (and `toString`) of more than 2<sup>26</sup> code units, the
-  longest string there is, is `RangeError: Invalid string length`.
+  longest string there is (see [`String`](#string)), is `RangeError: Invalid string length`.
 
 Array elements are a flat `JsValue` vector (no holes/sparse storage), so
 `arr.length = n` or `Array(n)` for a very large `n` throws
@@ -257,6 +257,15 @@ boxed `String` object — this engine has no boxed-primitive type at all).
   `RegExp String Iterator`, one search per step, starting at the regexp's `lastIndex`), `search`.
 - Called on `undefined` or `null` (`String.prototype.trim.call(null)`), each throws V8's
   `TypeError: String.prototype.trim called on null or undefined`.
+- **The longest string is 2<sup>26</sup> code units** (64M; V8's is 2<sup>29</sup>−24), and
+  everything that makes a string keeps to it: `+` and template literals, `concat`, `repeat`,
+  `padStart`/`padEnd`, `replace`/`replaceAll` (string or regexp), the case conversions,
+  `normalize`, `String.raw`, `fromCharCode`/`fromCodePoint`, the HTML methods, `join`,
+  `JSON.stringify`, `encodeURI`/`encodeURIComponent`, `escape`, a BigInt's `toString`, a bound
+  function's name, `Error.prototype.toString` and an error's `stack`. Each throws V8's
+  `RangeError: Invalid string length` where V8 throws it at its own limit; one that calls the
+  script back (a replacer function, a `toString`, `toJSON`) stops calling it there, as V8's
+  string builders do. See [deviations](/guide/deviations#strings).
 - **`replace`/`replaceAll` with a string pattern** take a replacement string
   (`$$`, `$&`, `` $` `` and `$'` expand; `$1` and `$<name>` stay literal, as
   there are no groups) or a function, called as `fn(match, position, string)`

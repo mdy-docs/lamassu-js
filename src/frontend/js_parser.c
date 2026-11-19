@@ -4152,6 +4152,12 @@ bool js_parse_module(JsArena *arena, const uint16_t *src, size_t len, bool allow
     out->module = NULL;
     out->err_msg = NULL;
     out->err_pos = 0;
+    /* the source becomes a string (its functions' text, every trace's line and column), so it
+     * is held to the string length limit too */
+    if (len > JS_MAX_STRING_UNITS) {
+        out->err_msg = "Invalid string length";
+        return false;
+    }
 
     p.bind_kind = JS_BIND_NONE;
     if (!scope_push(&p, JS_SCOPE_MODULE) || !advance(&p))

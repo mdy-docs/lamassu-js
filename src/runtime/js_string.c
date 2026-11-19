@@ -24,7 +24,7 @@ uint32_t js_units_hash(const uint16_t *units, size_t len, uint32_t seed) {
 }
 
 JsString *js_string_cell_new(JsVm *vm, const uint16_t *units, size_t len) {
-    if (len > UINT32_MAX)
+    if (len > JS_MAX_STRING_UNITS) /* the backstop: callers that can grow a string check first */
         return NULL;
     JsGcCell *c = js_gc_new_cell(vm, JS_KIND_STRING,
                                  sizeof(JsString) + len * sizeof(uint16_t));

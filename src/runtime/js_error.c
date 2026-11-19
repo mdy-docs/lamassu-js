@@ -211,12 +211,17 @@ JsErrorCause js_error_cause(JsContext *ctx, JsValue error) {
 typedef struct {
     uint16_t *u;
     size_t n, cap;
-    bool oom;
+    bool oom;      /* stopped: out of memory, or too_long */
+    bool too_long; /* stopped because the text would pass JS_MAX_STRING_UNITS */
 } FmtBuf;
 
 static void fb_units(FmtBuf *b, const uint16_t *u, size_t n) {
     if (b->oom || n == 0) /* an empty piece: nothing to copy (u or b->u may be NULL) */
         return;
+    if (n > JS_MAX_STRING_UNITS - b->n) { /* n stays <= the cap */
+        b->oom = b->too_long = true;
+        return;
+    }
     if (b->n + n > b->cap) {
         size_t cap = b->cap ? b->cap : 64;
         while (cap < b->n + n)
@@ -440,8 +445,10 @@ JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
         } else if (*f == '%' && f[1]) {
             f++;
             if (arg < nargs) {
-                if (pieces[arg].oom)
+                if (pieces[arg].oom) {
                     out.oom = true;
+                    out.too_long |= pieces[arg].too_long;
+                }
                 fb_units(&out, pieces[arg].u, pieces[arg].n);
                 arg++;
             }
@@ -452,7 +459,10 @@ JsValue js_error_fmt(JsContext *ctx, const char *fmt, ...) {
     for (int i = 0; i < nargs; i++)
         free(pieces[i].u);
     JsValue r;
-    if (out.oom) {
+    if (out.too_long) { /* a message past the string length limit: V8's RangeError in its place */
+        JsString *s = js_ascii_cell(vm, JS_STRING_LENGTH_ERROR);
+        r = s ? js_error_from_cell(ctx, s) : js_oom_value(vm);
+    } else if (out.oom) {
         r = js_oom_value(vm);
     } else {
         JsString *s = js_string_cell_new(vm, out.u, (uint32_t)out.n);
@@ -529,6 +539,10 @@ JsString *js_error_repr(JsContext *ctx, JsValue ov) {
         out = msg;
     } else {
         size_t total = (size_t)name->length + 2 + msg->length;
+        if (total > JS_MAX_STRING_UNITS) { /* V8 throws it too */
+            js_set_error(ctx, js_error_from_ascii(ctx, JS_STRING_LENGTH_ERROR));
+            goto done;
+        }
         uint16_t *buf = js_realloc_raw(vm, NULL, 0, total * sizeof(uint16_t));
         if (!buf)
             goto done;
@@ -922,6 +936,8 @@ static JsString *stack_text(JsContext *ctx, JsValue o, const JsErrorFrame *frame
     js_gc_unprotect(ctx->vm, &hv);
     JsString *s2 = b.oom ? NULL : js_string_cell_new(ctx->vm, b.u, b.n);
     free(b.u);
+    if (b.too_long) /* V8 throws it from the stack read too */
+        js_set_error(ctx, js_error_from_ascii(ctx, JS_STRING_LENGTH_ERROR));
     return s2;
 }
 
@@ -988,6 +1004,8 @@ static JsValue callsite_record(JsContext *ctx, const JsErrorFrame *fr) {
         frame_text(ctx, &b, fr);
         JsString *t = b.oom ? NULL : js_string_cell_new(vm, b.u, b.n);
         free(b.u);
+        if (b.too_long)
+            js_set_error(ctx, js_error_from_ascii(ctx, JS_STRING_LENGTH_ERROR));
         JsValue t_v = t ? js_value_from_cell(&t->gc) : js_undefined();
         js_gc_protect(vm, &t_v);
         ok = t && js_array_append(vm, rec, t_v);
@@ -1275,7 +1293,7 @@ static int prepared_stack(JsContext *ctx, JsValue fn, JsValue self, JsValue h,
     }
     int rc = -1;
     if (!ok) {
-        *out = js_oom_value(vm);
+        *out = js_take_error(ctx); /* the length limit, else out of memory */
     } else {
         bool saved = ctx->formatting_stack;
         ctx->formatting_stack = true; /* a `stack` read inside formats as if there were no hook */

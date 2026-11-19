@@ -441,10 +441,28 @@ JsBigInt *js_bigint_from_string(JsContext *ctx, const JsString *s, bool *bad) {
     return js_bigint_parse(ctx, u, n, 10, bad);
 }
 
-JsString *js_bigint_to_string(JsVm *vm, const JsBigInt *b, int radix) {
+/* ceil(log2(r)): a number of BITS bits has at least (BITS - 1) / log2(r) + 1 digits in radix r,
+ * and dividing by ceil(log2(r)) instead only lowers that bound, so a number it puts past the
+ * string limit surely is past it. */
+static unsigned ceil_log2(int r) {
+    unsigned k = 0;
+    while ((1 << k) < r)
+        k++;
+    return k;
+}
+
+JsString *js_bigint_to_string(JsVm *vm, const JsBigInt *b, int radix, bool *too_long) {
     static const char digs[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    if (too_long)
+        *too_long = false;
     if (!b->len)
         return js_ascii_cell(vm, "0");
+    /* the digits at least, sign aside: refused before the conversion, which no fuel pays for */
+    if ((bit_length(b) - 1) / ceil_log2(radix) + 1 > JS_MAX_STRING_UNITS) {
+        if (too_long)
+            *too_long = true;
+        return NULL;
+    }
     uint32_t chunk_digits = 1;
     uint64_t chunk_div = (uint64_t)radix;
     while (chunk_div * (uint64_t)radix <= 0xFFFFFFFFu) {
@@ -476,6 +494,13 @@ JsString *js_bigint_to_string(JsVm *vm, const JsBigInt *b, int radix) {
     if (b->neg)
         out[--pos] = '-';
     size_t total = max_digits + chunk_digits + 1;
+    if (total - pos > JS_MAX_STRING_UNITS) {
+        js_realloc_raw(vm, out, total * sizeof *out, 0);
+        js_realloc_raw(vm, m, (size_t)b->len * sizeof *m, 0);
+        if (too_long)
+            *too_long = true;
+        return NULL;
+    }
     JsString *s = js_string_cell_new(vm, out + pos, total - pos);
     js_realloc_raw(vm, out, total * sizeof *out, 0);
     js_realloc_raw(vm, m, (size_t)b->len * sizeof *m, 0);
@@ -904,7 +929,10 @@ static bool bp_toString(JsContext *ctx, JsValue tv, const JsValue *args, int arg
         *r = js_error_fmt(ctx, "RangeError: toString() radix argument must be between 2 and 36");
         return false;
     }
-    JsString *s = js_bigint_to_string(ctx->vm, js_value_bigint(tv), (int)radix);
+    bool too_long;
+    JsString *s = js_bigint_to_string(ctx->vm, js_value_bigint(tv), (int)radix, &too_long);
+    if (!s && too_long)
+        return (*r = js_error_from_ascii(ctx, JS_STRING_LENGTH_ERROR)), false;
     if (!s)
         return bthrow(ctx, r);
     *r = js_value_from_cell(&s->gc);

@@ -623,6 +623,24 @@ static void test_heap_limit(void) {
     free(out);
 }
 
+/* A source longer than the longest string does not compile: its text becomes a string. It is
+ * refused before a unit of it is read (calloc's pages stay untouched). */
+static void test_source_length(void) {
+    JsVm *vm = js_vm_new(NULL);
+    JsContext *ctx = js_context_new(vm);
+    size_t len = ((size_t)64 << 20) + 1; /* JS_MAX_STRING_UNITS + 1 */
+    uint16_t *u = calloc(len, sizeof *u);
+    CHECK(u != NULL);
+    const char *em = NULL;
+    uint32_t ep = 1;
+    JsValue fn = js_compile_module(ctx, u, len, &em, &ep);
+    CHECK(!js_is_function(fn));
+    CHECK(em && strcmp(em, "Invalid string length") == 0);
+    CHECK(ep == 0);
+    free(u);
+    js_vm_free(vm);
+}
+
 static void test_gc_stress_run(void) {
     RunOpts opts = {0};
     opts.cfg.gc_stress = true;
@@ -1606,6 +1624,7 @@ int main(void) {
     test_exceptions();
     test_fuel();
     test_heap_limit();
+    test_source_length();
     test_gc_stress_run();
     test_host_globals();
     test_completion_value();

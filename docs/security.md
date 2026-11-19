@@ -82,8 +82,10 @@ before the allocation, so the accounted total never exceeds it. The collector's
 mark stack is charged too, sized from the cell count before marking begins
 rather than grown in the middle of it, where a refusal could not have been
 reported. Individual operations have their own ceilings:
-`JS_MAX_STRING_UNITS` for anything that builds a string, `JS_MAX_ARRAY_GAP` for
-array growth per operation.
+`JS_MAX_STRING_UNITS` for anything that builds a string (enforced in
+`js_string_cell_new` and `js_concat_cells`, so no string cell can exceed it, and
+in each builder's buffer, so none allocates past it before failing),
+`JS_MAX_ARRAY_GAP` for array growth per operation.
 
 **Regex.** The matcher is a backtracking engine, so it is protected by an
 explicit step budget proportional to subject length rather than by construction.
