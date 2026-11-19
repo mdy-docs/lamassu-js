@@ -181,10 +181,11 @@ instruction is charged too, at about what the same time would buy in instruction
   length, including a literal's digits at compile time) and `normalize`.
 
 So a budget bounds the time a script can take, give or take a factor of two or so
-between kinds of work. One builtin call can still overrun the budget by the call it is
-in: an allocating builtin's work is charged when it returns, so the budget error comes
-at the next instruction. That call is bounded by the 64M-unit string limit and the
-heap limit, not by fuel.
+between kinds of work. A budget spent in the middle of one builtin call stops that call
+too: from then on the run's allocations are refused, as the heap limit refuses them, so
+a builtin that allocates as it goes (`split`, `JSON.parse`, `Array.from`) stops at its
+next allocation, and the error is the budget's. What one call can still do past the
+budget is the work between two of its allocations, or a single large copy.
 :::
 
 Arm a timer and call

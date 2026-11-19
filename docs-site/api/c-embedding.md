@@ -491,9 +491,10 @@ A builtin's work is charged with the instruction that called it, at about what t
 same time would buy in instructions: what it allocates, copies, compares, scans and
 hashes, and (a batch at a time, with the interrupt read between batches) the work no
 single call can bound by its data: string search, `sort`, regular expressions, BigInt
-arithmetic and printing, `normalize`. One allocating call can still overrun the budget
-by itself, up to the string length limit and `heap_limit`; to bound wall-clock
-exactly, arm a timer and call [`js_vm_interrupt`](#stopping-a-run-from-outside).
+arithmetic and printing, `normalize`. A budget spent inside an allocating call stops
+it at its next allocation, which is refused until the budget's error is thrown. To
+bound wall-clock exactly, arm a timer and call
+[`js_vm_interrupt`](#stopping-a-run-from-outside).
 :::
 
 ## Promises / async

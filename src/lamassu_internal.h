@@ -874,6 +874,11 @@ struct JsContext {
      * writes its remainder back, so a script that keeps re-queueing microtasks
      * cannot mint a fresh budget per job. Re-armed by js_context_set_fuel. */
     uint64_t fuel_left;
+    /* The budget was spent by a native's work (js_work_settle), in the middle of the native: until
+     * the error is thrown, the allocator refuses this context's guest allocations, so a native
+     * allocating in a loop stops at its next allocation instead of running to the end, and the
+     * failure it reports becomes the budget's error where the fiber throws (on_error). */
+    bool work_spent;
     uint32_t error_pos; /* source offset of last runtime error */
     JsNative *running_native; /* the native executing right now (js_native_userdata); NULL outside one */
     JsStackFrame error_trace[JS_TRACE_MAX]; /* its frames, innermost first */
@@ -1040,8 +1045,8 @@ static inline JsPromise *js_value_promise(JsValue v) { return (JsPromise *)js_va
 /* Longest string, in UTF-16 code units, any operation may produce (V8's is
  * 2^29-24; this one is lower on purpose). Bounds what one call from an
  * untrusted script can be made to allocate AND — just as importantly — how
- * long it can spend filling it, since a native's work reaches the fuel budget
- * only at the instruction after it (js_work below).
+ * long it can spend filling it, since one copy into a string is done in one
+ * go, whatever the fuel budget (js_work below).
  * js_string_cell_new and js_concat_cells refuse anything longer, so no string
  * cell can exceed it; every operation whose result can grow past its inputs
  * checks the length first and throws JS_STRING_LENGTH_ERROR, as V8 does at its
@@ -1060,7 +1065,8 @@ static inline JsPromise *js_value_promise(JsValue v) { return (JsPromise *)js_va
  * string its hashing (JS_WORK_HASH a unit), and the loops that touch data without allocating
  * (comparisons, scans, moves) count what they touch. Every JS_WORK_SETTLE bytes' worth is charged to the running fiber's fuel
  * at JS_WORK_PER_FUEL a unit, where the dispatch loop sees it at its next instruction (a budget
- * spent by it is spent there, as by an instruction). The rates are what the time would buy in
+ * spent by it is spent there, as by an instruction; until then the allocator refuses the run's
+ * allocations, JsContext.work_spent, so the native stops at its next one). The rates are what the time would buy in
  * instructions (one is about 2.5 ns). Work that is not bounded by the data's size within one call
  * (a search, a sort, a regexp) is charged by the native itself with js_native_charge_n, a batch at
  * a time, so the interrupt stops it too. */

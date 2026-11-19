@@ -143,8 +143,8 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
 ## Strings
 
 - **The longest string is 2<sup>26</sup> code units (64M), where V8's is 2<sup>29</sup>−24**, on
-  purpose: lamassu runs untrusted code, and a builtin's work is charged to the fuel budget only
-  when the call returns, so the limit bounds both the memory one call can take (128 MiB, as
+  purpose: lamassu runs untrusted code, and a single copy into one string happens in one go,
+  whatever the fuel budget, so the limit bounds both the memory one call can take (128 MiB, as
   every string is UTF-16 here, where V8 keeps Latin-1 text in a byte a character) and the time it
   can spend filling it. Every
   operation that makes a string checks it, and throws `RangeError: Invalid string length` as V8

@@ -48,6 +48,10 @@ static void *realloc_impl(JsVm *vm, void *ptr, size_t old_size, size_t new_size,
      * it, and sweep only frees), so the exemption bought nothing but a hole.
      * Only the collect ATTEMPT is conditional — a collector cannot stop to
      * collect, and js_gc_collect would refuse the reentry anyway. */
+    /* A budget spent by a native's work (JsContext.work_spent): refused as the heap limit
+     * refuses, so the native stops here; the fiber throws the budget's error for it. */
+    if (limited && new_size > old_size && js_running_ctx && js_running_ctx->work_spent)
+        return NULL;
     if (limited && vm->heap_limit && new_size > old_size) {
         size_t grow = new_size - old_size;
         if (vm->bytes_live + grow > vm->heap_limit) {
@@ -292,6 +296,7 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->fiber = NULL;
     ctx->fuel = 0;
     ctx->fuel_left = 0;
+    ctx->work_spent = false;
     ctx->error_pos = 0;
     ctx->running_native = NULL;
     ctx->native_act = NULL;
@@ -395,6 +400,7 @@ uint32_t js_context_error_pos(const JsContext *ctx) {
 void js_context_set_fuel(JsContext *ctx, uint64_t fuel) {
     ctx->fuel = fuel;
     ctx->fuel_left = fuel; /* arms a fresh turn */
+    ctx->work_spent = false;
 }
 
 /* Public: 1-based line/column of a source offset. Shared with the frontend's error reporting. */

@@ -687,6 +687,97 @@ static void test_fuel(void) {
     free(out);
 }
 
+/* A native's work that spends the budget in the middle of the native stops it there: the
+ * allocator refuses the run's allocations until the fiber throws the budget's error. Without
+ * that, one call (a split into 4M strings, a JSON.parse of 2M elements) ran to the end, about
+ * 200 MB and most of a second past the budget; the peak heap shows where it stopped. */
+typedef struct {
+    size_t live, peak;
+} PeakAlloc;
+
+static void *peak_realloc(void *ud, void *ptr, size_t old_size, size_t new_size) {
+    PeakAlloc *pa = ud;
+    if (new_size == 0) {
+        if (ptr) {
+            pa->live -= old_size;
+            free(ptr);
+        }
+        return NULL;
+    }
+    void *p = realloc(ptr, new_size);
+    if (!p)
+        return NULL;
+    pa->live = pa->live - old_size + new_size;
+    if (pa->live > pa->peak)
+        pa->peak = pa->live;
+    return p;
+}
+
+static void test_spent_in_native(void) {
+    /* each with a budget its setup (the input string) fits in, so that the one big call is
+     * what spends it */
+    static const char *const srcs[] = {
+        "const a = 'x'.repeat(1 << 22).split(''); 'never';",
+        "const a = JSON.parse('[' + '1,'.repeat(1 << 21) + '1]'); 'never';",
+        "try { const a = Array.from('x'.repeat(1 << 22)); } catch (e) {} 'never';",
+        "const a = ('ab '.repeat(1 << 21)).split(' '); 'never';",
+    };
+    static const uint64_t budgets[] = {5000000, 12000000, 5000000, 5000000};
+    for (size_t i = 0; i < sizeof srcs / sizeof srcs[0]; i++) {
+        PeakAlloc pa = {0, 0};
+        JsVmConfig cfg = {0};
+        cfg.realloc_fn = peak_realloc;
+        cfg.alloc_ud = &pa;
+        JsVm *vm = js_vm_new(&cfg);
+        JsContext *ctx = js_context_new(vm);
+        js_context_set_fuel(ctx, budgets[i]);
+        size_t len = strlen(srcs[i]);
+        uint16_t *u = malloc(len * sizeof *u);
+        for (size_t k = 0; k < len; k++)
+            u[k] = (uint16_t)(unsigned char)srcs[i][k];
+        const char *em;
+        uint32_t ep;
+        JsValue fn = js_compile_module(ctx, u, len, &em, &ep);
+        free(u);
+        CHECK(js_is_function(fn));
+        js_gc_protect(vm, &fn);
+        JsValue p = js_run_module(ctx, fn);
+        js_gc_protect(vm, &p);
+        js_run_jobs(ctx);
+        CHECK(js_promise_state(p) == 2); /* rejected */
+        JsValue r = js_promise_result(p);
+        js_gc_protect(vm, &r);
+        JsValue str = js_to_string(ctx, r);
+        size_t sl = 0;
+        const uint16_t *su = js_string_units(str, &sl);
+        char msg[128] = {0};
+        for (size_t k = 0; k < sl && k < sizeof msg - 1; k++)
+            msg[k] = su[k] < 128 ? (char)su[k] : '?';
+        CHECK(strstr(msg, "budget") != NULL); /* the budget's error, not the refusal's out of memory */
+        CHECK(pa.peak < 64u * 1024 * 1024);
+        if (!strstr(msg, "budget") || pa.peak >= 64u * 1024 * 1024)
+            fprintf(stderr, "  spent in a native: %s -> %s, peak %zu MB\n", srcs[i], msg, pa.peak >> 20);
+        /* and the context is usable again once re-armed: the refusal ended with the run */
+        js_gc_unprotect(vm, &r);
+        js_gc_unprotect(vm, &p);
+        js_gc_unprotect(vm, &fn);
+        js_context_set_fuel(ctx, 2000000);
+        const char *again = "[1, 2, 3].join('-');";
+        uint16_t u2[32];
+        size_t l2 = strlen(again);
+        for (size_t k = 0; k < l2; k++)
+            u2[k] = (uint16_t)again[k];
+        JsValue fn2 = js_compile_module(ctx, u2, l2, &em, &ep);
+        CHECK(js_is_function(fn2));
+        js_gc_protect(vm, &fn2);
+        JsValue p2 = js_run_module(ctx, fn2);
+        js_run_jobs(ctx);
+        CHECK(js_promise_state(p2) == 1);
+        js_gc_unprotect(vm, &fn2);
+        js_vm_free(vm);
+    }
+}
+
 static void test_heap_limit(void) {
     RunOpts opts = {0};
     opts.cfg.heap_limit = 200 * 1024;
@@ -1731,6 +1822,7 @@ int main(void) {
     test_exceptions();
     test_fuel();
     test_heap_limit();
+    test_spent_in_native();
     test_source_length();
     test_gc_stress_run();
     test_host_globals();

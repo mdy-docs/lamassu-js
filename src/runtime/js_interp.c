@@ -4243,6 +4243,14 @@ run:; /* (re)load the top frame */
     }
 
 on_error:
+    /* A budget a native's work spent (work_spent): whatever the native then reported (most often
+     * the out of memory the allocator's refusal made) is the budget's error, as it would have
+     * been had the work been an instruction; allocation is allowed again for the unwinding. */
+    if (JS_UNLIKELY(ctx->work_spent)) {
+        ctx->work_spent = false;
+        fb->error = js_error_from_ascii(ctx, JS_MSG_BUDGET);
+        fb->fuel = 1;
+    }
     /* Before any frame is popped: where the exception was raised, for
      * js_context_error_stack. A resume-with-rejection arrives here with the
      * top frame's ip just past its AWAIT, which reads the same way. */
@@ -4290,6 +4298,11 @@ on_error:
     ctx->raise_trace = NULL; /* the trace has changed: the cell made of it is no longer it */
     ctx->error_trace_value = fb->error;
     ctx->raise_fresh = true;
+    if (JS_UNLIKELY(ctx->work_spent)) { /* spent by the unwinding's own work, as on_error says */
+        ctx->work_spent = false;
+        fb->error = js_error_from_ascii(ctx, JS_MSG_BUDGET);
+        fb->fuel = 1;
+    }
     if (fb->inline_parent) { /* rejected, and back to the caller */
         fb = async_inline_leave(ctx, fb, 2, fb->error);
         goto run;
@@ -4471,6 +4484,8 @@ static JsRunStatus advance_fiber(JsContext *ctx, JsFiber *fb, JsValue *out) {
         ctx->reentry_depth--;
         js_work_settle(); /* this fiber's work, before its fuel goes back */
         js_running_ctx = outer;
+        if (!outer) /* the run is over: whatever it left spent, the host's allocations are its own */
+            ctx->work_spent = false;
     }
     ctx->fiber = saved;
     /* Return the fiber's remaining fuel to its caller so the shared budget
@@ -5448,7 +5463,15 @@ void js_work_settle(void) {
     if (!ctx || !ctx->fuel || !n)
         return;
     uint64_t *fuel = ctx->fiber ? &ctx->fiber->fuel : &ctx->fuel_left;
-    *fuel = *fuel > n ? *fuel - n : 1;
+    if (*fuel > n) {
+        *fuel -= n;
+    } else if (*fuel > 1) { /* spent here: the dispatch loop throws at its next instruction, and
+                             * until then (the rest of the native this work is in) the allocator
+                             * refuses. Already at 1, the budget's error is on its way (this is
+                             * the unwinding's own work) and nothing is refused. */
+        *fuel = 1;
+        ctx->work_spent = true;
+    }
 }
 
 /* N instructions' worth of a native's own work at once (a BigInt's digits, a normalization):

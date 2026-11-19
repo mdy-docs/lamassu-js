@@ -123,10 +123,13 @@ the work a single call cannot bound by its data: string search (up to haystack Ã
 `sort`'s comparisons, regexp steps (the step budget is no more than the fuel left buys, and
 the engine polls the interrupt), BigInt multiplication, division, `**`, parsing and printing,
 and `normalize`. A literal's BigInt parse falls on the budget armed when the source compiles,
-and stopping it is a compile error (`SyntaxError: execution budget exhausted`). What is left
-is the call in progress: an allocating builtin's work is charged as it allocates but the
-error comes at the next instruction, so one call (bounded by `JS_MAX_STRING_UNITS` and the
-heap limit) can overrun the budget. Arm a timer and call `js_vm_interrupt`, which
+and stopping it is a compile error (`SyntaxError: execution budget exhausted`). A budget
+spent in the middle of a native (`JsContext.work_spent`, set by `js_work_settle`) makes the
+allocator refuse the run's guest allocations, as `heap_limit` does, so a native that allocates
+as it goes stops at its next allocation; the fiber's throw (`on_error`, and the error return
+after it) turns whatever the native reported into the budget's error, and the refusal ends
+there, at the end of the run, or when the budget is re-armed. What a call can still do past
+the budget is the work between two allocations, or one large copy. Arm a timer and call `js_vm_interrupt`, which
 is safe from another thread or a signal handler and stops the run at the next
 dispatch. Keep an outer kill as well if the deadline is hard rather than
 best-effort: the interrupt is read between instructions, so a builtin already
