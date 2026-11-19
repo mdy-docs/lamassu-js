@@ -83,8 +83,13 @@ typedef struct JsVmConfig {
 
 `heap_limit` and `js_context_set_fuel` (below) are the two knobs for running
 genuinely untrusted scripts. Both default to off, so an embedding that leaves
-them alone has no bound on anything — see [Running untrusted
-code](/security) for how to set them and what they don't cover.
+them alone has no bound on time or memory — see [Running untrusted
+code](/security) for how to set them and what they don't cover. Call depth is
+always bounded and is not a knob: 2000 frames, and 200 nested entries from a
+native back into script (a host function calling a script callback counts as
+one), past which the call throws `RangeError: Maximum call stack size
+exceeded`. Both are compile-time constants (`JS_MAX_FRAMES`,
+`JS_MAX_REENTRY` in `src/runtime/js_interp.c`).
 
 `heap_limit` is checked before each allocation, so the accounted total never
 exceeds it, and it covers bulk allocations (property maps, array element

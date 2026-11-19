@@ -58,11 +58,13 @@ undefined behavior.
 **Recursion bounds.** Parser nesting is capped, and so is the compiler's own
 expression recursion — separately, because a left-associative chain like
 `a+b+c+…` parses iteratively but produces a deep tree the compiler walks
-recursively. Call frames are capped, and native re-entry into the interpreter
-is capped on top of that, since each re-entry spawns a fresh fiber the
+recursively. Call frames are capped at 2000, and native re-entry into the
+interpreter at 200 on top of that, since each re-entry spawns a fresh fiber the
 per-fiber frame limit cannot see. An async call made from script does not
 re-enter: it runs in the caller's loop, and its frames count toward the
-caller's cap.
+caller's cap. Both are always on, unlike the fuel and heap limits, and both
+throw a `RangeError` the guest can catch; they are fixed when the engine is
+built (`JS_MAX_FRAMES`, `JS_MAX_REENTRY`).
 
 **An execution budget.** One unit per dispatched bytecode instruction. It
 covers a *turn*, it is shared rather than per-fiber or per-job, and exhaustion

@@ -109,6 +109,22 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   `Function.prototype` has no `constructor`, and `AsyncFunction.prototype`
   (`Object.getPrototypeOf(async () => {})`) none either, so `f.constructor` is `Object` here
   and `Function` in V8.
+- **Calls go 2000 frames deep.** A script's call stack holds at most 2000 frames, whatever
+  their size: the call that would be frame 2001 throws `RangeError: Maximum call stack size
+  exceeded`, which a script can catch, as in V8. V8's limit is bytes of machine stack (about
+  1 MB), not frames, so how deep it goes depends on the frame: about 12,000 calls of an
+  empty function, about 4,000 of one with eight parameters and a few locals. Nothing is put
+  on the C stack for a call from script to script, so the limit is a count the interpreter
+  checks, not a guard against a crash.
+  - An `async` function called from script counts toward the same 2000 frames until its
+    first `await` (see [Async](/guide/language#async)); V8 goes about 9,000 deep.
+  - A function called by a native (a `forEach`, `map` or `sort` callback, a `toString` or
+    `valueOf` a conversion calls, a host function calling back into script) runs on a nested
+    interpreter on the C stack, and those nest at most 200 deep. A callback that recurses
+    through `[x].forEach(f)` stops at 200 levels; V8 reaches about 3,900. The same bound
+    gives the limits on nested conversions, `JSON.stringify` and `JSON.parse` (below).
+  - Both numbers are fixed when the engine is built (`JS_MAX_FRAMES` and `JS_MAX_REENTRY`
+    in `src/runtime/js_interp.c`); an embedding cannot change them at run time.
 
 ## Conversions
 

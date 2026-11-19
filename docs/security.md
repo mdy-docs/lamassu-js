@@ -59,9 +59,11 @@ Two runtime machines the bytecode can drive are checked rather than assumed:
 the compiler's own expression recursion (`JS_COMPILE_MAX_EXPR_DEPTH`) — the two
 are separate because left-associative chains like `a+b+c+…` are parsed
 iteratively but produce a deep left-leaning tree that the compiler walks
-recursively. Call frames are capped at `JS_MAX_FRAMES`; native re-entry into
-the interpreter is capped separately at `JS_MAX_REENTRY`, since each re-entry
-spawns a fresh fiber the per-fiber frame limit cannot see. A module graph is not
+recursively. Call frames are capped at `JS_MAX_FRAMES` (2000); native re-entry
+into the interpreter is capped separately at `JS_MAX_REENTRY` (200), since each
+re-entry spawns a fresh fiber the per-fiber frame limit cannot see. Both are
+always on and fixed at build time, and both throw a `RangeError` the guest can
+catch. A module graph is not
 walked on the C stack at all: linking and evaluation keep their path in the
 heap, so a graph of any shape costs memory (which `heap_limit` bounds), never
 stack. The walks along imports stop at `JS_MAX_MODULE_DEPTH` modules with a

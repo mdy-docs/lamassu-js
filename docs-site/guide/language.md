@@ -31,7 +31,9 @@ supported. `debugger;` is a statement that does nothing (there is no debugger to
   (`...args`, or a pattern: `...[first, second]`), spread in call arguments.
 - Closures and upvalues work as expected; the interpreter never uses the C
   stack for JS calls, so recursion depth is bounded and checked, not a
-  segfault risk.
+  segfault risk: 2000 frames, past which a call throws `RangeError: Maximum
+  call stack size exceeded` (V8 allows more; see
+  [Deviations](/guide/deviations#functions)).
 - `this` in a plain function is `undefined` (strict-mode semantics, not the
   global object).
 - `arguments` is available in regular functions (arrow functions see the
