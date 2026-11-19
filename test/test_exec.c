@@ -892,7 +892,8 @@ static char *repeat_src(const char *prefix, const char *unit, int n, const char 
 }
 
 /*
- * Regressions for docs/runtime-audit-plan.md. Under the _asan build these also
+ * Regressions for the findings of a runtime audit (its plan, docs/runtime-audit-plan.md, was
+ * removed in f92d3ac). Under the _asan build these also
  * assert no ASan use-after-free / UBSan report fired along the way.
  */
 static void test_audit_regressions(void) {

@@ -1,5 +1,5 @@
-// Composite, closer to the actual target workload (see docs/plan.md's
-// opening line: "a web-framework templating language"): iterate an array of
+// Composite, closer to the workload lamassu was first built for (scripts in a
+// web-framework templating language): iterate an array of
 // same-shape row objects, read several properties per row, build a string
 // via a template literal. Property access dominates; string building is
 // along for the ride since that's what a template does with it.

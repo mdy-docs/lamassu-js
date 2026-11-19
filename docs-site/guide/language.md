@@ -11,8 +11,8 @@ mode switch, and no `"use strict"` directive to write (it's already on).
   (`'var' is not supported; use 'let' or 'const'`) rather than a generic
   parse failure, and it is never silently aliased to `let` (their hoisting
   and redeclaration semantics differ, and this engine treats a silent
-  behavior difference from real JS as the worst possible failure mode for a
-  templating language).
+  behavior difference from real JS as the worst possible failure mode; see
+  [Explicit non-goals](#explicit-non-goals) for why it is left out).
 - Block-scoped `function` declarations are hoisted within their block, same
   as real JS.
 - Assigning to an undeclared variable is a compile-time `ReferenceError`,
@@ -207,17 +207,33 @@ These are permanent scoping decisions, not a "not yet implemented" list:
   synthesize and run new source at runtime, which is exactly what a sandbox
   for untrusted scripts needs to prevent.
 - **Sloppy (non-strict) mode.** Every unit of source is a module; there is
-  no script goal to make sloppy.
+  no script goal to make sloppy. One compilation goal means the parser and
+  compiler implement strict semantics unconditionally, with no mode flag to
+  thread through: no `with`, no `this` coerced to the global object (`this`
+  in a plain function is `undefined`), assignment to an undeclared name is a
+  `ReferenceError` rather than a new global, no `arguments.callee` or
+  `caller`, no legacy octal literals, and duplicate parameter names are
+  rejected.
+- **`var`.** It is the only declaration whose scope isn't shaped like the
+  block structure of the code: it hoists to function scope from any depth,
+  which needs a whole-function declaration pass, the spec's separate
+  variable and lexical environments, and the rules for how `var` and `let`
+  interact (collision errors, silent redeclaration, a `for` head that closes
+  over one binding instead of one per iteration). With only `let` and
+  `const` there is one rule: a binding belongs to its enclosing block, and
+  scope slots are allocated and released block by block. What `let` costs
+  already (the temporal dead zone, a fresh binding per loop iteration) is
+  paid either way, so leaving `var` out is pure subtraction; the only
+  hoisting left is a block's function declarations, a small scan per block.
 - **`for...in` and `with`.** (Labeled statements are supported: `break` and `continue` to a
   label, on loops, blocks and other statements.)
 - **String literals as module export names** (`export { a as "a b" }`, `import { "a b" as a }
   from 'm'`, ES2022): a name a module exports is always an identifier name.
 - **Advanced built-ins**: `Reflect`, `Proxy`, `Symbol`, generators, typed
   arrays, `Intl`.
-- **Full spec conformance.** Where the subset overlaps real JS, behavior is
-  meant to match Node closely enough for differential testing — edge-case
-  fidelity beyond that isn't a goal. See
-  [Deviations from real JS](/guide/deviations) for the specifics.
+- **The parts of the language above.** Everything the subset does have is
+  meant to behave as V8 does, down to error messages and positions; where it
+  doesn't, [Deviations from real JS](/guide/deviations) says so.
 - **Native code generation.** Bytecode interpretation is the execution
   model; it's also the only practical option running inside WebAssembly (no
   runtime codegen in linear memory).

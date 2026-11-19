@@ -1,8 +1,8 @@
 // Property get/set on objects that all share one shape (same keys, same
-// insertion order) — the case shapes + inline caches (see docs/plan.md,
-// "Property storage" tier 3) target directly. Today every access is a
-// hashed, pointer-compared lookup in JsObject's open-addressed table
-// (tier 1); this is the baseline that change should move.
+// insertion order) — the case shapes (hidden classes) and per-site inline
+// caches of (shape, slot) would target directly. Today every access is a
+// hashed, pointer-compared lookup in JsObject's open-addressed table keyed
+// by interned atom; this is the baseline that change should move.
 import { run } from "./_util.js";
 
 function Point(x, y) {

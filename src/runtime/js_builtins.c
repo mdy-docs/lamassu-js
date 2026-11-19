@@ -7513,8 +7513,8 @@ static bool arr_from(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
  * dispatch — both forms call this the same way, matching real JS's Array).
  * One numeric argument means "empty array of that length" (spec's special
  * case); anything else — zero args, or one non-numeric, or several — means
- * "array of these elements", like Array.of. No holes here (arrays are a
- * flat JsValue vector — see "Property storage" in docs/plan.md), so a
+ * "array of these elements", like Array.of. No holes here (an array's elements
+ * are a flat JsValue vector, apart from its named properties' table), so a
  * length past JS_MAX_ARRAY_GAP is refused rather than eagerly filled: same
  * memory-exhaustion guard as growing an array via index assignment. */
 static bool g_Array(JsContext *ctx, JsValue tv, const JsValue *args, int argc, JsValue *r) {
