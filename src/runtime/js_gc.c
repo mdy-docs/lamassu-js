@@ -401,6 +401,8 @@ void js_gc_collect(JsVm *vm) {
         js_gc_mark_module_registry(ctx);
         if (ctx->fiber)
             js_gc_mark_cell(vm, &ctx->fiber->gc);
+        for (uint32_t i = 0; i < ctx->fiber_pool_n; i++)
+            js_gc_mark_cell(vm, &ctx->fiber_pool[i]->gc);
         for (uint32_t i = 0; i < ctx->error_trace_count; i++) {
             js_gc_mark_value(vm, ctx->error_trace[i].specifier);
             js_gc_mark_value(vm, ctx->error_trace[i].function);

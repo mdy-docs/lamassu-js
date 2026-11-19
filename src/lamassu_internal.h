@@ -868,6 +868,13 @@ struct JsContext {
     uint64_t async_evaluations; /* the modules that have waited so far (JsModule.async_ordinal) */
     uint32_t eval_passes;       /* the evaluations so far (JsModule.eval_pass) */
     JsFiber *fiber;     /* current/last fiber; GC root */
+    /* Finished fibers kept for the next native-to-script call (a sort's comparator, a forEach's
+     * callback): taking one is a reset, where making one is a cell, a stack and a frame array, and
+     * the garbage they leave makes every collection walk the heap again. Only a fiber nothing can
+     * still reach goes back (run_closure); GC roots. */
+#define JS_FIBER_POOL 8
+    JsFiber *fiber_pool[JS_FIBER_POOL];
+    uint32_t fiber_pool_n;
     uint64_t fuel;      /* budget armed by js_context_set_fuel; 0 = unlimited */
     /* What remains of `fuel` for the current turn — the top-level run PLUS the
      * microtask drain it feeds. Every top-level fiber draws from this and

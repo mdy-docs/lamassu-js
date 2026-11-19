@@ -297,6 +297,7 @@ JsContext *js_context_new(JsVm *vm) {
     ctx->fuel = 0;
     ctx->fuel_left = 0;
     ctx->work_spent = false;
+    ctx->fiber_pool_n = 0;
     ctx->error_pos = 0;
     ctx->running_native = NULL;
     ctx->native_act = NULL;

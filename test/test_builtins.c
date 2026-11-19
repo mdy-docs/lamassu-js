@@ -668,6 +668,34 @@ static void test_date(void) {
     eq("let a = new Date(12345); let b = new Date(a); b.getTime();", "12345");
 }
 
+/* A native's call into script reuses a finished fiber (JsContext.fiber_pool): a closure made in a
+ * callback, an upvalue a throw left open, nested callbacks, a deep recursion (its fiber too big to
+ * keep), a stack trace and an async function suspended inside a callback must all be as if each
+ * call had its own fiber. Node's output; with a collection at every allocation too. */
+static void test_fiber_reuse(void) {
+    eq_s(
+        "const out = [];\n"
+        "const fs = [1, 2, 3].map((x) => () => x * 10);\n"
+        "[7, 8, 9].forEach((y) => y + 1);\n"
+        "out.push(fs.map((f) => f()).join());\n"
+        "let held;\n"
+        "try { [1].forEach((x) => { let v = x + 41; held = () => v; throw new Error('boom'); }); } catch (e) { out.push(e.message); }\n"
+        "[5, 6].map((z) => z * 2);\n"
+        "out.push(held());\n"
+        "out.push([[1, 2], [3, 4]].map((r) => r.map((c) => c * 2).reduce((a, b) => a + b, 0)).join());\n"
+        "const deep = (n) => (n ? deep(n - 1) + 1 : 0);\n"
+        "out.push([900].map((n) => deep(n)).join());\n"
+        "out.push([1, 2].map((x) => [x, x + 1].sort((a, b) => b - a).join('')).join('|'));\n"
+        "const st = [1].map(() => new Error('e').stack.split('\\n').length > 1)[0];\n"
+        "out.push(st);\n"
+        "let later = [];\n"
+        "[1, 2].forEach((x) => { later.push((async () => { await null; return x * 100; })()); });\n"
+        "[3, 4].forEach((x) => x);\n"
+        "out.push((await Promise.all(later)).join());\n"
+        "out.join(';');",
+        "10,20,30;boom;42;6,14;900;21|32;true;100,200");
+}
+
 /* Array.prototype.sort and toSorted: V8's PowerSort, ported so that the comparator sees the same
  * pairs in the same order. Node 26 still has V8 14.6's TimSort, so the comparator-order
  * expectations come from a reference port of V8's array-sort.tq in JavaScript, run under Node in
@@ -3119,6 +3147,7 @@ int main(void) {
     test_lexical();
     test_bigint();
     test_string_limit();
+    test_fiber_reuse();
     test_stress();
     test_integration();
     if (checks_failed) {

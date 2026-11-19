@@ -4330,6 +4330,24 @@ static uint64_t fiber_start_fuel(JsContext *ctx) {
     return ctx->fuel_left ? ctx->fuel_left : 1;
 }
 
+/* Puts FB, a synchronous call's fiber that has finished (ST), in the context's pool for the next
+ * spawn_fiber, when nothing can still reach it: no upvalue still open on its stack (an error that
+ * left frames unwound can), no promise, not async, not the running fiber, not grown far past a
+ * call's needs. Emptied first, so the pool holds nothing alive. */
+static void fiber_recycle(JsContext *ctx, JsFiber *fb, JsRunStatus st) {
+    if ((st != JS_RUN_DONE && st != JS_RUN_ERROR) || fb->open_upvals || fb->result_promise ||
+        fb->is_async || fb->inline_parent || ctx->fiber == fb || ctx->fiber_pool_n == JS_FIBER_POOL ||
+        fb->stack_cap > 4096 || fb->frame_cap > 256 || fb->try_cap > 64)
+        return;
+    fb->sp = 0;
+    fb->frame_count = 0;
+    fb->try_count = 0;
+    fb->trace_count = 0;
+    fb->caller = NULL;
+    fb->error = js_undefined();
+    ctx->fiber_pool[ctx->fiber_pool_n++] = fb;
+}
+
 /* Allocates a fiber and sets up frame 0 for a call; NULL + *err set on OOM. */
 static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
                             const JsValue *args, int argc, bool construct, const char **err) {
@@ -4338,19 +4356,37 @@ static JsFiber *spawn_fiber(JsContext *ctx, JsClosure *cl, JsValue this_val,
 
     /* Root cl/this across the fiber allocation (a GC safe point); args are
      * kept alive by the caller's fiber, which is still ctx->fiber here. */
-    JsValue cl_val = js_value_from_cell(&cl->gc);
-    js_gc_protect(vm, &cl_val);
-    js_gc_protect(vm, &this_val);
-    JsGcCell *fc = js_gc_new_cell(vm, JS_KIND_FIBER, sizeof(JsFiber));
-    js_gc_unprotect(vm, &this_val);
-    js_gc_unprotect(vm, &cl_val);
-    if (!fc) {
-        *err = "out of memory";
-        return NULL;
+    JsGcCell *fc;
+    JsFiber *fb;
+    if (ctx->fiber_pool_n) { /* a finished one: its buffers kept, everything else as new */
+        fb = ctx->fiber_pool[--ctx->fiber_pool_n];
+        fc = &fb->gc;
+        JsValue *stack = fb->stack;
+        JsFrame *frames = fb->frames;
+        JsTryEntry *trys = fb->trys;
+        uint32_t stack_cap = fb->stack_cap, frame_cap = fb->frame_cap, try_cap = fb->try_cap;
+        memset((char *)fb + sizeof(JsGcCell), 0, sizeof *fb - sizeof(JsGcCell));
+        fb->stack = stack;
+        fb->frames = frames;
+        fb->trys = trys;
+        fb->stack_cap = stack_cap;
+        fb->frame_cap = frame_cap;
+        fb->try_cap = try_cap;
+    } else {
+        JsValue cl_val = js_value_from_cell(&cl->gc);
+        js_gc_protect(vm, &cl_val);
+        js_gc_protect(vm, &this_val);
+        fc = js_gc_new_cell(vm, JS_KIND_FIBER, sizeof(JsFiber));
+        js_gc_unprotect(vm, &this_val);
+        js_gc_unprotect(vm, &cl_val);
+        if (!fc) {
+            *err = "out of memory";
+            return NULL;
+        }
+        cl = (JsClosure *)js_value_cell(cl_val);
+        fb = (JsFiber *)fc;
+        memset((char *)fb + sizeof(JsGcCell), 0, sizeof *fb - sizeof(JsGcCell));
     }
-    cl = (JsClosure *)js_value_cell(cl_val);
-    JsFiber *fb = (JsFiber *)fc;
-    memset((char *)fb + sizeof(JsGcCell), 0, sizeof *fb - sizeof(JsGcCell));
     fb->error = js_undefined();
     /* Fuel is a shared budget, not a per-fiber allowance: a fiber spawned by a
      * native re-entering the interpreter inherits the caller's *remaining*
@@ -4556,6 +4592,7 @@ static bool run_closure(JsContext *ctx, JsClosure *cl, JsValue this_val,
     }
     *result = js_undefined();
     JsRunStatus st = advance_fiber(ctx, fb, result);
+    fiber_recycle(ctx, fb, st);
     return st == JS_RUN_DONE;
 }
 
