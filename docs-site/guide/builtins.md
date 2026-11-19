@@ -177,9 +177,11 @@ is `Object.prototype`.
   `join` is a function, else `Object.prototype.toString`), and `keys`, `values`, `entries`, which
   return an `Array Iterator` ([Iteration](#iteration)) that reads the array live (an element
   pushed before it reaches the end is visited) and works on any array-like, as V8's does.
-  `sort` and `toSorted` are V8's TimSort (as in V8 14.6, Node 26): stable, O(n log n), and the
-  comparator is called with the same pairs in the same order, so a comparator that logs, or one
-  that is not a consistent ordering (`(a, b) => a > b`), gives what it gives in Node. `undefined`
+  `sort` and `toSorted` are V8's PowerSort (as V8 has it since April 2026): stable, O(n log n),
+  and the comparator is called with the same pairs in the same order, so a comparator that logs,
+  or one that is not a consistent ordering (`(a, b) => a > b`), gives what it gives in V8. Node 26
+  still ships V8 14.6's TimSort, so there such a comparator sees a different order (see
+  [deviations](/guide/deviations#arrays)). `undefined`
   elements are never compared and go last. The elements are sorted aside and written back at the
   end, so a comparator that changes the array does not disturb the sort, and a frozen array is
   refused only after its comparator has run, as in V8.

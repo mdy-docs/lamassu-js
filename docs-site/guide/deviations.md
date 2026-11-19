@@ -157,6 +157,12 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
 
 ## Arrays
 
+- **`sort` and `toSorted` follow current V8, not Node 26.** They are V8's PowerSort (V8 since
+  April 2026), where Node 26's V8 14.6 still has TimSort. The results are the same (both sorts are
+  stable), but a comparator that logs its calls, or is not a consistent ordering
+  (`(a, b) => a > b`, a random one), sees a different sequence of pairs than under Node 26, and
+  arrays shorter than 16 are sorted by insertion for `toSorted` too. A Node release on newer V8
+  gives the same sequence as here.
 - **No holes.** Array storage is a flat vector, not a sparse structure —
   every index up to `.length` is a real, materialized slot. `Array(n)` and
   `arr.length = n` both throw `RangeError` past a fixed growth cap rather

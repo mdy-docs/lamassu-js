@@ -1809,11 +1809,12 @@ static bool am_reduce(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
 }
 
 /* ---------------------------------------------------------------------
- * Array.prototype.sort and toSorted: V8's TimSort
+ * Array.prototype.sort and toSorted: V8's PowerSort
  *
- * A port of V8's third_party/v8/builtins/array-sort.tq as V8 14.6 has it
- * (itself CPython's listsort), statement for statement, so that the comparator
- * is called with the same pairs in the same order as in V8. The order is
+ * A port of V8's third_party/v8/builtins/array-sort.tq as V8 has it since
+ * 2026-04-20 ("Sorting: TimSort --> PowerSort"; Node 26 still ships V8 14.6's
+ * TimSort), itself CPython's listsort, statement for statement, so that the
+ * comparator is called with the same pairs in the same order as in V8. The order is
  * observable: in what a comparator logs, and in the result when the comparator
  * is not a consistent ordering (`(a, b) => a > b`, a random one).
  *
@@ -1837,6 +1838,7 @@ typedef struct {
     uint64_t compares; /* made since the last charge */
     int runs; /* the pending runs, a stack */
     int64_t run_base[SORT_MAX_RUNS], run_len[SORT_MAX_RUNS];
+    int run_power[SORT_MAX_RUNS]; /* the power of the boundary between run i and run i + 1 */
 } SortState;
 
 /* An array cell of N undefined elements, for the collector to trace what is put in it */
@@ -2279,43 +2281,52 @@ static bool sort_merge_at(SortState *st, int i) {
                           : sort_merge_high(st, base_a, len_a, base_b, len_b);
 }
 
-/* run N and the two below it: len[N - 2] > len[N - 1] + len[N] */
-static bool sort_run_invariant(const SortState *st, int n) {
-    return n < 2 || st->run_len[n - 2] > st->run_len[n - 1] + st->run_len[n];
-}
-
-/* Merges runs until the stack's invariants hold again (MergeCollapse) */
-static bool sort_merge_collapse(SortState *st) {
-    while (st->runs > 1) {
-        int n = st->runs - 2;
-        if (!sort_run_invariant(st, n + 1) || !sort_run_invariant(st, n)) {
-            if (st->run_len[n - 1] < st->run_len[n + 1])
-                n--;
-        } else if (st->run_len[n] > st->run_len[n + 1]) {
+/* The power of the boundary between two adjacent runs, [S1, S1 + N1) and [S1 + N1, S1 + N1 + N2),
+ * in an array of N: the depth that boundary would have in an optimal binary merge tree, the
+ * first bit where (S1 + N1/2) / N and (S1 + N1 + N2/2) / N differ (V8's NodePower32, CPython's
+ * powerloop). The bits are worked out one at a time, so nothing overflows whatever N is. */
+static int sort_node_power(int64_t s1, int64_t n1, int64_t n2, int64_t n) {
+    uint64_t a = 2 * (uint64_t)s1 + (uint64_t)n1, b = a + (uint64_t)n1 + (uint64_t)n2;
+    int result = 0;
+    for (;;) {
+        result++;
+        if (a >= (uint64_t)n) { /* both quotient bits 1 */
+            a -= (uint64_t)n;
+            b -= (uint64_t)n;
+        } else if (b >= (uint64_t)n) { /* the bits differ */
             break;
         }
-        if (!sort_merge_at(st, n))
-            return false;
+        a <<= 1;
+        b <<= 1;
     }
-    return true;
+    return result;
 }
 
-/* Sorts the work array. Array.prototype.sort inserts fewer than 8 elements one by one from the
- * first (ArrayTimSort); toSorted does not have that shortcut (ArrayTimSortIntoCopy), and the
- * comparator can tell. */
+/* Sorts the work array: PowerSort, as V8 does it (ArrayPowerSortImpl, after CPython's
+ * listobject.c). Fewer than 16 elements are inserted one by one from the first, for sort and
+ * toSorted alike (kMaxBinaryInsertionSortLength). The array is walked once, left to right: each
+ * natural run (extended to the minimum run length by binary insertion) is pushed after merging
+ * every pending run whose boundary has a greater power than the new run's boundary, and what is
+ * left is merged from the top at the end. The minimum run lengths are balanced (CPython's
+ * minrun_next): each is floor or ceil of length / 2^e, in [32, 64], and they sum to the length. */
 static bool sort_work(SortState *st, bool to_sorted) {
+    (void)to_sorted;
     int64_t length = st->work->elem_count;
-    if (!to_sorted && length < 8)
+    if (length < 16)
         return sort_binary_insertion(st, 0, 0, length);
-    if (length < 2)
-        return true;
-    int64_t min_run = length, bit = 0; /* ComputeMinRunLength */
-    while (min_run >= 64) {
-        bit |= min_run & 1;
-        min_run >>= 1;
+    int64_t mr_step = length, mr_mask = 0;
+    while (mr_step >= 64) {
+        mr_step >>= 1;
+        mr_mask = (mr_mask << 1) | 1;
     }
-    min_run += bit;
+    int64_t mr_remainder = length & mr_mask, mr_threshold = mr_mask + 1, mr_accum = 0;
     for (int64_t low = 0, remaining = length; remaining != 0;) {
+        mr_accum += mr_remainder;
+        int64_t min_run = mr_step;
+        if (mr_accum >= mr_threshold) {
+            mr_accum -= mr_threshold;
+            min_run++;
+        }
         int64_t run;
         if (!sort_count_run(st, low, low + remaining, &run))
             return false;
@@ -2325,16 +2336,24 @@ static bool sort_work(SortState *st, bool to_sorted) {
                 return false;
             run = forced;
         }
-        if (st->runs == SORT_MAX_RUNS) /* cannot be: the invariants bound the stack far below */
+        if (st->runs > 0) {
+            int top = st->runs - 1;
+            int p = sort_node_power(st->run_base[top], st->run_len[top], run, length);
+            while (st->runs > 1 && st->run_power[st->runs - 2] > p)
+                if (!sort_merge_at(st, st->runs - 2))
+                    return false;
+            /* the merged run's power slot is left as it was: the next comparison reads its left
+             * neighbour's, which is unchanged */
+            st->run_power[st->runs - 1] = p;
+        }
+        if (st->runs == SORT_MAX_RUNS) /* cannot be: the powers bound the stack far below */
             return native_throw(st->ctx, st->r, "internal: sort run stack");
         st->run_base[st->runs] = low;
         st->run_len[st->runs++] = run;
-        if (!sort_merge_collapse(st))
-            return false;
         low += run;
         remaining -= run;
     }
-    while (st->runs > 1) { /* MergeForceCollapse */
+    while (st->runs > 1) { /* what is left, from the top */
         int n = st->runs - 2;
         if (n > 0 && st->run_len[n - 1] < st->run_len[n + 1])
             n--;
@@ -3466,7 +3485,7 @@ static bool gen_reduce(Gen *g, const JsValue *args, int argc) {
     return true;
 }
 
-/* 23.1.3.30 sort (kind 0), 34 toSorted (kind 1), as V8's TimSort has them: sort takes the
+/* 23.1.3.30 sort (kind 0), 34 toSorted (kind 1), as V8's PowerSort has them: sort takes the
  * elements the receiver has, sorts them aside, writes them back from index 0 with the undefined
  * ones after them and deletes the rest; toSorted reads every index. The comparator was checked
  * by the caller. */
