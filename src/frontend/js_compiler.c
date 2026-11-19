@@ -122,6 +122,9 @@ typedef struct JsFuncState {
      * keeps one (its "latent source info"): see stmt_pos and expr_pos */
     uint32_t latent_pos;
     uint8_t latent; /* JS_LATENT_* */
+    /* the last expression position set (expr_pos), whether or not it was kept: a store with no
+     * position of its own shows it, as V8's does (see compile_pattern_store) */
+    uint32_t last_expr_pos;
     bool load_checked; /* the GET_LOCAL / GET_UPVAL about to be emitted can throw (the TDZ) */
 } JsFuncState;
 
@@ -132,6 +135,7 @@ enum { JS_LATENT_NONE, JS_LATENT_EXPR, JS_LATENT_STMT };
 typedef struct JsPreMember {
     const JsAstNode *node;
     uint16_t obj, key;
+    uint32_t at; /* the last expression position set while they were evaluated */
 } JsPreMember;
 
 typedef struct JsCompiler {
@@ -147,6 +151,8 @@ typedef struct JsCompiler {
      * `const { a } = o.b`), for the error's wording; read and cleared by the pattern. */
     const JsAstNode *pattern_src;
     JsPreMember pre_member;
+    /* a for-of statement's own target, which V8 places at its property (compile_pattern_store) */
+    const JsAstNode *for_of_target;
     const char *err_msg;
     uint32_t err_pos;
     int func_depth;
@@ -320,6 +326,7 @@ static void stmt_pos(JsCompiler *cx, uint32_t pos) {
 }
 
 static void expr_pos(JsCompiler *cx, uint32_t pos) {
+    cx->cur->last_expr_pos = pos;
     if (cx->cur->latent == JS_LATENT_STMT)
         return;
     cx->cur->latent_pos = pos;
@@ -1761,7 +1768,7 @@ static bool pre_member_begin(JsCompiler *cx, const JsAstNode *el, bool declaring
     *saved = cx->pre_member;
     *sm = scope_enter(cx);
     *active = true;
-    JsPreMember pm = {mem, 0, 0};
+    JsPreMember pm = {mem, 0, 0, 0};
     if (!declare_local(cx, NULL, 0, false, mem->pos, sm->local_count, &pm.obj) ||
         !compile_expr(cx, mem->a) || !emit_op_u16(cx, JS_OP_SET_LOCAL, pm.obj, 0) ||
         !emit_op(cx, JS_OP_POP, -1))
@@ -1772,6 +1779,7 @@ static bool pre_member_begin(JsCompiler *cx, const JsAstNode *el, bool declaring
             !emit_op(cx, JS_OP_POP, -1))
             return false;
     }
+    pm.at = cx->cur->last_expr_pos;
     cx->pre_member = pm;
     return true;
 }
@@ -1810,6 +1818,13 @@ static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat,
     case JS_AST_MEMBER: {
         if (declaring)
             return cerr(cx, pat->pos, "invalid binding pattern");
+        /* V8 gives a pattern's store no position of its own: it shows the last expression
+         * position set while its object and key were evaluated (`p` in `[p.x] = a`, `n` in
+         * `[p.n.y] = a`, `k` in `[p[k]] = a`). A for-of statement's own target is placed at its
+         * property as a statement before its object is evaluated, which a later position
+         * replaces in turn (`x` in `for (o.x of a)`, but `n` in `for (o.n.y of a)`). */
+        bool for_of = cx->for_of_target == pat;
+        cx->for_of_target = NULL;
         if (cx->pre_member.node == pat) {
             /* its object and key were evaluated already (pre_member_begin) */
             JsPreMember pm = cx->pre_member;
@@ -1817,17 +1832,19 @@ static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat,
             if (pat->flags & JS_F_COMPUTED) {
                 if (!emit_op_u16(cx, JS_OP_GET_LOCAL, pm.obj, +1) ||
                     !emit_op_u16(cx, JS_OP_GET_LOCAL, pm.key, +1) || !emit_op(cx, JS_OP_ROT3, 0) ||
-                    !emit_op(cx, JS_OP_SET_PROP, -2))
+                    (expr_pos(cx, pm.at), !emit_op(cx, JS_OP_SET_PROP, -2)))
                     return false;
             } else {
                 uint16_t c;
                 if (!atom_const(cx, pat->units, pat->len, pat->pos, &c) ||
                     !emit_op_u16(cx, JS_OP_GET_LOCAL, pm.obj, +1) || !emit_op(cx, JS_OP_SWAP, 0) ||
-                    !emit_op_u16(cx, JS_OP_SET_PROP_ATOM, c, -1))
+                    (expr_pos(cx, pm.at), !emit_op_u16(cx, JS_OP_SET_PROP_ATOM, c, -1)))
                     return false;
             }
             return emit_op(cx, JS_OP_POP, -1);
         }
+        if (for_of)
+            stmt_pos(cx, member_pos(pat));
         if (pat->flags & JS_F_COMPUTED) {
             if (!compile_expr(cx, pat->a) || !compile_expr(cx, pat->b))
                 return false;
@@ -3371,6 +3388,7 @@ static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const JsAstNode *
             !compile_pattern_store(cx, n->a, true))
             return false;
     } else {
+        cx->for_of_target = n->a;
         if (!compile_pattern_store(cx, n->a, false))
             return false;
     }

@@ -2644,7 +2644,7 @@ static JsAstNode *parse_unary(JsParser *p) {
             goto out;
         result->op = (uint8_t)op;
         result->flags |= JS_F_PREFIX;
-        result->pos2 = pos;
+        result->pos2 = p->prev_pos; /* V8's: the operand's last token (`x` in `++o.x`) */
         result->a = operand;
         break;
     }
