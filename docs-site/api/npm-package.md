@@ -115,7 +115,7 @@ the tab or the process dies.
 
 ```js
 const lam = await createLamassu({
-  fuel: 20_000_000,             // roughly 0.1s of guest CPU per evaluation
+  fuel: 20_000_000,             // roughly 50 ms of guest CPU per evaluation
   heapLimit: 16 * 1024 * 1024,
 });
 
@@ -126,8 +126,8 @@ await lam.eval("while (true) {}");
 The budget is re-armed for every `eval`/`evalModule` and covers the microtask
 drain that evaluation feeds, so re-queueing cannot extend it; the error it
 throws re-arms itself, so guest `try`/`catch` cannot swallow the stop and keep
-running. Fuel counts instructions rather than time — read [Running untrusted
-code](/security) for what that does and doesn't bound.
+running. Builtins pay for their own work at the same rate, so fuel follows time —
+read [Running untrusted code](/security) for what that does and doesn't bound.
 :::
 
 One thing to know: a guest that fills the heap leaves it full, because its

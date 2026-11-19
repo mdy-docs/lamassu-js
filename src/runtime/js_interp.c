@@ -376,11 +376,13 @@ __attribute__((noinline)) static int js_compare_values(JsContext *ctx, JsValue a
     }
     if (js_is_string(a) && js_is_string(b)) {
         JsString *x = js_value_string(a), *y = js_value_string(b);
-        uint32_t n = x->length < y->length ? x->length : y->length;
-        for (uint32_t i = 0; i < n; i++) {
-            if (x->units[i] != y->units[i])
-                return x->units[i] < y->units[i] ? -1 : 1;
-        }
+        uint32_t n = x->length < y->length ? x->length : y->length, i = 0;
+        while (i < n && x->units[i] == y->units[i])
+            i++;
+        if (i > 64)
+            js_work(i + i / 2); /* a unit compared: about 0.45 ns */
+        if (i < n)
+            return x->units[i] < y->units[i] ? -1 : 1;
         return x->length == y->length ? 0 : (x->length < y->length ? -1 : 1);
     }
     if (js_is_bigint(a) || js_is_bigint(b)) { /* compared as mathematical values */
@@ -1745,6 +1747,7 @@ JsString *js_concat_cells(JsVm *vm, const JsString *a, const JsString *b) {
      * the result is bit-identical (see js_units_hash_from), and building a
      * string by repeated append stops paying for its whole length each time. */
     s->hash = js_units_hash_from(a->hash, b->units, b->length);
+    js_work((uint64_t)b->length * JS_WORK_HASH);
     return s;
 }
 
@@ -4461,9 +4464,13 @@ static JsRunStatus advance_fiber(JsContext *ctx, JsFiber *fb, JsValue *out) {
         *out = fb->error;
         st = JS_RUN_ERROR;
     } else {
+        JsContext *outer = js_running_ctx;
+        js_running_ctx = ctx;
         ctx->reentry_depth++;
         st = run_fiber(ctx, fb, out);
         ctx->reentry_depth--;
+        js_work_settle(); /* this fiber's work, before its fuel goes back */
+        js_running_ctx = outer;
     }
     ctx->fiber = saved;
     /* Return the fiber's remaining fuel to its caller so the shared budget
@@ -5420,6 +5427,28 @@ bool js_delete_property(JsContext *ctx, JsValue base, JsValue key) {
  * pays. */
 bool js_native_charge(JsContext *ctx) {
     return js_native_charge_n(ctx, 1);
+}
+
+uint64_t js_fuel_remaining(JsContext *ctx) {
+    if (!ctx->fuel)
+        return UINT64_MAX;
+    return ctx->fiber ? ctx->fiber->fuel : ctx->fuel_left;
+}
+
+_Thread_local JsContext *js_running_ctx;
+_Thread_local uint64_t js_work_debt;
+
+/* The work counted so far, charged to the running fiber's fuel (lamassu_internal.h). A budget it
+ * spends is left at 1, where the dispatch loop throws at its next instruction; nothing is thrown
+ * here, as the work is done. Outside a run, or with no budget, it is dropped. */
+void js_work_settle(void) {
+    JsContext *ctx = js_running_ctx;
+    uint64_t n = js_work_debt / JS_WORK_PER_FUEL;
+    js_work_debt %= JS_WORK_PER_FUEL;
+    if (!ctx || !ctx->fuel || !n)
+        return;
+    uint64_t *fuel = ctx->fiber ? &ctx->fiber->fuel : &ctx->fuel_left;
+    *fuel = *fuel > n ? *fuel - n : 1;
 }
 
 /* N instructions' worth of a native's own work at once (a BigInt's digits, a normalization):

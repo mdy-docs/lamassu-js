@@ -467,7 +467,8 @@ have been thrown and caught since. For a rejected promise ask
 `js_promise_error_stack`.
 
 `js_context_set_fuel` arms an execution budget, charged **one unit per
-dispatched bytecode instruction** — the CPU-bound half of running untrusted
+dispatched bytecode instruction**, and a builtin's own work at the same rate (about
+2.5 ns a unit; see the note below) — the CPU-bound half of running untrusted
 scripts (`heap_limit` in `JsVmConfig` is the memory half). Three properties of
 it matter more than the count:
 
@@ -485,17 +486,14 @@ Because it arms *one* turn, it has to be re-armed per turn. A server that
 calls it once at startup has given the whole process a single budget, not one
 per request.
 
-::: warning Fuel counts instructions, not time
-A single instruction can enter a builtin that runs a while — `sort` without a
-comparator makes all its O(n log n) comparisons for one unit, string concatenation can copy
-and rehash a large string, and the regex step budget is per call, so a loop of
-cheap-looking `re.test(s)` calls multiplies it. All of those are individually
-bounded and none are memory-unsafe, but the aggregate is not bounded in *time*
-by fuel alone. (The builtins whose work grows faster than their input are charged
-for it: BigInt multiplication, division, `**`, parsing and printing, and `normalize`,
-spend about the fuel the time would buy in instructions, and read the interrupt as they
-go; a BigInt literal's digits are charged when the source compiles.) To bound wall-clock, arm a timer and call
-[`js_vm_interrupt`](#stopping-a-run-from-outside).
+::: info Builtins pay for their work
+A builtin's work is charged with the instruction that called it, at about what the
+same time would buy in instructions: what it allocates, copies, compares, scans and
+hashes, and (a batch at a time, with the interrupt read between batches) the work no
+single call can bound by its data: string search, `sort`, regular expressions, BigInt
+arithmetic and printing, `normalize`. One allocating call can still overrun the budget
+by itself, up to the string length limit and `heap_limit`; to bound wall-clock
+exactly, arm a timer and call [`js_vm_interrupt`](#stopping-a-run-from-outside).
 :::
 
 ## Promises / async

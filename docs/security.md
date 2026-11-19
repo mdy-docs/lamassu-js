@@ -114,22 +114,19 @@ someone else's code means passing them:
 top-level run plus the microtask drain it feeds. A server that sets it once at
 startup gives the whole process one budget, not one per request.
 
-**Bound wall-clock.** Fuel counts instructions, not time, and a single
-instruction can enter a builtin that runs long. `sort` without a comparator makes
-all its O(n log n) comparisons for one unit; string concatenation can copy and
-rehash up to `JS_MAX_STRING_UNITS` per instruction; the regex step budget is per
-call, so a loop of cheap-looking `re.test(s)` calls multiplies it. None of these
-are memory-unsafe, and all are bounded per operation — but the aggregate is not
-bounded in *time* by fuel alone. (The one builtin loop with no memory behind its
-length is charged: an array method on a receiver that is not an array,
-`Array.prototype.indexOf.call({ length: 2 ** 53 - 1 }, x)`, spends a unit of fuel
-for each index and reads the interrupt there. So are the builtins whose work grows faster
-than their input: BigInt multiplication, division, remainder, `**`, parsing (`BigInt(s)`,
-a comparison with a string, a literal at compile time) and printing, all quadratic in the
-length, and `normalize` (whose ordering of a run of marks is quadratic) charge about what the
-time would buy in instructions, a batch at a time through `js_native_charge_n`, and read the
-interrupt between batches. A literal's charge falls on the budget armed when the source
-compiles, and stopping it is a compile error: `SyntaxError: execution budget exhausted`.) Arm a timer and call `js_vm_interrupt`, which
+**Bound wall-clock.** Fuel counts instructions, and what a builtin does inside one is
+counted with it, at about the time it takes (an instruction is about 2.5 ns): the work
+debt in `lamassu_internal.h` (`js_work`, settled into the running fiber's fuel) takes every
+allocation, a new string's hashing, and the loops that compare, scan or move without
+allocating; `js_native_charge_n` charges, a batch at a time with the interrupt read between,
+the work a single call cannot bound by its data: string search (up to haystack × needle),
+`sort`'s comparisons, regexp steps (the step budget is no more than the fuel left buys, and
+the engine polls the interrupt), BigInt multiplication, division, `**`, parsing and printing,
+and `normalize`. A literal's BigInt parse falls on the budget armed when the source compiles,
+and stopping it is a compile error (`SyntaxError: execution budget exhausted`). What is left
+is the call in progress: an allocating builtin's work is charged as it allocates but the
+error comes at the next instruction, so one call (bounded by `JS_MAX_STRING_UNITS` and the
+heap limit) can overrun the budget. Arm a timer and call `js_vm_interrupt`, which
 is safe from another thread or a signal handler and stops the run at the next
 dispatch. Keep an outer kill as well if the deadline is hard rather than
 best-effort: the interrupt is read between instructions, so a builtin already

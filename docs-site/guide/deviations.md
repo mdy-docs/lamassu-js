@@ -143,9 +143,10 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
 ## Strings
 
 - **The longest string is 2<sup>26</sup> code units (64M), where V8's is 2<sup>29</sup>−24**, on
-  purpose: lamassu runs untrusted code, and a native builds a string without spending fuel, so
-  the limit bounds both the memory one call can take (128 MiB, as every string is UTF-16 here,
-  where V8 keeps Latin-1 text in a byte a character) and the time it can spend filling it. Every
+  purpose: lamassu runs untrusted code, and a builtin's work is charged to the fuel budget only
+  when the call returns, so the limit bounds both the memory one call can take (128 MiB, as
+  every string is UTF-16 here, where V8 keeps Latin-1 text in a byte a character) and the time it
+  can spend filling it. Every
   operation that makes a string checks it, and throws `RangeError: Invalid string length` as V8
   does at its own limit, so a script sees V8's error, just sooner. Two places V8 cannot reach
   are held to it too: an engine error whose message would pass it (a function's source text in

@@ -46,6 +46,13 @@
  */
 #define JS_REGEXP_STEP_BASE (1u << 20)
 #define JS_REGEXP_STEPS_PER_UNIT 2000u
+/* The steps a unit of fuel pays for (a step is about 0.8 ns, an instruction about 2.5): what a
+ * match spends is charged to the budget, and no match may spend more than the budget has left */
+#define JS_REGEXP_STEPS_PER_FUEL 3u
+/* and what entering the engine at a start position costs, beyond its steps (about 29 ns), and a
+ * match's own setting up (about 50 ns) */
+#define JS_REGEXP_POSITION_FUEL 12u
+#define JS_REGEXP_CALL_FUEL 20u
 
 typedef struct JsRegExp {
     JsObject obj;     /* obj_kind == JS_OBJ_REGEXP; props hold expandos only */

@@ -265,6 +265,7 @@ bool      js_has_property(JsContext *ctx, JsValue base, JsValue key, bool *out);
 bool      js_delete_property(JsContext *ctx, JsValue base, JsValue key);
 bool      js_native_charge(JsContext *ctx);
 bool      js_native_charge_n(JsContext *ctx, uint64_t n); /* N instructions' worth of a native's work */
+uint64_t  js_fuel_remaining(JsContext *ctx); /* what the budget has left; UINT64_MAX with none */
 bool      js_is_extensible(JsContext *ctx, JsValue v);
 bool      js_function_has_own_special(JsValue fn, bool name);
 bool      js_prevent_extensions(JsContext *ctx, JsValue v);

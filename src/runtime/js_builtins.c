@@ -198,6 +198,11 @@ static bool oom(JsContext *ctx, JsValue *result) {
     return native_throw(ctx, result, "out of memory");
 }
 
+/* The work (lamassu_internal.h) of the loops over a real array's elements that allocate nothing,
+ * in bytes' worth per element: a strict comparison (about 6.6 ns) and a move (about 1 ns) */
+#define WORK_ELEM_CMP 21u
+#define WORK_ELEM_MOVE 4u
+
 /* Why a StrBuf's text never became a string: the length limit (V8's RangeError), else what a
  * conversion threw or out of memory. For a result sb_finish left undefined. */
 static bool sb_fail(JsContext *ctx, const StrBuf *sb, JsValue *result) {
@@ -219,20 +224,66 @@ static JsString *arg_string(JsContext *ctx, JsValue v) {
 }
 
 /* substring search: returns index in hay of first needle at/after `from`, or -1 */
-static long units_find(const uint16_t *hay, uint32_t hlen, const uint16_t *ndl,
+/* A search compares a unit at a time, up to the needle's length at every start (haystack times
+ * needle at worst): each comparison is charged, about 0.4 ns, a batch at a time, which also polls
+ * the interrupt. */
+#define SEARCH_PER_FUEL 6u
+#define SEARCH_BATCH (1u << 16)
+
+/* Charges STEPS comparisons once they reach a batch (or at once when FLUSH and worth a unit) */
+static bool search_charge(JsContext *ctx, uint64_t *steps, bool flush) {
+    if (*steps < (flush ? SEARCH_PER_FUEL : SEARCH_BATCH))
+        return true;
+    uint64_t n = *steps / SEARCH_PER_FUEL;
+    *steps %= SEARCH_PER_FUEL;
+    return js_native_charge_n(ctx, n);
+}
+
+/* The first index >= FROM where NDL starts in HAY; -1 none, -2 the budget's or the interrupt's
+ * error pending */
+static long units_find(JsContext *ctx, const uint16_t *hay, uint32_t hlen, const uint16_t *ndl,
                        uint32_t nlen, uint32_t from) {
     if (nlen == 0)
         return from <= hlen ? (long)from : (long)hlen;
     if (nlen > hlen)
         return -1;
+    uint64_t steps = 0;
+    long found = -1;
     for (uint32_t i = from; i + nlen <= hlen; i++) {
         uint32_t j = 0;
         while (j < nlen && hay[i + j] == ndl[j])
             j++;
-        if (j == nlen)
-            return (long)i;
+        steps += j + 1;
+        if (j == nlen) {
+            found = (long)i;
+            break;
+        }
+        if (!search_charge(ctx, &steps, false))
+            return -2;
     }
-    return -1;
+    return search_charge(ctx, &steps, true) ? found : -2;
+}
+
+/* The last index <= LIMIT where NDL starts in HAY; -1 none, -2 as units_find */
+static long units_find_last(JsContext *ctx, const uint16_t *hay, uint32_t hlen, const uint16_t *ndl,
+                            uint32_t nlen, uint32_t limit) {
+    if (nlen > hlen)
+        return -1;
+    uint64_t steps = 0;
+    long found = -1;
+    for (long i = (long)(limit < hlen - nlen ? limit : hlen - nlen); i >= 0; i--) {
+        uint32_t j = 0;
+        while (j < nlen && hay[i + j] == ndl[j])
+            j++;
+        steps += j + 1;
+        if (j == nlen) {
+            found = i;
+            break;
+        }
+        if (!search_charge(ctx, &steps, false))
+            return -2;
+    }
+    return search_charge(ctx, &steps, true) ? found : -2;
 }
 
 /* =====================================================================
@@ -348,7 +399,10 @@ static bool sm_indexOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     if (argc > 1)
         TO_NUM(fromd, ARG(1));
     uint32_t from = clamp_index(fromd, s->length);
-    *r = js_number((double)units_find(s->units, s->length, n->units, n->length, from));
+    long f = units_find(ctx, s->units, s->length, n->units, n->length, from);
+    if (f == -2)
+        return (*r = js_take_error(ctx)), false;
+    *r = js_number((double)f);
     return true;
 }
 
@@ -371,14 +425,9 @@ static bool sm_lastIndexOf(JsContext *ctx, JsValue tv, const JsValue *args, int 
         limit = 0;
     else
         limit = (uint32_t)posd;
-    long found = -1;
-    for (long i = 0; i + (long)n->length <= (long)s->length && i <= (long)limit; i++) {
-        uint32_t j = 0;
-        while (j < n->length && s->units[i + j] == n->units[j])
-            j++;
-        if (j == n->length)
-            found = i;
-    }
+    long found = units_find_last(ctx, s->units, s->length, n->units, n->length, limit);
+    if (found == -2)
+        return (*r = js_take_error(ctx)), false;
     *r = js_number((double)found);
     return true;
 }
@@ -394,7 +443,10 @@ static bool sm_includes(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     JsString *n = arg_string(ctx, ARG(0));
     if (!n)
         return oom(ctx, r);
-    *r = js_bool(units_find(s->units, s->length, n->units, n->length, 0) >= 0);
+    long f = units_find(ctx, s->units, s->length, n->units, n->length, 0);
+    if (f == -2)
+        return (*r = js_take_error(ctx)), false;
+    *r = js_bool(f >= 0);
     return true;
 }
 
@@ -563,6 +615,7 @@ static bool str_case_convert(JsContext *ctx, JsValue tv, JsValue *r, bool to_upp
     JsString *s;
     if (!str_this(ctx, tv, &s, r))
         return false;
+    js_work((uint64_t)s->length * 128); /* a unit's mapping: about 40 ns (lamassu_internal.h) */
     StrBuf sb;
     sb_init(&sb, ctx->vm);
     for (uint32_t i = 0; i < s->length;) {
@@ -912,7 +965,13 @@ static bool sm_replace_impl(JsContext *ctx, JsValue tv, const JsValue *args, int
     sb_init(&sb, vm);
     uint32_t pos = 0, cursor = 0;
     while (ok && !sb.oom) { /* stops at the length limit, as V8's concatenation throws there */
-        long f = units_find(s->units, s->length, pat->units, pat->length, pos);
+        long f = units_find(ctx, s->units, s->length, pat->units, pat->length, pos);
+        if (f == -2) { /* the budget or the interrupt */
+            *r = js_take_error(ctx);
+            ok = false;
+            thrown = true;
+            break;
+        }
         if (f < 0)
             break;
         uint32_t at = (uint32_t)f;
@@ -1013,7 +1072,11 @@ static bool sm_split(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
     } else {
         uint32_t pos = 0;
         while (out->elem_count < lim) {
-            long f = units_find(s->units, s->length, sep->units, sep->length, pos);
+            long f = units_find(ctx, s->units, s->length, sep->units, sep->length, pos);
+            if (f == -2) {
+                js_gc_unprotect(ctx->vm, &outv);
+                return (*r = js_take_error(ctx)), false;
+            }
             uint32_t end = f < 0 ? s->length : (uint32_t)f;
             JsString *piece = js_string_cell_new(ctx->vm, s->units + pos, end - pos);
             if (!piece || !js_array_append(ctx->vm, out, js_value_from_cell(&piece->gc))) {
@@ -1277,6 +1340,7 @@ static bool am_shift(JsContext *ctx, JsValue tv, const JsValue *args, int argc, 
     JsValue first = a->elems[0];
     for (uint32_t i = 1; i < a->elem_count; i++)
         a->elems[i - 1] = a->elems[i];
+    js_work((uint64_t)a->elem_count * WORK_ELEM_MOVE);
     a->elem_count--;
     *r = first;
     return true;
@@ -1294,6 +1358,7 @@ static bool am_unshift(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     uint32_t n = (uint32_t)argc;
     for (uint32_t i = a->elem_count; i-- > n;)
         a->elems[i] = a->elems[i - n];
+    js_work((uint64_t)a->elem_count * WORK_ELEM_MOVE);
     for (int i = 0; i < argc; i++)
         a->elems[i] = args[i];
     *r = js_number(a->elem_count);
@@ -1324,14 +1389,12 @@ static bool am_indexOf(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     double fd = 0;
     if (argc > 1)
         TO_NUM(fd, ARG(1));
-    uint32_t from = clamp_index(fd, len);
-    for (uint32_t i = from; i < len && i < a->elem_count; i++) {
-        if (js_strict_equals(a->elems[i], ARG(0))) {
-            *r = js_number(i);
-            return true;
-        }
-    }
-    *r = js_number(-1);
+    uint32_t from = clamp_index(fd, len), i = from;
+    for (; i < len && i < a->elem_count; i++)
+        if (js_strict_equals(a->elems[i], ARG(0)))
+            break;
+    js_work((uint64_t)(i - from) * WORK_ELEM_CMP);
+    *r = js_number(i < len && i < a->elem_count ? (double)i : -1);
     return true;
 }
 
@@ -1348,15 +1411,16 @@ static bool am_lastIndexOf(JsContext *ctx, JsValue tv, const JsValue *args, int 
         TO_NUM(n, ARG(1));
         n = to_int(n);
     }
-    double k = n >= 0 ? (n < (double)len - 1 ? n : (double)len - 1) : (double)len + n;
+    double k = n >= 0 ? (n < (double)len - 1 ? n : (double)len - 1) : (double)len + n, k0 = k;
     for (; k >= 0; k--) {
         uint32_t i = (uint32_t)k;
         if (i < a->elem_count && js_strict_equals(a->elems[i], ARG(0))) {
             *r = js_number(i);
-            return true;
+            break;
         }
     }
-    *r = js_number(-1);
+    if (k0 > k)
+        js_work((uint64_t)(k0 - k) * WORK_ELEM_CMP);
     return true;
 }
 
@@ -1381,12 +1445,14 @@ static bool am_includes(JsContext *ctx, JsValue tv, const JsValue *args, int arg
     double fd = 0;
     if (argc > 1)
         TO_NUM(fd, ARG(1));
-    for (uint32_t i = clamp_index(fd, len); i < len; i++) {
+    uint32_t from = clamp_index(fd, len), i = from;
+    for (; i < len; i++) {
         if (same_value_zero(i < a->elem_count ? a->elems[i] : js_undefined(), ARG(0))) {
             *r = js_bool(true);
-            return true;
+            break;
         }
     }
+    js_work((uint64_t)(i - from) * WORK_ELEM_CMP);
     return true;
 }
 
@@ -1497,6 +1563,7 @@ static bool am_reverse(JsContext *ctx, JsValue tv, const JsValue *args, int argc
         a->elems[i] = a->elems[n - 1 - i];
         a->elems[n - 1 - i] = t;
     }
+    js_work((uint64_t)n * WORK_ELEM_MOVE);
     *r = tv;
     return true;
 }
@@ -1522,6 +1589,8 @@ static bool am_fill(JsContext *ctx, JsValue tv, const JsValue *args, int argc, J
         else if (!js_array_set_index(ctx->vm, a, i, ARG(0)))
             return oom(ctx, r);
     }
+    if (end > start)
+        js_work((uint64_t)(end - start) * WORK_ELEM_MOVE);
     *r = tv;
     return true;
 }
@@ -1765,6 +1834,7 @@ typedef struct {
     JsValue str;          /* the default comparison: x's string while y is converted */
     JsObject *work;
     int64_t min_gallop;
+    uint64_t compares; /* made since the last charge */
     int runs; /* the pending runs, a stack */
     int64_t run_base[SORT_MAX_RUNS], run_len[SORT_MAX_RUNS];
 } SortState;
@@ -1798,10 +1868,18 @@ static JsValue *sort_temp(SortState *st, int64_t n) {
  * ToString(x) against ToString(y) by code unit. False thrown. */
 static bool sort_less(SortState *st, JsValue x, JsValue y, bool *less) {
     JsContext *ctx = st->ctx;
-    /* A native costs one unit of fuel however long it runs, and a large sort is the longest a
-     * guest can stay inside one: poll the stop flag so an interrupt does not wait for it. */
+    /* A sort makes n log n comparisons in one call: each is charged (the merge's own work around
+     * it, about 10 ns; a comparator's instructions and a conversion's allocations pay for
+     * themselves), a batch at a time, and the stop flag is polled at each. */
     if (ctx->vm->interrupt)
         return native_throw(ctx, st->r, JS_MSG_INTERRUPT);
+    if (++st->compares >= 4096) {
+        if (!js_native_charge_n(ctx, st->compares * 4)) {
+            *st->r = js_take_error(ctx);
+            return false;
+        }
+        st->compares = 0;
+    }
     if (!js_is_undefined(st->cmp)) {
         JsValue argv[2] = {x, y};
         JsValue res;
@@ -1822,13 +1900,12 @@ static bool sort_less(SortState *st, JsValue x, JsValue y, bool *less) {
     JsString *sy = js_op_to_string(ctx, y);
     if (!sy)
         return oom(ctx, st->r);
-    uint32_t n = sx->length < sy->length ? sx->length : sy->length;
-    for (uint32_t k = 0; k < n; k++)
-        if (sx->units[k] != sy->units[k]) {
-            *less = sx->units[k] < sy->units[k];
-            return true;
-        }
-    *less = sx->length < sy->length;
+    uint32_t n = sx->length < sy->length ? sx->length : sy->length, k = 0;
+    while (k < n && sx->units[k] == sy->units[k])
+        k++;
+    if (k > 64)
+        js_work(k + k / 2); /* a unit compared: about 0.45 ns */
+    *less = k < n ? sx->units[k] < sy->units[k] : sx->length < sy->length;
     return true;
 }
 
@@ -2276,6 +2353,7 @@ static bool sort_array(JsContext *ctx, JsValue arrv, JsValue cmp, bool to_sorted
     st.cmp = cmp;
     st.workv = st.tempv = st.str = js_undefined();
     st.min_gallop = SORT_MIN_GALLOP;
+    st.compares = 0;
     st.runs = 0;
     js_gc_protect(ctx->vm, &arrv);
     js_gc_protect(ctx->vm, &st.cmp);
@@ -2324,6 +2402,8 @@ static bool sort_array(JsContext *ctx, JsValue arrv, JsValue cmp, bool to_sorted
         if (ok)
             *r = arrv;
     }
+    if (ok && st.compares) /* the comparisons short of a batch */
+        js_work(st.compares * 4 * JS_WORK_PER_FUEL);
     js_gc_unprotect(ctx->vm, &st.str);
     js_gc_unprotect(ctx->vm, &st.tempv);
     js_gc_unprotect(ctx->vm, &st.workv);
@@ -2635,6 +2715,8 @@ static bool am_splice(JsContext *ctx, JsValue tv, const JsValue *args, int argc,
     }
     for (uint32_t i = 0; ok && i < items; i++)
         ok = arr_put(ctx, a, start + i, args[2 + i], r);
+    if (items != del) /* every element after the gap moved */
+        js_work((uint64_t)(len - start) * WORK_ELEM_MOVE * 2);
     /* the length is set last; frozen, it is read-only even when unchanged */
     if (ok && (a->obj_flags & JS_OBJ_FROZEN))
         ok = native_throw(ctx, r, "TypeError: Cannot assign to read only property 'length' of object '[object Array]'");
@@ -2657,6 +2739,7 @@ static bool am_copyWithin(JsContext *ctx, JsValue tv, const JsValue *args, int a
     if (len - to < count)
         count = len - to;
     bool back = from < to && to < from + count;
+    js_work((uint64_t)count * WORK_ELEM_MOVE * 2);
     for (uint32_t i = 0; i < count; i++) {
         uint32_t f = back ? from + count - 1 - i : from + i, t = back ? to + count - 1 - i : to + i;
         bool ok = f < a->elem_count ? arr_put(ctx, a, t, a->elems[f], r) : arr_delete(ctx, a, t, r);
@@ -5472,6 +5555,7 @@ static bool json_parse(JsContext *ctx, JsValue tv, const JsValue *args, int argc
     js_gc_protect(ctx->vm, &snap);
     bool revive = js_is_function(ARG(1));
     JsonP p = {ctx, s->units, s->length, 0, false, 0, JE_NONE, NULL, 0};
+    js_work((uint64_t)s->length * 16); /* parsing a unit: about 5 ns, beyond what it allocates */
     JsValue out;
     bool ok = json_value(&p, &out, revive ? &snap : NULL);
     if (ok) {

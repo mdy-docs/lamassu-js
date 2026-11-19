@@ -42,7 +42,7 @@ lamassu --emit-bytecode SRC OUT         # compile SRC to a bytecode cache
 
 | option | meaning |
 | --- | --- |
-| `--fuel N` | Bytecode-instruction budget per evaluation (`0` = unlimited). Roughly 3e8 per second. |
+| `--fuel N` | Bytecode-instruction budget per evaluation (`0` = unlimited). Roughly 4e8 per second, a builtin's own work included. |
 | `--heap-limit N` | Cap on the guest heap, with an optional `K`/`M`/`G` suffix (e.g. `64M`). |
 | `-h`, `--help` | The same summary, from the tool itself. |
 

@@ -39,6 +39,7 @@ static int64_t setobj_find(const JsSetObj *s, JsValue value) {
 /* Already present: no-op (insertion order is unchanged, matching spec).
  * New: appended to the ordered array and recorded in the index. */
 static bool setobj_add(JsVm *vm, JsSetObj *s, JsValue value) {
+    js_work(256); /* hashing and probing, about 80 ns (lamassu_internal.h) */
     value = js_normalize_map_key(value); /* store +0, never -0 */
     if (setobj_find(s, value) >= 0)
         return true;

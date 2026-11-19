@@ -121,7 +121,7 @@ JsValue done = js_run_module(ctx, fn);
 import { createLamassu } from "@mdy-docs/lamassu-js";
 
 const lam = await createLamassu({
-  fuel: 20_000_000,               // ≈0.1s of guest CPU per evaluation
+  fuel: 20_000_000,               // ≈50 ms of guest CPU per evaluation
   heapLimit: 16 * 1024 * 1024,
 });
 
@@ -163,21 +163,28 @@ carrying on.
 
 ### Bound wall-clock separately
 
-::: warning Fuel counts instructions, not time
-A single instruction can enter a builtin that runs long. `sort` without a comparator
-makes all its O(n log n) comparisons for one unit; string concatenation can copy and
-rehash a large string in one step; the regex step budget is per call, so a
-loop of cheap-looking `re.test(s)` calls multiplies it. None of these are
-memory-unsafe and all are bounded per operation — but the aggregate is not
-bounded in *time* by fuel alone. The one builtin loop with no memory behind its
-length is charged: an array method on a receiver that is not an array
-(`Array.prototype.indexOf.call({ length: 2 ** 53 - 1 }, x)`) spends a unit of
-fuel for each index and reads the interrupt there. So are the builtins whose work
-grows faster than their input: BigInt multiplication, division, `**`, parsing and
-printing (all quadratic in the length) and `normalize` (whose ordering of a run of
-marks is quadratic) spend about the fuel the time would buy in instructions, and read
-the interrupt as they go. That includes a BigInt literal's digits at compile time, on
-the budget armed then.
+::: info Fuel follows time, builtins included
+Fuel is charged per bytecode instruction, and the work a builtin does inside one
+instruction is charged too, at about what the same time would buy in instructions:
+- **What a builtin allocates**, and the bytes it fills, copies or hashes: a string
+  copied by `+`, `slice` or `repeat`, an array made by `split`, `slice`, spread or
+  `JSON.parse`, an object made by `{ ...o }` or `Object.assign`.
+- **What it touches without allocating:** comparing long strings (`===`, `<`,
+  `sort`), scanning an array (`indexOf`, `includes`, `reverse`, `fill`), moving its
+  elements (`shift`, `unshift`, `splice`), mapping case, inserting into a `Map` or
+  `Set`.
+- **Work that grows faster than its input**, charged a batch at a time so the
+  interrupt stops it as it goes: string search (`indexOf`, `includes`, `split`,
+  `replace`, up to haystack × needle), `sort`'s comparisons, regular expressions
+  (every step of the engine, and no match may take more steps than the budget has
+  left), BigInt multiplication, division, `**`, parsing and printing (quadratic in the
+  length, including a literal's digits at compile time) and `normalize`.
+
+So a budget bounds the time a script can take, give or take a factor of two or so
+between kinds of work. One builtin call can still overrun the budget by the call it is
+in: an allocating builtin's work is charged when it returns, so the budget error comes
+at the next instruction. That call is bounded by the 64M-unit string limit and the
+heap limit, not by fuel.
 :::
 
 Arm a timer and call

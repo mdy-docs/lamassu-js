@@ -446,10 +446,13 @@ static uint32_t advance_index(const JsString *s, uint32_t i, bool uni) {
 static const char *const re_budget_msg =
     "RangeError: regular expression step budget exhausted";
 
-/* What a RE_RUN_BUDGET throws: the budget, or the out-of-memory it stood for. */
+/* What a RE_RUN_BUDGET throws: the fuel budget's or the interrupt's error when one is pending (the
+ * match was charged for, or stopped), else the step budget, or the out-of-memory it stood for. */
 static bool re_budget_throw(JsContext *ctx, JsValue *r) {
     bool oom = re_budget_was_oom;
     re_budget_was_oom = false;
+    if (!js_is_undefined(ctx->pending_error))
+        return (*r = js_take_error(ctx)), false;
     return oom ? re_oom(ctx, r) : re_throw(ctx, r, re_budget_msg);
 }
 
@@ -460,15 +463,18 @@ static bool re_budget_throw(JsContext *ctx, JsValue *r) {
  * caps[] holds (group_count+1)*2 unit offsets, -1 for an unmatched group.
  * Every call gets a fresh engine context with a step budget scaled to the
  * subject, so catastrophic backtracking returns RE_RUN_BUDGET instead of
- * hanging the VM.
+ * hanging the VM. The steps are paid for in fuel (JS_REGEXP_STEPS_PER_FUEL):
+ * the step budget is no more than the fuel left buys, the engine polls the
+ * interrupt flag, and what the match spent is charged; a budget spent or an
+ * interrupt is RE_RUN_BUDGET with that error pending.
  */
-static int re_run(JsRegExp *re, const JsString *s, uint32_t start, bool anchored,
+static int re_run(JsContext *ctx, JsRegExp *re, const JsString *s, uint32_t start, bool anchored,
                   int32_t *caps) {
     Program *prog = &re->prog;
     const uint16_t *text = s->units;
     const uint16_t *text_end = text + s->length;
     const uint16_t *captures[CAPS_MAX] = {0};
-    bool matched = false;
+    bool matched = false, charge_failed = false;
 
     VMContext *vctx = re->vctx;
     if (!vctx) {
@@ -481,20 +487,44 @@ static int re_run(JsRegExp *re, const JsString *s, uint32_t start, bool anchored
         }
         re->vctx = vctx;
     }
-    vm_context_set_step_budget(vctx, JS_REGEXP_STEP_BASE +
-                                         (uint64_t)s->length * JS_REGEXP_STEPS_PER_UNIT);
+    uint64_t cap = JS_REGEXP_STEP_BASE + (uint64_t)s->length * JS_REGEXP_STEPS_PER_UNIT;
+    uint64_t fuel = js_fuel_remaining(ctx);
+    uint64_t afford = fuel > UINT64_MAX / JS_REGEXP_STEPS_PER_FUEL ? UINT64_MAX
+                                                                   : fuel * JS_REGEXP_STEPS_PER_FUEL;
+    bool fuel_bound = afford < cap; /* the budget, not the subject, sets how far it may go */
+    vm_context_set_step_budget(vctx, fuel_bound ? afford : cap);
+    _Static_assert(sizeof(JsInterruptFlag) == sizeof(int), "the engine polls an int flag");
+    vm_context_set_interrupt(vctx, (const volatile int *)&ctx->vm->interrupt);
     if (anchored || prog->sticky) {
         matched = vm_execute(prog, vctx, 0, 1, text, text_end, text + start, captures);
     } else {
         bool uni = re_is_unicode(re);
+        uint32_t tried = 0; /* start positions not yet charged */
         for (uint32_t i = start; i <= s->length;) {
             matched = vm_execute(prog, vctx, 0, 1, text, text_end, text + i, captures);
             if (matched || vm_context_budget_exhausted(vctx))
                 break;
             i = advance_index(s, i, uni);
+            if (++tried == 4096) { /* a batch at a time, which polls the interrupt too */
+                tried = 0;
+                if (!js_native_charge_n(ctx, 4096 * JS_REGEXP_POSITION_FUEL)) {
+                    charge_failed = true;
+                    break;
+                }
+            }
         }
+        if (!charge_failed && !js_native_charge_n(ctx, (uint64_t)tried * JS_REGEXP_POSITION_FUEL))
+            charge_failed = true;
     }
-    bool exhausted = vm_context_budget_exhausted(vctx);
+    bool exhausted = vm_context_budget_exhausted(vctx) || charge_failed;
+    bool stopped = vm_context_interrupted(vctx) || (exhausted && fuel_bound && !re_alloc_failed);
+    /* what it spent, or (stopped) all there was: the error is pending when that is too much */
+    if (charge_failed ||
+        !js_native_charge_n(ctx, stopped ? UINT64_MAX
+                                         : JS_REGEXP_CALL_FUEL + vm_context_steps_used(vctx) / JS_REGEXP_STEPS_PER_FUEL)) {
+        matched = false;
+        exhausted = true;
+    }
     if (exhausted)
         re_budget_was_oom = re_alloc_failed;
     re_alloc_failed = false;
@@ -536,7 +566,7 @@ static void re_record(JsContext *ctx, const JsRegExp *re, JsString *s, const int
 /* re_run, recording a match for the legacy statics */
 static int re_match(JsContext *ctx, JsRegExp *re, JsString *s, uint32_t start, bool anchored,
                     int32_t *caps) {
-    int rc = re_run(re, s, start, anchored, caps);
+    int rc = re_run(ctx, re, s, start, anchored, caps);
     if (rc == RE_RUN_MATCH)
         re_record(ctx, re, s, caps);
     return rc;

@@ -1040,13 +1040,42 @@ static inline JsPromise *js_value_promise(JsValue v) { return (JsPromise *)js_va
 /* Longest string, in UTF-16 code units, any operation may produce (V8's is
  * 2^29-24; this one is lower on purpose). Bounds what one call from an
  * untrusted script can be made to allocate AND — just as importantly — how
- * long it can spend filling it, since natives run without consuming fuel.
+ * long it can spend filling it, since a native's work reaches the fuel budget
+ * only at the instruction after it (js_work below).
  * js_string_cell_new and js_concat_cells refuse anything longer, so no string
  * cell can exceed it; every operation whose result can grow past its inputs
  * checks the length first and throws JS_STRING_LENGTH_ERROR, as V8 does at its
  * own limit, instead of reporting out of memory. */
 #define JS_MAX_STRING_UNITS (64u * 1024 * 1024)
 #define JS_STRING_LENGTH_ERROR "RangeError: Invalid string length"
+
+/* ---- work: what natives do that no instruction pays for (js_interp.c) ----
+ *
+ * Fuel is charged per instruction, and a single instruction can enter a native that copies a
+ * 64M-unit string, allocates a million cells or scans an array of millions of elements. Such work
+ * is counted here, in bytes' worth (a byte copied, compared or allocated), wherever it happens,
+ * with no context needed: the allocator counts every allocation (JS_WORK_ALLOC for the call and
+ * each byte it gives: fresh memory costs its page faults as well as its filling, and a large
+ * block that is reused and barely touched is overcharged rather than a large copy under), a new
+ * string its hashing (JS_WORK_HASH a unit), and the loops that touch data without allocating
+ * (comparisons, scans, moves) count what they touch. Every JS_WORK_SETTLE bytes' worth is charged to the running fiber's fuel
+ * at JS_WORK_PER_FUEL a unit, where the dispatch loop sees it at its next instruction (a budget
+ * spent by it is spent there, as by an instruction). The rates are what the time would buy in
+ * instructions (one is about 2.5 ns). Work that is not bounded by the data's size within one call
+ * (a search, a sort, a regexp) is charged by the native itself with js_native_charge_n, a batch at
+ * a time, so the interrupt stops it too. */
+#define JS_WORK_PER_FUEL 8u
+#define JS_WORK_ALLOC 320u
+#define JS_WORK_HASH 1u
+#define JS_WORK_SETTLE 65536u
+extern _Thread_local struct JsContext *js_running_ctx; /* the context whose fiber runs, or NULL */
+extern _Thread_local uint64_t js_work_debt;
+void js_work_settle(void);
+static inline void js_work(uint64_t bytes) {
+    js_work_debt += bytes;
+    if (js_work_debt >= JS_WORK_SETTLE)
+        js_work_settle();
+}
 
 /* js_object.c: array helpers used by the interpreter. new_cell takes the
  * context (not just the VM) so it can set the new array's [[Prototype]] to

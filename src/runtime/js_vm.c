@@ -60,6 +60,9 @@ static void *realloc_impl(JsVm *vm, void *ptr, size_t old_size, size_t new_size,
     void *p = vm->realloc_fn(vm->alloc_ud, ptr, old_size, new_size);
     if (p)
         vm->bytes_live = vm->bytes_live - old_size + new_size;
+    if (p && limited && new_size > old_size) /* guest data: the allocation and what it holds (or,
+                                               * grown, what was copied into it) */
+        js_work(JS_WORK_ALLOC + new_size);
     return p;
 }
 

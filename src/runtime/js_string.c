@@ -33,6 +33,7 @@ JsString *js_string_cell_new(JsVm *vm, const uint16_t *units, size_t len) {
     JsString *s = (JsString *)c;
     s->length = (uint32_t)len;
     s->hash = js_units_hash(units, len, vm->hash_seed);
+    js_work(len * JS_WORK_HASH);
     s->interned = false;
     if (len)
         memcpy(s->units, units, len * sizeof(uint16_t));
@@ -69,6 +70,8 @@ bool js_string_equals(JsValue a, JsValue b) {
         return true;
     if (x->hash != y->hash || x->length != y->length)
         return false;
+    if (x->length > 64) /* equal hashes and lengths: most likely equal, and the whole is compared */
+        js_work(x->length);
     return memcmp(x->units, y->units, (size_t)x->length * sizeof(uint16_t)) == 0;
 }
 

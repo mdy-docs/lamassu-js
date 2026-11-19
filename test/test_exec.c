@@ -636,6 +636,43 @@ static void test_fuel(void) {
         CHECK(strstr(out, "budget") != NULL);
         free(out);
     }
+    /* and the work of builtins that is bounded within a call but not across calls: a copy, a
+     * comparison, a search, a scan, an allocation, a match. Each case runs its expression K times
+     * (K:expr): few enough that the loop's own instructions fit the budget many times over (the
+     * control case shows it), so only the work's charge can spend it. Uncharged, these took from
+     * seconds to minutes under the same budget. */
+    static const char *const per_call[] = {
+        "1000:t = s + 'y'", "1000:t = s.slice(1)", "1000:t = s.toUpperCase()",
+        "1000:t = s === s2", "1000:t = s < s2", "1000:t = h.indexOf(n)", "1000:t = h.includes(n)",
+        "1000:t = h.lastIndexOf(n2)", "1000:t = h.split(n)", "1000:t = h.replace(n, '')",
+        "4000:t = a.indexOf('y')", "4000:t = a.includes('y')", "10000:a.reverse()",
+        "20000:t = a.slice()", "20000:t = [...a]", "10000:t = a.join('')", "10000:a.fill('x')",
+        "10000:a.shift(); a.push('x')", "10000:a.unshift('x'); a.pop()", "1000:t = a.sort()",
+        "10000:t = JSON.stringify(a)", "1000:t = JSON.parse(j)", "20000:t = Object.keys(o)",
+        "10000:t = { ...o }", "1000:t = /b/.test(h)", "1000:t = h.replace(/a/g, 'c')",
+        "1000:try { /(a+)+$/.test(bt); } catch (e) {}", "1000:t = x.split('')",
+    };
+    static const char *const setup =
+        "const s = 'x'.repeat(1 << 20), s2 = 'x'.repeat(1 << 20), h = 'a'.repeat(1 << 16),"
+        " n = 'a'.repeat(256) + 'b', n2 = 'b' + 'a'.repeat(256), x = 'x'.repeat(1 << 10),"
+        " a = x.split('').concat(x.split('')), j = JSON.stringify(a), bt = 'a'.repeat(20) + 'X';"
+        " const o = {}; for (let k = 0; k < 2000; k++) o['k' + k] = k; let t;";
+    opts.fuel = 3000000;
+    char src[1024];
+    snprintf(src, sizeof src, "%s for (let i = 0; i < 20000; i++) { t = i; } 'done';", setup);
+    st = run_src_opts(src, &opts, &out); /* the control: setup and the longest loop, unpaid work aside */
+    CHECK(st == RUN_OK);
+    free(out);
+    for (size_t i = 0; i < sizeof per_call / sizeof per_call[0]; i++) {
+        const char *colon = strchr(per_call[i], ':');
+        snprintf(src, sizeof src, "%s for (let i = 0; i < %.*s; i++) { %s; } 'done';", setup,
+                 (int)(colon - per_call[i]), per_call[i], colon + 1);
+        st = run_src_opts(src, &opts, &out);
+        CHECK(st == RUN_RUNTIME_ERR && strstr(out, "budget") != NULL);
+        if (st != RUN_RUNTIME_ERR || !strstr(out, "budget"))
+            fprintf(stderr, "  per-call work not charged: %s -> %s\n", per_call[i], out);
+        free(out);
+    }
     /* the same work within its budget completes: the charge is what the time costs, not a cap */
     opts.fuel = 50000000;
     st = run_src_opts("((1n << 20000n) - 1n).toString().length + ('a' + '\\u0301'.repeat(2000) + '\\u0323'.repeat(2000)).normalize('NFD').length;",
@@ -1209,6 +1246,15 @@ static void test_interrupt(void) {
     CHECK(strstr(out, "interrupted") != NULL);
     free(out);
     st = run_with_stop("BigInt({ toString() { stopNow(); return '9'.repeat(3000000); } }); 'never';",
+                       &out, false);
+    CHECK(strstr(out, "interrupted") != NULL);
+    free(out);
+    /* a catastrophic match and a worst-case search poll it too */
+    st = run_with_stop("/(a+)+$/.test({ toString() { stopNow(); return 'a'.repeat(40) + 'X'; } }); 'never';",
+                       &out, false);
+    CHECK(strstr(out, "interrupted") != NULL);
+    free(out);
+    st = run_with_stop("'a'.repeat(1 << 22).indexOf({ toString() { stopNow(); return 'a'.repeat(1 << 12) + 'b'; } }); 'never';",
                        &out, false);
     CHECK(strstr(out, "interrupted") != NULL);
     free(out);

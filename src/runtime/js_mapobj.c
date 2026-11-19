@@ -44,6 +44,7 @@ static int64_t mapobj_find(const JsMapObj *m, JsValue key) {
 /* Existing key: value updated in place, insertion order unchanged (matches
  * spec). New key: appended to the ordered arrays and recorded in the index. */
 static bool mapobj_set(JsVm *vm, JsMapObj *m, JsValue key, JsValue value) {
+    js_work(256); /* hashing and probing, about 80 ns (lamassu_internal.h) */
     key = js_normalize_map_key(key); /* store +0, never -0 */
     int64_t idx = mapobj_find(m, key);
     if (idx >= 0) {
