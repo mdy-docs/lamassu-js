@@ -619,7 +619,8 @@ static void test_heap_limit(void) {
     RunStatus st = run_src_opts(
         "let s = 'x'; while (true) { s = s + s; }", &opts, &out);
     CHECK(st == RUN_RUNTIME_ERR);
-    CHECK(strstr(out, "memory") != NULL || strstr(out, "Invalid string length") != NULL);
+    /* the heap runs out long before the 2^26-unit string limit: that is what a failed `+` says */
+    CHECK(strstr(out, "memory") != NULL);
     free(out);
 }
 

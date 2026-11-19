@@ -60,7 +60,11 @@ check("infinite recursion", await lam.eval("function f(){return f();} f();"), ha
 check("microtask bomb", await lam.eval("function f(){Promise.resolve().then(f);} f(); 'queued';"),
       has("queued"), "returns, bounded");
 check("still usable after", await lam.eval("1 + 1;"), has("2"), "2");
-check("string bomb", await lam.eval("let s='x'; for(;;){ s = s + s; }"), has("Invalid string length"), "string cap");
+// With a 16 MB heap the doubling runs out of heap (at 8M units) long before the 64M string
+// limit, and that is what it reports; a string past the limit is "Invalid string length".
+check("string bomb", await lam.eval("let s='x'; for(;;){ s = s + s; }"), has("out of memory"), "heap cap");
+lam.reset(); // the doubled string is a live REPL global
+check("string cap", await lam.eval("try { 'x'.repeat(2 ** 26 + 1); } catch (e) { e.message; }"), has("Invalid string length"), "string cap");
 check("ReDoS", await lam.eval("/(a+)+$/.test('a'.repeat(60)+'X');"), has("step budget"), "regex budget");
 check("memory bomb", await lam.eval("let z=[]; for(;;) z.push({x:1});"), has("out of memory"), "heap cap");
 // The memory bomb's array is a live REPL global, so the heap stays full until
