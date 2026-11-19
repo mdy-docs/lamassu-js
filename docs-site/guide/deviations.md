@@ -208,6 +208,11 @@ string V8 refuses too gets that message where V8 has another: `import { "a" } fr
   an anonymous function's inferred name comes only from a member assignment
   (`x.y = function () {}` is `x.y`, `F.prototype.m = ...` is `F.m`), where V8 also infers from
   other places (`const a = [function () {}]` is `a` there); a host's natives have no frame.
+- **A `for`–`of` declaration's pattern is not named after V8's hidden variable**: V8 reads
+  `for (const [x] of [1])` as a declaration of `.for`, and says `.for is not iterable` at the
+  pattern's `]` (and `Cannot destructure property 'p' of '.for'`). Here the error is placed as
+  for any nested pattern and words the value by its type
+  (`number 1 is not iterable (cannot read property Symbol(Symbol.iterator))`).
 - **Subclassing is not possible** (no classes); set `name` on an instance
   for a custom discriminator.
 - **Messages follow V8's wording**, with these differences: an error about

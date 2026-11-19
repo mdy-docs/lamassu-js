@@ -2392,8 +2392,12 @@ JS_COLD static bool iter_open_slow(JsContext *ctx, JsFiber *fb, const JsFunction
         *slot = c.src;
         return true;
     }
+    const uint16_t *u;
+    uint32_t len;
     if (rc < 0)
         fiber_throw_value(fb, js_take_error(ctx)); /* what opening it threw, or out of memory */
+    else if (find_note(fn, ip, &u, &len) && len == 1 && u[0] == 0)
+        fiber_throw_value(fb, js_iter_not_iterable(ctx, *slot)); /* no text: V8's by type */
     else
         fiber_throw_operand(ctx, fb, fn, ip, *slot, " is not iterable");
     return false;
@@ -2655,8 +2659,8 @@ static void fiber_throw_read(JsContext *ctx, JsFiber *fb, const JsFunctionCell *
                                    key, sv, base)
                     : js_oom_value(vm);
             js_gc_unprotect(vm, &sv);
-        } else {
-            e = js_error_fmt(ctx, "TypeError: Cannot destructure property '%v' of '%v' as it is %v.",
+        } else { /* no text to name it by: V8 names it by its type */
+            e = js_error_fmt(ctx, "TypeError: Cannot destructure property '%v' of '%t' as it is %v.",
                              key, base, base);
         }
     } else {

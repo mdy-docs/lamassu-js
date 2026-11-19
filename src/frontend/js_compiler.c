@@ -118,7 +118,14 @@ typedef struct JsFuncState {
     int scope_depth; /* nesting of blocks/loops within this function */
     int pattern_depth; /* nesting of destructuring patterns being compiled */
     uint32_t last_line_pos;
+    /* The position the next instruction that can throw is placed at, as V8's bytecode builder
+     * keeps one (its "latent source info"): see stmt_pos and expr_pos */
+    uint32_t latent_pos;
+    uint8_t latent; /* JS_LATENT_* */
+    bool load_checked; /* the GET_LOCAL / GET_UPVAL about to be emitted can throw (the TDZ) */
 } JsFuncState;
+
+enum { JS_LATENT_NONE, JS_LATENT_EXPR, JS_LATENT_STMT };
 
 /* An assignment pattern's member target whose object (and computed key) were evaluated ahead
  * into hidden locals (pre_member_begin) */
@@ -224,7 +231,108 @@ static void set_depth(JsCompiler *cx, int d) {
         cx->cur->max_depth = d;
 }
 
+static void note_pos(JsCompiler *cx, uint32_t pos);
+
+/* Whether OP cannot throw or call out: V8's "without external side effects" bytecodes (constant
+ * and register loads and stores, context-slot loads, plain jumps), which an expression's position
+ * passes over to the next instruction. A local's load is one unless it checks the TDZ. */
+static bool op_without_effects(JsCompiler *cx, JsOp op) {
+    switch (op) {
+    case JS_OP_NOP: case JS_OP_CONST: case JS_OP_UNDEFINED: case JS_OP_NULL: case JS_OP_TRUE:
+    case JS_OP_FALSE: case JS_OP_POP: case JS_OP_DUP: case JS_OP_DUP2: case JS_OP_SWAP:
+    case JS_OP_ROT3: case JS_OP_SET_LOCAL: case JS_OP_TDZ: case JS_OP_GET_THIS:
+    case JS_OP_GET_CALLEE: case JS_OP_JUMP: case JS_OP_JUMP_IF_FALSE: case JS_OP_JUMP_IF_TRUE:
+    case JS_OP_JNN_PEEK: case JS_OP_OPT_CHAIN: case JS_OP_OPT_CALL_CHECK: case JS_OP_CLOSE_UPVALS:
+    case JS_OP_TRY_PUSH: case JS_OP_TRY_POP: case JS_OP_GOSUB: case JS_OP_RET_SUB:
+        return true;
+    case JS_OP_GET_LOCAL: case JS_OP_GET_UPVAL:
+        return !cx->cur->load_checked;
+    default:
+        return false;
+    }
+}
+
+/* A literal's truth (V8's ToBooleanIsTrue / ToBooleanIsFalse): 1 or 0, or -1 when N is not a
+ * literal */
+static int literal_truth(const JsAstNode *n) {
+    switch ((JsAstKind)n->kind) {
+    case JS_AST_NUMBER:
+        return n->number != 0 && n->number == n->number;
+    case JS_AST_STRING:
+        return n->len != 0;
+    case JS_AST_TEMPLATE:
+        return n->count == 1 ? n->items[0]->len != 0 : -1;
+    case JS_AST_NULL_LIT:
+        return 0;
+    case JS_AST_BOOL_LIT:
+        return (n->flags & JS_F_TRUE) != 0;
+    case JS_AST_BIGINT: {
+        uint32_t i = 0;
+        if (n->len > 1 && n->units[0] == '0' &&
+            (n->units[1] == 'x' || n->units[1] == 'X' || n->units[1] == 'o' ||
+             n->units[1] == 'O' || n->units[1] == 'b' || n->units[1] == 'B'))
+            i = 2;
+        for (; i < n->len; i++) {
+            uint16_t c = n->units[i];
+            if ((c >= '1' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))
+                return 1;
+        }
+        return 0;
+    }
+    default:
+        return -1;
+    }
+}
+
+/* Where V8 places a property read: its name or `[`, or past a call or a `?.` its dot */
+static uint32_t member_pos(const JsAstNode *n) {
+    return n->src_start ? n->src_start : n->pos2 ? n->pos2 : n->pos;
+}
+
+/* V8's position of an expression (Expression::position()), which a loop's clauses are placed at
+ * as statements: an operator's, a property read's, a call's or `new`'s; else where it starts
+ * (inside any parentheses, which V8 does not keep) */
+static uint32_t v8_expr_pos(const JsAstNode *n) {
+    switch ((JsAstKind)n->kind) {
+    case JS_AST_MEMBER:
+        return member_pos(n);
+    case JS_AST_CALL: case JS_AST_TAGGED_TEMPLATE: case JS_AST_ASSIGN: case JS_AST_BINARY:
+    case JS_AST_LOGICAL: case JS_AST_UPDATE:
+        return n->pos2 ? n->pos2 : n->pos;
+    default:
+        return n->pos;
+    }
+}
+
+/* Where an expression starts in the source: its outer `(` when it has one */
+static uint32_t expr_start_pos(const JsAstNode *n) {
+    return (n->flags & JS_F_PAREN) ? n->paren_pos : n->pos;
+}
+
+/* Source positions follow V8's bytecode builder. A statement's position is placed at its first
+ * instruction, whatever that is, and while it waits no expression position replaces it; an
+ * expression's position waits for the next instruction that can throw (op_without_effects), and a
+ * later one replaces it. An error or a stack frame shows the position of the last placed one at
+ * or before the instruction that was running. */
+static void stmt_pos(JsCompiler *cx, uint32_t pos) {
+    cx->cur->latent_pos = pos;
+    cx->cur->latent = JS_LATENT_STMT;
+}
+
+static void expr_pos(JsCompiler *cx, uint32_t pos) {
+    if (cx->cur->latent == JS_LATENT_STMT)
+        return;
+    cx->cur->latent_pos = pos;
+    cx->cur->latent = JS_LATENT_EXPR;
+}
+
 static bool emit_op(JsCompiler *cx, JsOp op, int delta) {
+    JsFuncState *fs = cx->cur;
+    if (fs->latent && (fs->latent == JS_LATENT_STMT || !op_without_effects(cx, op))) {
+        note_pos(cx, fs->latent_pos);
+        fs->latent = JS_LATENT_NONE;
+    }
+    fs->load_checked = false;
     if (!emit8(cx, (uint8_t)op))
         return false;
     adjust(cx, delta);
@@ -1437,12 +1545,15 @@ static bool binding_pending(JsFuncState *fs, const uint16_t *name, uint32_t len)
     return false;
 }
 
-static bool compile_ident_load(JsCompiler *cx, const JsAstNode *n) {
-    note_pos(cx, n->pos);
+/* A name's value, with no position of its own: what V8's BuildVariableLoad emits (the old value
+ * of a compound assignment or of ++ and --) */
+static bool load_ident(JsCompiler *cx, const JsAstNode *n) {
     int idx = resolve_local_in(cx->cur, n->units, n->len);
     if (idx >= 0) {
-        if (cx->cur->locals[idx].pending || cx->cur->locals[idx].tdz_anywhere)
+        if (cx->cur->locals[idx].pending || cx->cur->locals[idx].tdz_anywhere) {
             note_units(cx, n->units, n->len);
+            cx->cur->load_checked = true;
+        }
         return emit_op_u16(cx, JS_OP_GET_LOCAL, cx->cur->locals[idx].slot, +1);
     }
     bool is_const;
@@ -1450,8 +1561,10 @@ static bool compile_ident_load(JsCompiler *cx, const JsAstNode *n) {
     if (cx->err_msg)
         return false;
     if (up >= 0) {
-        if (binding_pending(cx->cur->parent, n->units, n->len))
+        if (binding_pending(cx->cur->parent, n->units, n->len)) {
             note_units(cx, n->units, n->len);
+            cx->cur->load_checked = true;
+        }
         return emit_op_u16(cx, JS_OP_GET_UPVAL, (uint16_t)up, +1);
     }
     if (cx->module) {
@@ -1466,8 +1579,14 @@ static bool compile_ident_load(JsCompiler *cx, const JsAstNode *n) {
     return emit_op_u16(cx, cx->repl ? JS_OP_GET_LEXICAL : JS_OP_GET_GLOBAL, c, +1);
 }
 
+/* A name read as an expression (V8's VisitVariableProxy): placed at the name */
+static bool compile_ident_load(JsCompiler *cx, const JsAstNode *n) {
+    expr_pos(cx, n->pos);
+    return load_ident(cx, n);
+}
+
+/* A store to a name; the caller places it (an assignment at its operator) */
 static bool compile_ident_store(JsCompiler *cx, const JsAstNode *target) {
-    note_pos(cx, target->pos);
     /* A write that may come before the declaration has run (see binding_pending) is checked:
      * in the TDZ it is a ReferenceError, which V8 reports before a const's TypeError. */
     int idx = resolve_local_in(cx->cur, target->units, target->len);
@@ -1476,6 +1595,7 @@ static bool compile_ident_store(JsCompiler *cx, const JsAstNode *target) {
         bool maybe_tdz = v->pending || v->tdz_anywhere;
         if (maybe_tdz)
             note_units(cx, target->units, target->len);
+        cx->cur->load_checked = maybe_tdz;
         if (v->is_const)
             return (!maybe_tdz || (emit_op_u16(cx, JS_OP_GET_LOCAL, v->slot, +1) &&
                                    emit_op(cx, JS_OP_POP, -1))) &&
@@ -1490,6 +1610,7 @@ static bool compile_ident_store(JsCompiler *cx, const JsAstNode *target) {
         bool maybe_tdz = binding_pending(cx->cur->parent, target->units, target->len);
         if (maybe_tdz)
             note_units(cx, target->units, target->len);
+        cx->cur->load_checked = maybe_tdz;
         if (is_const)
             return (!maybe_tdz || (emit_op_u16(cx, JS_OP_GET_UPVAL, (uint16_t)up, +1) &&
                                    emit_op(cx, JS_OP_POP, -1))) &&
@@ -1533,7 +1654,6 @@ static bool compile_member_chain(JsCompiler *cx, const JsAstNode *n,
         return compile_expr(cx, n);
     if (!compile_chain_part(cx, n->a, opt))
         return false;
-    note_pos(cx, n->pos2 ? n->pos2 : n->pos); /* V8's: the property */
     if (n->flags & JS_F_OPTIONAL) {
         uint32_t patch;
         if (!emit_jump(cx, JS_OP_OPT_CHAIN, 0, &patch) ||
@@ -1543,11 +1663,13 @@ static bool compile_member_chain(JsCompiler *cx, const JsAstNode *n,
     if (n->flags & JS_F_COMPUTED) {
         if (!compile_expr(cx, n->b))
             return false;
+        expr_pos(cx, member_pos(n)); /* V8's: the property */
         return emit_op(cx, JS_OP_GET_PROP, -1);
     }
     uint16_t c;
     if (!atom_const(cx, n->units, n->len, n->pos, &c))
         return false;
+    expr_pos(cx, member_pos(n));
     return emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0);
 }
 
@@ -1620,6 +1742,7 @@ static bool store_target(JsCompiler *cx, const JsAstNode *tgt, bool declaring) {
         return emit_op_u16(cx, JS_OP_SET_LOCAL, cx->cur->locals[idx].slot, 0) &&
                emit_op(cx, JS_OP_POP, -1);
     }
+    expr_pos(cx, tgt->pos);
     if (!compile_ident_store(cx, tgt))
         return false;
     return emit_op(cx, JS_OP_POP, -1);
@@ -1726,8 +1849,13 @@ static bool compile_pattern_store(JsCompiler *cx, const JsAstNode *pat,
         return compile_pattern_default(cx, pat, declaring);
     case JS_AST_ARRAY_PATTERN: {
         /* the value must be iterable: ITER_NEW checks it (and turns a Map or Set into an
-         * iterator over it), and each element steps it, as V8's iterator protocol does */
-        note_text(cx, src, false);
+         * iterator over it), and each element steps it, as V8's iterator protocol does. Only a
+         * declaration's value is where V8 places it; elsewhere (an assignment, a nested pattern, a
+         * parameter) V8 words it by the value's type */
+        if (src)
+            note_text(cx, src, false);
+        else
+            note_units(cx, (const uint16_t[]){0}, 1);
         if (!emit_op(cx, JS_OP_ITER_NEW, +1))
             return false;
         /* [it i]. A pattern that can throw part way (a default, a nested pattern, a store that
@@ -1778,6 +1906,8 @@ static bool compile_array_pattern_items(JsCompiler *cx, const JsAstNode *pat, bo
             const JsAstNode *el = pat->items[i];
             bool rest = el->kind == JS_AST_REST;
             const JsAstNode *tgt = rest ? el->a : el;
+            if (tgt->kind != JS_AST_HOLE) /* V8 places each element at its target, as a statement */
+                stmt_pos(cx, v8_expr_pos(tgt->kind == JS_AST_DEFAULT ? tgt->a : tgt));
             JsScopeMark sm = {0, 0};
             JsPreMember saved = {0};
             bool pre = false;
@@ -1807,6 +1937,7 @@ static bool compile_array_pattern_items(JsCompiler *cx, const JsAstNode *pat, bo
 static bool compile_object_rest(JsCompiler *cx, const JsAstNode *pat, uint32_t rest_at, bool declaring,
                                 const uint16_t *key_slots, const JsAstNode *src, bool outer) {
     const JsAstNode *rest = pat->items[rest_at];
+    stmt_pos(cx, v8_expr_pos(rest->a)); /* V8 places it at its target, as a statement */
     if (rest_at == 0) {
         /* nothing read before it: a null or undefined source fails here, as V8 has it */
         static const uint16_t probe[] = {'v', 'a', 'l', 'u', 'e', 'O', 'f'};
@@ -1850,13 +1981,17 @@ static bool compile_object_pattern_items(JsCompiler *cx, const JsAstNode *pat, b
     {
         /* with a rest, each computed key is converted once and kept, to exclude it after */
         bool has_rest = pat->count && pat->items[pat->count - 1]->kind == JS_AST_REST;
-        if (!pat->count) { /* `const {} = v` still requires an object-coercible v */
+        /* `const {} = v` still requires an object-coercible v, and V8 checks it first, at the
+         * pattern, when the first key is computed (reading it runs code) */
+        if (!pat->count || (pat->items[0]->kind != JS_AST_REST &&
+                            (pat->items[0]->flags & JS_F_COMPUTED))) {
             static const uint16_t probe[] = {'v', 'a', 'l', 'u', 'e', 'O', 'f'};
             uint16_t c;
             if (!emit_op(cx, JS_OP_DUP, +1) || !atom_const(cx, probe, 7, pat->pos, &c))
                 return false;
             if (outer)
                 note_whole(cx, src);
+            expr_pos(cx, pat->pos);
             if (!emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0) || !emit_op(cx, JS_OP_POP, -1))
                 return false;
         }
@@ -1871,6 +2006,12 @@ static bool compile_object_pattern_items(JsCompiler *cx, const JsAstNode *pat, b
             }
             if (!emit_op(cx, JS_OP_DUP, +1))
                 return false;
+            /* V8 places each property at its target, as a statement */
+            const JsAstNode *tgt = prop->b->kind == JS_AST_DEFAULT ? prop->b->a : prop->b;
+            stmt_pos(cx, v8_expr_pos(tgt));
+            /* V8 words the failure as a destructuring only where it is placed at the property's
+             * value: not with a default (its value is the `=`), nor in a nested pattern */
+            bool worded = i == 0 && outer && prop->b->kind != JS_AST_DEFAULT;
             /* The first read is where a null or undefined source fails: its note (even an
              * empty one) marks it as a destructuring for the error's wording. */
             if (prop->flags & JS_F_COMPUTED) {
@@ -1895,7 +2036,7 @@ static bool compile_object_pattern_items(JsCompiler *cx, const JsAstNode *pat, b
                 if (key->kind == JS_AST_NUMBER) {
                     if (!emit_number(cx, key->number, key->pos))
                         return false;
-                    if (i == 0 && outer)
+                    if (worded)
                         note_text(cx, src, true);
                     if (!emit_op(cx, JS_OP_GET_PROP, -1))
                         return false;
@@ -1903,7 +2044,7 @@ static bool compile_object_pattern_items(JsCompiler *cx, const JsAstNode *pat, b
                     uint16_t c;
                     if (!atom_const(cx, key->units, key->len, key->pos, &c))
                         return false;
-                    if (i == 0 && outer)
+                    if (worded)
                         note_text(cx, src, true);
                     if (!emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0))
                         return false;
@@ -2031,14 +2172,18 @@ static bool compile_member_value(JsCompiler *cx, const JsAstNode *value, const J
 
 static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
     const JsAstNode *t = n->a;
-    note_pos(cx, n->pos);
+    /* V8 places the store at the operator, after the value; the old value of a compound or
+     * logical assignment has no position of its own */
+    uint32_t at = n->pos2;
 
     if (n->op == JS_T_EQ) {
         if (t->kind == JS_AST_IDENT)
-            return compile_named_value(cx, n->b, t->units, t->len) && compile_ident_store(cx, t);
+            return compile_named_value(cx, n->b, t->units, t->len) &&
+                   (expr_pos(cx, at), compile_ident_store(cx, t));
         if (t->kind == JS_AST_MEMBER) {
             if (!compile_member_target_base(cx, t) || !compile_member_value(cx, n->b, t))
                 return false;
+            expr_pos(cx, at);
             if (t->flags & JS_F_COMPUTED)
                 return emit_op(cx, JS_OP_SET_PROP, -2);
             uint16_t c;
@@ -2048,7 +2193,10 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
         }
         if (!compile_expr(cx, n->b) || !emit_op(cx, JS_OP_DUP, +1))
             return false;
-        cx->pattern_src = n->b;
+        /* V8 names the value in an object pattern's error, not an array pattern's (placed at
+         * the `=`) */
+        cx->pattern_src = t->kind == JS_AST_OBJECT_PATTERN ? n->b : NULL;
+        expr_pos(cx, at);
         return compile_pattern_store(cx, t, false);
     }
 
@@ -2056,10 +2204,10 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
         JsOp peek = logical_peek_op(n->op);
         if (t->kind == JS_AST_IDENT) {
             uint32_t end;
-            if (!compile_ident_load(cx, t) || !emit_jump(cx, peek, 0, &end))
+            if (!load_ident(cx, t) || !emit_jump(cx, peek, 0, &end))
                 return false;
             if (!emit_op(cx, JS_OP_POP, -1) || !compile_named_value(cx, n->b, t->units, t->len) ||
-                !compile_ident_store(cx, t))
+                (expr_pos(cx, at), !compile_ident_store(cx, t)))
                 return false;
             patch_here(cx, end);
             return true;
@@ -2075,7 +2223,7 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
             if (!emit_jump(cx, peek, 0, &sc))
                 return false;
             if (!emit_op(cx, JS_OP_POP, -1) || !compile_expr(cx, n->b) ||
-                !emit_op_u16(cx, JS_OP_SET_PROP_ATOM, c, -1))
+                (expr_pos(cx, at), !emit_op_u16(cx, JS_OP_SET_PROP_ATOM, c, -1)))
                 return false;
             if (!emit_jump(cx, JS_OP_JUMP, 0, &end))
                 return false;
@@ -2094,7 +2242,7 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
             if (!emit_jump(cx, peek, 0, &sc))
                 return false;
             if (!emit_op(cx, JS_OP_POP, -1) || !compile_expr(cx, n->b) ||
-                !emit_op(cx, JS_OP_SET_PROP, -2))
+                (expr_pos(cx, at), !emit_op(cx, JS_OP_SET_PROP, -2)))
                 return false;
             if (!emit_jump(cx, JS_OP_JUMP, 0, &end))
                 return false;
@@ -2113,9 +2261,9 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
     if (op == JS_OP_NOP)
         return cerr(cx, n->pos, "unsupported assignment operator");
     if (t->kind == JS_AST_IDENT) {
-        if (!compile_ident_load(cx, t) || !compile_expr(cx, n->b) ||
-            !emit_op(cx, op, -1))
+        if (!load_ident(cx, t) || !compile_expr(cx, n->b) || !emit_op(cx, op, -1))
             return false;
+        expr_pos(cx, at);
         return compile_ident_store(cx, t);
     }
     if (t->kind == JS_AST_MEMBER && !(t->flags & JS_F_COMPUTED)) {
@@ -2126,6 +2274,7 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
             !emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0) ||
             !compile_expr(cx, n->b) || !emit_op(cx, op, -1))
             return false;
+        expr_pos(cx, at);
         return emit_op_u16(cx, JS_OP_SET_PROP_ATOM, c, -1);
     }
     if (t->kind == JS_AST_MEMBER) {
@@ -2133,6 +2282,7 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
             !emit_op(cx, JS_OP_DUP2, +2) || !emit_op(cx, JS_OP_GET_PROP, -1) ||
             !compile_expr(cx, n->b) || !emit_op(cx, op, -1))
             return false;
+        expr_pos(cx, at);
         return emit_op(cx, JS_OP_SET_PROP, -2);
     }
     return cerr(cx, t->pos, "Invalid left-hand side in assignment");
@@ -2142,16 +2292,17 @@ static bool compile_update(JsCompiler *cx, const JsAstNode *n) {
     const JsAstNode *t = n->a;
     uint8_t dec = n->op == JS_T_INC ? 0 : 1;
     bool prefix = (n->flags & JS_F_PREFIX) != 0;
-    note_pos(cx, n->pos);
+    /* V8 places only the store, at the operator */
 
     if (t->kind == JS_AST_IDENT) {
-        if (!compile_ident_load(cx, t))
+        if (!load_ident(cx, t))
             return false;
         if (prefix) /* [v] -> [v'] */
-            return emit_op(cx, JS_OP_UPDATE, 0) && emit8(cx, dec) && compile_ident_store(cx, t);
+            return emit_op(cx, JS_OP_UPDATE, 0) && emit8(cx, dec) &&
+                   (expr_pos(cx, n->pos2), compile_ident_store(cx, t));
         /* [v] -> [old new]; the new is stored, the old is the value */
-        return emit_op(cx, JS_OP_UPDATE_POST, +1) && emit8(cx, dec) && compile_ident_store(cx, t) &&
-               emit_op(cx, JS_OP_POP, -1);
+        return emit_op(cx, JS_OP_UPDATE_POST, +1) && emit8(cx, dec) &&
+               (expr_pos(cx, n->pos2), compile_ident_store(cx, t)) && emit_op(cx, JS_OP_POP, -1);
     }
     if (t->kind != JS_AST_MEMBER)
         return cerr(cx, t->pos, "Invalid left-hand side expression in postfix operation");
@@ -2179,6 +2330,7 @@ static bool compile_update(JsCompiler *cx, const JsAstNode *n) {
             !emit_op(cx, JS_OP_POP, -1))
             return false;
     }
+    expr_pos(cx, n->pos2);
     if (computed) {
         if (!emit_op(cx, JS_OP_SET_PROP, -2))
             return false;
@@ -2195,11 +2347,13 @@ static bool compile_update(JsCompiler *cx, const JsAstNode *n) {
 }
 
 static bool compile_template(JsCompiler *cx, const JsAstNode *n) {
-    if (!emit_string_const(cx, n->items[0]->units, n->items[0]->len, n->pos))
+    /* an empty first chunk is left out, as V8 does (what runs first shows in positions) */
+    bool lead = n->count == 1 || n->items[0]->len;
+    if (lead && !emit_string_const(cx, n->items[0]->units, n->items[0]->len, n->pos))
         return false;
     for (uint32_t i = 1; i < n->count; i += 2) {
         if (!compile_expr(cx, n->items[i]) || !emit_op(cx, JS_OP_TO_STRING, 0) ||
-            !emit_op(cx, JS_OP_ADD, -1))
+            ((lead || i > 1) && !emit_op(cx, JS_OP_ADD, -1)))
             return false;
         const JsAstNode *chunk = n->items[i + 1];
         if (chunk->len) {
@@ -2212,12 +2366,19 @@ static bool compile_template(JsCompiler *cx, const JsAstNode *n) {
 }
 
 static bool compile_object(JsCompiler *cx, const JsAstNode *n) {
+    /* `{...x, ...}`: x first, then the object (V8's CloneObject; what runs first shows in
+     * positions) */
+    bool lead = n->count && n->items[0]->kind == JS_AST_SPREAD;
+    if (lead && !compile_expr(cx, n->items[0]->a))
+        return false;
     if (!emit_op(cx, JS_OP_NEW_OBJECT, +1))
+        return false;
+    if (lead && !emit_op(cx, JS_OP_SWAP, 0))
         return false;
     for (uint32_t i = 0; i < n->count; i++) {
         const JsAstNode *prop = n->items[i];
         if (prop->kind == JS_AST_SPREAD) {
-            if (!compile_expr(cx, prop->a) || !emit_op(cx, JS_OP_OBJ_SPREAD, -1))
+            if (((i || !lead) && !compile_expr(cx, prop->a)) || !emit_op(cx, JS_OP_OBJ_SPREAD, -1))
                 return false;
             continue;
         }
@@ -2256,7 +2417,14 @@ static bool compile_object(JsCompiler *cx, const JsAstNode *n) {
 }
 
 static bool compile_array(JsCompiler *cx, const JsAstNode *n) {
+    /* `[...x, ...]`: x first, then the array (V8's CreateArrayFromIterable; what runs first shows
+     * in positions) */
+    bool lead = n->count && n->items[0]->kind == JS_AST_SPREAD;
+    if (lead && !compile_expr(cx, n->items[0]->a))
+        return false;
     if (!emit_op(cx, JS_OP_NEW_ARRAY, +1) || !emit_u16(cx, 0))
+        return false;
+    if (lead && !emit_op(cx, JS_OP_SWAP, 0))
         return false;
     for (uint32_t i = 0; i < n->count; i++) {
         const JsAstNode *el = n->items[i];
@@ -2264,9 +2432,10 @@ static bool compile_array(JsCompiler *cx, const JsAstNode *n) {
             if (!emit_op(cx, JS_OP_UNDEFINED, +1) || !emit_op(cx, JS_OP_ARRAY_APPEND, -1))
                 return false;
         } else if (el->kind == JS_AST_SPREAD) {
-            if (!compile_expr(cx, el->a))
+            if ((i || !lead) && !compile_expr(cx, el->a))
                 return false;
             note_text(cx, el->a, false);
+            expr_pos(cx, v8_expr_pos(el->a)); /* V8: the iterable */
             if (!emit_op(cx, JS_OP_ARRAY_SPREAD, -1))
                 return false;
         } else {
@@ -2347,7 +2516,6 @@ static bool template_object_const(JsCompiler *cx, const JsAstNode *tpl, uint16_t
 /* tag`a${x}b`: tag(strings, x), with `this` the tag's object for a member tag */
 static bool compile_tagged_template(JsCompiler *cx, const JsAstNode *n) {
     const JsAstNode *callee = n->a, *tpl = n->b;
-    note_pos(cx, n->pos);
     if (callee->kind == JS_AST_MEMBER) {
         /* an optional chain here is parenthesized (`a?.b```` is a SyntaxError): it ends there */
         if (!compile_method_callee(cx, callee, NULL))
@@ -2365,7 +2533,7 @@ static bool compile_tagged_template(JsCompiler *cx, const JsAstNode *n) {
     if (argc > 255)
         return cerr(cx, n->pos, "too many call arguments");
     note_callee(cx, callee);
-    note_pos(cx, n->pos2 ? n->pos2 : n->pos);
+    expr_pos(cx, n->pos2 ? n->pos2 : n->pos);
     return emit_op(cx, JS_OP_CALL, -(int)argc) && emit8(cx, (uint8_t)argc);
 }
 
@@ -2385,13 +2553,17 @@ static bool compile_method_callee(JsCompiler *cx, const JsAstNode *callee, JsPat
     }
     if (!emit_op(cx, JS_OP_DUP, +1)) /* [recv recv] */
         return false;
-    if (callee->pos2)
-        note_pos(cx, callee->pos2);
     if (callee->flags & JS_F_COMPUTED) {
-        if (!compile_expr(cx, callee->b) || !emit_op(cx, JS_OP_GET_PROP, -1))
+        if (!compile_expr(cx, callee->b))
+            return false;
+        if (callee->pos2)
+            expr_pos(cx, member_pos(callee));
+        if (!emit_op(cx, JS_OP_GET_PROP, -1))
             return false;
     } else {
         uint16_t c;
+        if (callee->pos2)
+            expr_pos(cx, member_pos(callee));
         if (!atom_const(cx, callee->units, callee->len, callee->pos, &c) ||
             !emit_op_u16(cx, JS_OP_GET_PROP_ATOM, c, 0))
             return false;
@@ -2417,7 +2589,6 @@ static bool compile_method_callee(JsCompiler *cx, const JsAstNode *callee, JsPat
  * `f?.()`, and the calls inside `a?.b().c` and `a?.()()`, which the short-circuit skips too). */
 static bool compile_call_link(JsCompiler *cx, const JsAstNode *n, JsPatchList *opt) {
     const JsAstNode *callee = n->a;
-    note_pos(cx, n->pos);
     if (callee->kind == JS_AST_MEMBER) {
         if (!compile_method_callee(cx, callee, opt))
             return false;
@@ -2439,7 +2610,7 @@ static bool compile_call_link(JsCompiler *cx, const JsAstNode *n, JsPatchList *o
     if (!compile_args(cx, callee, n->items, n->count, &varargs))
         return false;
     note_callee(cx, callee);
-    note_pos(cx, n->pos2 ? n->pos2 : n->pos); /* the call itself, where V8 places it */
+    expr_pos(cx, n->pos2 ? n->pos2 : n->pos); /* the call itself, where V8 places it */
     if (varargs) {
         if (!emit_op(cx, JS_OP_CALL_VARARGS, -2)) /* [callee this arr] -> [res] */
             return false;
@@ -2463,7 +2634,6 @@ static bool compile_call(JsCompiler *cx, const JsAstNode *n) {
 }
 
 static bool compile_new(JsCompiler *cx, const JsAstNode *n) {
-    note_pos(cx, n->pos);
     if (!compile_expr(cx, n->a)) /* callee value (member chains ok) */
         return false;
     if (!emit_op(cx, JS_OP_UNDEFINED, +1)) /* this placeholder; NEW overwrites it */
@@ -2472,7 +2642,7 @@ static bool compile_new(JsCompiler *cx, const JsAstNode *n) {
     if (!compile_args(cx, n->a, n->items, n->count, &varargs))
         return false;
     note_callee(cx, n->a);
-    note_pos(cx, n->pos); /* `new` */
+    expr_pos(cx, n->pos); /* `new` */
     if (varargs) {
         if (!emit_op(cx, JS_OP_NEW_VARARGS, -2)) /* [callee this arr] -> [res] */
             return false;
@@ -2605,6 +2775,9 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
         return true;
     case JS_AST_COND: {
         uint32_t pelse, pend;
+        int truth = literal_truth(n->a);
+        if (truth >= 0) /* V8 leaves out a literal test and the branch it does not take */
+            return compile_expr(cx, truth ? n->b : n->c);
         if (!compile_expr(cx, n->a) || !emit_jump(cx, JS_OP_JUMP_IF_FALSE, -1, &pelse))
             return false;
         int d0 = cx->cur->depth;
@@ -2619,6 +2792,16 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
     }
     case JS_AST_LOGICAL: {
         uint32_t end;
+        /* V8 leaves out what a literal on the left decides */
+        int truth = literal_truth(n->a);
+        if (truth >= 0) {
+            bool left;
+            if (n->op == JS_T_QUESQUES)
+                left = n->a->kind != JS_AST_NULL_LIT;
+            else
+                left = n->op == JS_T_ANDAND ? !truth : truth;
+            return compile_expr(cx, left ? n->a : n->b);
+        }
         if (!compile_expr(cx, n->a) || !emit_jump(cx, logical_peek_op(n->op), 0, &end) ||
             !emit_op(cx, JS_OP_POP, -1) || !compile_expr(cx, n->b))
             return false;
@@ -2629,24 +2812,30 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
         JsOp op = binop_opcode(n->op);
         if (op == JS_OP_NOP)
             return cerr(cx, n->pos, "unsupported operator");
-        note_pos(cx, n->pos);
-        return compile_expr(cx, n->a) && compile_expr(cx, n->b) && emit_op(cx, op, -1);
+        if (!compile_expr(cx, n->a) || !compile_expr(cx, n->b))
+            return false;
+        expr_pos(cx, n->pos2); /* the operator */
+        return emit_op(cx, op, -1);
     }
     case JS_AST_UNARY:
-        note_pos(cx, n->pos);
+        /* V8 places - + ~ at the operator; ! typeof void delete have no position of their own */
         switch ((JsTokKind)n->op) {
         case JS_T_MINUS:
-            return compile_expr(cx, n->a) && emit_op(cx, JS_OP_NEG, 0);
+            return compile_expr(cx, n->a) && (expr_pos(cx, n->pos), emit_op(cx, JS_OP_NEG, 0));
         case JS_T_PLUS:
-            return compile_expr(cx, n->a) && emit_op(cx, JS_OP_POS, 0);
+            return compile_expr(cx, n->a) && (expr_pos(cx, n->pos), emit_op(cx, JS_OP_POS, 0));
         case JS_T_NOT:
             return compile_expr(cx, n->a) && emit_op(cx, JS_OP_NOT, 0);
         case JS_T_TILDE:
-            return compile_expr(cx, n->a) && emit_op(cx, JS_OP_BITNOT, 0);
+            return compile_expr(cx, n->a) && (expr_pos(cx, n->pos), emit_op(cx, JS_OP_BITNOT, 0));
         case JS_T_VOID:
             return compile_expr(cx, n->a) && emit_op(cx, JS_OP_POP, -1) &&
                    emit_op(cx, JS_OP_UNDEFINED, +1);
         case JS_T_TYPEOF:
+            /* a name has no position of its own here (V8 loads it without one) */
+            if (n->a->kind == JS_AST_IDENT && !(n->a->flags & JS_F_PAREN) &&
+                resolve_local_in(cx->cur, n->a->units, n->a->len) >= 0)
+                return load_ident(cx, n->a) && emit_op(cx, JS_OP_TYPEOF, 0);
             if (n->a->kind == JS_AST_IDENT &&
                 resolve_local_in(cx->cur, n->a->units, n->a->len) < 0) {
                 bool ic;
@@ -2654,8 +2843,7 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
                 if (cx->err_msg)
                     return false;
                 if (up >= 0)
-                    return emit_op_u16(cx, JS_OP_GET_UPVAL, (uint16_t)up, +1) &&
-                           emit_op(cx, JS_OP_TYPEOF, 0);
+                    return load_ident(cx, n->a) && emit_op(cx, JS_OP_TYPEOF, 0);
                 if (cx->module && resolve_module_binding(cx, n->a->units, n->a->len)) {
                     int m = emit_module_load(cx, n->a);
                     return m > 0 && emit_op(cx, JS_OP_TYPEOF, 0);
@@ -2712,14 +2900,13 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
     case JS_AST_ASSIGN:
         return compile_assign(cx, n);
     case JS_AST_AWAIT:
-        note_pos(cx, n->pos);
+        expr_pos(cx, n->pos);
         /* operand in, result out: net stack effect 0 */
         if (!compile_expr(cx, n->a))
             return false;
-        note_pos(cx, n->pos); /* `await`: where an async frame shows it waits */
+        expr_pos(cx, n->pos); /* `await`: where an async frame shows it waits */
         return emit_op(cx, JS_OP_AWAIT, 0);
     case JS_AST_IMPORT_CALL:
-        note_pos(cx, n->pos);
         if (!compile_expr(cx, n->a))
             return false;
         /* the options after the specifier, per spec order; the op takes the pair as one array
@@ -2729,6 +2916,7 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
         if (!emit_op_u16(cx, JS_OP_NEW_ARRAY, 2, -1))
             return false;
         /* [specifier, options] in, promise out: net stack effect 0 */
+        expr_pos(cx, n->pos);
         return emit_op(cx, JS_OP_DYNAMIC_IMPORT, 0);
     case JS_AST_REGEX: {
 #ifdef LAMASSU_HAS_REGEX
@@ -2738,7 +2926,6 @@ static bool compile_expr_node(JsCompiler *cx, const JsAstNode *n) {
         if (!atom_const(cx, n->units, n->len, n->pos, &csrc) ||
             !atom_const(cx, n->units2, n->len2, n->pos, &cflags))
             return false;
-        note_pos(cx, n->pos);
         return emit_op_u16(cx, JS_OP_NEW_REGEXP, csrc, +1) && emit_u16(cx, cflags);
 #else
         return cerr(cx, n->pos, "regex support is not compiled into this build");
@@ -2861,6 +3048,8 @@ static bool bind_params_inner(JsCompiler *cx, const JsAstNode *fnode, uint16_t *
                           target->kind == JS_AST_OBJECT_PATTERN;
         if (!has_default && !is_pattern)
             continue; /* plain ident: slot already holds the arg */
+        if (is_pattern) /* V8's statement that destructures it is at the parameters' `(` */
+            stmt_pos(cx, fnode->pos2 ? fnode->pos2 : target->pos);
         if (!emit_op_u16(cx, JS_OP_GET_LOCAL, fs->locals[i].slot, +1))
             return false;
         if (has_default) {
@@ -3031,7 +3220,9 @@ static bool compile_let_decl(JsCompiler *cx, const JsAstNode *n) {
     cx->decl_const = (n->flags & JS_F_CONST) != 0; /* for REPL DEFINE_LEXICAL */
     for (uint32_t i = 0; i < n->count; i++) {
         const JsAstNode *d = n->items[i];
-        note_pos(cx, d->pos);
+        /* V8's statement for each declarator starts at its value */
+        if (d->b)
+            stmt_pos(cx, expr_start_pos(d->b));
         if (d->b) {
             if (d->a->kind == JS_AST_IDENT ? !compile_named_value(cx, d->b, d->a->units, d->a->len)
                                            : !compile_expr(cx, d->b))
@@ -3063,7 +3254,7 @@ static bool hoist_functions(JsCompiler *cx, JsAstNode *const *stmts, uint32_t co
                 return cerr(cx, s->pos, JS_ERR_NEEDS_MODULE_LOADER);
             static const uint16_t def_name[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
             uint16_t c;
-            note_pos(cx, s->pos);
+            stmt_pos(cx, s->pos);
             if (!compile_function_as(cx, s->a, def_name, 7))
                 return false;
             const JsAstNode *f = named_default_decl(s);
@@ -3132,7 +3323,7 @@ static bool compile_loop_body(JsCompiler *cx, const JsAstNode *body) {
 static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const JsAstNode *labels, uint32_t nlabels) {
     JsFuncState *fs = cx->cur;
     JsScopeMark m = scope_enter(cx);
-    note_pos(cx, n->pos);
+    stmt_pos(cx, v8_expr_pos(n->b)); /* V8: the subject, as a statement */
     if (!compile_expr(cx, n->b))
         return false;
     note_text(cx, n->b, false);
@@ -3160,6 +3351,7 @@ static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const JsAstNode *
     loop->continue_target = top;
 
     uint32_t done;
+    stmt_pos(cx, n->a->pos); /* each step: the target, as a statement */
     if (!emit_jump(cx, JS_OP_ITER_NEXT, +1, &done))
         return false;
 
@@ -3199,7 +3391,6 @@ static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const JsAstNode *
 
 static bool compile_for(JsCompiler *cx, const JsAstNode *n, const JsAstNode *labels, uint32_t nlabels) {
     JsScopeMark m = scope_enter(cx);
-    note_pos(cx, n->pos);
     bool has_let = n->a && n->a->kind == JS_AST_LET_DECL;
     if (n->a) {
         if (has_let) {
@@ -3211,6 +3402,7 @@ static bool compile_for(JsCompiler *cx, const JsAstNode *n, const JsAstNode *lab
             if (!compile_let_decl(cx, n->a))
                 return false;
         } else {
+            stmt_pos(cx, expr_start_pos(n->a->a));
             if (!compile_expr(cx, n->a->a) || !emit_op(cx, JS_OP_POP, -1))
                 return false;
         }
@@ -3225,6 +3417,7 @@ static bool compile_for(JsCompiler *cx, const JsAstNode *n, const JsAstNode *lab
     uint32_t exit = 0;
     bool has_test = n->b != NULL;
     if (has_test) {
+        stmt_pos(cx, v8_expr_pos(n->b)); /* V8: the condition, as a statement */
         if (!compile_expr(cx, n->b) || !emit_jump(cx, JS_OP_JUMP_IF_FALSE, -1, &exit))
             return false;
     }
@@ -3238,6 +3431,7 @@ static bool compile_for(JsCompiler *cx, const JsAstNode *n, const JsAstNode *lab
             return false;
     }
     if (n->c) {
+        stmt_pos(cx, v8_expr_pos(n->c));
         if (!compile_expr(cx, n->c) || !emit_op(cx, JS_OP_POP, -1))
             return false;
     }
@@ -3254,19 +3448,21 @@ static bool compile_while(JsCompiler *cx, const JsAstNode *n, bool is_do,
     JsLoopInfo *loop = loop_push(cx, true, labels, nlabels);
     if (!loop)
         return false;
-    note_pos(cx, n->pos);
+    /* V8 places the condition as a statement */
     if (is_do) {
         uint32_t top = FN->code_len;
         if (!compile_loop_body(cx, n->a))
             return false;
         for (uint32_t i = 0; i < loop->continues.count; i++)
             patch_here(cx, loop->continues.offs[i]);
+        stmt_pos(cx, v8_expr_pos(n->b));
         if (!compile_expr(cx, n->b) || !emit_jump_to(cx, JS_OP_JUMP_IF_TRUE, -1, top))
             return false;
     } else {
         uint32_t top = FN->code_len;
         loop->continue_target = top;
         uint32_t exit;
+        stmt_pos(cx, v8_expr_pos(n->a));
         if (!compile_expr(cx, n->a) || !emit_jump(cx, JS_OP_JUMP_IF_FALSE, -1, &exit))
             return false;
         if (!compile_loop_body(cx, n->b) || !emit_jump_to(cx, JS_OP_JUMP, 0, top))
@@ -3291,7 +3487,7 @@ static bool compile_switch(JsCompiler *cx, const JsAstNode *n) {
         if (!hoist_functions(cx, n->items[i]->items, n->items[i]->count))
             return false;
     }
-    note_pos(cx, n->pos);
+    stmt_pos(cx, n->pos);
     if (!compile_expr(cx, n->a))
         return false;
 
@@ -3475,7 +3671,7 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
     case JS_AST_BLOCK:
         return compile_block_stmts(cx, n->items, n->count);
     case JS_AST_EXPR_STMT:
-        note_pos(cx, n->pos);
+        stmt_pos(cx, n->pos);
         if (!compile_expr(cx, n->a))
             return false;
         if (cx->cur->is_module)
@@ -3486,7 +3682,7 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
         return compile_let_decl(cx, n);
     case JS_AST_IF: {
         uint32_t pelse;
-        note_pos(cx, n->pos);
+        stmt_pos(cx, n->pos);
         if (!compile_expr(cx, n->a) || !emit_jump(cx, JS_OP_JUMP_IF_FALSE, -1, &pelse))
             return false;
         if (!compile_stmt(cx, n->b))
@@ -3523,7 +3719,7 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
         if (!l)
             return cerr(cx, n->pos, is_break ? "no matching loop or switch for 'break'"
                                              : "no matching loop for 'continue'");
-        note_pos(cx, n->pos);
+        stmt_pos(cx, n->pos);
         int depth = cx->cur->depth;
         bool unwound = emit_cleanups(cx, is_break ? l->cleanup_floor : l->continue_floor, false) &&
                        emit_pops_to(cx, is_break ? l->entry_depth : l->continue_depth, false);
@@ -3556,7 +3752,7 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
     case JS_AST_RETURN:
         if (cx->cur->is_module && !(cx->module && cx->module->entry))
             return cerr(cx, n->pos, "Illegal return statement");
-        note_pos(cx, n->pos);
+        stmt_pos(cx, n->pos);
         if (n->a) {
             if (!compile_expr(cx, n->a))
                 return false;
@@ -3572,7 +3768,7 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
         }
         return emit_op(cx, JS_OP_RETURN, -1);
     case JS_AST_THROW:
-        note_pos(cx, n->pos);
+        stmt_pos(cx, n->pos);
         return compile_expr(cx, n->a) && emit_op(cx, JS_OP_THROW, -1);
     case JS_AST_LABELED:
         return compile_stmt_labeled(cx, n);
@@ -3594,7 +3790,7 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
         if (n->flags & JS_F_DEFAULT_DECL)
             return true; /* a function declaration: hoisted (hoist_functions) */
         /* exports.default = value (an anonymous function is named default) */
-        note_pos(cx, n->pos);
+        stmt_pos(cx, n->pos);
         static const uint16_t dflt[] = {'d', 'e', 'f', 'a', 'u', 'l', 't'};
         if (!compile_named_value(cx, n->a, dflt, 7))
             return false;

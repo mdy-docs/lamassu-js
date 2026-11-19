@@ -197,11 +197,13 @@ struct JsAstNode {
     JsAstNode *a, *b, *c, *d;
     JsAstNode **items; uint32_t count;
     /* FUNC_*: the source text Function.prototype.toString gives; EXPORT_ALL with `as`: where
-     * the name after it is (src_start) */
+     * the name after it is (src_start); MEMBER `.name` past a call or a `?.`: its dot or `?.`,
+     * where V8 places the read (src_start, else 0) */
     uint32_t src_start, src_end;
     /* Where V8 places the operation, for errors and stack frames: MEMBER the property (its name,
      * or `[`); CALL the callee's name when it is a name or a member's name, else the `(`;
-     * EXPORT_ALL the `*`; EXPORT_DEFAULT the `default`. */
+     * EXPORT_ALL the `*`; EXPORT_DEFAULT the `default`; BINARY, LOGICAL, ASSIGN and a postfix
+     * UPDATE the operator; FUNC_* the parameters' `(` (an arrow's one parameter without one). */
     uint32_t pos2;
 };
 

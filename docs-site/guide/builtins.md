@@ -484,8 +484,14 @@ Each subclass constructor's `[[Prototype]]` is `Error`, so `TypeError.captureSta
   `x.y` for `x.y = function () {}`), ` [as k]` when it was called under another key, `new C`,
   `async f` for an async function waiting on the one above it, and builtins as
   `at Array.map (<anonymous>)` (no frames for `call`, `apply` or a bound function, nor for a
-  host's natives). The column is where V8 puts it: a call at its callee's name (or its `(`), a
-  property read at the property, `new` and `await` at the keyword. A function compiled outside
+  host's natives). The column is where V8 puts it, for an error's own frame too, by V8's rules
+  for its bytecode: an expression that can fail is placed at its own position (a call at its
+  callee's name or its `(`, a property read at the property, or at its `.` after a call or a
+  `?.`, a name at the name, an assignment, `++` or an operator at the operator, `new` and
+  `await` at the keyword), except what runs first in a statement, which is placed at the
+  statement (`x = a.b` with `a` undefined points at the `x`). A loop's condition and update and a
+  `for`–`of` subject are placed as statements at their own position, and a destructuring at each
+  target. A function compiled outside
   the module pipeline is in `<anonymous>`. `stack` is an own accessor property that is not
   enumerated (`Object.keys`, `JSON.stringify` and spread do not see it); it can be assigned,
   even on a frozen error, and deleted. Its getter and setter are the same two functions on

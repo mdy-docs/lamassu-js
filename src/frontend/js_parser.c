@@ -1731,6 +1731,7 @@ static JsAstNode *parse_func_common(JsParser *p, uint8_t flags, bool need_name,
     JsNodeVec params = {0};
     bool super_ok = p->super_ok; /* the parameters' defaults are the function's, not the method's around it */
     p->super_ok = false;
+    fn->pos2 = TOK(p).pos; /* the `(` */
     if (!parse_params(p, &params))
         return NULL;
     vec_store(fn, &params);
@@ -1753,6 +1754,8 @@ static JsAstNode *build_arrow(JsParser *p, JsAstNode *params_src, bool is_async,
         return perr_here(p, "no line break allowed before '=>'");
     uint32_t pos = params_src->pos;
     JsAstNode *fn = new_node(p, JS_AST_FUNC_EXPR, pos);
+    if (fn)
+        fn->pos2 = pos; /* the `(`, or the one parameter */
     /* the parameters are patterns from the `=>` on, before anything after it is read: what
      * was read with a cover initializer in them is claimed */
     if (params_src->kind == JS_AST_COVER)
@@ -2009,6 +2012,7 @@ static JsAstNode *parse_object_literal_inner(JsParser *p) {
                 fn->flags = (uint8_t)(JS_F_METHOD_FN | ((prop->flags & JS_F_PROP_ASYNC) ? JS_F_ASYNC : 0));
                 JsNodeVec params = {0};
                 uint32_t params_pos = TOK(p).pos;
+                fn->pos2 = params_pos; /* the `(` */
                 bool super_ok = p->super_ok; /* a method may say `super.x`, from its parameters on */
                 p->super_ok = true;
                 if (!parse_params(p, &params))
@@ -2469,6 +2473,8 @@ static JsAstNode *parse_call_member(JsParser *p) {
     JsAstNode *base = TOK(p).kind == JS_T_NEW ? parse_new_expr(p) : parse_primary(p);
     if (!base)
         return NULL;
+    /* past a call or a `?.`, V8 places a `.name` at its dot (its LeftHandSideContinuation) */
+    bool past_call = false;
     for (;;) {
         if (p->err_msg)
             return NULL;
@@ -2482,6 +2488,7 @@ static JsAstNode *parse_call_member(JsParser *p) {
         }
         if (k == JS_T_DOT || k == JS_T_QUESDOT) {
             bool optional = k == JS_T_QUESDOT;
+            uint32_t dot = TOK(p).pos;
             if (!advance(p))
                 return NULL;
             if (optional && TOK(p).kind == JS_T_LPAREN) {
@@ -2497,6 +2504,7 @@ static JsAstNode *parse_call_member(JsParser *p) {
                 call->items = args.items;
                 call->count = args.count;
                 base = call;
+                past_call = true;
                 continue;
             }
             if (optional && TOK(p).kind == JS_T_LBRACK) {
@@ -2512,6 +2520,7 @@ static JsAstNode *parse_call_member(JsParser *p) {
                 if (!m->b || !expect(p, JS_T_RBRACK, "expected ']'"))
                     return NULL;
                 base = m;
+                past_call = true;
                 continue;
             }
             JsAstNode *name = parse_name_any(p, "expected property name");
@@ -2526,6 +2535,9 @@ static JsAstNode *parse_call_member(JsParser *p) {
             m->units = name->units;
             m->len = name->len;
             m->pos2 = name->pos;
+            if (optional || past_call)
+                m->src_start = dot;
+            past_call |= optional;
             base = m;
         } else if (k == JS_T_LBRACK) {
             JsAstNode *m = new_node(p, JS_AST_MEMBER, base->pos);
@@ -2552,6 +2564,7 @@ static JsAstNode *parse_call_member(JsParser *p) {
             call->items = args.items;
             call->count = args.count;
             base = call;
+            past_call = true;
         } else if (k == JS_T_TEMPLATE) {
             for (const JsAstNode *c = base; c && (c->kind == JS_AST_MEMBER || c->kind == JS_AST_CALL) &&
                                             !(c->flags & JS_F_PAREN); c = c->a)
@@ -2631,6 +2644,7 @@ static JsAstNode *parse_unary(JsParser *p) {
             goto out;
         result->op = (uint8_t)op;
         result->flags |= JS_F_PREFIX;
+        result->pos2 = pos;
         result->a = operand;
         break;
     }
@@ -2681,6 +2695,7 @@ static JsAstNode *parse_unary(JsParser *p) {
                 goto out;
             }
             upd->op = (uint8_t)TOK(p).kind;
+            upd->pos2 = TOK(p).pos; /* the operator */
             upd->a = target;
             result = advance(p) ? upd : NULL;
         }
@@ -2740,7 +2755,7 @@ static JsAstNode *parse_binary(JsParser *p, int min_prec) {
             if (!left)
                 return NULL;
         }
-        uint32_t pos = left->pos;
+        uint32_t pos = left->pos, op_pos = TOK(p).pos;
         if (!advance(p))
             return NULL;
         /* Right-associative '**' re-enters parse_binary at the same precedence,
@@ -2763,6 +2778,7 @@ static JsAstNode *parse_binary(JsParser *p, int min_prec) {
         JsAstNode *n = new_node(p, logical ? JS_AST_LOGICAL : JS_AST_BINARY, pos);
         if (!n)
             return NULL;
+        n->pos2 = op_pos;
         n->op = (uint8_t)k;
         n->a = left;
         n->b = right;
@@ -2846,6 +2862,8 @@ static JsAstNode *parse_assign(JsParser *p) {
         if (!target)
             goto out;
         JsAstNode *n = new_node(p, JS_AST_ASSIGN, lhs->pos);
+        if (n)
+            n->pos2 = TOK(p).pos; /* the operator */
         if (!n || !advance(p))
             goto out;
         n->op = (uint8_t)op;
