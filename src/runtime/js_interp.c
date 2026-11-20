@@ -1850,6 +1850,27 @@ __attribute__((noinline)) static bool update_slow(JsContext *ctx, JsFiber *fb, u
     return true;
 }
 
+/* INC_LOCAL / DEC_LOCAL on a value that is not a number (the local at stack index SLOT): a binding
+ * still in its TDZ throws as GET_LOCAL's read would, else update_slow with the value pushed, its
+ * result stored back. Out of line, for run_fiber. */
+JS_COLD static void fiber_throw_tdz(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn, uint32_t ip);
+JS_COLD static bool update_local_slow(JsContext *ctx, JsFiber *fb, const JsFunctionCell *fn,
+                                      uint32_t op_ip, uint32_t ip, uint32_t slot, uint8_t dec) {
+    JsValue v = fb->stack[slot];
+    if (v.bits == JS_SPECIAL_TDZ) {
+        fiber_throw_tdz(ctx, fb, fn, op_ip);
+        return false;
+    }
+    fb->stack[fb->sp++] = v; /* within the frame's headroom (max_stack's 8) */
+    if (!update_slow(ctx, fb, ip, false, dec)) {
+        fb->error = js_take_error(ctx);
+        fb->failed = true;
+        return false;
+    }
+    fb->stack[slot] = fb->stack[--fb->sp];
+    return true;
+}
+
 /* ToNumber of the top two operands, left first. */
 /* The operands of a binary arithmetic or bitwise op that are not both numbers: 1 with their
  * ToNumber in *A and *B, 2 when the op was done here (BigInt operands: the result replaces them),
@@ -3144,6 +3165,23 @@ run:; /* (re)load the top frame */
             case JS_OP_SET_LOCAL:
                 S[base + READ_U16()] = PEEK(0);
                 break;
+            case JS_OP_SET_LOCAL_POP: {
+                uint16_t slot = READ_U16();
+                S[base + slot] = PEEK(0);
+                fb->sp--;
+                break;
+            }
+            case JS_OP_INC_LOCAL: case JS_OP_DEC_LOCAL: {
+                uint32_t slot = base + READ_U16();
+                JsValue v = S[slot];
+                if (js_is_number(v)) {
+                    S[slot] = js_number(js_get_number(v) + (op == JS_OP_INC_LOCAL ? 1.0 : -1.0));
+                    break;
+                }
+                if (!update_local_slow(ctx, fb, fn, op_ip, ip, slot, op == JS_OP_DEC_LOCAL))
+                    RT_RAISE();
+                break;
+            }
             case JS_OP_SET_LOCAL_CHECKED: {
                 uint16_t slot = READ_U16();
                 if (S[base + slot].bits == JS_SPECIAL_TDZ) {

@@ -126,6 +126,10 @@ typedef struct JsFuncState {
      * position of its own shows it, as V8's does (see compile_pattern_store) */
     uint32_t last_expr_pos;
     bool load_checked; /* the GET_LOCAL / GET_UPVAL about to be emitted can throw (the TDZ) */
+    /* For emit_op's fusion of SET_LOCAL and POP: where the last instruction starts, and the last
+     * offset a jump lands on (here) */
+    uint32_t last_op_off;
+    uint32_t label_off;
 } JsFuncState;
 
 enum { JS_LATENT_NONE, JS_LATENT_EXPR, JS_LATENT_STMT };
@@ -333,8 +337,26 @@ static void expr_pos(JsCompiler *cx, uint32_t pos) {
     cx->cur->latent = JS_LATENT_EXPR;
 }
 
+/* Whether an instruction emitted now could not be fused with the one before it: a jump lands here,
+ * or a position or a name is already recorded against it */
+static bool fusion_barrier(JsCompiler *cx) {
+    JsFunctionCell *f = FN;
+    return cx->cur->label_off == f->code_len || cx->cur->latent == JS_LATENT_STMT ||
+           (f->line_count && f->lines[f->line_count - 1].off == f->code_len) ||
+           (f->callee_count && f->callees[f->callee_count - 1].off == f->code_len);
+}
+
 static bool emit_op(JsCompiler *cx, JsOp op, int delta) {
     JsFuncState *fs = cx->cur;
+    /* SET_LOCAL then POP, an assignment or initialiser whose value is unused, is one instruction */
+    if (op == JS_OP_POP && fs->last_op_off + 3 == FN->code_len && FN->code_len >= 3 &&
+        FN->code[fs->last_op_off] == JS_OP_SET_LOCAL && !fusion_barrier(cx)) {
+        FN->code[fs->last_op_off] = JS_OP_SET_LOCAL_POP;
+        fs->load_checked = false;
+        adjust(cx, delta);
+        return true;
+    }
+    fs->last_op_off = FN->code_len;
     if (fs->latent && (fs->latent == JS_LATENT_STMT || !op_without_effects(cx, op))) {
         note_pos(cx, fs->latent_pos);
         fs->latent = JS_LATENT_NONE;
@@ -367,6 +389,8 @@ static bool emit_jump(JsCompiler *cx, JsOp op, int delta, uint32_t *patch) {
 }
 
 static void patch_at(JsCompiler *cx, uint32_t operand_off, uint32_t target) {
+    if (target == FN->code_len)
+        cx->cur->label_off = target;
     FN->code[operand_off] = (uint8_t)(target & 0xFF);
     FN->code[operand_off + 1] = (uint8_t)((target >> 8) & 0xFF);
     FN->code[operand_off + 2] = (uint8_t)((target >> 16) & 0xFF);
@@ -375,6 +399,11 @@ static void patch_at(JsCompiler *cx, uint32_t operand_off, uint32_t target) {
 
 static void patch_here(JsCompiler *cx, uint32_t operand_off) {
     patch_at(cx, operand_off, FN->code_len);
+}
+
+/* The offset the next instruction is emitted at, as a jump's target */
+static uint32_t here(JsCompiler *cx) {
+    return cx->cur->label_off = FN->code_len;
 }
 
 static bool emit_jump_to(JsCompiler *cx, JsOp op, int delta, uint32_t target) {
@@ -2305,6 +2334,25 @@ static bool compile_assign(JsCompiler *cx, const JsAstNode *n) {
     return cerr(cx, t->pos, "Invalid left-hand side in assignment");
 }
 
+/* An expression whose value is unused (a statement's, a for loop's update): `i++` or `--i` on a
+ * local that is neither const nor ever in its TDZ is one INC_LOCAL or DEC_LOCAL, with the
+ * positions the four instructions it replaces have; anything else is compiled and popped */
+static bool compile_expr_discard(JsCompiler *cx, const JsAstNode *n) {
+    if (n->kind == JS_AST_UPDATE && n->a->kind == JS_AST_IDENT) {
+        int idx = resolve_local_in(cx->cur, n->a->units, n->a->len);
+        if (idx >= 0) {
+            const JsLocalVar *v = &cx->cur->locals[idx];
+            if (!v->pending && !v->tdz_anywhere && !v->is_const) {
+                if (!emit_op_u16(cx, n->op == JS_T_INC ? JS_OP_INC_LOCAL : JS_OP_DEC_LOCAL, v->slot, 0))
+                    return false;
+                expr_pos(cx, n->pos2);
+                return true;
+            }
+        }
+    }
+    return compile_expr(cx, n) && emit_op(cx, JS_OP_POP, -1);
+}
+
 static bool compile_update(JsCompiler *cx, const JsAstNode *n) {
     const JsAstNode *t = n->a;
     uint8_t dec = n->op == JS_T_INC ? 0 : 1;
@@ -3372,7 +3420,7 @@ static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const JsAstNode *
     uint32_t handler;
     if (!emit_jump(cx, JS_OP_TRY_PUSH, 0, &handler))
         return false;
-    uint32_t top = FN->code_len;
+    uint32_t top = here(cx);
     loop->continue_target = top;
 
     uint32_t done;
@@ -3461,7 +3509,7 @@ static bool compile_for(JsCompiler *cx, const JsAstNode *n, const JsAstNode *lab
     if (has_let)
         loop->loopvar_slot = m.slot_count;
 
-    uint32_t top = FN->code_len;
+    uint32_t top = here(cx);
     uint32_t exit = 0;
     bool has_test = n->b != NULL;
     if (has_test) {
@@ -3483,7 +3531,7 @@ static bool compile_for(JsCompiler *cx, const JsAstNode *n, const JsAstNode *lab
     }
     if (n->c) {
         stmt_pos(cx, v8_expr_pos(n->c));
-        if (!compile_expr(cx, n->c) || !emit_op(cx, JS_OP_POP, -1))
+        if (!compile_expr_discard(cx, n->c))
             return false;
     }
     if (!emit_jump_to(cx, JS_OP_JUMP, 0, top))
@@ -3501,7 +3549,7 @@ static bool compile_while(JsCompiler *cx, const JsAstNode *n, bool is_do,
         return false;
     /* V8 places the condition as a statement */
     if (is_do) {
-        uint32_t top = FN->code_len;
+        uint32_t top = here(cx);
         if (!compile_loop_body(cx, n->a))
             return false;
         for (uint32_t i = 0; i < loop->continues.count; i++)
@@ -3510,7 +3558,7 @@ static bool compile_while(JsCompiler *cx, const JsAstNode *n, bool is_do,
         if (!compile_expr(cx, n->b) || !emit_jump_to(cx, JS_OP_JUMP_IF_TRUE, -1, top))
             return false;
     } else {
-        uint32_t top = FN->code_len;
+        uint32_t top = here(cx);
         loop->continue_target = top;
         uint32_t exit;
         stmt_pos(cx, v8_expr_pos(n->a));
@@ -3669,7 +3717,7 @@ static bool compile_try(JsCompiler *cx, const JsAstNode *n) {
         if (!emit_gosub(cx, &gosubs) || !emit_op(cx, JS_OP_THROW, -1))
             return false;
         /* Emit finally body as a subroutine and patch all GOSUBs to it. */
-        uint32_t body = FN->code_len;
+        uint32_t body = here(cx);
         for (uint32_t i = 0; i < gosubs.count; i++)
             patch_at(cx, gosubs.offs[i], body);
         set_depth(cx, start_depth + 2); /* [pending, return address], whichever way it is entered */
@@ -3723,12 +3771,10 @@ static bool compile_stmt(JsCompiler *cx, const JsAstNode *n) {
         return compile_block_stmts(cx, n->items, n->count);
     case JS_AST_EXPR_STMT:
         stmt_pos(cx, n->pos);
-        if (!compile_expr(cx, n->a))
-            return false;
-        if (cx->cur->is_module)
-            return emit_op_u16(cx, JS_OP_SET_LOCAL, JS_COMPLETION_SLOT, 0) &&
-                   emit_op(cx, JS_OP_POP, -1);
-        return emit_op(cx, JS_OP_POP, -1);
+        if (!cx->cur->is_module)
+            return compile_expr_discard(cx, n->a);
+        return compile_expr(cx, n->a) && emit_op_u16(cx, JS_OP_SET_LOCAL, JS_COMPLETION_SLOT, 0) &&
+               emit_op(cx, JS_OP_POP, -1);
     case JS_AST_LET_DECL:
         return compile_let_decl(cx, n);
     case JS_AST_IF: {

@@ -140,6 +140,9 @@ const JsOpInfo js_op_info[JS_OP__COUNT] = {
     OP(JS_OP_UPDATE, OPF_U8, CF_NEXT, 0, 1, 1),
     OP(JS_OP_UPDATE_POST, OPF_U8, CF_NEXT, +1, 1, 1),
     OP(JS_OP_SET_PROTO, OPF_NONE, CF_NEXT, -1, 2, 0),
+    OP(JS_OP_SET_LOCAL_POP, OPF_LOCAL, CF_NEXT, -1, 1, 2),
+    OP(JS_OP_INC_LOCAL, OPF_LOCAL, CF_NEXT, 0, 0, 2),
+    OP(JS_OP_DEC_LOCAL, OPF_LOCAL, CF_NEXT, 0, 0, 2),
 };
 #undef OP
 

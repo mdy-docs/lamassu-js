@@ -518,6 +518,59 @@ static void test_real_prototypes(void) {
     expect_error("Object.setPrototypeOf({}, 5);", RUN_RUNTIME_ERR, "TypeError");
 }
 
+/* The fused instructions (SET_LOCAL_POP, INC_LOCAL, DEC_LOCAL) behave as the ones they replace:
+ * ++ and -- convert as an expression's do, and a store is not fused with a POP a jump lands on
+ * (a conditional's, a logical's, an optional chain's or a switch's join). Expected values from Node. */
+static void test_fused_ops(void) {
+    /* a join's POP left out would leave a value under the call's arguments */
+    expect_result("function j2(a, b) { return a + '/' + b; } function sj(c) { let x = 0, y = 0; const r = j2('a', (c ? x = 1 : x = 2, c && (y = 3), c || (y = 4), x = c ?? (x = 5), 'b')); return [r, x, y].join(); } [sj(true), sj(false), sj(null)].join(' ');",
+                  "a/b,true,3 a/b,false,4 a/b,5,4");
+    expect_result("function j3(a, b) { return a + '/' + b; } function so(o) { let x = 0; return j3('a', (x = o?.p, 'b')) + x; } [so(null), so({ p: 1 })].join(' ');",
+                  "a/bundefined a/b1");
+    expect_result("function j4(a, b) { return a + '/' + b; } function ss(v) { let x = 0; return j4('a', (() => { switch (v) { case 1: x = 1; case 2: x = 2; } return 'b'; })()) + x; } [ss(1), ss(3)].join(' ');",
+                  "a/b2 a/b0");
+    expect_result("let calls = 0; function f() { let s = '5'; s++; let t = '5'; t--; let u; u++; let n = null; n++; let b = 1n; b++; let c = 3n; c--; let o = { valueOf() { calls++; return 7; } }; o++; let d = { toString() { return '2'; } }; d--; let x = 1.5; --x; return [s, typeof s, t, u, n, b, typeof b, c, o, calls, d, x].join(); } f();",
+                  "6,number,4,NaN,1,2,bigint,2,8,1,1,0.5");
+    expect_result("let r = []; for (let i = 3; i > 0; i--) r.push(i); r.join();",
+                  "3,2,1");
+    expect_result("function g(c) { let x = 0; c ? x = 1 : x = 2; return x; } [g(true), g(false)].join();",
+                  "1,2");
+    expect_result("function h(c) { let x = 0, y = 0; c && (x = 5); c || (y = 6); return x + ':' + y; } [h(true), h(false)].join();",
+                  "5:0,0:6");
+    expect_result("function k(c) { let x = 0; x = c ?? (x = 9); return x; } [k(1), k(null)].join();",
+                  "1,9");
+    expect_result("function m(a) { let x; if (a) x = 1; else x = 2; let y = 3; return x + y; } [m(1), m(0)].join();",
+                  "4,5");
+    expect_result("function w(a, b) { let x = 0; a ? (b ? x = 1 : x = 2) : x = 3; return x; } [w(1, 1), w(1, 0), w(0, 0)].join();",
+                  "1,2,3");
+    expect_result("function sw(v) { let x = 0; switch (v) { case 1: x = 1; case 2: x += 2; break; default: x = 9; } return x; } [sw(1), sw(2), sw(3)].join();",
+                  "3,2,9");
+    expect_result("function tf() { let x = 0; try { x = 1; } finally { x = x + 1; } return x; } tf();",
+                  "2");
+    expect_result("function oc(o) { let x = 0; x = o?.p; return x; } [oc(null), oc({ p: 4 })].join();",
+                  ",4");
+    expect_result("function lb() { let n = 0; outer: for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) { if (j === 1) continue outer; n = n + 10; } } return n; } lb();",
+                  "30");
+    expect_result("function ci() { let i = 0; const g = () => i; i++; i++; ++i; i--; return g(); } ci();",
+                  "2");
+    expect_result("function td() { let r; { r = () => z; } let z = 1; z++; return r(); } td();",
+                  "2");
+    expect_result("function cs() { const c = 1; try { c++; } catch (e) { return e.message; } } cs();",
+                  "Assignment to constant variable.");
+    expect_result("let a = 1; a++;",
+                  "1");
+    expect_result("let a2 = 1; a2++; a2;",
+                  "2");
+    expect_result("function sq() { let i = 0, j = 10; for (; i < 3; i++, j--) {} return i + ':' + j; } sq();",
+                  "3:7");
+    expect_result("function dw() { let i = 0; do i++; while (i < 5); return i; } dw();",
+                  "5");
+    expect_result("function bi() { let b = 2n ** 64n; b++; return String(b); } bi();",
+                  "18446744073709551617");
+    expect_result("function tz() { let u = { valueOf() { throw new RangeError('no'); } }; let n = 0; try { u++; } catch (e) { n = e.name; } return [n, typeof u].join(); } tz();",
+                  "RangeError,object");
+}
+
 static void test_closures(void) {
     expect_result("function counter() { let n = 0; return () => ++n; }"
                   " let c = counter(); c(); c(); c();", "3");
@@ -1842,6 +1895,7 @@ int main(void) {
     test_new();
     test_real_prototypes();
     test_closures();
+    test_fused_ops();
     test_exceptions();
     test_fuel();
     test_heap_limit();

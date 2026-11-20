@@ -2088,6 +2088,22 @@ static void test_error_positions(void) {
     {"const f = () => { const p = Object.freeze({ x: 1 }); for (p.x of [1]) {} };\nf();", "2:61"},
     {"const u = undefined; [u.x] = [1];", "2:23"},
     {"const u = undefined; for (u[0] of [1]) {}", "2:28"},
+    /* ++ and -- whose value is unused, on a local: one INC_LOCAL or DEC_LOCAL */
+    {"let o = Object.create(null);\no++;", "3:1"},
+    {"let o = Object.create(null);\no--;", "3:1"},
+    {"let o = Object.create(null);\n++o;", "3:1"},
+    {"let o = Object.create(null);\n--o;", "3:1"},
+    {"let o = Object.create(null);\n  o ++ ;", "3:3"},
+    {"let o = Object.create(null);\nfor (let i = 0; i < 1; o++) {}", "3:25"},
+    {"let o = Object.create(null);\nfor (let i = 0; i < 1; --o) {}", "3:26"},
+    {"for (let i = Object.create(null); ; i++) {}", "2:38"},
+    {"for (let i = Object.create(null); ; i--) { }", "2:38"},
+    {"function f(p) {\n  p++;\n}\nf(Object.create(null));", "3:3"},
+    {"function f(p) {\n  if (p) p--;\n}\nf(Object.create(null));", "3:10"},
+    {"let q = { valueOf() { return a; } };\nq++;", "2:23"},
+    {"let q = { valueOf() { return a; } };\nfor (let i = 0; i < 1; q--) {}", "2:23"},
+    {"let q = { valueOf: 1, toString: 1 };\nlet z = 0;\nz++;\nq++;", "5:1"},
+    {"let o = Object.create(null);\nlet x = 0;\nwhile (x < 1) { x++; o++; }", "4:22"},
 
     };
     static const char head[] = "try {\n", tail[] =

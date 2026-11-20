@@ -130,9 +130,18 @@ typedef enum JsOp {
     /* An object literal's `__proto__: v`: obj v -> obj, the object's prototype v when v is an
      * object, a function or null, and as it was for any other value */
     JS_OP_SET_PROTO,
+    /* Fused pairs the compiler emits for the most common statements, one dispatch instead of
+     * two or four (the same effects, errors and positions as the instructions they replace):
+     * SET_LOCAL_POP is SET_LOCAL then POP (u16 slot; v ->), an assignment or initialiser whose
+     * value is unused. INC_LOCAL and DEC_LOCAL are `i++;` and `i--;` on a local whose value is
+     * unused (u16 slot; no stack effect), GET_LOCAL, UPDATE, SET_LOCAL, POP: TDZ-checked, then
+     * ToNumeric of the value and one added or taken away in its own type. */
+    JS_OP_SET_LOCAL_POP,
+    JS_OP_INC_LOCAL,
+    JS_OP_DEC_LOCAL,
 } JsOp;
 
-#define JS_OP__COUNT (JS_OP_SET_PROTO + 1)
+#define JS_OP__COUNT (JS_OP_DEC_LOCAL + 1)
 
 /*
  * Per-opcode metadata, the single source of truth the bytecode verifier
