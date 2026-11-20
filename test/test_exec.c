@@ -531,6 +531,28 @@ static void test_closures(void) {
                   " fns[0]() + '' + fns[1]() + fns[2]();", "012");
     expect_result("let fns = []; for (const v of [10, 20, 30]) fns[fns.length] = () => v;"
                   " fns[0]() + '/' + fns[2]();", "10/30");
+    /* a for loop closes its per-iteration binding only when a closure takes it: in the body,
+     * the head, a nested block or a nested function, or the update clause (compiled after the
+     * close, so asked by what it contains) */
+    expect_result("let fs = []; for (let i = 0; i < 3; i++, fs.push(() => i)) {}"
+                  " fs.map(f => f()).join();", "1,2,3");
+    expect_result("let fs = []; for (let i = 0; fs.push(() => i), i < 2; i++) {}"
+                  " fs.map(f => f()).join();", "0,1,2");
+    expect_result("let fs = []; for (let i = 0; i < 3; i++) { { let j = i; fs.push(() => j * 10 + i); } }"
+                  " fs.map(f => f()).join();", "0,11,22");
+    expect_result("let fs = []; for (let i = 0; i < 3; i++) { const g = () => () => i; fs.push(g()); }"
+                  " fs.map(f => f()).join();", "0,1,2");
+    expect_result("let fs = []; for (let i = 0; i < 4; i++) { if (i % 2) continue; fs.push(() => i); }"
+                  " fs.map(f => f()).join();", "0,2");
+    expect_result("let s = 0; for (let i = 0; i < 5; i++) s += i; s;", "10");
+    /* open upvalues of several frames and blocks, captured out of slot order and closed by a
+     * block exit, a return and a loop iteration while others stay open below them */
+    expect_result("let a = 1; const fa = () => a; let r = [];"
+                  " { let b = 2; let c = 3; const fc = () => c; const fb = () => b; b = 20; c = 30; r.push(fb() + fc()); }"
+                  " function f(n) { let x = n; const gx = () => x; x++; return gx; }"
+                  " const g1 = f(1), g2 = f(5); a = 7; r.push(fa(), g1(), g2()); r.join();", "50,7,2,6");
+    expect_result("function deep(n, acc) { let v = n; acc.push(() => v); if (n) deep(n - 1, acc); v = -n; return acc; }"
+                  " deep(3, []).map(f => f()).join();", "-3,-2,-1,0");
     /* shared upvalue between two closures */
     expect_result("function pair() { let n = 0; return [() => ++n, () => n]; }"
                   " let [inc, get] = pair(); inc(); inc(); get();", "2");

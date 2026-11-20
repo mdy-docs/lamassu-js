@@ -3415,6 +3415,28 @@ static bool compile_for_of(JsCompiler *cx, const JsAstNode *n, const JsAstNode *
     return scope_leave(cx, m);
 }
 
+/* Whether a closure captured one of the locals at or above SLOT still in scope */
+static bool loop_vars_captured(const JsFuncState *fs, int slot) {
+    for (uint32_t i = 0; i < fs->local_count; i++)
+        if ((int)fs->locals[i].slot >= slot && fs->locals[i].captured)
+            return true;
+    return false;
+}
+
+/* Whether N makes a function (and so may capture), anywhere inside it */
+static bool makes_closure(const JsAstNode *n) {
+    if (!n)
+        return false;
+    if (n->kind == JS_AST_FUNC_EXPR || n->kind == JS_AST_FUNC_DECL)
+        return true;
+    if (makes_closure(n->a) || makes_closure(n->b) || makes_closure(n->c) || makes_closure(n->d))
+        return true;
+    for (uint32_t i = 0; i < n->count; i++)
+        if (makes_closure(n->items[i]))
+            return true;
+    return false;
+}
+
 static bool compile_for(JsCompiler *cx, const JsAstNode *n, const JsAstNode *labels, uint32_t nlabels) {
     JsScopeMark m = scope_enter(cx);
     bool has_let = n->a && n->a->kind == JS_AST_LET_DECL;
@@ -3451,8 +3473,11 @@ static bool compile_for(JsCompiler *cx, const JsAstNode *n, const JsAstNode *lab
         return false;
     for (uint32_t i = 0; i < loop->continues.count; i++)
         patch_here(cx, loop->continues.offs[i]);
-    /* fresh per-iteration binding for captured loop vars */
-    if (has_let && loop->loopvar_slot >= 0) {
+    /* fresh per-iteration binding for captured loop vars: only when a closure took one, in the
+     * head or the body (compiled by now, so their captures are known) or in the update clause
+     * (compiled after this, so it is asked whether it makes a closure at all) */
+    if (has_let && loop->loopvar_slot >= 0 &&
+        (loop_vars_captured(cx->cur, loop->loopvar_slot) || (n->c && makes_closure(n->c)))) {
         if (!emit_op_u16(cx, JS_OP_CLOSE_UPVALS, (uint16_t)loop->loopvar_slot, 0))
             return false;
     }

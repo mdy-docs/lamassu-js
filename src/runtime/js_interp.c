@@ -2732,11 +2732,17 @@ static JsClosure *closure_new(JsVm *vm, JsFunctionCell *fn) {
     return cl;
 }
 
+/* A fiber's open upvalues are a list sorted by slot, highest first: a frame's own are at the head,
+ * above every frame below it, so capturing one looks only as far as its slot, and closing a
+ * frame's (a return, a loop iteration, a block a closure was made in) stops at the first one
+ * below the frame. Unsorted, both walked every upvalue the fiber had open, which made each call
+ * and each iteration cost in proportion to the variables closures captured further down. */
 static JsUpvalue *upvalue_capture(JsVm *vm, JsFiber *fb, uint32_t slot) {
-    for (JsUpvalue *uv = fb->open_upvals; uv; uv = uv->next_open) {
-        if (uv->slot == slot)
-            return uv;
-    }
+    JsUpvalue **link = &fb->open_upvals;
+    while (*link && (*link)->slot > slot)
+        link = &(*link)->next_open;
+    if (*link && (*link)->slot == slot)
+        return *link;
     JsGcCell *c = js_gc_new_cell(vm, JS_KIND_UPVALUE, sizeof(JsUpvalue));
     if (!c)
         return NULL;
@@ -2745,23 +2751,23 @@ static JsUpvalue *upvalue_capture(JsVm *vm, JsFiber *fb, uint32_t slot) {
     uv->slot = slot;
     uv->open = true;
     uv->closed = js_undefined();
-    uv->next_open = fb->open_upvals;
-    fb->open_upvals = uv;
+    /* found again: the list is the collector's to read, not to change, but nothing is lost by
+     * not relying on that */
+    link = &fb->open_upvals;
+    while (*link && (*link)->slot > slot)
+        link = &(*link)->next_open;
+    uv->next_open = *link;
+    *link = uv;
     return uv;
 }
 
 static void upvalues_close_from(JsFiber *fb, uint32_t floor) {
-    JsUpvalue **link = &fb->open_upvals;
-    while (*link) {
-        JsUpvalue *uv = *link;
-        if (uv->slot >= floor) {
-            uv->closed = fb->stack[uv->slot];
-            uv->open = false;
-            *link = uv->next_open;
-            uv->next_open = NULL;
-        } else {
-            link = &uv->next_open;
-        }
+    JsUpvalue *uv;
+    while ((uv = fb->open_upvals) && uv->slot >= floor) {
+        uv->closed = fb->stack[uv->slot];
+        uv->open = false;
+        fb->open_upvals = uv->next_open;
+        uv->next_open = NULL;
     }
 }
 
